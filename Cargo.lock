@@ -481,9 +481,11 @@ dependencies = [
 name = "bloomd"
 version = "0.1.0"
 dependencies = [
+ "async-trait",
  "bloom-domain",
  "bloom-ipc",
  "bloom-secrets",
+ "bloom-transport",
  "libc",
  "rusqlite",
  "serde_json",

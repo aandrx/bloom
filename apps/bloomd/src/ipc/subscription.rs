@@ -1,0 +1,210 @@
+//! Bounded event fanout for dedicated subscription sockets.
+use std::time::Duration;
+
+use bloom_ipc::{Event, Response, ResponseKind};
+use tokio::{io::AsyncWrite, sync::broadcast, time::timeout};
+
+use super::listener::AuthenticatedStream;
+
+pub const SUBSCRIPTION_WRITE_TIMEOUT: Duration = Duration::from_secs(30);
+const DEFAULT_CAPACITY: usize = 128;
+
+/// Bounded fanout for events that have already been persisted.
+#[derive(Clone)]
+pub struct SubscriptionHub {
+    sender: broadcast::Sender<Event>,
+}
+
+impl SubscriptionHub {
+    pub fn new(capacity: usize) -> Self {
+        assert!(capacity > 0, "subscription capacity must be nonzero");
+        let (sender, _) = broadcast::channel(capacity);
+        Self { sender }
+    }
+
+    pub fn with_default_capacity() -> Self {
+        Self::new(DEFAULT_CAPACITY)
+    }
+
+    /// Subscribe before acknowledging the request so subsequent events cannot fall in a gap.
+    pub fn subscribe(&self) -> broadcast::Receiver<Event> {
+        self.sender.subscribe()
+    }
+
+    /// Publish a persisted event. No receivers is normal and is not a persistence error.
+    pub fn publish(&self, event: Event) {
+        let _ = self.sender.send(event);
+    }
+}
+
+async fn wait_for_client_close(stream: &mut tokio::net::UnixStream) -> std::io::Result<()> {
+    let mut byte = [0u8; 1];
+    use tokio::io::AsyncReadExt;
+    match stream.read(&mut byte).await? {
+        0 => Ok(()),
+        _ => Err(std::io::Error::other("unexpected subscription client data")),
+    }
+}
+
+/// Send one acknowledgement followed exclusively by event frames.
+pub async fn serve_subscriber(
+    mut connection: AuthenticatedStream,
+    request_id: u64,
+    mut receiver: broadcast::Receiver<Event>,
+) {
+    let response = Response {
+        request_id,
+        response: ResponseKind::Subscribed,
+    };
+    if timeout(
+        SUBSCRIPTION_WRITE_TIMEOUT,
+        bloom_ipc::write_response(connection.stream_mut(), &response),
+    )
+    .await
+    .map_or(true, |result| result.is_err())
+    {
+        return;
+    }
+
+    loop {
+        let event = tokio::select! {
+            result = receiver.recv() => match result {
+                Ok(event) => event,
+                Err(broadcast::error::RecvError::Lagged(_))
+                | Err(broadcast::error::RecvError::Closed) => return,
+            },
+            result = wait_for_client_close(connection.stream_mut()) => {
+                let _ = result;
+                return;
+            }
+        };
+        if write_event_bounded(connection.stream_mut(), &event, SUBSCRIPTION_WRITE_TIMEOUT)
+            .await
+            .is_err()
+        {
+            return;
+        }
+    }
+}
+
+async fn write_event_bounded<W: AsyncWrite + Unpin>(
+    writer: &mut W,
+    event: &Event,
+    deadline: Duration,
+) -> Result<(), ()> {
+    timeout(deadline, bloom_ipc::write_event(writer, event))
+        .await
+        .map_err(|_| ())?
+        .map_err(|_| ())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use bloom_ipc::{
+        read_event, read_request, read_response, write_request, EventKind, Request, RequestKind,
+    };
+    use std::{fs, os::unix::fs::PermissionsExt};
+    use tokio::{io::AsyncReadExt, net::UnixStream};
+
+    async fn pair() -> (tempfile::TempDir, AuthenticatedStream, UnixStream) {
+        let dir = tempfile::tempdir().unwrap();
+        fs::set_permissions(dir.path(), fs::Permissions::from_mode(0o700)).unwrap();
+        let path = dir.path().join("bloomd.sock");
+        let listener = super::super::listener::Listener::bind(&path).unwrap();
+        let (server, client) = tokio::join!(listener.accept(), UnixStream::connect(path));
+        (dir, server.unwrap(), client.unwrap())
+    }
+
+    fn event() -> Event {
+        Event {
+            event: EventKind::Session {
+                state: bloom_domain::SessionState::Disconnected,
+            },
+        }
+    }
+
+    async fn subscribe_request(server: &mut AuthenticatedStream, client: &mut UnixStream) {
+        write_request(
+            client,
+            &Request {
+                request_id: 77,
+                request: RequestKind::Subscribe,
+            },
+        )
+        .await
+        .unwrap();
+        let request = read_request(server.stream_mut()).await.unwrap();
+        assert_eq!(request.request_id, 77);
+        assert!(matches!(request.request, RequestKind::Subscribe));
+    }
+
+    #[tokio::test]
+    async fn acknowledgement_precedes_buffered_events_and_echoes_id() {
+        let (_dir, mut server, mut client) = pair().await;
+        subscribe_request(&mut server, &mut client).await;
+        let hub = SubscriptionHub::new(4);
+        let receiver = hub.subscribe();
+        hub.publish(event());
+        let task = tokio::spawn(serve_subscriber(server, 77, receiver));
+        let ack = read_response(&mut client).await.unwrap();
+        assert_eq!(ack.request_id, 77);
+        assert!(matches!(ack.response, ResponseKind::Subscribed));
+        let received = read_event(&mut client).await.unwrap();
+        assert!(received == event());
+        drop(client);
+        timeout(Duration::from_secs(1), task)
+            .await
+            .unwrap()
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn idle_disconnect_releases_connection_without_an_event() {
+        let (_dir, mut server, mut client) = pair().await;
+        subscribe_request(&mut server, &mut client).await;
+        let hub = SubscriptionHub::new(4);
+        let task = tokio::spawn(serve_subscriber(server, 77, hub.subscribe()));
+        assert!(matches!(
+            read_response(&mut client).await.unwrap().response,
+            ResponseKind::Subscribed
+        ));
+        drop(client);
+        timeout(Duration::from_secs(1), task)
+            .await
+            .unwrap()
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn lagged_subscriber_is_disconnected_instead_of_missing_events() {
+        let (_dir, mut server, mut client) = pair().await;
+        subscribe_request(&mut server, &mut client).await;
+        let hub = SubscriptionHub::new(1);
+        let receiver = hub.subscribe();
+        for _ in 0..3 {
+            hub.publish(event());
+        }
+        let task = tokio::spawn(serve_subscriber(server, 77, receiver));
+        assert!(matches!(
+            read_response(&mut client).await.unwrap().response,
+            ResponseKind::Subscribed
+        ));
+        timeout(Duration::from_secs(1), task)
+            .await
+            .unwrap()
+            .unwrap();
+        let mut byte = [0];
+        assert_eq!(client.read(&mut byte).await.unwrap(), 0);
+    }
+
+    #[tokio::test]
+    async fn blocked_writer_has_deadline() {
+        let (mut writer, _reader) = tokio::io::duplex(1);
+        assert!(
+            write_event_bounded(&mut writer, &event(), Duration::from_millis(20))
+                .await
+                .is_err()
+        );
+    }
+}

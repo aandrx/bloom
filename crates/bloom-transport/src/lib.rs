@@ -131,7 +131,10 @@ pub trait Transport: Send + Sync {
         conversation: &ConversationId,
         limit: u16,
     ) -> TransportResult<Vec<Message>>;
-    /// Success means accepted by the transport, not delivered.
+    /// Success means accepted by the transport, not delivered. Shutdown may cancel
+    /// an in-flight call. Before integrating a side-effecting adapter, extend this
+    /// interface with a caller-owned idempotency key or equivalent recovery for an
+    /// uncertain send result; the fake has no external network side effects.
     async fn send(
         &self,
         conversation: &ConversationId,

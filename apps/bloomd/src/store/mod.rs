@@ -1,8 +1,10 @@
 //! Encrypted-at-rest SQLite store.
 
 mod conversations;
+mod ingest;
 mod messages;
 pub use conversations::{get_conversation, list_conversations, upsert_conversation};
+pub use ingest::{ingest_message, update_delivery};
 pub use messages::{get_message, history, upsert_message, MessageUpsertOutcome};
 
 use bloom_secrets::{SecretStore, SecretStoreError};

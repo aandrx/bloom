@@ -5,7 +5,10 @@ use bloom_domain::{Conversation, ConversationId, Message, MessageId, OutgoingBod
 use bloom_ipc::{ProtocolError, RequestKind, Response, ResponseKind};
 use tokio::{io::AsyncWrite, time::timeout};
 
-use super::listener::{AuthenticatedStream, MAX_HANDSHAKE_IDLE};
+use super::{
+    listener::{AuthenticatedStream, MAX_HANDSHAKE_IDLE},
+    subscription::{serve_subscriber, SubscriptionHub},
+};
 
 pub const REQUEST_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
 pub const RESPONSE_WRITE_TIMEOUT: Duration = Duration::from_secs(30);
@@ -28,12 +31,31 @@ pub trait RequestHandler: Send + Sync {
 
 /// Serve sequential requests. Codec errors and idle timeouts close this connection.
 pub async fn serve<H: RequestHandler>(connection: AuthenticatedStream, handler: &H) {
-    serve_with_first_timeout(connection, handler, MAX_HANDSHAKE_IDLE).await;
+    serve_inner(connection, handler, None, MAX_HANDSHAKE_IDLE).await;
 }
 
+/// Serve requests with a dedicated subscription path when Subscribe is the first frame.
+pub async fn serve_with_subscriptions<H: RequestHandler>(
+    connection: AuthenticatedStream,
+    handler: &H,
+    hub: &SubscriptionHub,
+) {
+    serve_inner(connection, handler, Some(hub), MAX_HANDSHAKE_IDLE).await;
+}
+
+#[cfg(test)]
 async fn serve_with_first_timeout<H: RequestHandler>(
+    connection: AuthenticatedStream,
+    handler: &H,
+    first_timeout: Duration,
+) {
+    serve_inner(connection, handler, None, first_timeout).await;
+}
+
+async fn serve_inner<H: RequestHandler>(
     mut connection: AuthenticatedStream,
     handler: &H,
+    hub: Option<&SubscriptionHub>,
     first_timeout: Duration,
 ) {
     let mut first = true;
@@ -47,6 +69,13 @@ async fn serve_with_first_timeout<H: RequestHandler>(
             Ok(Ok(request)) => request,
             _ => return,
         };
+        if first && matches!(&request.request, RequestKind::Subscribe) {
+            if let Some(hub) = hub {
+                let receiver = hub.subscribe();
+                serve_subscriber(connection, request.request_id, receiver).await;
+                return;
+            }
+        }
         first = false;
         let response = match request.request {
             RequestKind::ListConversations => match handler.list_conversations().await {
@@ -76,7 +105,11 @@ async fn serve_with_first_timeout<H: RequestHandler>(
                 Err(error) => ResponseKind::Error { error },
             },
             RequestKind::Subscribe => ResponseKind::Error {
-                error: ProtocolError::Unsupported,
+                error: if hub.is_some() {
+                    ProtocolError::InvalidRequest
+                } else {
+                    ProtocolError::Unsupported
+                },
             },
         };
         let response = Response {
@@ -107,7 +140,7 @@ async fn write_response_bounded<W: AsyncWrite + Unpin>(
 mod tests {
     use super::*;
     use bloom_domain::TransportId;
-    use bloom_ipc::{read_response, write_request, Request};
+    use bloom_ipc::{read_event, read_response, write_request, Event, EventKind, Request};
     use std::{
         fs,
         sync::{
@@ -220,6 +253,89 @@ mod tests {
                 .await
                 .is_err()
         );
+    }
+
+    #[tokio::test]
+    async fn dedicated_subscribe_receives_events_and_late_subscribe_is_rejected() {
+        let (_dir, listener, path) = socket();
+        let hub = SubscriptionHub::new(4);
+        let server_hub = hub.clone();
+        let server = tokio::spawn(async move {
+            serve_with_subscriptions(
+                listener.accept().await.unwrap(),
+                &FakeHandler(Arc::new(AtomicUsize::new(0))),
+                &server_hub,
+            )
+            .await;
+        });
+        let mut client = UnixStream::connect(path).await.unwrap();
+        write_request(
+            &mut client,
+            &Request {
+                request_id: 42,
+                request: RequestKind::Subscribe,
+            },
+        )
+        .await
+        .unwrap();
+        let ack = read_response(&mut client).await.unwrap();
+        assert_eq!(ack.request_id, 42);
+        assert!(matches!(ack.response, ResponseKind::Subscribed));
+        let expected = Event {
+            event: EventKind::Session {
+                state: bloom_domain::SessionState::Active,
+            },
+        };
+        hub.publish(expected.clone());
+        assert!(read_event(&mut client).await.unwrap() == expected);
+        drop(client);
+        tokio::time::timeout(Duration::from_secs(1), server)
+            .await
+            .unwrap()
+            .unwrap();
+
+        let (_dir, listener, path) = socket();
+        let server = tokio::spawn(async move {
+            serve_with_subscriptions(
+                listener.accept().await.unwrap(),
+                &FakeHandler(Arc::new(AtomicUsize::new(0))),
+                &SubscriptionHub::new(4),
+            )
+            .await;
+        });
+        let mut client = UnixStream::connect(path).await.unwrap();
+        write_request(
+            &mut client,
+            &Request {
+                request_id: 1,
+                request: RequestKind::ListConversations,
+            },
+        )
+        .await
+        .unwrap();
+        assert!(matches!(
+            read_response(&mut client).await.unwrap().response,
+            ResponseKind::Conversations { .. }
+        ));
+        write_request(
+            &mut client,
+            &Request {
+                request_id: 2,
+                request: RequestKind::Subscribe,
+            },
+        )
+        .await
+        .unwrap();
+        let rejected = read_response(&mut client).await.unwrap();
+        assert_eq!(rejected.request_id, 2);
+        assert!(matches!(
+            rejected.response,
+            ResponseKind::Error {
+                error: ProtocolError::InvalidRequest
+            }
+        ));
+        drop(client);
+        server.await.unwrap();
     }
 
     fn socket() -> (

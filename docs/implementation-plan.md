@@ -145,7 +145,7 @@ SSPL-separated adapter and should not be integrated until that boundary is set.
 
 ## 8. Gates
 
-- **Gate 0:** Find a lawful, locally runnable IDS validation-data implementation;
+- **Gate 0:** See [validation evidence](ids-validation-gate.md). Find a lawful, locally runnable IDS validation-data implementation;
   then Phase 0 spike must register, send, receive, and renew with the Mac off.
   Public `OpenAbsinthe-Stub` has `todo!()` in this path. The author's legacy
   [pypush mechanism](https://jjtech.dev/reverse-engineering/imessage-explained/)
