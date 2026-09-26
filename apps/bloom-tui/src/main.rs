@@ -93,20 +93,23 @@ async fn poll_terminal_key() -> Result<Option<KeyCode>> {
     Ok(None)
 }
 
-async fn select_key_or_join<K, J>(key: K, join: J) -> KeyOrJoin
+async fn select_key_or_send<K, J, S>(key: K, join: J, send: S) -> KeyOrJoinOrSend
 where
     K: std::future::Future<Output = Result<Option<KeyCode>>>,
     J: std::future::Future<Output = Option<(String, anyhow::Result<()>)>>,
+    S: std::future::Future<Output = Option<(String, String, u64, anyhow::Result<String>)>>,
 {
     tokio::select! {
-        key = key => KeyOrJoin::Key(key),
-        result = join => KeyOrJoin::Join(result),
+        key = key => KeyOrJoinOrSend::Key(key),
+        result = join => KeyOrJoinOrSend::Join(result),
+        result = send => KeyOrJoinOrSend::Send(result),
     }
 }
 
-enum KeyOrJoin {
+enum KeyOrJoinOrSend {
     Key(Result<Option<KeyCode>>),
     Join(Option<(String, anyhow::Result<()>)>),
+    Send(Option<(String, String, u64, anyhow::Result<String>)>),
 }
 
 fn spawn_join<F>(
@@ -119,6 +122,21 @@ fn spawn_join<F>(
     tokio::spawn(async move {
         let result = action.await;
         let _ = tx.send((id, result));
+    });
+}
+
+fn spawn_send<F>(
+    room: String,
+    body: String,
+    generation: u64,
+    action: F,
+    tx: tokio::sync::mpsc::UnboundedSender<(String, String, u64, anyhow::Result<String>)>,
+) where
+    F: std::future::Future<Output = anyhow::Result<String>> + Send + 'static,
+{
+    tokio::spawn(async move {
+        let result = action.await;
+        let _ = tx.send((room, body, generation, result));
     });
 }
 
@@ -147,6 +165,7 @@ async fn run(out: &mut io::Stdout, core: Bloom) -> Result<()> {
     let (room_tx, mut room_rx) = tokio::sync::mpsc::unbounded_channel();
     let (history_tx, mut history_rx) = tokio::sync::mpsc::unbounded_channel();
     let (join_tx, mut join_rx) = tokio::sync::mpsc::unbounded_channel();
+    let (send_tx, mut send_rx) = tokio::sync::mpsc::unbounded_channel();
     let mut room_epoch = RoomEpoch::default();
     let initial_generation = room_epoch.current();
     let initial_core = core.clone();
@@ -174,9 +193,31 @@ async fn run(out: &mut io::Stdout, core: Bloom) -> Result<()> {
                     }
                 },
                 Some((id, result)) = history_rx.recv() => app.history_result(id, result),
-                selected = select_key_or_join(poll_terminal_key(), join_rx.recv()) => match selected {
-                KeyOrJoin::Key(Ok(key)) => {
-                            match key {
+                selected = select_key_or_send(poll_terminal_key(), join_rx.recv(), send_rx.recv()) => match selected {
+                KeyOrJoinOrSend::Send(Some((id, body, generation, result))) => app.send_result(id, body, generation, result),
+                KeyOrJoinOrSend::Send(None) => {},
+                KeyOrJoinOrSend::Join(Some((id, result))) => { app.join_result(id, result); let generation = room_epoch.advance(); let core = core.clone(); let tx = room_tx.clone(); tokio::spawn(async move { let _ = tx.send((generation, core.rooms().await)); }); },
+                KeyOrJoinOrSend::Join(None) => {},
+                KeyOrJoinOrSend::Key(Ok(key)) => {
+                            if app.composer_open {
+                                match key {
+                                    Some(KeyCode::Esc) => app.cancel_composer(),
+                                    Some(KeyCode::Enter) => if let Some((id, body, generation)) = app.begin_send() {
+                                        let core = core.clone(); let tx = send_tx.clone();
+                                        let submitted_id = id.clone(); let submitted_body = body.clone();
+                                        spawn_send(id, body, generation, async move {
+                                            match submitted_id.parse() {
+                                                Ok(room) => core.send(&room, &submitted_body).await,
+                                                Err(error) => Err(anyhow::anyhow!(error)),
+                                            }
+                                        }, tx);
+                                    },
+                                    Some(KeyCode::Backspace) => app.backspace(),
+                                    Some(KeyCode::Char(c)) => app.edit_char(c),
+                                    _ => {}
+                                }
+                            } else { match key {
+                                Some(KeyCode::Char('m')) => app.open_composer(),
                                 Some(KeyCode::Down) => app.select_step(1),
                                 Some(KeyCode::Up) => app.select_step(-1),
                                 Some(KeyCode::Char('j')) => if let Some(id) = app.request_join() {
@@ -185,11 +226,9 @@ async fn run(out: &mut io::Stdout, core: Bloom) -> Result<()> {
                                 },
                                 Some(KeyCode::Char('q')) => break,
                                 _ => {}
-                            }
+                            }}
                 }
-                KeyOrJoin::Key(Err(error)) => return Err(error),
-                KeyOrJoin::Join(Some((id, result))) => { app.join_result(id, result); let generation = room_epoch.advance(); let core = core.clone(); let tx = room_tx.clone(); tokio::spawn(async move { let _ = tx.send((generation, core.rooms().await)); }); },
-                KeyOrJoin::Join(None) => {},
+                KeyOrJoinOrSend::Key(Err(error)) => return Err(error),
                 },
             }
         }
@@ -215,7 +254,8 @@ fn spawn_history(
 #[cfg(test)]
 mod tests {
     use super::{
-        select_key_or_join, spawn_join, with_shutdown, KeyOrJoin, RoomEpoch, TerminalGuard,
+        select_key_or_send, spawn_join, spawn_send, with_shutdown, KeyOrJoinOrSend, RoomEpoch,
+        TerminalGuard,
     };
     use anyhow::anyhow;
     use crossterm::event::KeyCode;
@@ -251,14 +291,64 @@ mod tests {
             join_tx,
         );
         started_rx.await.unwrap();
-
-        let selected = select_key_or_join(async { Ok(Some(KeyCode::Down)) }, join_rx.recv()).await;
-        assert!(matches!(selected, KeyOrJoin::Key(Ok(Some(KeyCode::Down)))));
+        let (_send_tx, mut send_rx) =
+            tokio::sync::mpsc::unbounded_channel::<(String, String, u64, anyhow::Result<String>)>();
+        let selected = select_key_or_send(
+            async { Ok(Some(KeyCode::Down)) },
+            join_rx.recv(),
+            send_rx.recv(),
+        )
+        .await;
+        assert!(matches!(
+            selected,
+            KeyOrJoinOrSend::Key(Ok(Some(KeyCode::Down)))
+        ));
         assert!(join_rx.try_recv().is_err());
+        assert!(send_rx.try_recv().is_err());
         assert!(release_tx.send(()).is_ok());
+        let selected =
+            select_key_or_send(std::future::pending(), join_rx.recv(), send_rx.recv()).await;
+        assert!(matches!(selected, KeyOrJoinOrSend::Join(Some((id, Ok(())))) if id == "room"));
+    }
 
-        let selected = select_key_or_join(std::future::pending(), join_rx.recv()).await;
-        assert!(matches!(selected, KeyOrJoin::Join(Some((id, Ok(())))) if id == "room"));
+    #[tokio::test]
+    async fn key_remains_responsive_while_send_is_pending() {
+        let (send_tx, mut send_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel::<()>();
+        spawn_send(
+            "room".into(),
+            "text".into(),
+            1,
+            async move {
+                let _ = started_tx.send(());
+                let _ = release_rx.await;
+                Ok("$event".into())
+            },
+            send_tx,
+        );
+        started_rx.await.unwrap();
+        let selected = select_key_or_send(
+            async { Ok(Some(KeyCode::Char('x'))) },
+            std::future::pending(),
+            send_rx.recv(),
+        )
+        .await;
+        assert!(matches!(
+            selected,
+            KeyOrJoinOrSend::Key(Ok(Some(KeyCode::Char('x'))))
+        ));
+        assert!(send_rx.try_recv().is_err());
+        release_tx.send(()).unwrap();
+        let selected = select_key_or_send(
+            std::future::pending(),
+            std::future::pending(),
+            send_rx.recv(),
+        )
+        .await;
+        assert!(
+            matches!(selected, KeyOrJoinOrSend::Send(Some((room, body, 1, Ok(event)))) if room == "room" && body == "text" && event == "$event")
+        );
     }
 
     #[test]

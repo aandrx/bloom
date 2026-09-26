@@ -65,22 +65,63 @@ fn render_detail(frame: &mut Frame<'_>, area: Rect, app: &App) {
         .map(|e| format!("Error: {e}"))
         .or_else(|| (!app.status.is_empty()).then(|| app.status.clone()))
         .unwrap_or_else(|| "↑/↓ select  j join invitation  q quit".into());
-    if area.height < 7 {
-        let lines = [
-            format!("Room: {title}"),
-            format!("Membership: {membership}"),
-            format!("Encryption: {encryption}"),
-            format!("Connection: {connection}"),
-            status,
-        ];
+    if area.height < 11 {
+        let composer = format!(
+            "Composer: {}",
+            if app.can_send() {
+                if app.composer_open {
+                    &app.draft
+                } else {
+                    "m to compose"
+                }
+            } else {
+                app.send_reason()
+            }
+        );
+        let lines = match area.height {
+            0 => Vec::new(),
+            1 => vec![format!("{membership} | {encryption} | {composer}")],
+            2 => vec![
+                format!("Room: {title}"),
+                format!("{membership} | {encryption} | {composer}"),
+            ],
+            3 => vec![
+                format!("Room: {title}"),
+                format!("{membership} | {encryption}"),
+                composer,
+            ],
+            4 => vec![
+                format!("Room: {title}"),
+                format!("{membership} | {encryption}"),
+                format!("Connection: {connection}"),
+                composer,
+            ],
+            5 => vec![
+                format!("Room: {title}"),
+                format!("Membership: {membership}"),
+                format!("Encryption: {encryption}"),
+                format!("Connection: {connection}"),
+                composer,
+            ],
+            _ => vec![
+                format!("Room: {title}"),
+                format!("Membership: {membership}"),
+                format!("Encryption: {encryption}"),
+                format!("Connection: {connection}"),
+                status,
+                composer,
+            ],
+        };
         frame.render_widget(Paragraph::new(lines.join("\n")), area);
         return;
     }
     let header_height = 4;
-    let status_height = 3;
+    let composer_height = 3;
+    let status_height = if area.height <= 12 { 1 } else { 3 };
     let chunks = Layout::vertical([
         Constraint::Length(header_height),
         Constraint::Min(1),
+        Constraint::Length(composer_height),
         Constraint::Length(status_height),
     ])
     .split(area);
@@ -111,16 +152,41 @@ fn render_detail(frame: &mut Frame<'_>, area: Rect, app: &App) {
         chunks[1],
     );
     if chunks[2].height > 0 {
+        let composer = if app.can_send() {
+            format!(
+                "{}{}",
+                if app.composer_open { "> " } else { "" },
+                if app.composer_open {
+                    app.draft.as_str()
+                } else {
+                    "m to compose"
+                }
+            )
+        } else {
+            app.send_reason().to_string()
+        };
+        frame.render_widget(
+            Paragraph::new(composer)
+                .block(Block::default().borders(Borders::ALL).title(" Composer ")),
+            chunks[2],
+        );
+    }
+    if chunks[3].height > 0 {
         let status = app
             .error
             .as_deref()
             .map(|e| format!("Error: {e}"))
             .or_else(|| (!app.status.is_empty()).then(|| app.status.clone()))
             .unwrap_or_else(|| "↑/↓ select  j join invitation  q quit".into());
-        frame.render_widget(
-            Paragraph::new(status).block(Block::default().borders(Borders::ALL)),
-            chunks[2],
-        );
+        let status = Paragraph::new(status);
+        if status_height == 1 {
+            frame.render_widget(status, chunks[3]);
+        } else {
+            frame.render_widget(
+                status.block(Block::default().borders(Borders::ALL)),
+                chunks[3],
+            );
+        }
     }
 }
 
@@ -165,6 +231,16 @@ mod tests {
                 MembershipState::Joined,
                 bloom_core::EncryptionStatus::NotEncrypted,
             );
+            app.messages.insert(
+                "!room:example.org".into(),
+                vec![bloom_core::Message {
+                    event_id: "$event:example.org".into(),
+                    sender: "@alice:example.org".into(),
+                    body: Some("Visible message body".into()),
+                    timestamp_ms: 1,
+                    send_state: bloom_core::SendState::Sent,
+                }],
+            );
             app.error = Some("Sync failed".into());
             let text = rendered_text(width, height, &app);
             for expected in [
@@ -177,6 +253,12 @@ mod tests {
                 assert!(
                     text.contains(expected),
                     "missing {expected:?} at {width}x{height}: {text:?}"
+                );
+            }
+            if width == 70 && height == 12 {
+                assert!(
+                    text.contains("Visible message body"),
+                    "transcript body clipped at 70x12: {text:?}"
                 );
             }
         }
@@ -215,21 +297,95 @@ mod tests {
     }
 
     #[test]
-    fn compact_view_uses_separate_visible_lines() {
-        let app = selected_room(
+    fn compact_view_shows_composer_and_state_at_five_rows() {
+        let joined = selected_room(
+            MembershipState::Joined,
+            bloom_core::EncryptionStatus::Encrypted,
+        );
+        let mut joined = joined;
+        joined.composer_open = true;
+        joined.draft = "Draft message".into();
+        let joined_text = rendered_text(70, 5, &joined);
+        for expected in [
+            "Membership: Joined",
+            "Encryption: Encrypted",
+            "Connection: Connected",
+            "Composer: Draft message",
+        ] {
+            assert!(
+                joined_text.contains(expected),
+                "missing {expected:?}: {joined_text:?}"
+            );
+        }
+
+        let invited = selected_room(
             MembershipState::Invited,
             bloom_core::EncryptionStatus::Unknown,
         );
-        let text = rendered_text(70, 5, &app);
+        let invited_text = rendered_text(70, 5, &invited);
         for expected in [
-            "Room: Project Room",
             "Membership: Invited",
+            "Encryption: Unknown",
             "Connection: Connected",
-            "Invitation ready",
+            "Composer: Join the room to send",
         ] {
-            assert!(text.contains(expected), "missing {expected:?}: {text:?}");
+            assert!(
+                invited_text.contains(expected),
+                "missing {expected:?}: {invited_text:?}"
+            );
         }
-        assert!(text.lines().count() >= 4);
+    }
+
+    #[test]
+    fn compact_short_views_keep_security_and_composer_visible() {
+        let app = selected_room(
+            MembershipState::Joined,
+            bloom_core::EncryptionStatus::Encrypted,
+        );
+        for (width, height) in [(70, 4), (70, 3), (70, 2), (70, 1)] {
+            let text = rendered_text(width, height, &app);
+            assert!(
+                text.contains("Encrypted"),
+                "missing security at {width}x{height}: {text:?}"
+            );
+            assert!(
+                text.contains("to compose"),
+                "missing composer at {width}x{height}: {text:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn compact_view_preserves_send_reason_at_five_rows_and_status_at_six() {
+        let mut app = selected_room(
+            MembershipState::Joined,
+            bloom_core::EncryptionStatus::Unknown,
+        );
+        app.error = Some("Sync failed".into());
+
+        let five_rows = rendered_text(70, 5, &app);
+        assert!(
+            five_rows.contains("Composer: Sending requires confirmed encryption"),
+            "missing full send explanation: {five_rows:?}"
+        );
+
+        let six_rows = rendered_text(70, 6, &app);
+        assert!(six_rows.contains("Error: Sync failed"), "{six_rows:?}");
+        assert!(
+            six_rows.contains("Composer: Sending requires confirmed encryption"),
+            "{six_rows:?}"
+        );
+    }
+
+    #[test]
+    fn compact_view_shows_status_or_error_when_rows_allow() {
+        let mut app = selected_room(
+            MembershipState::Invited,
+            bloom_core::EncryptionStatus::Unknown,
+        );
+        app.error = Some("Sync failed".into());
+        assert!(rendered_text(70, 6, &app).contains("Error: Sync failed"));
+        assert!(rendered_text(70, 6, &app).contains("Composer:"));
     }
 
     #[test]
