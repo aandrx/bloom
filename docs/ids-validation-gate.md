@@ -39,3 +39,7 @@ that app's behavior, not Bloom's independent transport.
 
 Until all three pass, Bloom's local daemon and TUI may progress against the fake
 transport, but direct iMessage must remain disabled and marked unverified.
+
+A separate, narrower route exists for users who accept the installed local
+OpenBubbles app as the engine and want only a different interface. That is not a
+Gate 0 fix and does not give Bloom its own registration; see `engine-sidecar.md`.
