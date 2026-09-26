@@ -1,0 +1,12 @@
+services:
+  synapse:
+    image: matrixdotorg/synapse:v1.127.0
+    container_name: bloom-matrix-synapse
+    environment:
+      SYNAPSE_SERVER_NAME: localhost
+      SYNAPSE_REPORT_STATS: "no"
+    ports:
+      - "127.0.0.1:8008:8008"
+    volumes:
+      - ./data/synapse:/data
+    restart: unless-stopped

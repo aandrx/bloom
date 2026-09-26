@@ -1,0 +1,17 @@
+[workspace]
+resolver = "2"
+members = ["crates/bloom-core", "apps/bloom-tui"]
+exclude = ["spike/matrix"]
+
+[workspace.package]
+edition = "2021"
+license = "MIT"
+version = "0.1.0"
+
+[workspace.dependencies]
+anyhow = "1"
+keyring = { version = "4.2.0", default-features = true }
+matrix-sdk = { version = "=0.19.1", default-features = true, features = ["e2e-encryption", "sqlite"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "time", "signal"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
