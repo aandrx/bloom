@@ -1,12 +1,13 @@
+mod auth;
+
 use anyhow::Result;
-use bloom_core::{Bloom, OsKeyring};
 use crossterm::{
     event::{self, Event, KeyCode},
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
 use ratatui::{prelude::*, widgets::*};
-use std::{io, path::PathBuf, sync::Arc};
+use std::io;
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -16,29 +17,54 @@ async fn main() -> Result<()> {
         );
         return Ok(());
     }
-    let secrets = Arc::new(OsKeyring);
-    let home = std::env::var_os("HOME")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("."));
-    let core = Bloom::open(
-        &std::env::var("BLOOM_HOMESERVER").unwrap_or_else(|_| "".into()),
-        &home.join(".local/share/bloom"),
-        "default",
-        secrets,
-    )
-    .await?;
-    if !core.restore().await? {
-        anyhow::bail!("No saved session. Login UI is not yet implemented.");
-    }
-    let _room_summaries = core.rooms().await;
-    enable_raw_mode()?;
-    let mut out = io::stdout();
-    execute!(out, EnterAlternateScreen)?;
-    let result = run(&mut out);
-    disable_raw_mode()?;
-    execute!(out, LeaveAlternateScreen)?;
-    result
+    let _core = auth::authenticate().await?;
+    let mut terminal_guard = TerminalGuard::enter()?;
+    run(terminal_guard.output())
 }
+struct TerminalGuard {
+    output: io::Stdout,
+    raw_mode: bool,
+    alternate_screen: bool,
+}
+
+impl TerminalGuard {
+    fn setup_phase<F, E>(cleanup_flag: &mut bool, setup: F) -> std::result::Result<(), E>
+    where
+        F: FnOnce() -> std::result::Result<(), E>,
+    {
+        *cleanup_flag = true;
+        setup()
+    }
+
+    fn enter() -> Result<Self> {
+        let mut guard = Self {
+            output: io::stdout(),
+            raw_mode: false,
+            alternate_screen: false,
+        };
+        Self::setup_phase(&mut guard.raw_mode, enable_raw_mode)?;
+        Self::setup_phase(&mut guard.alternate_screen, || {
+            execute!(guard.output, EnterAlternateScreen)
+        })?;
+        Ok(guard)
+    }
+
+    fn output(&mut self) -> &mut io::Stdout {
+        &mut self.output
+    }
+}
+
+impl Drop for TerminalGuard {
+    fn drop(&mut self) {
+        if self.alternate_screen {
+            let _ = execute!(self.output, LeaveAlternateScreen);
+        }
+        if self.raw_mode {
+            let _ = disable_raw_mode();
+        }
+    }
+}
+
 fn run(out: &mut io::Stdout) -> Result<()> {
     let mut terminal = Terminal::new(CrosstermBackend::new(out))?;
     loop {
@@ -49,8 +75,10 @@ fn run(out: &mut io::Stdout) -> Result<()> {
                 .constraints([Constraint::Length(28), Constraint::Min(30)])
                 .split(area);
             f.render_widget(
-                Paragraph::new("BLOOM  ·  PLACEHOLDER\n\nUI is not implemented yet\n\n[q] quit")
-                    .block(Block::default().borders(Borders::ALL).title(" Bloom ")),
+                Paragraph::new(
+                    "BLOOM  ·  PLACEHOLDER\n\nMessaging UI is not implemented yet\n\n[q] quit",
+                )
+                .block(Block::default().borders(Borders::ALL).title(" Bloom ")),
                 chunks[0],
             );
             let right = Layout::default()
@@ -62,7 +90,7 @@ fn run(out: &mut io::Stdout) -> Result<()> {
                 ])
                 .split(chunks[1]);
             f.render_widget(
-                Paragraph::new("No conversation selected  ·  E2EE")
+                Paragraph::new("No conversation selected")
                     .block(Block::default().borders(Borders::ALL)),
                 right[0],
             );
@@ -72,7 +100,7 @@ fn run(out: &mut io::Stdout) -> Result<()> {
                 right[1],
             );
             f.render_widget(
-                Paragraph::new("Type a message…     Enter to send")
+                Paragraph::new("Messaging is not available yet")
                     .block(Block::default().borders(Borders::ALL).title(" Composer ")),
                 right[2],
             );
@@ -84,4 +112,20 @@ fn run(out: &mut io::Stdout) -> Result<()> {
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::TerminalGuard;
+    use std::io;
+
+    #[test]
+    fn setup_failure_leaves_cleanup_flag_set() {
+        let mut cleanup_flag = false;
+        let result =
+            TerminalGuard::setup_phase(&mut cleanup_flag, || Err(io::Error::other("setup failed")));
+
+        assert!(result.is_err());
+        assert!(cleanup_flag);
+    }
 }
