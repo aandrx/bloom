@@ -1,0 +1,17 @@
+# Rust build output
+/target/
+
+# Local environment and credentials
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*credentials*
+
+# Local Matrix / Synapse data
+/synapse-data/
+/matrix-data/
+/data/
+*.db
+*.db-*
