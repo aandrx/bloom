@@ -1,6 +1,14 @@
 [workspace]
 resolver = "2"
-members = ["crates/bloom-core", "apps/bloom-tui"]
+members = [
+    "crates/bloom-core",
+    "crates/bloom-domain",
+    "crates/bloom-secrets",
+    "crates/bloom-ipc",
+    "crates/bloom-transport",
+    "apps/bloomd",
+    "apps/bloom-tui",
+]
 exclude = ["spike/matrix"]
 
 [workspace.package]

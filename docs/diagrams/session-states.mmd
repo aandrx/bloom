@@ -1,0 +1,26 @@
+stateDiagram-v2
+    [*] --> Unregistered
+    Unregistered --> Activating: import Mac hardware info
+    Activating --> Registered: IDS registration accepted
+    Activating --> ActivationFailed: cert rejected or throttled
+    Registered --> Active: APS connected
+    Active --> RenewalDue: renewal window reached
+    RenewalDue --> Renewing
+    Renewing --> Active: renewed
+    Renewing --> Throttled: Apple throttles
+    Renewing --> Blocked: account blocked
+    Throttled --> RenewalDue: backoff elapsed
+    Active --> TransportUnavailable: protocol change breaks client
+    TransportUnavailable --> Active: client updated
+    ActivationFailed --> [*]: fall back to RelayTransport
+    Blocked --> [*]: account unrecoverable
+
+    note right of Active
+        Normal operation.
+        Send and receive both work.
+    end note
+
+    note right of TransportUnavailable
+        RelayTransport remains usable,
+        so history stays readable.
+    end note

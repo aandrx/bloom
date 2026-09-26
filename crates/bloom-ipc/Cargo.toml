@@ -1,0 +1,16 @@
+[package]
+name = "bloom-ipc"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+bloom-domain = { path = "../bloom-domain" }
+serde = { workspace = true }
+serde_json = { workspace = true }
+libc = "0.2"
+tokio = { workspace = true, features = ["io-util", "net", "time", "fs"] }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt", "net", "time"] }
+tempfile = "3"

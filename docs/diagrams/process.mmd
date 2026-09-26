@@ -1,0 +1,26 @@
+flowchart TB
+    D1["Decision A - Apple ID<br/>personal account vs throwaway"]
+    D2["Decision B - license<br/>private use vs SSPL vs distribute"]
+
+    P0["Gate 0 - Direct transport spike<br/>find local IDS validation generator,<br/>register, send, receive, renew<br/>Mac powered off - currently BLOCKED"]
+    P1["Phase 1 - Core, parallel with Gate 0<br/>bloom-domain + Transport trait<br/>bloomd: IPC, encrypted store, fake transport"]
+    DIRECT["Direct adapter integration<br/>only after Gate 0 passes"]
+    P2["Phase 2 - UI<br/>rebind bloom-tui onto bloomd<br/>retire Matrix to spike/"]
+    P3["Phase 3 - Resilience<br/>RelayTransport + capability flags<br/>graceful degradation in the UI"]
+    P4["Phase 4 - Second surface<br/>bloom-gpui on the same daemon"]
+
+    D1 --> P0
+    D2 --> P1
+
+    P0 -->|"unlocks direct adapter"| DIRECT
+    P1 --> DIRECT
+    P1 -->|"daemon speaks, UI listens"| P2
+    DIRECT --> P3
+    P2 -->|"UI no longer cares which backend"| P3
+    P3 -->|"same API, new surface"| P4
+
+    classDef gate fill:#d2992222,stroke:#d29922,stroke-width:2px,color:#c9d1d9
+    classDef phase fill:#1f6feb22,stroke:#1f6feb,stroke-width:1.5px,color:#c9d1d9
+    classDef done fill:#2ea04333,stroke:#2ea043,stroke-width:2px,color:#c9d1d9
+    class D1,D2,P0 gate
+    class P1,DIRECT,P2,P3,P4 phase

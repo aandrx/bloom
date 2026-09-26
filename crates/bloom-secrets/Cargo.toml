@@ -1,0 +1,8 @@
+[package]
+name = "bloom-secrets"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+keyring.workspace = true

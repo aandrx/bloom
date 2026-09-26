@@ -1,0 +1,36 @@
+sequenceDiagram
+    autonumber
+    actor U as User
+    participant TUI as bloom-tui
+    participant D as bloomd
+    participant X as Transport
+    participant A as Apple services
+
+    Note over TUI,A: Outbound send
+
+    U->>TUI: type message and press Enter
+    TUI->>D: Send conversation body generation
+    D->>D: persist as Queued
+    D-->>TUI: MessageAccepted id
+    D->>X: send conversation body
+    X->>A: encrypted iMessage
+    A-->>X: delivery receipt
+    X-->>D: DeliveryChanged Delivered
+    D-->>TUI: event delivery updated
+    TUI->>U: transcript shows Delivered
+
+    Note over TUI,A: Inbound receive
+
+    A->>X: APS push
+    X->>X: decrypt and handle
+    X-->>D: Message received
+    D->>D: dedupe then persist
+    D-->>TUI: event Message
+    TUI->>U: render in transcript
+
+    Note over TUI,A: Session loss
+
+    X-->>D: Session RenewalDue
+    D->>D: enter Renewing state
+    D-->>TUI: event Session degraded
+    TUI->>U: show non-blocking warning

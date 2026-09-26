@@ -1,0 +1,74 @@
+flowchart LR
+    subgraph WA["Wave A - foundation"]
+        direction TB
+        A1["A1 workspace"] --> A2["A2 scoped domain"]
+        A2 --> A3["A3 IPC contract"]
+        A2 --> A4["A4 transport contract"]
+    end
+
+    subgraph WB["Wave B - independent foundations"]
+        direction TB
+        B1["B1 secrets"]
+        B2["B2 encrypted store"]
+        B3["B3 authenticated listener"]
+        B4["B4 IPC client"]
+        B5["B5 fake transport"]
+        B8["B8 TUI adapter"]
+        B9["B9 local direct spike"]
+    end
+
+    subgraph WL["Local integration - does not require Gate 0"]
+        direction TB
+        L1["L1 atomic message ingest"]
+        L2["L2 session supervisor"]
+        L3["L3 subscription fanout"] --> L4["L4 dispatch subscription"]
+        L4 --> L5["L5 client reconnect + snapshot"]
+        L1 --> L6["L6 service bridge"]
+        L2 --> L6
+        L5 --> L6
+        L6 --> L7["L7 runnable daemon"]
+        L8["L8 TUI state adapter"] --> L9["L9 TUI rebind"]
+        L7 --> L9
+        L9 --> L10["L10 local end to end"]
+    end
+
+    subgraph WC["Direct transport - blocked until Gate 0"]
+        direction TB
+        G0["Gate 0 - lawful local IDS validation"] --> C1["C1 independent registration"]
+        C1 --> C3["C3 APS receive"]
+        C1 --> C4["C4 send"]
+        C2["C2 offline mapping"] --> C3
+        C2 --> C4
+    end
+
+    subgraph WD["Acceptance and retirement"]
+        direction TB
+        D1["D1 local PTY end to end"]
+        D2["D2 live iMessage with Mac off"]
+        D3["D3 retire Matrix after PTY"]
+    end
+
+    A2 --> B1
+    A2 --> B2
+    A3 --> B3
+    A3 --> B4
+    A4 --> B5
+    A3 --> B8
+    B2 --> L1
+    B3 --> L3
+    B4 --> L5
+    B5 --> L2
+    B8 --> L8
+    B9 --> G0
+    L10 --> D1
+    D1 --> D3
+    C3 --> D2
+    C4 --> D2
+    L7 --> D2
+
+    classDef risk fill:#f8514933,stroke:#f85149,stroke-width:2.5px,color:#c9d1d9
+    classDef local fill:#1f6feb22,stroke:#1f6feb,stroke-width:1.5px,color:#c9d1d9
+    classDef goal fill:#2ea04333,stroke:#2ea043,stroke-width:2px,color:#c9d1d9
+    class B9,G0,C1,C2,C3,C4,D2 risk
+    class L1,L2,L3,L4,L5,L6,L7,L8,L9,L10 local
+    class D1,D3 goal

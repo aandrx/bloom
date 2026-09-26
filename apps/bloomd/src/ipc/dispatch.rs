@@ -1,0 +1,345 @@
+//! Request/response handling on an authenticated local socket.
+use std::{future::Future, pin::Pin, time::Duration};
+
+use bloom_domain::{Conversation, ConversationId, Message, MessageId, OutgoingBody};
+use bloom_ipc::{ProtocolError, RequestKind, Response, ResponseKind};
+use tokio::{io::AsyncWrite, time::timeout};
+
+use super::listener::{AuthenticatedStream, MAX_HANDSHAKE_IDLE};
+
+pub const REQUEST_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
+pub const RESPONSE_WRITE_TIMEOUT: Duration = Duration::from_secs(30);
+
+type HandlerFuture<'a, T> = Pin<Box<dyn Future<Output = Result<T, ProtocolError>> + Send + 'a>>;
+
+pub trait RequestHandler: Send + Sync {
+    fn list_conversations(&self) -> HandlerFuture<'_, Vec<Conversation>>;
+    fn history(
+        &self,
+        conversation_id: ConversationId,
+        limit: u16,
+    ) -> HandlerFuture<'_, Vec<Message>>;
+    fn send(
+        &self,
+        conversation_id: ConversationId,
+        body: OutgoingBody,
+    ) -> HandlerFuture<'_, MessageId>;
+}
+
+/// Serve sequential requests. Codec errors and idle timeouts close this connection.
+pub async fn serve<H: RequestHandler>(connection: AuthenticatedStream, handler: &H) {
+    serve_with_first_timeout(connection, handler, MAX_HANDSHAKE_IDLE).await;
+}
+
+async fn serve_with_first_timeout<H: RequestHandler>(
+    mut connection: AuthenticatedStream,
+    handler: &H,
+    first_timeout: Duration,
+) {
+    let mut first = true;
+    loop {
+        let idle = if first {
+            first_timeout
+        } else {
+            REQUEST_IDLE_TIMEOUT
+        };
+        let request = match timeout(idle, bloom_ipc::read_request(connection.stream_mut())).await {
+            Ok(Ok(request)) => request,
+            _ => return,
+        };
+        first = false;
+        let response = match request.request {
+            RequestKind::ListConversations => match handler.list_conversations().await {
+                Ok(conversations) => ResponseKind::Conversations { conversations },
+                Err(error) => ResponseKind::Error { error },
+            },
+            RequestKind::History {
+                conversation_id,
+                limit,
+            } => {
+                if limit == 0 || limit > u16::MAX as u32 {
+                    ResponseKind::Error {
+                        error: ProtocolError::InvalidRequest,
+                    }
+                } else {
+                    match handler.history(conversation_id, limit as u16).await {
+                        Ok(messages) => ResponseKind::History { messages },
+                        Err(error) => ResponseKind::Error { error },
+                    }
+                }
+            }
+            RequestKind::Send {
+                conversation_id,
+                body,
+            } => match handler.send(conversation_id, body).await {
+                Ok(message_id) => ResponseKind::Send { message_id },
+                Err(error) => ResponseKind::Error { error },
+            },
+            RequestKind::Subscribe => ResponseKind::Error {
+                error: ProtocolError::Unsupported,
+            },
+        };
+        let response = Response {
+            request_id: request.request_id,
+            response,
+        };
+        if write_response_bounded(connection.stream_mut(), &response, RESPONSE_WRITE_TIMEOUT)
+            .await
+            .is_err()
+        {
+            return;
+        }
+    }
+}
+
+async fn write_response_bounded<W: AsyncWrite + Unpin>(
+    writer: &mut W,
+    response: &Response,
+    deadline: Duration,
+) -> Result<(), ()> {
+    timeout(deadline, bloom_ipc::write_response(writer, response))
+        .await
+        .map_err(|_| ())?
+        .map_err(|_| ())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use bloom_domain::TransportId;
+    use bloom_ipc::{read_response, write_request, Request};
+    use std::{
+        fs,
+        sync::{
+            atomic::{AtomicUsize, Ordering},
+            Arc,
+        },
+    };
+    use tokio::{
+        io::{AsyncReadExt, AsyncWriteExt},
+        net::UnixStream,
+    };
+
+    struct FakeHandler(Arc<AtomicUsize>);
+    impl RequestHandler for FakeHandler {
+        fn list_conversations(&self) -> HandlerFuture<'_, Vec<Conversation>> {
+            Box::pin(async { Ok(vec![]) })
+        }
+        fn history(&self, _: ConversationId, _: u16) -> HandlerFuture<'_, Vec<Message>> {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            Box::pin(async { Ok(vec![]) })
+        }
+        fn send(&self, _: ConversationId, _: OutgoingBody) -> HandlerFuture<'_, MessageId> {
+            Box::pin(async {
+                Ok(MessageId::new(TransportId::new("fake").unwrap(), "message").unwrap())
+            })
+        }
+    }
+
+    struct ErrorHandler;
+    impl RequestHandler for ErrorHandler {
+        fn list_conversations(&self) -> HandlerFuture<'_, Vec<Conversation>> {
+            Box::pin(async { Err(ProtocolError::AccountThrottled) })
+        }
+        fn history(&self, _: ConversationId, _: u16) -> HandlerFuture<'_, Vec<Message>> {
+            Box::pin(async { Err(ProtocolError::Internal) })
+        }
+        fn send(&self, _: ConversationId, _: OutgoingBody) -> HandlerFuture<'_, MessageId> {
+            Box::pin(async { Err(ProtocolError::Internal) })
+        }
+    }
+
+    #[tokio::test]
+    async fn handler_error_remains_typed() {
+        let (_dir, listener, path) = socket();
+        let server = tokio::spawn(async move {
+            serve(listener.accept().await.unwrap(), &ErrorHandler).await;
+        });
+        let mut client = UnixStream::connect(path).await.unwrap();
+        write_request(
+            &mut client,
+            &Request {
+                request_id: 77,
+                request: RequestKind::ListConversations,
+            },
+        )
+        .await
+        .unwrap();
+        let response = read_response(&mut client).await.unwrap();
+        assert_eq!(response.request_id, 77);
+        assert!(matches!(
+            response.response,
+            ResponseKind::Error {
+                error: ProtocolError::AccountThrottled
+            }
+        ));
+        drop(client);
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn malformed_json_and_truncated_body_close_connection() {
+        for (length, body) in [(1_u32, b"{".as_slice()), (2_u32, b"{".as_slice())] {
+            let (_dir, listener, path) = socket();
+            let server = tokio::spawn(async move {
+                serve(
+                    listener.accept().await.unwrap(),
+                    &FakeHandler(Arc::new(AtomicUsize::new(0))),
+                )
+                .await;
+            });
+            let mut client = UnixStream::connect(path).await.unwrap();
+            client
+                .write_all(&[bloom_ipc::PROTOCOL_VERSION as u8])
+                .await
+                .unwrap();
+            client.write_all(&length.to_be_bytes()).await.unwrap();
+            client.write_all(body).await.unwrap();
+            client.shutdown().await.unwrap();
+            let mut byte = [0];
+            match client.read(&mut byte).await {
+                Ok(0) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::ConnectionReset => {}
+                other => panic!("expected closed connection, got {other:?}"),
+            }
+            server.await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn slow_reader_cannot_hold_write_forever() {
+        let (mut writer, _reader) = tokio::io::duplex(1);
+        let response = Response {
+            request_id: 1,
+            response: ResponseKind::Conversations {
+                conversations: vec![],
+            },
+        };
+        assert!(
+            write_response_bounded(&mut writer, &response, Duration::from_millis(20))
+                .await
+                .is_err()
+        );
+    }
+
+    fn socket() -> (
+        tempfile::TempDir,
+        super::super::Listener,
+        std::path::PathBuf,
+    ) {
+        let dir = tempfile::tempdir().unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(dir.path(), fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        let path = dir.path().join("bloomd.sock");
+        let listener = super::super::Listener::bind(&path).unwrap();
+        (dir, listener, path)
+    }
+
+    #[tokio::test]
+    async fn serves_requests_and_echoes_ids_without_invalid_history_call() {
+        let (_dir, listener, path) = socket();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let server_calls = calls.clone();
+        let server = tokio::spawn(async move {
+            let stream = listener.accept().await.unwrap();
+            serve(stream, &FakeHandler(server_calls)).await;
+        });
+        let mut client = UnixStream::connect(path).await.unwrap();
+        let conversation_id = ConversationId::new(TransportId::new("fake").unwrap(), "c").unwrap();
+        for (id, request) in [
+            (9, RequestKind::ListConversations),
+            (
+                10,
+                RequestKind::History {
+                    conversation_id: conversation_id.clone(),
+                    limit: 0,
+                },
+            ),
+            (11, RequestKind::Subscribe),
+            (
+                12,
+                RequestKind::Send {
+                    conversation_id,
+                    body: OutgoingBody { parts: vec![] },
+                },
+            ),
+        ] {
+            write_request(
+                &mut client,
+                &Request {
+                    request_id: id,
+                    request,
+                },
+            )
+            .await
+            .unwrap();
+            let response = read_response(&mut client).await.unwrap();
+            assert_eq!(response.request_id, id);
+            match id {
+                9 => assert!(matches!(
+                    response.response,
+                    ResponseKind::Conversations { .. }
+                )),
+                10 => assert!(matches!(
+                    response.response,
+                    ResponseKind::Error {
+                        error: ProtocolError::InvalidRequest
+                    }
+                )),
+                11 => assert!(matches!(
+                    response.response,
+                    ResponseKind::Error {
+                        error: ProtocolError::Unsupported
+                    }
+                )),
+                12 => assert!(matches!(response.response, ResponseKind::Send { .. })),
+                _ => unreachable!(),
+            }
+        }
+        client.shutdown().await.unwrap();
+        server.await.unwrap();
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn malformed_frame_and_idle_first_request_close_connection() {
+        let (_dir, listener, path) = socket();
+        let server = tokio::spawn(async move {
+            let stream = listener.accept().await.unwrap();
+            serve(stream, &FakeHandler(Arc::new(AtomicUsize::new(0)))).await;
+        });
+        let mut client = UnixStream::connect(path).await.unwrap();
+        client.write_all(&[99, 0, 0, 0, 0]).await.unwrap();
+        let mut byte = [0];
+        // Linux may reset when closing a socket with unread malformed frame bytes.
+        match client.read(&mut byte).await {
+            Ok(0) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::ConnectionReset => {}
+            other => panic!("expected closed connection, got {other:?}"),
+        }
+        server.await.unwrap();
+
+        let (_dir, listener, path) = socket();
+        let server = tokio::spawn(async move {
+            let stream = listener.accept().await.unwrap();
+            serve_with_first_timeout(
+                stream,
+                &FakeHandler(Arc::new(AtomicUsize::new(0))),
+                Duration::from_millis(20),
+            )
+            .await;
+        });
+        let mut client = UnixStream::connect(path).await.unwrap();
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(1), client.read(&mut byte))
+                .await
+                .unwrap()
+                .unwrap(),
+            0
+        );
+        server.await.unwrap();
+    }
+}

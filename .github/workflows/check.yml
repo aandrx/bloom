@@ -1,0 +1,27 @@
+name: Check Bloom
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  rust:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+      - uses: Swatinem/rust-cache@v2
+      - name: Enforce direct transport boundary
+        run: |
+          if cargo tree -p bloomd -e normal --prefix none | grep -q '^rustpush '; then
+            echo 'rustpush must not enter the default bloomd dependency graph'
+            exit 1
+          fi
+      - name: Formatting
+        run: cargo fmt --all -- --check
+      - name: Tests
+        run: cargo test --workspace --all-targets
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
