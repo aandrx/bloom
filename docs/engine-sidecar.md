@@ -194,6 +194,12 @@ behavior is restart/resume, coexistence with the app, and one observed renewal.
 18. Replace the spike's mirror-based encoder with explicit encoders and write into
     Bloom's encrypted store instead of a JSONL file.
 
+The sidecar half of item 18 is done: `ext/bloom-engine-sidecar` holds the packaged
+sidecar with an explicit field-by-field encoder, a versioned stdio protocol, config
+guards, and 28 offline tests, and it was verified live against the real engine
+(ready frame, 37 inbound frames, clean shutdown). Writing into Bloom's encrypted
+store is the daemon half and is still outstanding.
+
 ## Open decision
 
 Which state directory the engine uses:
