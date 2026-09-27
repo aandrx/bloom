@@ -36,10 +36,8 @@ socket=${BLOOM_SOCKET_PATH:-${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/bloom/bloomd.
 export BLOOM_SOCKET_PATH="$socket"
 log="${XDG_STATE_HOME:-$HOME/.local/share}/bloom/bloomd.log"
 
-if [ ! -x target/debug/bloomd ] || [ ! -x target/debug/bloom-tui ]; then
-  echo "building bloom..." >&2
-  CARGO_BUILD_JOBS=${CARGO_BUILD_JOBS:-2} cargo build -p bloomd -p bloom-tui
-fi
+echo "building bloom..." >&2
+CARGO_BUILD_JOBS=${CARGO_BUILD_JOBS:-2} cargo build -p bloomd -p bloom-tui
 
 # A leftover socket file from a crashed daemon must not be mistaken for a live one,
 # so probe by connecting rather than testing for the file.

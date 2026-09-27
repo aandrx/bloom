@@ -24,9 +24,7 @@ if [ ! -x "$tools" ]; then
   $HOME/.cache/bloom-tools/bin/pip install -q pyte
 fi
 
-if [ ! -x target/debug/bloom-tui ]; then
-  CARGO_BUILD_JOBS=${CARGO_BUILD_JOBS:-2} cargo build -p bloom-tui
-fi
+CARGO_BUILD_JOBS=${CARGO_BUILD_JOBS:-2} cargo build -p bloom-tui
 
 mkdir -p "$out"
 chmod 700 "$out"
