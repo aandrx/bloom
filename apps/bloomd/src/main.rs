@@ -86,6 +86,17 @@ async fn main() -> ExitCode {
         std::process::id(),
         config.socket_path.display()
     );
+    // Claim the socket before touching the engine. The sidecar owns the user's real
+    // registration state, so a second daemon must be refused here rather than after
+    // it has already started an engine and risked two owners of that state.
+    let listener = match Listener::bind(&config.socket_path) {
+        Ok(listener) => listener,
+        Err(error) => {
+            eprintln!("bloomd: cannot bind socket: {error}");
+            return ExitCode::from(2);
+        }
+    };
+
     let hub = SubscriptionHub::with_default_capacity();
     let engine = Arc::new(Engine::new(engine_config));
 
@@ -106,15 +117,6 @@ async fn main() -> ExitCode {
                 }
             }
         })
-    };
-
-    let listener = match Listener::bind(&config.socket_path) {
-        Ok(listener) => listener,
-        Err(error) => {
-            eprintln!("bloomd: cannot bind socket: {error}");
-            let _ = supervisor.shutdown(SHUTDOWN_DRAIN).await;
-            return ExitCode::from(2);
-        }
     };
 
     loop {

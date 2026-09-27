@@ -225,13 +225,15 @@ fn the_two_step_composer_keeps_the_draft_between_the_steps() {
         app.handle_key(key(KeyCode::Char(character)));
     }
     assert_eq!(app.handle_key(key(KeyCode::Enter)), Action::None);
+    // The composer must stay open: the prompt now asks for a message, so the next
+    // keystrokes have to reach the body. It used to close here, which silently
+    // dropped the body until the user pressed Enter a second time.
     assert!(
-        !app.composing,
-        "recording the recipient ends the first step"
+        app.composing,
+        "confirming the recipient must leave the composer open for the body"
     );
 
     // Step two: starting a message for that recipient must not lose the address.
-    app.composing = true;
     for character in "see you soon".chars() {
         app.handle_key(key(KeyCode::Char(character)));
     }
@@ -355,4 +357,54 @@ fn scrolling_does_not_disturb_the_composer_or_the_filter() {
     app.handle_key(key(KeyCode::PageUp));
     assert_eq!(app.scroll, 0);
     assert_eq!(app.draft, "");
+}
+
+#[test]
+fn the_recipient_step_keeps_the_composer_open_all_the_way_to_sending() {
+    // The whole two-step flow through the real key path, with no manual state
+    // pokes: n, recipient, Enter, body, Enter must send to the typed address.
+    let mut app = app_with(&["Jules Lee"]);
+    app.handle_key(key(KeyCode::Char('n')));
+    for character in "newfriend@example.invalid".chars() {
+        app.handle_key(key(KeyCode::Char(character)));
+    }
+    assert_eq!(app.handle_key(key(KeyCode::Enter)), Action::None);
+    for character in "hello there".chars() {
+        app.handle_key(key(KeyCode::Char(character)));
+    }
+    match app.handle_key(key(KeyCode::Enter)) {
+        Action::StartConversation { address, body } => {
+            assert_eq!(address, "newfriend@example.invalid");
+            assert_eq!(body, "hello there");
+        }
+        other => panic!("the two-step flow must send, got {other:?}"),
+    }
+}
+
+#[test]
+fn opening_another_thread_returns_to_its_newest_message() {
+    let mut app = app_with(&["Jules Lee", "Maya Chen"]);
+    let first = app.selected.clone().expect("selected");
+
+    app.handle_key(key(KeyCode::PageUp));
+    app.handle_key(key(KeyCode::PageUp));
+    assert!(app.is_scrolled_back());
+
+    // Moving to another thread must not inherit the previous reading position.
+    app.handle_key(key(KeyCode::Down));
+    assert_ne!(app.selected, Some(first));
+    assert!(
+        !app.is_scrolled_back(),
+        "a different thread must open at its newest message"
+    );
+
+    // Home followed by a thread change is the worst case: it leaves the largest
+    // offset behind if the position is not reset.
+    app.handle_key(key(KeyCode::Home));
+    assert!(app.is_scrolled_back());
+    app.handle_key(key(KeyCode::Up));
+    assert!(
+        !app.is_scrolled_back(),
+        "Home in one thread must not carry over to the next"
+    );
 }

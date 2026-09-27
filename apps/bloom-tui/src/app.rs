@@ -82,6 +82,15 @@ impl App {
         }
     }
 
+    /// Move the selection. A reading position belongs to the thread it was made in,
+    /// so opening a different thread returns to that thread's newest message.
+    pub fn select(&mut self, id: Option<ConversationId>) {
+        if self.selected != id {
+            self.scroll = 0;
+        }
+        self.selected = id;
+    }
+
     /// Scroll the transcript back through older messages, in display rows.
     pub fn scroll_back(&mut self, rows: usize) {
         self.scroll = self.scroll.saturating_add(rows);
@@ -167,7 +176,7 @@ impl App {
     pub fn select_step(&mut self, step: isize) {
         let visible = self.visible_ids();
         if visible.is_empty() {
-            self.selected = None;
+            self.select(None);
             return;
         }
         let at = self
@@ -176,7 +185,7 @@ impl App {
             .and_then(|id| visible.iter().position(|candidate| candidate == id))
             .unwrap_or(0);
         let next = (at as isize + step).clamp(0, visible.len() as isize - 1) as usize;
-        self.selected = Some(visible[next].clone());
+        self.select(Some(visible[next].clone()));
     }
 
     /// The conversations the sidebar should show: everything, or the filtered set.
@@ -258,7 +267,7 @@ impl App {
                 KeyCode::Esc => self.cancel_filter(),
                 KeyCode::Enter => {
                     if let Some(id) = self.confirm_filter() {
-                        self.selected = Some(id);
+                        self.select(Some(id));
                     }
                 }
                 KeyCode::Up => self.select_step(-1),
@@ -296,7 +305,10 @@ impl App {
                             }
                         }
                     };
-                    self.composing = false;
+                    // `submit_intent` owns the composer state: it closes the composer
+                    // when a message is sent, and deliberately keeps it open after the
+                    // recipient step so the body can be typed without pressing Enter
+                    // again, which is what the prompt then asks for.
                     return action;
                 }
                 KeyCode::Backspace => {
