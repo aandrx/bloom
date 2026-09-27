@@ -5,7 +5,10 @@
 # replays the output through a terminal emulator, and renders a PNG. The fixtures
 # contain no real messages or handles.
 #
-# Usage: tui-shot.sh [output-dir] [cols] [rows] [keystrokes]
+# Usage: tui-shot.sh [output-dir] [cols] [rows] [keys]
+# Keys are whitespace-separated tokens: up down left right pageup pagedown home
+# end enter esc tab backspace space delete ctrl-c. Use text:... to type a
+# literal ambiguous token; a single non-key token remains literal text.
 # Prints the path of the produced PNG.
 
 set -eu

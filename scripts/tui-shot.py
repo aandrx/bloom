@@ -28,6 +28,24 @@ import pyte
 
 DEFAULT_FG = "#cdd6f4"
 DEFAULT_BG = "#1e1e2e"
+KEY_SEQUENCES = {
+    "up": b"\x1b[A",
+    "down": b"\x1b[B",
+    "right": b"\x1b[C",
+    "left": b"\x1b[D",
+    "pageup": b"\x1b[5~",
+    "pagedown": b"\x1b[6~",
+    "home": b"\x1b[H",
+    "end": b"\x1b[F",
+    "enter": b"\r",
+    "esc": b"\x1b",
+    "tab": b"\t",
+    "backspace": b"\x7f",
+    "space": b" ",
+    "delete": b"\x1b[3~",
+    "ctrl-c": b"\x03",
+}
+
 PALETTE = {
     "black": "#45475a",
     "red": "#f38ba8",
@@ -73,7 +91,28 @@ def xterm_colour(index: int) -> str:
     return f"#{level:02x}{level:02x}{level:02x}"
 
 
-def run_tui(command: list[str], cols: int, rows: int, keys: list[str], settle: float) -> bytes:
+def parse_keys(value: str) -> list[bytes]:
+    tokens = value.split()
+    if not tokens:
+        return []
+    # Preserve the historical single-argument literal typing form, including words
+    # that happen to match a key name. text: explicitly disambiguates token input.
+    if len(tokens) == 1 and not tokens[0].lower().startswith("text:"):
+        token = tokens[0]
+        if token.lower() not in KEY_SEQUENCES:
+            return [char.encode() for char in token]
+    result = []
+    for token in tokens:
+        if token.lower().startswith("text:"):
+            result.extend(char.encode() for char in token[5:])
+        elif token.lower() in KEY_SEQUENCES:
+            result.append(KEY_SEQUENCES[token.lower()])
+        else:
+            result.extend(char.encode() for char in token)
+    return result
+
+
+def run_tui(command: list[str], cols: int, rows: int, keys: list[bytes], settle: float) -> bytes:
     pid, master = pty.fork()
     if pid == 0:
         os.environ["COLUMNS"] = str(cols)
@@ -100,7 +139,7 @@ def run_tui(command: list[str], cols: int, rows: int, keys: list[str], settle: f
     while time.time() < deadline:
         pump(0.1)
     for key in keys:
-        os.write(master, key.encode())
+        os.write(master, key)
         end = time.time() + 0.6
         while time.time() < end:
             pump(0.1)
@@ -168,7 +207,12 @@ def main() -> int:
     parser.add_argument("--cols", type=int, default=100)
     parser.add_argument("--rows", type=int, default=30)
     parser.add_argument("--settle", type=float, default=6.0)
-    parser.add_argument("--keys", default="", help="literal keystrokes after startup")
+    parser.add_argument(
+        "--keys", default="", metavar="TOKENS",
+        help="whitespace-separated keys or text; key names: up down left right pageup "
+             "pagedown home end enter esc tab backspace space delete ctrl-c; "
+             "use text:... to type an otherwise ambiguous token",
+    )
     parser.add_argument("command", nargs=argparse.REMAINDER)
     args = parser.parse_args()
 
@@ -178,7 +222,7 @@ def main() -> int:
     if not command:
         parser.error("command required after --")
 
-    raw = run_tui(command, args.cols, args.rows, list(args.keys), args.settle)
+    raw = run_tui(command, args.cols, args.rows, parse_keys(args.keys), args.settle)
     screen = render(raw, args.cols, args.rows)
     args.out.mkdir(parents=True, exist_ok=True)
     (args.out / "screen.txt").write_text(screen.display and "\n".join(screen.display) + "\n")
