@@ -1,6 +1,6 @@
 use crate::app::{
-    chat_name, message_text, participant_count, speaker_label, status_text, timestamp, App,
-    ComposerPrompt,
+    chat_name, message_text, participant_count, speaker_label, status_text, status_tone, timestamp,
+    App, ComposerPrompt, StatusTone,
 };
 
 /// Key hints, exactly as the mockup shows them.
@@ -15,6 +15,13 @@ const TEXT: Color = Color::Rgb(205, 214, 244);
 const MUTED: Color = Color::Rgb(166, 173, 200);
 const CYAN: Color = Color::Rgb(137, 220, 235);
 const GREEN: Color = Color::Rgb(166, 227, 161);
+const YELLOW: Color = Color::Rgb(249, 226, 175);
+const RED: Color = Color::Rgb(243, 139, 168);
+
+/// The mockup caps its transcript and composer at roughly 780px of a ~1300px panel,
+/// about 60%. A terminal has no px, so cap in columns: a full-width transcript was
+/// the main reason the UI read as denser than the mockup.
+const MAX_CONTENT_WIDTH: u16 = 72;
 
 /// Keep only the trailing lines that fit the available height, so the newest
 /// content stays visible. Wrapped rows are counted so nothing is silently clipped.
@@ -31,7 +38,9 @@ fn tail_that_fits(lines: Vec<Line<'_>>, width: u16, height: u16) -> Vec<Line<'_>
             .iter()
             .map(|span| span.content.as_ref())
             .collect();
-        let rows = text.chars().count().div_ceil(width).max(1);
+        let rows = unicode_width::UnicodeWidthStr::width(text.as_str())
+            .div_ceil(width)
+            .max(1);
         if used + rows > height as usize {
             break;
         }
@@ -171,11 +180,15 @@ pub fn render(frame: &mut Frame<'_>, app: &App) {
     .split(body[2]);
     // The mockup gives the transcript clear separation from the sidebar divider.
     let gutter = ratatui::layout::Margin {
-        horizontal: 2,
+        horizontal: 3,
         vertical: 0,
     };
-    let content = right[1].inner(gutter);
-    let composer = right[2].inner(gutter);
+    let cap = |area: Rect| Rect {
+        width: area.width.min(MAX_CONTENT_WIDTH),
+        ..area
+    };
+    let content = cap(right[1].inner(gutter));
+    let composer = cap(right[2].inner(gutter));
     let selected = app.selected_conversation();
     let mut heading = vec![Span::styled("Bloom", Style::default().fg(TEXT))];
     if let Some(c) = selected {
@@ -200,11 +213,16 @@ pub fn render(frame: &mut Frame<'_>, app: &App) {
     // On narrow terminals the identity needs the room more than the badge does.
     if inner.width >= 60 {
         if let Some(status) = status_text(app) {
+            let tone = status_tone(app);
             let width = status.chars().count() as u16 + 1;
             frame.render_widget(
                 Paragraph::new(status)
                     .alignment(Alignment::Right)
-                    .style(Style::default().fg(MUTED)),
+                    .style(Style::default().fg(match tone {
+                        StatusTone::Healthy => MUTED,
+                        StatusTone::Attention => YELLOW,
+                        StatusTone::Failure => RED,
+                    })),
                 Rect::new(
                     right[0].x + right[0].width.saturating_sub(width),
                     right[0].y,

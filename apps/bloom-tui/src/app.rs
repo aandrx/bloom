@@ -402,6 +402,27 @@ pub fn status_text(app: &App) -> Option<String> {
     Some(session.to_owned())
 }
 
+/// Severity of the status shown in the header, so colour can carry meaning the way
+/// the design's palette intends.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StatusTone {
+    Healthy,
+    Attention,
+    Failure,
+}
+
+/// Session states that mean the engine needs the user's attention.
+pub fn status_tone(app: &App) -> StatusTone {
+    if !app.connection.is_empty() && app.connection != "Connected" {
+        return StatusTone::Failure;
+    }
+    match app.session.trim() {
+        "" | "Active" | "Registered" => StatusTone::Healthy,
+        "Throttled" | "Blocked" | "Failed" | "Disconnected" => StatusTone::Failure,
+        _ => StatusTone::Attention,
+    }
+}
+
 pub fn message_text(message: &Message) -> String {
     message
         .parts()
@@ -784,6 +805,42 @@ mod tests {
         .unwrap();
         assert_eq!(speaker_label(&phone, Some(&conversation)), "+15550000001");
         assert_eq!(speaker_label(&named, None), "Maya");
+    }
+
+    #[test]
+    fn status_tone_distinguishes_trouble_from_health() {
+        let healthy = App {
+            connection: "Connected".into(),
+            session: "Active".into(),
+            ..Default::default()
+        };
+        assert_eq!(status_tone(&healthy), StatusTone::Healthy);
+
+        // The engine wanting a renewal is worth noticing, not a failure.
+        let renewing = App {
+            connection: "Connected".into(),
+            session: "RenewalDue".into(),
+            ..Default::default()
+        };
+        assert_eq!(status_tone(&renewing), StatusTone::Attention);
+
+        // Throttled or blocked is a failure the user must act on.
+        for state in ["Throttled", "Blocked", "Failed", "Disconnected"] {
+            let bad = App {
+                connection: "Connected".into(),
+                session: state.into(),
+                ..Default::default()
+            };
+            assert_eq!(status_tone(&bad), StatusTone::Failure, "state {state}");
+        }
+
+        // A dead daemon connection outranks whatever the session last was.
+        let offline = App {
+            connection: "Disconnected, retrying".into(),
+            session: "Active".into(),
+            ..Default::default()
+        };
+        assert_eq!(status_tone(&offline), StatusTone::Failure);
     }
 
     #[test]

@@ -8,6 +8,7 @@ bloom-ipc = { path = "../../crates/bloom-ipc" }
 bloom-domain = { path = "../../crates/bloom-domain" }
 anyhow.workspace = true
 ratatui = "0.29"
+unicode-width = "0.2"
 crossterm = "0.28"
 tokio = { workspace = true, features = ["sync", "net", "io-util", "rt"] }
 libc = "0.2"

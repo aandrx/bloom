@@ -182,6 +182,18 @@ fn layout_matches_the_mockup_structure() {
         "connection state belongs in the header, found: {hint_text:?}"
     );
 
+    // The transcript is capped rather than running edge to edge, which is the
+    // mockup's proportion: the columns before the frame edge stay empty.
+    for y in 4..26 {
+        for x in 94..99 {
+            assert_eq!(
+                symbol(x, y),
+                " ",
+                "transcript should not reach the frame edge at ({x},{y})"
+            );
+        }
+    }
+
     // The old boxed layout and debug output must be gone.
     for unwanted in [
         "Conversations",
