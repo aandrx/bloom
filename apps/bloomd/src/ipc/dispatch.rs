@@ -27,6 +27,11 @@ pub trait RequestHandler: Send + Sync {
         conversation_id: ConversationId,
         body: OutgoingBody,
     ) -> HandlerFuture<'_, MessageId>;
+    fn start_conversation(
+        &self,
+        address: String,
+        body: OutgoingBody,
+    ) -> HandlerFuture<'_, MessageId>;
 }
 
 /// Serve sequential requests. Codec errors and idle timeouts close this connection.
@@ -104,6 +109,12 @@ async fn serve_inner<H: RequestHandler>(
                 Ok(message_id) => ResponseKind::Send { message_id },
                 Err(error) => ResponseKind::Error { error },
             },
+            RequestKind::StartConversation { address, body } => {
+                match handler.start_conversation(address, body).await {
+                    Ok(message_id) => ResponseKind::Send { message_id },
+                    Err(error) => ResponseKind::Error { error },
+                }
+            }
             RequestKind::Subscribe => ResponseKind::Error {
                 error: if hub.is_some() {
                     ProtocolError::InvalidRequest
@@ -167,6 +178,12 @@ mod tests {
                 Ok(MessageId::new(TransportId::new("fake").unwrap(), "message").unwrap())
             })
         }
+        fn start_conversation(&self, _: String, _: OutgoingBody) -> HandlerFuture<'_, MessageId> {
+            self.send(
+                ConversationId::new(TransportId::new("fake").unwrap(), "unused").unwrap(),
+                OutgoingBody { parts: vec![] },
+            )
+        }
     }
 
     struct ErrorHandler;
@@ -178,6 +195,9 @@ mod tests {
             Box::pin(async { Err(ProtocolError::Internal) })
         }
         fn send(&self, _: ConversationId, _: OutgoingBody) -> HandlerFuture<'_, MessageId> {
+            Box::pin(async { Err(ProtocolError::Internal) })
+        }
+        fn start_conversation(&self, _: String, _: OutgoingBody) -> HandlerFuture<'_, MessageId> {
             Box::pin(async { Err(ProtocolError::Internal) })
         }
     }

@@ -14,6 +14,7 @@ pub struct App {
     pub session: String,
     pub draft: String,
     pub composing: bool,
+    pub new_conversation: bool,
     pub error: Option<String>,
 }
 
@@ -42,6 +43,29 @@ impl App {
             .is_some_and(|id| self.conversations.iter().any(|c| &c.id == id))
         {
             self.selected = self.conversations.first().map(|c| c.id.clone());
+        }
+    }
+
+    pub fn begin_new_conversation(&mut self) {
+        self.new_conversation = true;
+        self.composing = true;
+        self.draft.clear();
+    }
+
+    pub fn cancel_composition(&mut self) {
+        self.new_conversation = false;
+        self.composing = false;
+        self.draft.clear();
+    }
+
+    pub fn submit_intent(&mut self) -> CompositionIntent {
+        let value = self.draft.trim().to_owned();
+        self.draft.clear();
+        self.composing = false;
+        if std::mem::take(&mut self.new_conversation) {
+            CompositionIntent::StartConversation(value)
+        } else {
+            CompositionIntent::SendMessage(value)
         }
     }
 
@@ -126,6 +150,46 @@ impl App {
     }
 }
 
+pub fn chat_name(conversation: &Conversation) -> &str {
+    conversation
+        .title
+        .as_deref()
+        .or_else(|| {
+            conversation
+                .participants
+                .first()
+                .and_then(|p| p.display_name.as_deref())
+        })
+        .unwrap_or("Conversation")
+}
+
+pub fn participant_count(count: usize) -> String {
+    format!("{count} {}", if count == 1 { "person" } else { "people" })
+}
+
+pub fn timestamp(created_at: i64) -> String {
+    use std::time::{Duration, UNIX_EPOCH};
+    let time = UNIX_EPOCH
+        .checked_add(Duration::from_millis(created_at.max(0) as u64))
+        .unwrap_or(UNIX_EPOCH);
+    let seconds = time
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs() as i64;
+    let local = unsafe { libc::localtime_r(&seconds, &mut std::mem::zeroed()) };
+    if local.is_null() {
+        return "--:--".into();
+    }
+    let tm = unsafe { *local };
+    format!("{:02}:{:02}", tm.tm_hour, tm.tm_min)
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub enum CompositionIntent {
+    StartConversation(String),
+    SendMessage(String),
+}
+
 pub fn message_text(message: &Message) -> String {
     message
         .parts()
@@ -133,7 +197,7 @@ pub fn message_text(message: &Message) -> String {
         .map(|part| match part {
             bloom_domain::MessagePart::Text(s) => s.clone(),
             bloom_domain::MessagePart::Attachment(_) => "[attachment]".into(),
-            bloom_domain::MessagePart::Unsupported { kind } => format!("[{kind}]"),
+            bloom_domain::MessagePart::Unsupported { .. } => "[attachment]".into(),
         })
         .collect::<Vec<_>>()
         .join(" ")
@@ -179,6 +243,37 @@ mod tests {
             None,
         )
         .unwrap()
+    }
+
+    #[test]
+    fn helper_text_and_timestamp_formatting() {
+        let chat = conversation("a", None);
+        assert_eq!(chat_name(&chat), "Conversation");
+        assert_eq!(participant_count(1), "1 person");
+        assert_eq!(participant_count(3), "3 people");
+        assert_eq!(timestamp(0).len(), 5);
+        assert!(timestamp(0).contains(':'));
+    }
+
+    #[test]
+    fn new_conversation_mode_enters_cancels_and_submits_address() {
+        let mut app = App::default();
+        app.begin_new_conversation();
+        assert!(app.composing && app.new_conversation);
+        app.cancel_composition();
+        assert!(!app.composing && !app.new_conversation);
+        app.begin_new_conversation();
+        app.draft = " someone@example.com ".into();
+        assert_eq!(
+            app.submit_intent(),
+            CompositionIntent::StartConversation("someone@example.com".into())
+        );
+        app.composing = true;
+        app.draft = "hello".into();
+        assert_eq!(
+            app.submit_intent(),
+            CompositionIntent::SendMessage("hello".into())
+        );
     }
 
     #[test]

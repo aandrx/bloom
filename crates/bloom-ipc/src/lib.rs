@@ -60,6 +60,13 @@ pub enum RequestKind {
         conversation_id: ConversationId,
         body: OutgoingBody,
     },
+    /// Start (or reuse) a conversation with a bare address and send into it. On a
+    /// fresh store this is how the first message gets sent, because no conversation
+    /// exists yet.
+    StartConversation {
+        address: String,
+        body: OutgoingBody,
+    },
 }
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Response {

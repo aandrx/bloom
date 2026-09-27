@@ -142,6 +142,7 @@ impl FakeDaemon {
                                     )
                                     .await;
                                 }
+                                RequestKind::StartConversation { .. } => unreachable!(),
                                 RequestKind::Send { .. } => {
                                     let _ = write_response(
                                         &mut stream,

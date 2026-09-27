@@ -83,6 +83,8 @@ pub struct Engine {
     pending: Arc<Pending>,
     next_request: AtomicU64,
     started: AtomicBool,
+    /// Addresses the account can send from, learned from the sidecar's ready frame.
+    my_handles: Arc<Mutex<Vec<String>>>,
 }
 
 impl Engine {
@@ -100,7 +102,19 @@ impl Engine {
             }),
             next_request: AtomicU64::new(1),
             started: AtomicBool::new(false),
+            my_handles: Arc::new(Mutex::new(Vec::new())),
         }
+    }
+
+    /// Addresses this account can send from, as reported by the engine.
+    pub fn my_handles(&self) -> Vec<String> {
+        self.my_handles.lock().unwrap().clone()
+    }
+
+    /// The local participant's handle, used as the sender of outbound messages.
+    pub fn primary_handle(&self) -> Option<Handle> {
+        let handles = self.my_handles();
+        handles.first().and_then(|raw| handle_from(raw))
     }
 
     /// Send a text message into a conversation identified by its engine chat guid.
@@ -210,6 +224,7 @@ impl Transport for Engine {
         // Hand the only sender to the reader task. If the engine held one, the
         // supervisor's forwarder could never observe the channel closing and
         // shutdown would always report an incomplete drain.
+        let my_handles = self.my_handles.clone();
         let outgoing = self
             .outgoing
             .lock()
@@ -219,7 +234,7 @@ impl Transport for Engine {
         let pending = self.pending.clone();
         let id = self.id.clone();
         tokio::spawn(async move {
-            read_frames(stdout, outgoing, pending, id).await;
+            read_frames(stdout, outgoing, pending, id, my_handles).await;
         });
         Ok(())
     }
@@ -274,9 +289,11 @@ async fn read_frames(
     outgoing: mpsc::Sender<TransportEvent>,
     pending: Arc<Pending>,
     id: TransportId,
+    my_handles_store: Arc<Mutex<Vec<String>>>,
 ) {
     let mut lines = BufReader::new(stdout).lines();
     let mut my_handles: Vec<String> = Vec::new();
+    let mut skipped: HashMap<SkipReason, u64> = HashMap::new();
     while let Ok(Some(line)) = lines.next_line().await {
         if line.len() > MAX_FRAME_BYTES {
             eprintln!("engine frame too large; closing engine connection");
@@ -297,6 +314,7 @@ async fn read_frames(
                         .filter_map(Value::as_str)
                         .map(str::to_owned)
                         .collect();
+                    *my_handles_store.lock().unwrap() = my_handles.clone();
                 }
                 if outgoing
                     .send(TransportEvent::Session {
@@ -321,7 +339,7 @@ async fn read_frames(
                             return;
                         }
                     }
-                    Err(reason) => eprintln!("engine message skipped: {reason}"),
+                    Err(reason) => *skipped.entry(reason).or_default() += 1,
                 }
             }
             Some("send_confirmation") => {
@@ -369,6 +387,14 @@ async fn read_frames(
             _ => eprintln!("engine sent an unknown frame type"),
         }
     }
+    if !skipped.is_empty() {
+        let summary = skipped
+            .iter()
+            .map(|(reason, count)| format!("{reason}={count}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        eprintln!("engine skipped payloads: {summary}");
+    }
     let _ = outgoing
         .send(TransportEvent::Session {
             state: SessionState::Disconnected,
@@ -393,7 +419,7 @@ fn map_session_state(state: &str) -> SessionState {
 }
 
 /// Why a payload could not be turned into a domain message. Reported, never silent.
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, PartialEq, Eq, Hash)]
 pub enum SkipReason {
     NotAnInboundMessage,
     NotANormalMessage,

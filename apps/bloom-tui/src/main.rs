@@ -145,12 +145,13 @@ async fn main() -> Result<()> {
                 }
                 if app.composing {
                     match key.code {
-                        KeyCode::Esc => {
-                            app.composing = false;
-                            app.draft.clear();
-                        }
+                        KeyCode::Esc => app.cancel_composition(),
                         KeyCode::Enter => {
-                            let body = app.draft.trim().to_owned();
+                            let intent = app.submit_intent();
+                            let bloom_tui::app::CompositionIntent::SendMessage(body) = intent else {
+                                app.error = Some("Start conversation request is awaiting BloomClient support".into());
+                                continue;
+                            };
                             if let (Some(id), false) = (app.selected.clone(), body.is_empty()) {
                                 let client = client.clone();
                                 let send_tx = send_tx.clone();
@@ -179,6 +180,7 @@ async fn main() -> Result<()> {
                     match key.code {
                         KeyCode::Down => app.select_step(1),
                         KeyCode::Up => app.select_step(-1),
+                        KeyCode::Char('n') => app.begin_new_conversation(),
                         KeyCode::Enter => app.composing = true,
                         _ => {}
                     }

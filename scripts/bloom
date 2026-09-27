@@ -42,14 +42,18 @@ fi
 
 started_daemon=""
 if [ ! -S "$socket" ]; then
-  target/debug/bloomd &
+  log="${XDG_STATE_HOME:-$HOME/.local/share}/bloom/bloomd.log"
+  mkdir -p "$(dirname "$log")"
+  # Keep daemon diagnostics out of the TUI: they would overwrite the screen.
+  target/debug/bloomd >>"$log" 2>&1 &
   started_daemon=$!
+  echo "bloom: daemon log at $log" >&2
   # Wait for the socket, but fail loudly instead of opening an empty UI.
   i=0
   while [ ! -S "$socket" ]; do
     i=$((i + 1))
     if [ "$i" -gt 100 ]; then
-      echo "bloom: daemon did not come up; see its output above" >&2
+      echo "bloom: daemon did not come up; see $log" >&2
       exit 1
     fi
     sleep 0.1

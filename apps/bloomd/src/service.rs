@@ -10,8 +10,8 @@ use crate::{
     store::{self, EncryptedStore},
 };
 use bloom_domain::{
-    Conversation, ConversationId, DeliveryState, Handle, HandleKind, Message, MessageId,
-    OutgoingBody,
+    Conversation, ConversationId, ConversationKind, DeliveryState, Handle, HandleKind, Message,
+    MessageId, OutgoingBody, Participant,
 };
 use bloom_ipc::{Event, EventKind, ProtocolError};
 use bloom_transport::{TransportError, TransportEvent};
@@ -132,6 +132,105 @@ impl RequestHandler for Service {
         })
     }
 
+    fn start_conversation(
+        &self,
+        address: String,
+        body: OutgoingBody,
+    ) -> HandlerFuture<'_, MessageId> {
+        Box::pin(async move {
+            let text = outgoing_text(&body).map_err(|_| ProtocolError::Unsupported)?;
+            let (handle, recipient) = normalize_address(&address)?;
+            let (conversation, existed) = {
+                let store = self.store.lock().unwrap();
+                let found = store::list_conversations(&store)
+                    .map_err(|_| ProtocolError::Internal)?
+                    .into_iter()
+                    .find(|c| {
+                        c.participants
+                            .iter()
+                            .any(|p| !p.is_me && p.handle == handle)
+                    });
+                match found {
+                    Some(conversation) => (conversation, true),
+                    None => {
+                        let remote_id = format!("iMessage;-;{}", recipient);
+                        let id =
+                            ConversationId::new(crate::engine::transport_id(), remote_id.clone())
+                                .map_err(|_| ProtocolError::InvalidRequest)?;
+                        let conversation = Conversation {
+                            id,
+                            remote_id,
+                            kind: ConversationKind::Direct,
+                            title: None,
+                            participants: {
+                                let mut participants = vec![Participant {
+                                    handle,
+                                    display_name: None,
+                                    is_me: false,
+                                }];
+                                if let Some(me) = self.engine.primary_handle() {
+                                    participants.push(Participant {
+                                        handle: me,
+                                        display_name: None,
+                                        is_me: true,
+                                    });
+                                }
+                                participants
+                            },
+                            created_at: now_millis(),
+                            last_message_at: None,
+                        };
+                        (conversation, false)
+                    }
+                }
+            };
+            let message_id = self
+                .engine
+                .send_text(&recipient, Some(&conversation.remote_id), &text)
+                .await
+                .map_err(map_transport_error)?;
+            let sender = conversation
+                .participants
+                .iter()
+                .find(|p| p.is_me)
+                .map(|p| p.handle.clone())
+                .unwrap_or_else(|| {
+                    Handle::new(HandleKind::Opaque, "me").expect("static handle is valid")
+                });
+            let message = Message::new(
+                message_id.clone(),
+                conversation.id.clone(),
+                None,
+                sender,
+                body.parts.clone(),
+                now_millis(),
+                None,
+                DeliveryState::Sent,
+                true,
+                None,
+                Vec::new(),
+                None,
+            )
+            .map_err(|_| ProtocolError::Internal)?;
+            {
+                let mut store = self.store.lock().unwrap();
+                if !existed {
+                    store::upsert_conversation(&mut store, &conversation)
+                        .map_err(|_| ProtocolError::Internal)?;
+                }
+                store::ingest_inbound(&mut store, &conversation, &message)
+                    .map_err(|_| ProtocolError::Internal)?;
+            }
+            self.hub.publish(Event {
+                event: EventKind::Message {
+                    conversation_id: conversation.id,
+                    message,
+                },
+            });
+            Ok(message_id)
+        })
+    }
+
     fn send(
         &self,
         conversation_id: ConversationId,
@@ -200,6 +299,71 @@ fn map_transport_error(error: TransportError) -> ProtocolError {
         TransportError::Protocol => ProtocolError::Protocol,
         TransportError::Internal => ProtocolError::Internal,
     }
+}
+
+fn normalize_address(address: &str) -> Result<(Handle, String), ProtocolError> {
+    let value = address.trim();
+    if value.is_empty() {
+        return Err(ProtocolError::InvalidRequest);
+    }
+    let is_phone_like = !value.contains('@');
+    // Humans type phone numbers with spaces and punctuation; normalise them away.
+    let value: String = if is_phone_like {
+        value
+            .chars()
+            .filter(|c| !c.is_whitespace() && !"().-".contains(*c))
+            .collect()
+    } else {
+        value.to_owned()
+    };
+    let value = value.as_str();
+    if value.is_empty() || value.chars().any(char::is_whitespace) {
+        return Err(ProtocolError::InvalidRequest);
+    }
+    let (kind, value) = if let Some(v) = value.strip_prefix("mailto:") {
+        if v.contains('@')
+            && v.split_once('@').is_some_and(|(local, domain)| {
+                !local.is_empty()
+                    && domain.contains('.')
+                    && !domain.starts_with('.')
+                    && !domain.ends_with('.')
+            })
+        {
+            (HandleKind::Email, v)
+        } else {
+            return Err(ProtocolError::InvalidRequest);
+        }
+    } else if let Some(v) = value.strip_prefix("tel:") {
+        if v.chars().any(|c| c.is_ascii_digit())
+            && v.chars()
+                .all(|c| c.is_ascii_digit() || "+()- .".contains(c))
+        {
+            (HandleKind::Tel, v)
+        } else {
+            return Err(ProtocolError::InvalidRequest);
+        }
+    } else if value.contains('@') {
+        if value.split_once('@').is_some_and(|(local, domain)| {
+            !local.is_empty()
+                && domain.contains('.')
+                && !domain.starts_with('.')
+                && !domain.ends_with('.')
+        }) {
+            (HandleKind::Email, value)
+        } else {
+            return Err(ProtocolError::InvalidRequest);
+        }
+    } else if value.chars().any(|c| c.is_ascii_digit())
+        && value
+            .chars()
+            .all(|c| c.is_ascii_digit() || "+()- .".contains(c))
+    {
+        (HandleKind::Tel, value)
+    } else {
+        return Err(ProtocolError::InvalidRequest);
+    };
+    let handle = Handle::new(kind, value).map_err(|_| ProtocolError::InvalidRequest)?;
+    Ok((handle.clone(), rust_handle(&handle)))
 }
 
 /// Render a domain handle back into the engine's `mailto:`/`tel:` form.
