@@ -92,10 +92,26 @@ impl Listener {
             ));
         }
         match fs::symlink_metadata(&path) {
-            Ok(_) => {
-                return Err(ListenerError::UnsafePath(
-                    "socket path already exists; refusing to unlink",
-                ));
+            Ok(meta) => {
+                // A previous daemon may have crashed and left its socket behind,
+                // which would otherwise make restart impossible. Only reclaim a path
+                // that is a socket, owned by us, in our own 0700 directory, and that
+                // nothing is answering on.
+                if !meta.file_type().is_socket() || meta.uid() != unsafe { libc::geteuid() } {
+                    return Err(ListenerError::UnsafePath(
+                        "socket path exists and is not our socket",
+                    ));
+                }
+                match std::os::unix::net::UnixStream::connect(&path) {
+                    Ok(_) => {
+                        return Err(ListenerError::UnsafePath(
+                            "another daemon is already listening on this socket",
+                        ));
+                    }
+                    Err(_) => {
+                        fs::remove_file(&path)?;
+                    }
+                }
             }
             Err(e) if e.kind() == io::ErrorKind::NotFound => (),
             Err(e) => return Err(e.into()),
@@ -176,6 +192,39 @@ mod tests {
     fn uid_policy() {
         assert!(credential_matches(1000, 1000));
         assert!(!credential_matches(1000, 1001));
+    }
+
+    #[tokio::test]
+    async fn a_stale_socket_is_reclaimed_but_a_live_one_is_respected() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::set_permissions(dir.path(), fs::Permissions::from_mode(0o700)).unwrap();
+        let path = dir.path().join("bloomd.sock");
+
+        // A crashed daemon leaves the socket file behind with nothing listening.
+        {
+            let stale = std::os::unix::net::UnixListener::bind(&path).unwrap();
+            drop(stale);
+        }
+        assert!(
+            path.exists(),
+            "the stale socket file should still be present"
+        );
+        let listener = Listener::bind(&path).expect("stale socket must be reclaimed");
+        assert!(path.exists());
+        drop(listener);
+        let _ = fs::remove_file(&path);
+
+        // A live daemon must not be displaced.
+        let live = std::os::unix::net::UnixListener::bind(&path).unwrap();
+        let error = match Listener::bind(&path) {
+            Ok(_) => panic!("a live socket must not be taken over"),
+            Err(error) => error,
+        };
+        assert!(
+            matches!(error, ListenerError::UnsafePath(_)),
+            "unexpected error: {error:?}"
+        );
+        drop(live);
     }
 
     #[tokio::test]

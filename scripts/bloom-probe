@@ -1,0 +1,26 @@
+#!/usr/bin/env python3
+"""Return 0 when something is listening on the given Unix socket.
+
+Used by the launcher so that a stale socket file left by a crashed daemon is not
+mistaken for a running one.
+"""
+
+import socket
+import sys
+
+def main() -> int:
+    if len(sys.argv) != 2:
+        print("usage: bloom-probe <socket path>", file=sys.stderr)
+        return 2
+    probe = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    probe.settimeout(0.5)
+    try:
+        probe.connect(sys.argv[1])
+    except OSError:
+        return 1
+    finally:
+        probe.close()
+    return 0
+
+if __name__ == "__main__":
+    sys.exit(main())

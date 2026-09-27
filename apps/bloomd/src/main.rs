@@ -93,6 +93,8 @@ async fn main() -> ExitCode {
     }
 
     drop(listener);
+    // Leave no stale socket behind for the next start to trip over.
+    let _ = std::fs::remove_file(&config.socket_path);
     let _ = supervisor.shutdown(SHUTDOWN_DRAIN).await;
     drop(service);
     persistence.abort();
