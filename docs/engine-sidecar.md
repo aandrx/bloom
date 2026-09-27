@@ -191,13 +191,27 @@ behavior is restart/resume, coexistence with the app, and one observed renewal.
     `apps/bloomd/src/engine.rs` spawns the sidecar child process, maps payloads into
     domain types, and is owned by the existing `Supervisor`; `service.rs` persists
     before fanout; `main.rs` assembles store, listener, subscriptions and shutdown.
+
+    **Ownership rule, learned the hard way.** The sidecar loads the user's real
+    engine state, so at most one process may own that state at a time. An observed
+    failure: `bloomd` died without its graceful path, the child was reparented to
+    `systemd --user`, and it kept polling for over an hour while still holding the
+    engine. The child now exits on stdin EOF (shared with the explicit `stop`
+    command) and the daemon requests `PR_SET_PDEATHSIG` on Linux as a backstop.
+    Because `PR_SET_PDEATHSIG` covers only the direct `dart run` child, stdin EOF
+    is the real shutdown path. Before starting the engine, check for a leftover
+    sidecar (`pgrep -f bloom_engine`) and for a live `bloomd`, not just for the
+    OpenBubbles app, since either can still hold the state.
 16. End-to-end test through the TUI with the OpenBubbles app not running. **DONE**:
     `apps/bloom-tui` no longer depends on Matrix; it talks to `bloomd` over the
     Bloom IPC socket, with conversation list, thread view, composer, session status,
-    resync on reconnect, and headless tests (7 state tests plus a fake-daemon
-    integration test covering snapshot, live events, resync on selection change, and
-    subscription loss). A PTY smoke run against the real daemon rendered the UI and
-    reported the engine session as active.
+    transcript scrolling, filtering, resync on reconnect, and headless tests. The
+    suite is currently 20 unit tests, 2 daemon-session tests, 13 key-path
+    interaction tests and 13 render tests, plus a fake-daemon integration test
+    covering snapshot, live events, resync on selection change, and subscription
+    loss. A PTY smoke run against the real daemon rendered the UI and reported the
+    engine session as active. The tests run under two timezones in CI because a
+    clock-dependent assertion passed locally and failed there.
 17. Read existing history from the app's ObjectBox store, or accept starting from
     takeover and backfilling from Apple. **BLOCKED**: the app's model classes import
     Flutter and app services, so they cannot be reused headlessly. A safe read-only
@@ -209,7 +223,7 @@ behavior is restart/resume, coexistence with the app, and one observed renewal.
 
 The sidecar half of item 18 is done: `ext/bloom-engine-sidecar` holds the packaged
 sidecar with an explicit field-by-field encoder, a versioned stdio protocol, config
-guards, and 29 offline tests, and it was verified live against the real engine
+guards, and 34 offline tests, and it was verified live against the real engine
 (ready frame, inbound frames, clean shutdown).
 
 ## Conversation listing from the engine

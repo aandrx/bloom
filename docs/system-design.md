@@ -150,6 +150,18 @@ omission and a Matrix habit.
 
 ## 6. Transport contract
 
+### Starting a conversation to a bare address
+
+`start_conversation` reuses an existing conversation only when it is a **Direct**
+conversation that already contains that recipient. A group that happens to
+include the recipient is never reused: matching on any participant sent private
+messages into the group. When no direct conversation exists, a new one is created
+with the transport's direct remote id, and address forms are normalised first
+(`mailto:` prefixes and phone formatting).
+
+A body carrying anything other than text parts is rejected rather than partially
+sent, so a `[text, attachment]` message cannot silently arrive as text alone.
+
 ```rust
 #[async_trait]
 pub trait Transport: Send + Sync {
@@ -222,6 +234,20 @@ sync_state      (transport, cursor, updated_at)
 Attachments live outside the database as content-addressed files with restrictive
 permissions. Nothing plaintext, no session material, no key material in SQLite.
 
+### Store key provisioning
+
+A key is generated only when there is no existing database. If the database file
+exists and the keychain has no key for it, `open_or_create` fails with
+`StoreError::ExistingDatabaseKeyMissing` and leaves the keychain untouched.
+
+This is deliberate and was a real defect before: the store used to generate and
+store a fresh key whenever the keychain read returned nothing, so a transient
+keychain failure (daemon not running, locked, entry removed) replaced the real
+key with a new one. The existing database then could not be decrypted with it,
+and the key that could have opened it was gone, which made the store
+unrecoverable rather than merely unopenable. Failing closed keeps the data
+recoverable once the keychain is available again.
+
 ## 9. Security model
 
 ### Assets
@@ -233,7 +259,9 @@ identifiers; the message database; attachment contents.
 1. Identity and credential material never leave the machine that registered it.
    The Mac bridge never receives Apple credentials; the daemon never sends them.
 2. No plaintext fallback. If the keychain is unavailable, fail closed, exactly as
-   the existing `bloom-core` and TUI auth do today.
+   the existing `bloom-core` and TUI auth do today. For the message store this is
+   enforced in `open_or_create`: a missing key never causes a new one to be
+   provisioned over an existing database (see section 8).
 3. Secrets never enter logs, error strings, panics, or support dumps. Hardware
    identifiers and activation material are treated as secrets.
 4. The socket is owner-only, uid-checked, and never network-exposed.
