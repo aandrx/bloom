@@ -1,0 +1,74 @@
+#!/bin/sh
+set -eu
+root=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
+cd "$root"
+manifest=scripts/check-guards.manifest
+failed=0
+found=0
+active_file=
+
+restore_active() {
+    if [ -n "$active_file" ]; then
+        git checkout -- "$active_file" >/dev/null 2>&1 || return 1
+        active_file=
+    fi
+}
+trap 'restore_active' EXIT
+trap 'exit 130' HUP INT TERM
+
+run_guard() {
+    name=$1 file=$2 old=$3 new=$4 package=$5 test_target=$6 test=$7
+    found=1
+    if [ -n "$(git status --porcelain -- "$file")" ]; then
+        echo "$name: REFUSED (file has uncommitted changes)" >&2
+        failed=1
+        return
+    fi
+    if ! grep -Fq "$old" "$file"; then
+        echo "$name: ERROR (mutation text not found: $old)" >&2
+        failed=1
+        return
+    fi
+    active_file=$file
+    OLD_TEXT=$old NEW_TEXT=$new perl -0pi -e 's/\Q$ENV{OLD_TEXT}\E/$ENV{NEW_TEXT}/ or die "mutation text not found\\n"' "$file" || {
+        echo "$name: ERROR (mutation failed)" >&2
+        failed=1
+        return
+    }
+    log=$(mktemp)
+    set +e
+    if [ "$test_target" = lib ]; then
+        CARGO_BUILD_JOBS=2 cargo test -p "$package" --lib "$test" >"$log" 2>&1
+    else
+        CARGO_BUILD_JOBS=2 cargo test -p "$package" --test "$test_target" "$test" -- --exact >"$log" 2>&1
+    fi
+    status=$?
+    set -e
+    if restore_active && git diff --quiet HEAD -- "$file"; then
+        restored=1
+    else
+        echo "$name: ERROR (could not restore/verify $file)" >&2
+        failed=1
+        restored=0
+    fi
+    short_test=${test##*::}
+    if [ "$restored" -eq 1 ] && [ "$status" -ne 0 ] && grep -Fq "$short_test ... FAILED" "$log"; then
+        echo "$name: PROVEN (named test failed under mutation; source restored)"
+    else
+        echo "$name: FAILED (test status=$status, named_failure=$(grep -F "$short_test ... FAILED" "$log" >/dev/null && echo yes || echo no), restored=$restored)" >&2
+        tail -n 12 "$log" >&2
+        failed=1
+    fi
+    rm -f "$log"
+}
+
+while IFS='|' read -r name file old new package test_target test; do
+    case "$name" in ''|'#'*) continue ;; esac
+    if [ "$#" -gt 0 ] && [ "$1" != "$name" ]; then continue; fi
+    run_guard "$name" "$file" "$old" "$new" "$package" "$test_target" "$test"
+done < "$manifest"
+if [ "$#" -gt 0 ] && [ "$found" -eq 0 ]; then
+    echo "unknown guard: $1" >&2
+    exit 2
+fi
+[ "$failed" -eq 0 ]
