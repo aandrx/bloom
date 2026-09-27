@@ -3,7 +3,26 @@
 use crate::daemon::Snapshot;
 use bloom_domain::{Conversation, ConversationId, HandleKind, Message};
 use bloom_ipc::EventKind;
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use std::collections::HashMap;
+
+/// What a key press wants the shell to do.
+///
+/// The key semantics live here rather than inside the event loop so the real key
+/// path is testable; the loop only performs the async work an action asks for.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Action {
+    None,
+    Quit,
+    SendMessage {
+        conversation: ConversationId,
+        body: String,
+    },
+    StartConversation {
+        address: String,
+        body: String,
+    },
+}
 
 #[derive(Default)]
 pub struct App {
@@ -189,6 +208,81 @@ impl App {
         let selected = self.selected.clone();
         self.filter = None;
         selected
+    }
+
+    /// Apply a key press and report what the shell should do about it.
+    ///
+    /// Ctrl+C always quits. Otherwise the open prompt owns the keyboard: while the
+    /// filter is open its characters are query text, and while composing they are
+    /// message text, so `q` only quits from the plain conversation list.
+    pub fn handle_key(&mut self, key: KeyEvent) -> Action {
+        if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
+            return Action::Quit;
+        }
+        if self.filter_query().is_some() {
+            match key.code {
+                KeyCode::Esc => self.cancel_filter(),
+                KeyCode::Enter => {
+                    if let Some(id) = self.confirm_filter() {
+                        self.selected = Some(id);
+                    }
+                }
+                KeyCode::Up => self.select_step(-1),
+                KeyCode::Down => self.select_step(1),
+                KeyCode::Backspace => self.filter_backspace(),
+                KeyCode::Char(character) => self.filter_input(character),
+                _ => {}
+            }
+            return Action::None;
+        }
+        if self.composing {
+            match key.code {
+                KeyCode::Esc => {
+                    self.cancel_composition();
+                    return Action::None;
+                }
+                KeyCode::Enter => {
+                    let action = match self.submit_intent() {
+                        CompositionIntent::None => Action::None,
+                        CompositionIntent::SendMessage(body) => {
+                            match (self.selected.clone(), body.is_empty()) {
+                                (Some(conversation), false) => {
+                                    self.draft.clear();
+                                    Action::SendMessage { conversation, body }
+                                }
+                                _ => Action::None,
+                            }
+                        }
+                        CompositionIntent::StartConversation { address, body } => {
+                            if address.is_empty() || body.is_empty() {
+                                Action::None
+                            } else {
+                                self.draft.clear();
+                                Action::StartConversation { address, body }
+                            }
+                        }
+                    };
+                    self.composing = false;
+                    return action;
+                }
+                KeyCode::Backspace => {
+                    self.draft.pop();
+                }
+                KeyCode::Char(character) => self.draft.push(character),
+                _ => {}
+            }
+            return Action::None;
+        }
+        match key.code {
+            KeyCode::Char('q') => return Action::Quit,
+            KeyCode::Down => self.select_step(1),
+            KeyCode::Up => self.select_step(-1),
+            KeyCode::Char('n') => self.begin_new_conversation(),
+            KeyCode::Char('/') => self.begin_filter(),
+            KeyCode::Enter => self.composing = true,
+            _ => {}
+        }
+        Action::None
     }
 
     /// Keep the selection inside the filtered set as the query changes.

@@ -7,7 +7,7 @@ use bloom_tui::app::App;
 use bloom_tui::daemon::{self, ConnectionState, Snapshot};
 use bloom_tui::ui;
 use crossterm::{
-    event::{self, Event, KeyCode, KeyEvent, KeyModifiers},
+    event::{self, Event, KeyEvent},
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
@@ -150,102 +150,46 @@ async fn main() -> Result<()> {
                 Err(error) => app.error = Some(error),
             },
             Some(key) = key_rx.recv() => {
-                let quit = key.code == KeyCode::Char('q') && !app.composing
-                    || key.code == KeyCode::Char('c')
-                        && key.modifiers.contains(KeyModifiers::CONTROL);
-                if quit {
-                    break;
+                // All key semantics live in `App::handle_key` so the real key path is
+                // testable; this loop only performs the async work an action asks for.
+                match app.handle_key(key) {
+                    bloom_tui::app::Action::Quit => break,
+                    bloom_tui::app::Action::SendMessage { conversation, body } => {
+                        let client = client.clone();
+                        let send_tx = send_tx.clone();
+                        tokio::spawn(async move {
+                            let result = client
+                                .send(conversation, OutgoingBody {
+                                    parts: vec![MessagePart::Text(body)],
+                                })
+                                .await
+                                .context("send failed")
+                                .map(|_| ())
+                                .map_err(|error| error.to_string());
+                            let _ = send_tx.send(result);
+                        });
+                    }
+                    bloom_tui::app::Action::StartConversation { address, body } => {
+                        let client = client.clone();
+                        let send_tx = send_tx.clone();
+                        tokio::spawn(async move {
+                            let result = client
+                                .start_conversation(address, OutgoingBody {
+                                    parts: vec![MessagePart::Text(body)],
+                                })
+                                .await
+                                .context("start conversation failed")
+                                .map(|_| ())
+                                .map_err(|error| error.to_string());
+                            let _ = send_tx.send(result);
+                        });
+                    }
+                    bloom_tui::app::Action::None => {}
                 }
-                if app.filter_query().is_some() {
-                    // The filter prompt owns the keyboard while it is open.
-                    match key.code {
-                        KeyCode::Esc => app.cancel_filter(),
-                        KeyCode::Enter => {
-                            if let Some(id) = app.confirm_filter() {
-                                app.selected = Some(id);
-                                last_visible = app.selected.clone();
-                                let _ = visible_tx.send(last_visible.clone());
-                            }
-                        }
-                        KeyCode::Up => app.select_step(-1),
-                        KeyCode::Down => app.select_step(1),
-                        KeyCode::Backspace => app.filter_backspace(),
-                        KeyCode::Char(character) => app.filter_input(character),
-                        _ => {}
-                    }
-                    continue;
-                }
-                if app.composing {
-                    match key.code {
-                        KeyCode::Esc => app.cancel_composition(),
-                        KeyCode::Enter => {
-                            match app.submit_intent() {
-                                bloom_tui::app::CompositionIntent::None => {}
-                                bloom_tui::app::CompositionIntent::SendMessage(body) => {
-                                    if let (Some(id), false) = (app.selected.clone(), body.is_empty()) {
-                                        let client = client.clone();
-                                        let send_tx = send_tx.clone();
-                                        tokio::spawn(async move {
-                                            let result = client
-                                                .send(id, OutgoingBody {
-                                                    parts: vec![MessagePart::Text(body)],
-                                                })
-                                                .await
-                                                .context("send failed")
-                                                .map(|_| ())
-                                                .map_err(|error| error.to_string());
-                                            let _ = send_tx.send(result);
-                                        });
-                                        app.draft.clear();
-                                    }
-                                }
-                                bloom_tui::app::CompositionIntent::StartConversation {
-                                    address,
-                                    body,
-                                } => {
-                                    if !address.is_empty() && !body.is_empty() {
-                                        let client = client.clone();
-                                        let send_tx = send_tx.clone();
-                                        tokio::spawn(async move {
-                                            let result = client
-                                                .start_conversation(
-                                                    address.clone(),
-                                                    OutgoingBody {
-                                                        parts: vec![MessagePart::Text(body)],
-                                                    },
-                                                )
-                                                .await
-                                                .context("start conversation failed")
-                                                .map(|_| ())
-                                                .map_err(|error| error.to_string());
-                                            let _ = send_tx.send(result);
-                                        });
-                                        app.draft.clear();
-                                    }
-                                }
-                            }
-                            app.composing = false;
-                        }
-                        KeyCode::Backspace => {
-                            app.draft.pop();
-                        }
-                        KeyCode::Char(c) => app.draft.push(c),
-                        _ => {}
-                    }
-                } else {
-                    match key.code {
-                        KeyCode::Down => app.select_step(1),
-                        KeyCode::Up => app.select_step(-1),
-                        KeyCode::Char('n') => app.begin_new_conversation(),
-                        KeyCode::Char('/') => app.begin_filter(),
-                        KeyCode::Enter => app.composing = true,
-                        _ => {}
-                    }
-                    // A selection change is a request for a fresh read, not an event.
-                    if app.selected != last_visible {
-                        last_visible = app.selected.clone();
-                        let _ = visible_tx.send(last_visible.clone());
-                    }
+                // A selection change is a request for a fresh read, not an event.
+                if app.selected != last_visible {
+                    last_visible = app.selected.clone();
+                    let _ = visible_tx.send(last_visible.clone());
                 }
             }
             _ = tokio::time::sleep(Duration::from_millis(50)) => {}
