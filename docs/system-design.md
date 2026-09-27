@@ -74,7 +74,9 @@ These are evidence-backed, not assumptions.
 ```
 
 The important property: the transport is a deployment choice. The UI cannot tell
-which one is behind the trait except through declared capabilities.
+which one is behind the trait except through declared capabilities. The independent
+transport remains blocked at Gate 0; the OpenBubbles sidecar path does not make that
+path production-ready.
 
 ## 4. Components
 
@@ -102,7 +104,10 @@ Mac-side daemon: `LaunchAgent`, reads `~/Library/Messages/chat.db` for inbound,
 LAN/VPN. Holds no Apple credentials beyond what Messages already has.
 
 ### 4.6 Surfaces (MIT)
-`bloom-tui` exists today and carries over. `bloom-gpui` is a later surface.
+`bloom-tui` is the terminal client today; it provides a conversation list and thread
+view, a composer, list filtering, transcript scrolling, light and dark themes, and
+session status. See [`tui.md`](tui.md) for the user-facing guide. `bloom-gpui` is a
+later surface.
 
 ## 5. Domain model
 
@@ -202,12 +207,24 @@ Rules:
 
 ## 7. Daemon IPC
 
+Frames from the engine are newline-delimited JSON, read with a 1 MiB bound enforced
+as bytes arrive. The daemon distinguishes stream EOF, oversized frames, read errors,
+and invalid UTF-8 in its reader diagnostics. Daemon startup logs its pid and socket,
+and shutdown logs the received signal and a clean-stop marker. SIGTERM and Ctrl+C
+both use the orderly drain-and-stop path.
+
 - Unix domain socket at `$XDG_RUNTIME_DIR/bloom/bloomd.sock`, mode `0600`.
 - Frames are a version byte, four-byte big-endian length, then bounded JSON.
-  Any codec error closes the connection; requests and responses carry IDs.
+  Any codec error closes the connection; requests and responses carry IDs. The
+  engine sidecar's separate stdio protocol is newline-delimited JSON; its `ready`
+  frame includes protocol version, engine version, send/history capability flags,
+  and account handles. Handle lookup is best effort, so failure does not prevent
+  startup but can make own-message classification incorrect.
 - Peer credentials checked via `SO_PEERCRED`; reject any uid but the owner's.
 - Request/response for reads and sends; a subscription stream for events.
-- One writer to the message store and to the transport session. The daemon is a
+- One writer to the message store and to the transport session. The daemon claims
+  its IPC socket before starting the engine sidecar, so a competing daemon fails
+  before it can also open the user's live registration state. The daemon is a
   singleton per account.
 
 The UI never touches the transport, the store, or credentials directly. That
@@ -237,8 +254,8 @@ permissions. Nothing plaintext, no session material, no key material in SQLite.
 ### Store key provisioning
 
 A key is generated only when there is no existing database. If the database file
-exists and the keychain has no key for it, `open_or_create` fails with
-`StoreError::ExistingDatabaseKeyMissing` and leaves the keychain untouched.
+exists and the keychain has no key for it, `open_or_create` fails with the distinct
+`StoreError::ExistingDatabaseKeyMissing` and does not provision a replacement key.
 
 This is deliberate and was a real defect before: the store used to generate and
 store a fresh key whenever the keychain read returned nothing, so a transient
@@ -280,6 +297,14 @@ identifiers; the message database; attachment contents.
 | Protocol breakage leaks data | Failing closed on unknown message kinds, never rendering raw payloads |
 
 ## 10. Activation and lifecycle
+
+`bloomd` logs its start, engine child pid, received termination signal, and clean
+shutdown. It handles both SIGTERM (the normal service-manager stop path) and Ctrl+C
+(SIGINT), drains and shuts down the supervisor on either path, then removes the
+socket. The sidecar exits on stdin EOF as well as the explicit shutdown command.
+On Linux the daemon also requests `PR_SET_PDEATHSIG` for the direct child it spawns;
+that is only a backstop for that child, not a process-tree guarantee. Stdin EOF is
+the sidecar's actual orphan-shutdown path.
 
 States: `Unregistered -> Activating -> Registered -> Active -> RenewalDue ->
 (Renewing | Throttled | Blocked | Failed)`.
@@ -368,6 +393,9 @@ Phase 1, core. `bloom-domain`, `Transport` trait, one working transport, `bloomd
 with IPC, store, and event fanout.
 
 Phase 2, UI rebind. Point the existing TUI at `bloomd`; retire Matrix to `spike/`.
+The current terminal client has a conversation list, thread view, composer,
+filtering, transcript scrolling, light and dark themes, and session status; see
+[`tui.md`](tui.md).
 
 Phase 3, second transport. Capability-driven UI so relay and direct coexist
 honestly.

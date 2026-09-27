@@ -68,8 +68,10 @@ Mapping the public tag's restore path established three facts that shape the pla
 
 ## Approach
 
-1. A small Dart program (`bloom-engine`) loads the installed engine library with
-   the matching generated bridge and owns all engine state.
+1. A small Dart program (`bloom-engine`) loads the installed engine library with the
+   matching generated bridge and owns all engine state. `bloomd` claims its IPC
+   socket before starting this child, preventing a second daemon from opening the
+   same live registration state before discovering the singleton conflict.
 2. It speaks Bloom's existing versioned Unix-socket IPC, so `bloomd`, the TUI and
    any future GPUI client stay unchanged in shape.
 3. Hardware bootstrap uses the offline `OABS` payload from Mac Hardware Info. The
@@ -191,27 +193,35 @@ behavior is restart/resume, coexistence with the app, and one observed renewal.
     `apps/bloomd/src/engine.rs` spawns the sidecar child process, maps payloads into
     domain types, and is owned by the existing `Supervisor`; `service.rs` persists
     before fanout; `main.rs` assembles store, listener, subscriptions and shutdown.
+    It claims the socket before starting the engine, logs daemon start, child pid,
+    received signal, and clean shutdown, and handles SIGTERM as well as Ctrl+C. The
+    sidecar exits on stdin EOF as well as the explicit shutdown command. Linux
+    `PR_SET_PDEATHSIG` is only a direct-child backstop. The engine reader distinguishes
+    stream EOF, oversized frames, read failures and invalid UTF-8 in its diagnostics,
+    and enforces its 1 MiB frame limit while reading rather than after buffering a
+    complete line.
 
     **Ownership rule, learned the hard way.** The sidecar loads the user's real
     engine state, so at most one process may own that state at a time. An observed
     failure: `bloomd` died without its graceful path, the child was reparented to
     `systemd --user`, and it kept polling for over an hour while still holding the
-    engine. The child now exits on stdin EOF (shared with the explicit `stop`
-    command) and the daemon requests `PR_SET_PDEATHSIG` on Linux as a backstop.
-    Because `PR_SET_PDEATHSIG` covers only the direct `dart run` child, stdin EOF
-    is the real shutdown path. Before starting the engine, check for a leftover
-    sidecar (`pgrep -f bloom_engine`) and for a live `bloomd`, not just for the
-    OpenBubbles app, since either can still hold the state.
+    engine. Before starting the engine, check for a leftover sidecar
+    (`pgrep -f bloom_engine`) and for a live `bloomd`, not just for the OpenBubbles
+    app, since either can still hold the state.
 16. End-to-end test through the TUI with the OpenBubbles app not running. **DONE**:
     `apps/bloom-tui` no longer depends on Matrix; it talks to `bloomd` over the
     Bloom IPC socket, with conversation list, thread view, composer, session status,
-    transcript scrolling, filtering, resync on reconnect, and headless tests. The
-    suite is currently 20 unit tests, 2 daemon-session tests, 13 key-path
-    interaction tests and 13 render tests, plus a fake-daemon integration test
-    covering snapshot, live events, resync on selection change, and subscription
-    loss. A PTY smoke run against the real daemon rendered the UI and reported the
-    engine session as active. The tests run under two timezones in CI because a
-    clock-dependent assertion passed locally and failed there.
+    transcript scrolling, filtering, light and dark themes, resync on reconnect, and
+    headless tests. See [`tui.md`](tui.md) for the user-facing guide, and
+    [`tui-internals.md`](tui-internals.md) for how the redraw and accessibility
+    machinery works. The suite covers unit-tested state transitions, key-path
+    interaction, headless rendering against the mockup, and a fake-daemon integration
+    test for snapshot, live events, resync on selection change and subscription loss;
+    `cargo test -p bloom-tui` prints the current counts, which are deliberately not
+    repeated here because they go stale. A PTY smoke run against the real daemon
+    rendered the UI and reported the engine session as active. The tests run under two
+    timezones in CI because a clock-dependent assertion passed locally and failed
+    there.
 17. Read existing history from the app's ObjectBox store, or accept starting from
     takeover and backfilling from Apple. **BLOCKED**: the app's model classes import
     Flutter and app services, so they cannot be reused headlessly. A safe read-only
@@ -224,7 +234,10 @@ behavior is restart/resume, coexistence with the app, and one observed renewal.
 The sidecar half of item 18 is done: `ext/bloom-engine-sidecar` holds the packaged
 sidecar with an explicit field-by-field encoder, a versioned stdio protocol, config
 guards, and 34 offline tests, and it was verified live against the real engine
-(ready frame, inbound frames, clean shutdown).
+(ready frame, inbound frames, clean shutdown). The ready frame carries protocol
+version, engine version, send/history capability flags, and the account's handles.
+Handle lookup is best effort: failure is logged, startup continues with an empty
+list, and the daemon may consequently mislabel own messages.
 
 ## Conversation listing from the engine
 
@@ -258,7 +271,7 @@ export BLOOM_ENGINE_LIBRARY=<installed librust_lib_bluebubbles.so>
 export BLOOM_ENGINE_SCRIPT=<repo>/ext/bloom-engine-sidecar/dart/bin/bloom_engine.dart
 export BLOOM_DART_EXECUTABLE=<dart>
 
-bloomd          # opens the encrypted store, spawns the engine, serves the socket
+bloomd          # opens the encrypted store, claims the socket, spawns the engine
 bloom-tui       # reads BLOOM_SOCKET_PATH (or BLOOM_SOCKET)
 ```
 
