@@ -1,4 +1,4 @@
-use crate::app::{chat_name, message_text, participant_count, timestamp, App};
+use crate::app::{chat_name, message_text, participant_count, timestamp, App, ComposerPrompt};
 use bloom_domain::DeliveryState;
 use ratatui::{prelude::*, widgets::*};
 
@@ -93,7 +93,9 @@ pub fn render(frame: &mut Frame<'_>, app: &App) {
     let mut transcript = Vec::new();
     if let Some(messages) = app.selected.as_ref().and_then(|id| app.messages.get(id)) {
         for message in messages {
-            let speaker = if message.sender.value() == "me" {
+            // `from_me` is the authoritative signal; comparing the sender against a
+            // placeholder string mislabels our own messages.
+            let speaker = if message.from_me {
                 "You"
             } else {
                 message.sender.value()
@@ -110,12 +112,13 @@ pub fn render(frame: &mut Frame<'_>, app: &App) {
                 message_text(message),
                 Style::default().fg(TEXT),
             )];
-            if speaker == "You" {
+            if message.from_me {
                 let state = match message.delivery {
+                    DeliveryState::Queued => "sending",
+                    DeliveryState::Sent => "sent",
                     DeliveryState::Delivered => "delivered",
                     DeliveryState::Read => "read",
-                    DeliveryState::Sent => "sent",
-                    _ => "failed",
+                    DeliveryState::Failed => "failed",
                 };
                 content.push(Span::raw("  "));
                 content.push(Span::styled(
@@ -135,10 +138,10 @@ pub fn render(frame: &mut Frame<'_>, app: &App) {
         Paragraph::new(transcript).wrap(Wrap { trim: false }),
         right[0],
     );
-    let prompt = if app.new_conversation {
-        "›  Enter recipient address..."
-    } else {
-        "›  Write a message..."
+    let prompt = match app.composer_prompt() {
+        ComposerPrompt::Recipient => "›  To: recipient address...".to_owned(),
+        ComposerPrompt::Body(address) => format!("›  To {address} — write a message..."),
+        _ => "›  Write a message...".to_owned(),
     };
     frame.render_widget(
         Paragraph::new(prompt)

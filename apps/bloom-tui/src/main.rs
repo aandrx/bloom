@@ -147,26 +147,50 @@ async fn main() -> Result<()> {
                     match key.code {
                         KeyCode::Esc => app.cancel_composition(),
                         KeyCode::Enter => {
-                            let intent = app.submit_intent();
-                            let bloom_tui::app::CompositionIntent::SendMessage(body) = intent else {
-                                app.error = Some("Start conversation request is awaiting BloomClient support".into());
-                                continue;
-                            };
-                            if let (Some(id), false) = (app.selected.clone(), body.is_empty()) {
-                                let client = client.clone();
-                                let send_tx = send_tx.clone();
-                                tokio::spawn(async move {
-                                    let result = client
-                                        .send(id, OutgoingBody {
-                                            parts: vec![MessagePart::Text(body)],
-                                        })
-                                        .await
-                                        .context("send failed")
-                                        .map(|_| ())
-                                        .map_err(|error| error.to_string());
-                                    let _ = send_tx.send(result);
-                                });
-                                app.draft.clear();
+                            match app.submit_intent() {
+                                bloom_tui::app::CompositionIntent::None => {}
+                                bloom_tui::app::CompositionIntent::SendMessage(body) => {
+                                    if let (Some(id), false) = (app.selected.clone(), body.is_empty()) {
+                                        let client = client.clone();
+                                        let send_tx = send_tx.clone();
+                                        tokio::spawn(async move {
+                                            let result = client
+                                                .send(id, OutgoingBody {
+                                                    parts: vec![MessagePart::Text(body)],
+                                                })
+                                                .await
+                                                .context("send failed")
+                                                .map(|_| ())
+                                                .map_err(|error| error.to_string());
+                                            let _ = send_tx.send(result);
+                                        });
+                                        app.draft.clear();
+                                    }
+                                }
+                                bloom_tui::app::CompositionIntent::StartConversation {
+                                    address,
+                                    body,
+                                } => {
+                                    if !address.is_empty() && !body.is_empty() {
+                                        let client = client.clone();
+                                        let send_tx = send_tx.clone();
+                                        tokio::spawn(async move {
+                                            let result = client
+                                                .start_conversation(
+                                                    address.clone(),
+                                                    OutgoingBody {
+                                                        parts: vec![MessagePart::Text(body)],
+                                                    },
+                                                )
+                                                .await
+                                                .context("start conversation failed")
+                                                .map(|_| ())
+                                                .map_err(|error| error.to_string());
+                                            let _ = send_tx.send(result);
+                                        });
+                                        app.draft.clear();
+                                    }
+                                }
                             }
                             app.composing = false;
                         }

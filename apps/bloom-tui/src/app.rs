@@ -14,6 +14,8 @@ pub struct App {
     pub session: String,
     pub draft: String,
     pub composing: bool,
+    /// Recipient address captured before the first message of a new conversation.
+    pub pending_address: Option<String>,
     pub new_conversation: bool,
     pub error: Option<String>,
 }
@@ -46,26 +48,60 @@ impl App {
         }
     }
 
+    /// Start a new conversation: first the recipient address, then the message.
     pub fn begin_new_conversation(&mut self) {
         self.new_conversation = true;
+        self.pending_address = None;
         self.composing = true;
         self.draft.clear();
     }
 
     pub fn cancel_composition(&mut self) {
         self.new_conversation = false;
+        self.pending_address = None;
         self.composing = false;
         self.draft.clear();
     }
 
+    /// Advance the composer one step. Address entry does not send anything; it
+    /// moves on to the body so a new conversation cannot be started with a
+    /// placeholder message.
     pub fn submit_intent(&mut self) -> CompositionIntent {
         let value = self.draft.trim().to_owned();
         self.draft.clear();
+        if self.new_conversation && self.pending_address.is_none() {
+            if value.is_empty() {
+                self.cancel_composition();
+                return CompositionIntent::None;
+            }
+            self.pending_address = Some(value);
+            self.composing = true;
+            return CompositionIntent::None;
+        }
         self.composing = false;
-        if std::mem::take(&mut self.new_conversation) {
-            CompositionIntent::StartConversation(value)
+        if let Some(address) = self.pending_address.take() {
+            self.new_conversation = false;
+            if value.is_empty() {
+                return CompositionIntent::None;
+            }
+            return CompositionIntent::StartConversation {
+                address,
+                body: value,
+            };
+        }
+        CompositionIntent::SendMessage(value)
+    }
+
+    /// What the composer is currently asking for, if anything.
+    pub fn composer_prompt(&self) -> ComposerPrompt {
+        if self.new_conversation && self.pending_address.is_none() {
+            ComposerPrompt::Recipient
+        } else if let Some(address) = &self.pending_address {
+            ComposerPrompt::Body(address.clone())
+        } else if self.composing {
+            ComposerPrompt::Message
         } else {
-            CompositionIntent::SendMessage(value)
+            ComposerPrompt::Idle
         }
     }
 
@@ -185,8 +221,20 @@ pub fn timestamp(created_at: i64) -> String {
 }
 
 #[derive(Debug, PartialEq, Eq)]
+pub enum ComposerPrompt {
+    Idle,
+    Message,
+    Recipient,
+    Body(String),
+}
+
 pub enum CompositionIntent {
-    StartConversation(String),
+    /// The composer advanced a step without dispatching anything.
+    None,
+    StartConversation {
+        address: String,
+        body: String,
+    },
     SendMessage(String),
 }
 
@@ -256,24 +304,55 @@ mod tests {
     }
 
     #[test]
-    fn new_conversation_mode_enters_cancels_and_submits_address() {
+    fn new_conversation_asks_for_the_recipient_before_the_body() {
         let mut app = App::default();
         app.begin_new_conversation();
         assert!(app.composing && app.new_conversation);
-        app.cancel_composition();
-        assert!(!app.composing && !app.new_conversation);
-        app.begin_new_conversation();
+        assert!(matches!(app.composer_prompt(), ComposerPrompt::Recipient));
+
+        // Entering the address only advances the composer; nothing is dispatched.
         app.draft = " someone@example.com ".into();
-        assert_eq!(
-            app.submit_intent(),
-            CompositionIntent::StartConversation("someone@example.com".into())
-        );
+        assert!(matches!(app.submit_intent(), CompositionIntent::None));
+        assert_eq!(app.pending_address.as_deref(), Some("someone@example.com"));
+        assert!(matches!(app.composer_prompt(), ComposerPrompt::Body(_)));
+
+        // The body is what actually starts the conversation.
+        app.draft = "hello".into();
+        match app.submit_intent() {
+            CompositionIntent::StartConversation { address, body } => {
+                assert_eq!(address, "someone@example.com");
+                assert_eq!(body, "hello");
+            }
+            _ => panic!("expected a start-conversation intent"),
+        }
+        assert_eq!(app.pending_address, None);
+        assert!(!app.new_conversation);
+
+        // Cancelling clears everything.
+        app.begin_new_conversation();
+        app.draft = "someone@example.com".into();
+        let _ = app.submit_intent();
+        app.cancel_composition();
+        assert_eq!(app.pending_address, None);
+        assert!(!app.composing && !app.new_conversation);
+
+        // An empty address aborts instead of starting a conversation.
+        app.begin_new_conversation();
+        app.draft = "   ".into();
+        assert!(matches!(app.submit_intent(), CompositionIntent::None));
+        assert!(!app.composing);
+        assert_eq!(app.pending_address, None);
+    }
+
+    #[test]
+    fn normal_messages_still_submit_as_a_single_step() {
+        let mut app = App::default();
         app.composing = true;
         app.draft = "hello".into();
-        assert_eq!(
-            app.submit_intent(),
-            CompositionIntent::SendMessage("hello".into())
-        );
+        match app.submit_intent() {
+            CompositionIntent::SendMessage(body) => assert_eq!(body, "hello"),
+            _ => panic!("expected a send intent"),
+        }
     }
 
     #[test]

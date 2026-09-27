@@ -160,6 +160,22 @@ impl BloomClient {
         }
     }
 
+    /// Send to a bare address, creating the conversation if it does not exist yet.
+    /// This is how the first message is sent into an empty store.
+    pub async fn start_conversation(
+        &self,
+        address: String,
+        body: OutgoingBody,
+    ) -> Result<MessageId, ClientError> {
+        match self
+            .request(RequestKind::StartConversation { address, body })
+            .await?
+        {
+            ResponseKind::Send { message_id } => Ok(message_id),
+            _ => Err(ClientError::UnexpectedResponse),
+        }
+    }
+
     pub async fn subscribe(&self) -> Result<EventStream, ClientError> {
         let id = Self::id();
         let mut stream = self.connect().await?;
