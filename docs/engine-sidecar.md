@@ -191,8 +191,13 @@ behavior is restart/resume, coexistence with the app, and one observed renewal.
     `apps/bloomd/src/engine.rs` spawns the sidecar child process, maps payloads into
     domain types, and is owned by the existing `Supervisor`; `service.rs` persists
     before fanout; `main.rs` assembles store, listener, subscriptions and shutdown.
-16. End-to-end test through the TUI with the OpenBubbles app not running. The daemon
-    half is verified; the TUI is being rebound off Matrix.
+16. End-to-end test through the TUI with the OpenBubbles app not running. **DONE**:
+    `apps/bloom-tui` no longer depends on Matrix; it talks to `bloomd` over the
+    Bloom IPC socket, with conversation list, thread view, composer, session status,
+    resync on reconnect, and headless tests (7 state tests plus a fake-daemon
+    integration test covering snapshot, live events, resync on selection change, and
+    subscription loss). A PTY smoke run against the real daemon rendered the UI and
+    reported the engine session as active.
 17. Read existing history from the app's ObjectBox store, or accept starting from
     takeover and backfilling from Apple. **BLOCKED**: the app's model classes import
     Flutter and app services, so they cannot be reused headlessly. A safe read-only
@@ -206,6 +211,21 @@ The sidecar half of item 18 is done: `ext/bloom-engine-sidecar` holds the packag
 sidecar with an explicit field-by-field encoder, a versioned stdio protocol, config
 guards, and 29 offline tests, and it was verified live against the real engine
 (ready frame, inbound frames, clean shutdown).
+
+## Running it locally
+
+```sh
+export BLOOM_ENGINE_STATE=<openbubbles state dir>
+export BLOOM_ENGINE_LIBRARY=<installed librust_lib_bluebubbles.so>
+export BLOOM_ENGINE_SCRIPT=<repo>/ext/bloom-engine-sidecar/dart/bin/bloom_engine.dart
+export BLOOM_DART_EXECUTABLE=<dart>
+
+bloomd          # opens the encrypted store, spawns the engine, serves the socket
+bloom-tui       # reads BLOOM_SOCKET_PATH (or BLOOM_SOCKET)
+```
+
+The store starts empty, so the UI shows conversations only for messages received
+while Bloom is running until history import exists.
 
 ## Verified end to end through the daemon
 
