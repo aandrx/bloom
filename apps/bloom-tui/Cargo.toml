@@ -4,12 +4,13 @@ version.workspace = true
 edition.workspace = true
 
 [dependencies]
-bloom-core = { path = "../../crates/bloom-core" }
-matrix-sdk.workspace = true
+bloom-ipc = { path = "../../crates/bloom-ipc" }
+bloom-domain = { path = "../../crates/bloom-domain" }
 anyhow.workspace = true
 ratatui = "0.29"
 crossterm = "0.28"
-tokio.workspace = true
-sha2 = "0.10"
-rpassword = "7"
-url = "2"
+tokio = { workspace = true, features = ["sync", "net", "io-util", "rt"] }
+libc = "0.2"
+
+[dev-dependencies]
+tempfile = "3"

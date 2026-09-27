@@ -1,363 +1,317 @@
-use bloom_core::{CoreEvent, EncryptionStatus, MembershipState, Message, RoomSummary, SendState};
-use std::collections::{HashMap, HashSet};
+//! UI state for the Bloom TUI. Rendering lives in `ui.rs`.
+
+use crate::daemon::Snapshot;
+use bloom_domain::{Conversation, ConversationId, Message};
+use bloom_ipc::EventKind;
+use std::collections::HashMap;
 
 #[derive(Default)]
 pub struct App {
-    pub rooms: Vec<RoomSummary>,
-    pub selected: Option<String>,
-    pub messages: HashMap<String, Vec<Message>>,
+    pub conversations: Vec<Conversation>,
+    pub selected: Option<ConversationId>,
+    pub messages: HashMap<ConversationId, Vec<Message>>,
     pub connection: String,
-    pub status: String,
-    pub error: Option<String>,
-    pub joining: HashSet<String>,
-    pub composer_open: bool,
+    pub session: String,
     pub draft: String,
-    pub sending: bool,
-    loading: HashSet<String>,
-    loaded: HashSet<String>,
-    submitted: Option<(String, String, u64)>,
-    draft_generation: u64,
+    pub composing: bool,
+    pub error: Option<String>,
 }
 
 impl App {
-    pub fn can_send(&self) -> bool {
-        self.selected_room().is_some_and(|room| {
-            room.membership == MembershipState::Joined
-                && room.encryption == EncryptionStatus::Encrypted
-        })
-    }
-
-    pub fn send_reason(&self) -> &'static str {
-        match self.selected_room() {
-            None => "No room selected",
-            Some(room) if room.membership != MembershipState::Joined => "Join the room to send",
-            Some(room) if room.encryption != EncryptionStatus::Encrypted => {
-                "Sending requires confirmed encryption"
+    /// Apply a store snapshot. History is replaced, not merged, because the store is
+    /// authoritative. The current selection is kept while it still exists.
+    pub fn apply_snapshot(&mut self, snapshot: Snapshot) {
+        if let Some(id) = snapshot.visible.clone() {
+            self.messages.insert(id.clone(), snapshot.history);
+            // Adopt the snapshot's conversation only when nothing is selected yet;
+            // a deliberate user selection must not be pulled back.
+            if self.selected.is_none() {
+                self.selected = Some(id);
             }
-            Some(_) => "Enter to send, Esc to cancel",
         }
-    }
-
-    pub fn open_composer(&mut self) {
-        self.composer_open = self.can_send();
+        self.set_conversations(snapshot.conversations);
         self.error = None;
     }
-    pub fn cancel_composer(&mut self) {
-        self.composer_open = false;
-        self.draft.clear();
-        self.draft_generation = self.draft_generation.wrapping_add(1);
-    }
-    pub fn edit_char(&mut self, c: char) {
-        self.draft.push(c);
-        self.draft_generation = self.draft_generation.wrapping_add(1);
-    }
-    pub fn backspace(&mut self) {
-        if self.draft.pop().is_some() {
-            self.draft_generation = self.draft_generation.wrapping_add(1);
+
+    pub fn set_conversations(&mut self, mut conversations: Vec<Conversation>) {
+        conversations.sort_by_key(|c| std::cmp::Reverse(c.last_message_at));
+        self.conversations = conversations;
+        if !self
+            .selected
+            .as_ref()
+            .is_some_and(|id| self.conversations.iter().any(|c| &c.id == id))
+        {
+            self.selected = self.conversations.first().map(|c| c.id.clone());
         }
     }
-    pub fn begin_send(&mut self) -> Option<(String, String, u64)> {
-        if self.sending || !self.can_send() || self.draft.trim().is_empty() {
-            return None;
-        }
-        let room = self.selected.clone()?;
-        let body = self.draft.clone();
-        self.sending = true;
-        let generation = self.draft_generation;
-        self.submitted = Some((room.clone(), body.clone(), generation));
-        Some((room, body, generation))
-    }
-    pub fn send_result(
-        &mut self,
-        room: String,
-        body: String,
-        generation: u64,
-        result: anyhow::Result<String>,
-    ) {
-        if self.submitted.as_ref() != Some(&(room.clone(), body.clone(), generation)) {
-            return;
-        }
-        self.sending = false;
-        self.submitted = None;
-        match result {
-            Ok(event_id) => {
-                if self.selected.as_deref() == Some(&room) && self.draft_generation == generation {
-                    self.draft.clear();
-                    self.composer_open = false;
-                }
-                let message = Message {
-                    event_id,
-                    sender: "You".into(),
-                    body: Some(body),
-                    timestamp_ms: now_ms(),
-                    send_state: SendState::Sent,
-                };
-                self.insert_message(room, message);
-                self.error = None;
-            }
-            Err(error) => self.error = Some(error.to_string()),
-        }
-    }
-    fn insert_message(&mut self, room: String, message: Message) {
-        let list = self.messages.entry(room).or_default();
-        if !list.iter().any(|old| old.event_id == message.event_id) {
-            list.push(message);
-        }
-        list.sort_by_key(|message| message.timestamp_ms);
-    }
-    pub fn set_rooms(&mut self, rooms: Vec<RoomSummary>) -> Vec<String> {
-        let selected = self.selected.clone();
-        self.rooms = rooms;
-        self.selected = selected
-            .filter(|id| self.rooms.iter().any(|room| room.room_id.as_str() == id))
-            .or_else(|| self.rooms.first().map(|room| room.room_id.to_string()));
-        self.take_history_requests()
-    }
-    pub fn handle(&mut self, event: CoreEvent) -> Vec<String> {
-        match event {
-            CoreEvent::RoomsChanged(rooms) => return self.set_rooms(rooms),
-            CoreEvent::Message { room_id, message } => {
-                self.insert_message(room_id.to_string(), message)
-            }
-            CoreEvent::Connection { connected, error } => {
-                self.connection = if connected {
-                    "Connected"
-                } else {
-                    "Disconnected"
-                }
-                .into();
-                self.error = error;
-            }
-        }
-        Vec::new()
-    }
-    pub fn take_history_requests(&mut self) -> Vec<String> {
-        let mut requests = Vec::new();
-        for room in &self.rooms {
-            let id = room.room_id.to_string();
-            if room.membership == MembershipState::Joined
-                && !self.loading.contains(&id)
-                && !self.loaded.contains(&id)
-            {
-                self.loading.insert(id.clone());
-                requests.push(id);
-            }
-        }
-        requests
-    }
-    pub fn history_result(&mut self, id: String, result: anyhow::Result<Vec<Message>>) {
-        self.loading.remove(&id);
-        match result {
-            Ok(messages) => {
-                self.loaded.insert(id.clone());
-                for message in messages {
-                    self.insert_message(id.clone(), message);
-                }
-            }
-            Err(error) => self.error = Some(error.to_string()),
-        }
-    }
-    pub fn select_step(&mut self, delta: isize) {
-        if self.rooms.is_empty() {
+
+    pub fn select_step(&mut self, step: isize) {
+        if self.conversations.is_empty() {
             self.selected = None;
             return;
         }
-        let current = self
+        let at = self
             .selected
             .as_ref()
-            .and_then(|id| {
-                self.rooms
-                    .iter()
-                    .position(|room| room.room_id.as_str() == id)
-            })
+            .and_then(|id| self.conversations.iter().position(|c| &c.id == id))
             .unwrap_or(0);
-        let next = (current as isize + delta).clamp(0, self.rooms.len() as isize - 1) as usize;
-        self.selected = Some(self.rooms[next].room_id.to_string());
+        let next = (at as isize + step).clamp(0, self.conversations.len() as isize - 1) as usize;
+        self.selected = Some(self.conversations[next].id.clone());
     }
-    pub fn selected_room(&self) -> Option<&RoomSummary> {
-        self.rooms
+
+    pub fn selected_conversation(&self) -> Option<&Conversation> {
+        self.conversations
             .iter()
-            .find(|room| Some(room.room_id.to_string()) == self.selected)
+            .find(|c| Some(&c.id) == self.selected.as_ref())
     }
-    pub fn request_join(&mut self) -> Option<String> {
-        let room = self.selected_room()?;
-        if room.membership != MembershipState::Invited {
-            return None;
+
+    pub fn apply_event(&mut self, event: EventKind) {
+        match event {
+            EventKind::Message {
+                conversation_id,
+                message,
+            }
+            | EventKind::Update {
+                conversation_id,
+                message,
+            } => {
+                self.upsert(conversation_id.clone(), message);
+                if let Some(c) = self
+                    .conversations
+                    .iter_mut()
+                    .find(|c| c.id == conversation_id)
+                {
+                    c.last_message_at = self
+                        .messages
+                        .get(&conversation_id)
+                        .and_then(|m| m.last())
+                        .map(|m| m.created_at);
+                }
+                self.conversations
+                    .sort_by_key(|c| std::cmp::Reverse(c.last_message_at));
+            }
+            EventKind::Delivery {
+                conversation_id,
+                message_id,
+                state,
+            } => {
+                if let Some(m) = self
+                    .messages
+                    .get_mut(&conversation_id)
+                    .and_then(|v| v.iter_mut().find(|m| m.id() == &message_id))
+                {
+                    m.delivery = state;
+                }
+            }
+            EventKind::Session { state } => self.session = format!("{state:?}"),
         }
-        let id = room.room_id.to_string();
-        let name = room.display_name.clone();
-        if self.joining.insert(id.clone()) {
-            self.status = format!("Joining {name}");
-            Some(id)
+    }
+
+    pub fn upsert(&mut self, id: ConversationId, message: Message) {
+        let list = self.messages.entry(id).or_default();
+        if let Some(old) = list.iter_mut().find(|m| m.id() == message.id()) {
+            *old = message;
         } else {
-            None
+            list.push(message);
         }
+        list.sort_by_key(|m| m.created_at);
     }
-    pub fn join_result(&mut self, id: String, result: anyhow::Result<()>) {
-        self.joining.remove(&id);
-        match result {
-            Ok(()) => self.status = "Joined room".into(),
-            Err(error) => self.error = Some(error.to_string()),
-        }
+
+    pub fn preview(&self, id: &ConversationId) -> String {
+        self.messages
+            .get(id)
+            .and_then(|v| v.last())
+            .map(message_text)
+            .unwrap_or_default()
     }
 }
-fn now_ms() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis() as u64
-}
-pub fn encryption_label(status: &EncryptionStatus) -> &'static str {
-    match status {
-        EncryptionStatus::Encrypted => "Encrypted",
-        EncryptionStatus::NotEncrypted => "Not encrypted",
-        EncryptionStatus::Unknown => "Unknown",
-    }
+
+pub fn message_text(message: &Message) -> String {
+    message
+        .parts()
+        .iter()
+        .map(|part| match part {
+            bloom_domain::MessagePart::Text(s) => s.clone(),
+            bloom_domain::MessagePart::Attachment(_) => "[attachment]".into(),
+            bloom_domain::MessagePart::Unsupported { kind } => format!("[{kind}]"),
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use matrix_sdk::ruma::room_id;
-    fn room(id: &str, membership: MembershipState, encryption: EncryptionStatus) -> RoomSummary {
-        RoomSummary {
-            room_id: id.parse().unwrap(),
-            display_name: id.into(),
-            membership,
-            encryption,
-        }
-    }
-    #[test]
-    fn send_requires_joined_confirmed_encryption() {
-        let mut no_room = App {
-            draft: "attempt".into(),
-            ..Default::default()
-        };
-        assert!(!no_room.can_send());
-        assert!(no_room.begin_send().is_none());
+    use bloom_domain::{
+        ConversationKind, DeliveryState, Handle, HandleKind, MessageId, Participant, TransportId,
+    };
 
-        for (membership, encryption, expected) in [
-            (MembershipState::Joined, EncryptionStatus::Encrypted, true),
-            (MembershipState::Joined, EncryptionStatus::Unknown, false),
-            (
-                MembershipState::Joined,
-                EncryptionStatus::NotEncrypted,
-                false,
-            ),
-            (MembershipState::Invited, EncryptionStatus::Encrypted, false),
-            (MembershipState::Left, EncryptionStatus::Encrypted, false),
-        ] {
-            let mut app = App {
-                rooms: vec![room("!a:example.org", membership, encryption)],
-                selected: Some("!a:example.org".into()),
-                draft: "attempt".into(),
-                ..Default::default()
-            };
-            assert_eq!(app.can_send(), expected);
-            if expected {
-                assert!(app.begin_send().is_some());
-            } else {
-                assert!(app.begin_send().is_none());
-            }
+    fn conversation(value: &str, last: Option<i64>) -> Conversation {
+        let transport = TransportId::new("openbubbles").unwrap();
+        Conversation {
+            id: ConversationId::new(transport, value).unwrap(),
+            remote_id: format!("iMessage;-;{value}"),
+            kind: ConversationKind::Direct,
+            title: None,
+            participants: vec![Participant {
+                handle: Handle::new(HandleKind::Opaque, value).unwrap(),
+                display_name: None,
+                is_me: false,
+            }],
+            created_at: 1,
+            last_message_at: last,
         }
     }
+
+    fn message(conversation: &Conversation, id: &str, at: i64, text: &str) -> Message {
+        Message::new(
+            MessageId::new(conversation.id.transport().clone(), id).unwrap(),
+            conversation.id.clone(),
+            None,
+            Handle::new(HandleKind::Opaque, "someone").unwrap(),
+            vec![bloom_domain::MessagePart::Text(text.to_owned())],
+            at,
+            None,
+            DeliveryState::Delivered,
+            false,
+            None,
+            Vec::new(),
+            None,
+        )
+        .unwrap()
+    }
+
     #[test]
-    fn composer_edits_unicode_and_retains_failure_then_clears_success() {
-        let mut app = App {
-            rooms: vec![room(
-                "!a:example.org",
-                MembershipState::Joined,
-                EncryptionStatus::Encrypted,
-            )],
-            selected: Some("!a:example.org".into()),
-            ..Default::default()
-        };
-        app.open_composer();
-        app.edit_char('🦀');
-        app.edit_char('x');
-        app.backspace();
-        assert_eq!(app.draft, "🦀");
-        let (id, body, generation) = app.begin_send().unwrap();
-        app.send_result(
-            id.clone(),
-            body.clone(),
-            generation,
-            Err(anyhow::anyhow!("failed")),
+    fn conversations_are_ordered_newest_first_and_selection_survives() {
+        let mut app = App::default();
+        let a = conversation("a", Some(10));
+        let b = conversation("b", Some(30));
+        let c = conversation("c", None);
+        app.set_conversations(vec![a.clone(), b.clone(), c.clone()]);
+        assert_eq!(
+            app.conversations
+                .iter()
+                .map(|c| c.id.value())
+                .collect::<Vec<_>>(),
+            vec!["b", "a", "c"],
+            "newest first, unknown timestamps last"
         );
-        assert_eq!(app.draft, "🦀");
-        let (id, body, generation) = app.begin_send().unwrap();
-        app.send_result(id, body, generation, Ok("$event".into()));
-        assert!(app.draft.is_empty());
-        assert_eq!(app.messages["!a:example.org"].len(), 1);
+        assert_eq!(app.selected.as_ref().unwrap().value(), "b");
+
+        app.select_step(1);
+        assert_eq!(app.selected.as_ref().unwrap().value(), "a");
+        // A later refresh must not move the user's selection.
+        app.set_conversations(vec![c.clone(), a.clone(), b.clone()]);
+        assert_eq!(app.selected.as_ref().unwrap().value(), "a");
+
+        // A selection that disappears falls back to the first conversation.
+        app.set_conversations(vec![c.clone()]);
+        assert_eq!(app.selected.as_ref().unwrap().value(), "c");
     }
+
     #[test]
-    fn edited_identical_draft_survives_old_success() {
-        let mut app = App {
-            rooms: vec![room(
-                "!a:example.org",
-                MembershipState::Joined,
-                EncryptionStatus::Encrypted,
-            )],
-            selected: Some("!a:example.org".into()),
-            ..Default::default()
-        };
-        app.open_composer();
-        for c in "same".chars() {
-            app.edit_char(c);
-        }
-        let (id, body, generation) = app.begin_send().unwrap();
-        app.backspace();
-        app.edit_char('e');
-        app.send_result(id, body, generation, Ok("$event".into()));
-        assert_eq!(app.draft, "same");
-        assert!(app.composer_open);
+    fn snapshot_replaces_history_for_the_visible_conversation_only() {
+        let mut app = App::default();
+        let a = conversation("a", Some(10));
+        let b = conversation("b", Some(20));
+        app.upsert(a.id.clone(), message(&a, "stale", 1, "stale"));
+        app.apply_snapshot(Snapshot {
+            visible: Some(a.id.clone()),
+            conversations: vec![a.clone(), b.clone()],
+            history: vec![message(&a, "fresh", 2, "fresh")],
+        });
+        assert_eq!(
+            app.preview(&a.id),
+            "fresh",
+            "authoritative history replaces"
+        );
+        assert_eq!(app.selected.as_ref().unwrap().value(), "a");
     }
+
     #[test]
-    fn canceled_and_retyped_identical_draft_survives_old_success() {
-        let mut app = App {
-            rooms: vec![room(
-                "!a:example.org",
-                MembershipState::Joined,
-                EncryptionStatus::Encrypted,
-            )],
-            selected: Some("!a:example.org".into()),
-            ..Default::default()
-        };
-        app.open_composer();
-        for c in "same".chars() {
-            app.edit_char(c);
-        }
-        let (id, body, generation) = app.begin_send().unwrap();
-        app.cancel_composer();
-        app.open_composer();
-        for c in body.chars() {
-            app.edit_char(c);
-        }
-        app.send_result(id, body, generation, Ok("$event".into()));
-        assert_eq!(app.draft, "same");
-        assert!(app.composer_open);
+    fn inbound_events_upsert_and_reorder() {
+        let mut app = App::default();
+        let a = conversation("a", Some(10));
+        let b = conversation("b", Some(20));
+        app.set_conversations(vec![a.clone(), b.clone()]);
+        app.apply_event(EventKind::Message {
+            conversation_id: a.id.clone(),
+            message: message(&a, "m1", 50, "newest"),
+        });
+        assert_eq!(
+            app.conversations[0].id.value(),
+            "a",
+            "latest message reorders"
+        );
+        assert_eq!(app.preview(&a.id), "newest");
+
+        // A re-delivered message id must update in place, not duplicate.
+        app.apply_event(EventKind::Message {
+            conversation_id: a.id.clone(),
+            message: message(&a, "m1", 50, "edited"),
+        });
+        assert_eq!(app.messages.get(&a.id).unwrap().len(), 1);
+        assert_eq!(app.preview(&a.id), "edited");
     }
+
     #[test]
-    fn unrelated_draft_survives_inflight_result() {
-        let mut app = App {
-            rooms: vec![room(
-                "!a:example.org",
-                MembershipState::Joined,
-                EncryptionStatus::Encrypted,
-            )],
-            selected: Some("!a:example.org".into()),
-            draft: "one".into(),
-            ..Default::default()
-        };
-        let (id, body, generation) = app.begin_send().unwrap();
-        app.cancel_composer();
-        app.open_composer();
-        app.draft = "two".into();
-        app.send_result(id, body, generation, Ok("$event".into()));
-        assert_eq!(app.draft, "two");
+    fn delivery_and_session_events_update_state() {
+        let mut app = App::default();
+        let a = conversation("a", Some(1));
+        app.set_conversations(vec![a.clone()]);
+        app.upsert(a.id.clone(), message(&a, "m1", 5, "hi"));
+        let id = app.messages[&a.id][0].id().clone();
+
+        app.apply_event(EventKind::Delivery {
+            conversation_id: a.id.clone(),
+            message_id: id,
+            state: DeliveryState::Read,
+        });
+        assert_eq!(app.messages[&a.id][0].delivery, DeliveryState::Read);
+
+        app.apply_event(EventKind::Session {
+            state: bloom_domain::SessionState::Active,
+        });
+        assert_eq!(app.session, "Active");
     }
+
     #[test]
-    fn room_id_type_remains_supported() {
-        let _ = room_id!("!a:example.org");
+    fn empty_state_is_selectable_without_panicking() {
+        let mut app = App::default();
+        app.select_step(1);
+        assert!(app.selected.is_none());
+        app.apply_event(EventKind::Session {
+            state: bloom_domain::SessionState::Disconnected,
+        });
+        assert!(app.selected_conversation().is_none());
+    }
+
+    #[test]
+    fn preview_renders_attachments_and_unknown_parts() {
+        let a = conversation("a", Some(1));
+        let message = Message::new(
+            MessageId::new(a.id.transport().clone(), "m").unwrap(),
+            a.id.clone(),
+            None,
+            Handle::new(HandleKind::Opaque, "someone").unwrap(),
+            vec![
+                bloom_domain::MessagePart::Unsupported {
+                    kind: "attachment".to_owned(),
+                },
+                bloom_domain::MessagePart::Text("caption".to_owned()),
+            ],
+            1,
+            None,
+            DeliveryState::Delivered,
+            false,
+            None,
+            Vec::new(),
+            None,
+        )
+        .unwrap();
+        let mut app = App::default();
+        app.set_conversations(vec![a.clone()]);
+        app.upsert(a.id.clone(), message);
+        assert_eq!(app.preview(&a.id), "[attachment] caption");
     }
 }
