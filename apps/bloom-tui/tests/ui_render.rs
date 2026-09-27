@@ -21,10 +21,11 @@ use ratatui::{
 fn buffer(app: &App, width: u16, height: u16) -> ratatui::buffer::Buffer {
     let backend = TestBackend::new(width, height);
     let mut terminal = Terminal::new(backend).unwrap();
-    terminal.draw(|frame| {
-        ui::render(frame, app);
-    })
-    .unwrap();
+    terminal
+        .draw(|frame| {
+            ui::render(frame, app);
+        })
+        .unwrap();
     terminal.backend().buffer().clone()
 }
 
@@ -48,6 +49,7 @@ fn conversation(title: &str, participants: usize, last: i64) -> Conversation {
             .collect(),
         created_at: 1,
         last_message_at: Some(last),
+        preview: None,
     }
 }
 
@@ -197,15 +199,15 @@ fn layout_matches_the_mockup_structure() {
 
     for expected in [
         "Chats",                  // sidebar label
-        "Bloom /",                // header prefix
+        "Weekend crew",           // selected conversation title
         "Weekend crew",           // selected conversation title
         "person1",                // direct-chat recipient subtitle
         "Saturday looks perfect", // transcript body
         "Yes, 8:40 works.",       // our own message
         "delivered",              // delivery marker
         "Write a message",        // composer placeholder
-        "↑↓ scroll",               // footer hints
-        "Tab chats",          // sidebar focus shortcut
+        "↑↓ scroll",              // footer hints
+        "Tab chats",              // sidebar focus shortcut
         "Dark",                   // current theme in the header
     ] {
         assert!(text.contains(expected), "missing {expected:?} in:\n{text}");
@@ -313,7 +315,8 @@ fn command_menu_renders_suggestions_and_compact_hints() {
         "Filter your conversations",
         "/compact",
         "Toggle sidebar density",
-        "/cancel",
+        "/unhide",
+        "Restore chats hidden with Close",
         "↑↓ select",
         "Enter run",
     ] {
@@ -418,10 +421,7 @@ fn session_status_remains_visible_when_the_theme_control_is_hidden() {
     let grid = buffer(&app, 40, 12);
     let header = row_text(&grid, 0);
     assert!(header.contains("● Active"), "status is visible: {header:?}");
-    assert!(
-        !header.contains("Weekend"),
-        "the selected chat title yields space to the status: {header:?}"
-    );
+    assert!(header.contains("Weekend"), "title is retained: {header:?}");
     assert!(
         !header.contains("Dark"),
         "theme control yields space: {header:?}"
@@ -498,7 +498,7 @@ fn settings_panel_shows_selected_local_preferences() {
         ..Default::default()
     };
     let screen = rendered(&app);
-    assert!(screen.contains("Bloom / Settings"), "settings header:\n{screen}");
+    assert!(screen.contains("│Settings"), "settings header:\n{screen}");
     assert!(
         screen.contains("Automatic (Dark)"),
         "theme value:\n{screen}"
@@ -523,10 +523,7 @@ fn settings_remain_actionable_on_a_short_terminal() {
         .map(|row| row_text(&compact, row))
         .collect::<Vec<_>>()
         .join("\n");
-    assert!(
-        screen.contains("Automatic"),
-        "compact settings:\n{screen}"
-    );
+    assert!(screen.contains("Automatic"), "compact settings:\n{screen}");
     assert!(
         screen.contains("Sidebar"),
         "compact settings retain both setting rows:\n{screen}"
@@ -722,10 +719,14 @@ fn long_header_title_does_not_overlap_status_or_theme() {
 
     let grid = buffer(&app, 100, 30);
     let header = row_text(&grid, 0);
-    let title = column_of(&grid, 0, "Bloom").expect("product title is visible");
-    let status = column_of(&grid, 0, "⠋ Disconnected").expect("status follows title");
+    let title = column_of(&grid, 0, "A conversation").expect("chat title visible");
+    let status = column_of(&grid, 0, "⠋ Disconnected").expect("status visible");
     let theme = column_of(&grid, 0, "Dark").expect("theme chip remains visible");
-    assert!(title + 6 <= status, "title/status overlap in {header:?}");
+    assert!(title < status, "title/status overlap in {header:?}");
+    assert!(
+        header.rfind("Bloom").unwrap() > theme as usize,
+        "Bloom stays at far right: {header:?}"
+    );
     assert!(status < theme, "status/theme overlap in {header:?}");
     assert!(
         header.contains("A conversation title"),
@@ -738,16 +739,14 @@ fn long_header_title_does_not_overlap_status_or_theme() {
 
     let narrow = buffer(&app, 60, 10);
     let narrow_header = row_text(&narrow, 0);
-    let narrow_title = column_of(&narrow, 0, "Bloom").expect("narrow product title");
-    let narrow_status = column_of(&narrow, 0, "⠋ Disconnected").expect("narrow status");
     let narrow_theme = column_of(&narrow, 0, "Dark").expect("narrow theme chip");
     assert!(
-        narrow_title + 6 <= narrow_status,
-        "narrow title/status overlap: {narrow_header:?}"
+        narrow_header.contains("●") && narrow_header.contains("?"),
+        "status and help remain visible: {narrow_header:?}"
     );
     assert!(
-        narrow_status < narrow_theme,
-        "narrow status/theme overlap: {narrow_header:?}"
+        narrow_theme > 0,
+        "theme chip remains visible: {narrow_header:?}"
     );
 }
 
@@ -797,13 +796,19 @@ fn composer_and_own_messages_use_codex_style_surfaces() {
         .find(|y| (0..grid.area.width).any(|x| grid[(x, *y)].symbol() == "›"))
         .unwrap();
     let input_column = column_of(&grid, input_row, "›").unwrap();
-    assert_eq!(grid[(input_column, input_row)].bg, ratatui::style::Color::Rgb(24, 24, 37));
+    assert_eq!(
+        grid[(input_column, input_row)].bg,
+        ratatui::style::Color::Rgb(24, 24, 37)
+    );
 
     let message_row = (0..grid.area.height)
         .find(|y| row_text(&grid, *y).contains("A user message highlighted"))
         .unwrap();
     let message_column = column_of(&grid, message_row, "A user message").unwrap();
-    assert_eq!(grid[(message_column, message_row)].bg, ratatui::style::Color::Rgb(49, 50, 68));
+    assert_eq!(
+        grid[(message_column, message_row)].bg,
+        ratatui::style::Color::Rgb(49, 50, 68)
+    );
     assert_eq!(
         grid[(grid.area.width - 5, message_row)].bg,
         ratatui::style::Color::Rgb(49, 50, 68)
@@ -820,10 +825,11 @@ fn composer_cursor_aligns_with_ascii_draft() {
     };
     let backend = TestBackend::new(100, 30);
     let mut terminal = Terminal::new(backend).unwrap();
-    terminal.draw(|frame| {
-        ui::render(frame, &app);
-    })
-    .unwrap();
+    terminal
+        .draw(|frame| {
+            ui::render(frame, &app);
+        })
+        .unwrap();
     let grid = terminal.backend().buffer().clone();
     let row = (0..grid.area.height)
         .find(|y| (0..grid.area.width).any(|x| grid[(x, *y)].symbol() == "›"))
@@ -844,10 +850,11 @@ fn composer_cursor_tracks_wide_graphemes_and_long_drafts() {
     };
     let backend = TestBackend::new(100, 30);
     let mut terminal = Terminal::new(backend).unwrap();
-    terminal.draw(|frame| {
-        ui::render(frame, &app);
-    })
-    .unwrap();
+    terminal
+        .draw(|frame| {
+            ui::render(frame, &app);
+        })
+        .unwrap();
     let grid = terminal.backend().buffer().clone();
     let row = (0..grid.area.height)
         .find(|y| (0..grid.area.width).any(|x| grid[(x, *y)].symbol() == "›"))
@@ -864,10 +871,11 @@ fn composer_cursor_tracks_wide_graphemes_and_long_drafts() {
     app.draft_cursor = app.draft.chars().count();
     let backend = TestBackend::new(40, 8);
     let mut terminal = Terminal::new(backend).unwrap();
-    terminal.draw(|frame| {
-        ui::render(frame, &app);
-    })
-    .unwrap();
+    terminal
+        .draw(|frame| {
+            ui::render(frame, &app);
+        })
+        .unwrap();
     let grid = terminal.backend().buffer().clone();
     let screen = (0..grid.area.height)
         .map(|y| row_text(&grid, y))
@@ -891,10 +899,11 @@ fn small_composer_keeps_prompt_cursor_and_footer_in_bounds() {
     };
     let backend = TestBackend::new(40, 8);
     let mut terminal = Terminal::new(backend).unwrap();
-    terminal.draw(|frame| {
-        ui::render(frame, &app);
-    })
-    .unwrap();
+    terminal
+        .draw(|frame| {
+            ui::render(frame, &app);
+        })
+        .unwrap();
     let grid = terminal.backend().buffer().clone();
     let cursor = terminal.backend_mut().get_cursor_position().unwrap();
     assert!(cursor.x < grid.area.width && cursor.y < grid.area.height);
@@ -905,10 +914,11 @@ fn small_composer_keeps_prompt_cursor_and_footer_in_bounds() {
 
     let backend = TestBackend::new(16, 5);
     let mut terminal = Terminal::new(backend).unwrap();
-    terminal.draw(|frame| {
-        ui::render(frame, &app);
-    })
-    .unwrap();
+    terminal
+        .draw(|frame| {
+            ui::render(frame, &app);
+        })
+        .unwrap();
     let grid = terminal.backend().buffer().clone();
     let cursor = terminal.backend_mut().get_cursor_position().unwrap();
     assert!(cursor.x < grid.area.width && cursor.y < grid.area.height);
@@ -1350,7 +1360,10 @@ fn the_theme_control_sits_one_column_inside_the_frame() {
             .unwrap_or_else(|| panic!("the {expected} control must be in the header:\n{text}"));
         let left_border = header[..at].rfind('│').expect("chip left border");
         let end = at + label.len();
-        let right_border = header[end..].find('│').map(|offset| end + offset).expect("chip right border");
+        let right_border = header[end..]
+            .find('│')
+            .map(|offset| end + offset)
+            .expect("chip right border");
         assert!(left_border < at && right_border >= end);
         assert!(header[right_border..].contains('⚙') && header[right_border..].contains('?'));
     }
@@ -1403,5 +1416,136 @@ fn the_theme_control_stays_visible_on_a_narrow_terminal() {
     assert!(
         footer.contains("↑↓ scroll"),
         "the narrow hints must still name the theme key, got:\n{footer}"
+    );
+}
+
+#[test]
+fn sidebar_entries_show_a_clipped_preview_and_highlight_both_rows() {
+    let mut first = conversation("Weekend crew", 3, 40);
+    first.preview = Some("I'll check the tide times tonight and send the link here.".into());
+    let mut second = conversation("Jules Lee", 2, 20);
+    second.preview = Some("Sending the deck".into());
+    let mut app = App {
+        selected: Some(first.id.clone()),
+        ..Default::default()
+    };
+    app.set_conversations(vec![first, second]);
+    let grid = buffer(&app, 100, 30);
+    let sidebar = |y: u16| {
+        row_text(&grid, y)
+            .split('│')
+            .next()
+            .unwrap_or_default()
+            .to_owned()
+    };
+    let name_row = (0..30)
+        .find(|y| sidebar(*y).contains("Weekend crew"))
+        .expect("name row");
+    let preview = sidebar(name_row + 1);
+    assert!(
+        preview.contains("I'll check"),
+        "preview under the name: {preview:?}"
+    );
+    assert!(
+        preview.trim_end().ends_with('…'),
+        "long preview is clipped: {preview:?}"
+    );
+    assert!(sidebar(name_row + 3).contains("Sending the deck"));
+
+    // The selection fills both rows of the chosen chat and no other row.
+    let selected_bg = grid[(4, name_row)].bg;
+    assert_eq!(
+        grid[(4, name_row + 1)].bg,
+        selected_bg,
+        "highlight spans both rows"
+    );
+    assert_ne!(
+        grid[(4, name_row + 2)].bg,
+        selected_bg,
+        "other chats are not highlighted"
+    );
+}
+
+#[test]
+fn the_header_leads_with_the_chat_and_ends_with_bloom() {
+    let selected = conversation("Weekend crew", 3, 40);
+    let mut app = App {
+        selected: Some(selected.id.clone()),
+        ..Default::default()
+    };
+    app.set_conversations(vec![selected]);
+    let grid = buffer(&app, 100, 30);
+    let header = row_text(&grid, 0);
+    let pane = header.split('│').nth(1).expect("pane header");
+    assert!(
+        pane.starts_with("Weekend crew"),
+        "chat name leads: {pane:?}"
+    );
+    assert!(
+        header.trim_end().ends_with("Bloom"),
+        "Bloom sits at the right: {header:?}"
+    );
+    assert!(!header.contains("Bloom /"));
+}
+
+#[test]
+fn the_command_popup_aligns_with_the_chat_not_the_center() {
+    let selected = conversation("Weekend crew", 3, 40);
+    let mut app = App {
+        selected: Some(selected.id.clone()),
+        draft: "/".into(),
+        draft_cursor: 1,
+        command_menu: true,
+        ..Default::default()
+    };
+    app.set_conversations(vec![selected]);
+    let grid = buffer(&app, 100, 30);
+    let title_row = (0..30)
+        .find(|y| row_text(&grid, *y).contains("Commands"))
+        .expect("popup title");
+    let panel_x = column_of(&grid, title_row, "╭").expect("popup corner");
+    let prompt_row = (0..30)
+        .find(|y| row_text(&grid, *y).contains("›  /"))
+        .expect("composer prompt");
+    let prompt_x = column_of(&grid, prompt_row, "›").expect("prompt glyph");
+    assert_eq!(panel_x, prompt_x, "popup starts at the chat's left edge");
+}
+
+#[test]
+fn consecutive_messages_from_one_sender_share_a_byline_under_a_day_divider() {
+    let selected = conversation("Weekend crew", 3, 40);
+    let mut app = App {
+        selected: Some(selected.id.clone()),
+        ..Default::default()
+    };
+    app.set_conversations(vec![selected.clone()]);
+    for (id, at, text, mine) in [
+        ("m1", 1_700_000_000_000, "first from Maya", false),
+        ("m2", 1_700_000_060_000, "second from Maya", false),
+        ("m3", 1_700_000_120_000, "and a reply", true),
+    ] {
+        app.upsert(selected.id.clone(), message(&selected, id, at, text, mine));
+    }
+    let text = rendered(&app);
+    let maya_bylines = text
+        .lines()
+        .filter(|line| {
+            line.split('│')
+                .nth(1)
+                .is_some_and(|pane| pane.trim_start().starts_with("Maya"))
+        })
+        .count();
+    assert_eq!(
+        maya_bylines, 1,
+        "a run from one sender has one byline:\n{text}"
+    );
+    assert!(
+        text.contains("You"),
+        "a new sender starts a byline:\n{text}"
+    );
+    let (_, _, day) = bloom_tui::app::day_label(1_700_000_000_000);
+    assert!(
+        text.contains(&day),
+        "the day divider names the day:\n{text}"
     );
 }

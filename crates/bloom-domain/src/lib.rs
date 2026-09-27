@@ -158,6 +158,11 @@ pub struct Conversation {
     pub participants: Vec<Participant>,
     pub created_at: Timestamp,
     pub last_message_at: Option<Timestamp>,
+    /// A short preview of the newest message, for the sidebar's second line. The
+    /// daemon fills it from its store; the engine's own listing carries no message
+    /// text, so it is absent until Bloom has seen a message for the conversation.
+    #[serde(default)]
+    pub preview: Option<String>,
 }
 impl fmt::Debug for Conversation {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {

@@ -18,6 +18,13 @@ pub struct Config {
     pub compact_sidebar: bool,
     /// Local display labels keyed by canonical participant identity.
     pub nicknames: HashMap<String, String>,
+    /// Local conversation titles keyed by canonical conversation identity. Used by
+    /// the sidebar's Rename action for group chats, which have no participant to
+    /// nickname.
+    pub titles: HashMap<String, String>,
+    /// Conversations closed locally, keyed by canonical conversation identity. The
+    /// messages are untouched; the chat is only hidden from the list.
+    pub hidden: Vec<String>,
 }
 
 impl Default for Config {
@@ -27,6 +34,8 @@ impl Default for Config {
             theme: None,
             compact_sidebar: false,
             nicknames: HashMap::new(),
+            titles: HashMap::new(),
+            hidden: Vec::new(),
         }
     }
 }

@@ -126,11 +126,42 @@ impl Service {
     }
 }
 
+/// A one-line preview of a message for the sidebar's second line. Our own
+/// messages are prefixed, the way a chat list usually reads.
+fn preview_text(message: &Message) -> String {
+    let body = message
+        .parts()
+        .iter()
+        .map(|part| match part {
+            bloom_domain::MessagePart::Text(text) => text.clone(),
+            bloom_domain::MessagePart::Attachment(_) => "[attachment]".to_owned(),
+            bloom_domain::MessagePart::Unsupported { .. } => "[attachment]".to_owned(),
+        })
+        .collect::<Vec<_>>()
+        .join(" ");
+    if message.from_me {
+        format!("You: {body}")
+    } else {
+        body
+    }
+}
+
 impl RequestHandler for Service {
     fn list_conversations(&self) -> HandlerFuture<'_, Vec<Conversation>> {
         Box::pin(async move {
             let store = self.store.lock().unwrap();
-            store::list_conversations(&store).map_err(|_| ProtocolError::Internal)
+            let mut conversations =
+                store::list_conversations(&store).map_err(|_| ProtocolError::Internal)?;
+            // The engine's listing carries no message text, so the preview comes
+            // from Bloom's own store. A conversation Bloom has never seen a message
+            // for keeps a null preview and the sidebar shows its name alone.
+            for conversation in &mut conversations {
+                conversation.preview = store::history(&store, &conversation.id, 1)
+                    .map_err(|_| ProtocolError::Internal)?
+                    .last()
+                    .map(preview_text);
+            }
+            Ok(conversations)
         })
     }
 
@@ -193,6 +224,7 @@ impl RequestHandler for Service {
                             },
                             created_at: now_millis(),
                             last_message_at: None,
+                            preview: None,
                         };
                         (conversation, false)
                     }
@@ -394,4 +426,56 @@ fn now_millis() -> i64 {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|elapsed| elapsed.as_millis() as i64)
         .unwrap_or_default()
+}
+
+#[cfg(test)]
+mod preview_tests {
+    use super::preview_text;
+    use bloom_domain::{
+        ConversationId, DeliveryState, Handle, HandleKind, Message, MessageId, MessagePart,
+        TransportId,
+    };
+
+    fn message(parts: Vec<MessagePart>, from_me: bool) -> Message {
+        let transport = TransportId::new("iMessage").unwrap();
+        Message::new(
+            MessageId::new(transport.clone(), "m1").unwrap(),
+            ConversationId::new(transport, "c1").unwrap(),
+            None,
+            Handle::new(HandleKind::Opaque, "someone").unwrap(),
+            parts,
+            1,
+            None,
+            DeliveryState::Delivered,
+            from_me,
+            None,
+            Vec::new(),
+            None,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn previews_join_text_mark_attachments_and_prefix_our_own() {
+        assert_eq!(
+            preview_text(&message(vec![MessagePart::Text("hi there".into())], false)),
+            "hi there"
+        );
+        assert_eq!(
+            preview_text(&message(vec![MessagePart::Text("on my way".into())], true)),
+            "You: on my way"
+        );
+        assert_eq!(
+            preview_text(&message(
+                vec![
+                    MessagePart::Unsupported {
+                        kind: "attachment".into()
+                    },
+                    MessagePart::Text("caption".into())
+                ],
+                false
+            )),
+            "[attachment] caption"
+        );
+    }
 }

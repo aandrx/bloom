@@ -49,6 +49,7 @@ fn conversation(title: &str, participants: usize) -> Conversation {
         participants: people,
         created_at: 1,
         last_message_at: Some(10),
+        preview: None,
     }
 }
 
@@ -129,9 +130,11 @@ fn slash_picker_completes_commands_and_never_sends_command_text() {
     assert_eq!(app.handle_key(key(KeyCode::Enter)), Action::None);
     assert_eq!(app.draft, "/theme ");
     assert!(app.composing);
-    for character in "dark".chars() {
-        app.handle_key(key(KeyCode::Char(character)));
-    }
+    assert_eq!(app.draft, "/theme ");
+    assert!(!app.command_menu);
+    app.draft.push_str("dark");
+    app.draft_cursor = app.draft.len();
+    app.composing = true;
     assert_eq!(app.handle_key(key(KeyCode::Enter)), Action::None);
     assert_eq!(app.theme, bloom_tui::app::Theme::Dark);
     assert!(app.draft.is_empty());
@@ -173,7 +176,10 @@ fn herdr_style_leader_chords_navigate_without_breaking_composition() {
     composing.composing = true;
     composing.handle_key(ctrl(KeyCode::Char('b')));
     assert!(composing.leader_pending);
-    assert!(composing.draft.is_empty(), "Ctrl+B is not typed into the draft");
+    assert!(
+        composing.draft.is_empty(),
+        "Ctrl+B is not typed into the draft"
+    );
     composing.handle_key(key(KeyCode::Char('s')));
     assert!(composing.settings_open, "Ctrl+B s opens settings");
 }
@@ -289,6 +295,7 @@ fn direct_chat_nicknames_are_local_filterable_and_clearable() {
     for character in "/nickname Maya Chen".chars() {
         app.handle_key(key(KeyCode::Char(character)));
     }
+    assert!(!app.command_menu);
     assert_eq!(app.handle_key(key(KeyCode::Enter)), Action::None);
     assert_eq!(
         app.nicknames.get(&peer_key).map(String::as_str),
@@ -331,6 +338,7 @@ fn groups_reject_direct_chat_nickname_overrides() {
     for character in "/nickname Maya".chars() {
         app.handle_key(key(KeyCode::Char(character)));
     }
+    assert!(!app.command_menu);
     app.handle_key(key(KeyCode::Enter));
     assert!(app.nicknames.is_empty());
     assert!(app.error.as_deref().unwrap().contains("direct chats only"));
@@ -616,7 +624,10 @@ fn page_keys_move_the_reading_position_and_clamp_at_the_newest() {
     assert!(app.scroll > 0, "Ctrl+Home requests the oldest content");
 
     app.handle_key(ctrl(KeyCode::End));
-    assert!(!app.is_scrolled_back(), "Ctrl+End returns to the newest message");
+    assert!(
+        !app.is_scrolled_back(),
+        "Ctrl+End returns to the newest message"
+    );
 
     // Home and End belong to the composer line now.
     app.draft = "a draft".into();
@@ -653,8 +664,14 @@ fn scrolling_does_not_disturb_the_composer_or_the_filter() {
     app.cancel_filter();
     app.draft = "half written".into();
     app.handle_key(key(KeyCode::PageUp));
-    assert_eq!(app.scroll, 10, "PageUp scrolls the transcript while composing");
-    assert_eq!(app.draft, "half written", "scrolling must not touch the draft");
+    assert_eq!(
+        app.scroll, 10,
+        "PageUp scrolls the transcript while composing"
+    );
+    assert_eq!(
+        app.draft, "half written",
+        "scrolling must not touch the draft"
+    );
     app.handle_key(key(KeyCode::Down));
     assert_eq!(app.scroll, 9, "Down scrolls the transcript by one row");
 }

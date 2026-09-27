@@ -71,8 +71,17 @@ def conversation(value: str, title: str, people: int, last: int) -> dict:
         "participants": participants,
         "created_at": 1,
         "last_message_at": last,
+        "preview": PREVIEWS.get(value),
     }
 
+
+# The real daemon fills previews from its store; the fixture mirrors that.
+PREVIEWS = {
+    "weekend@example.invalid": "I'll check the tide times tonight and send the link here.",
+    "dana@example.invalid": "Perfect, see you at the usual spot.",
+    "jules@example.invalid": "Sending the revised deck over after lunch.",
+    "design@example.invalid": "New type scale is in the shared library now.",
+}
 
 CONVERSATIONS = [
     conversation("weekend@example.invalid", "Weekend crew", 3, 1_700_000_400_000),
@@ -129,6 +138,8 @@ HISTORY = {
             delivery="delivered",
         ),
         message("weekend@example.invalid", "m4", 1_700_000_400_000, "I'll check the tide times tonight and send the link here.", False),
+        # A follow-up from the same sender a minute later: grouped under one byline.
+        message("weekend@example.invalid", "m5", 1_700_000_460_000, "Low tide is around 9, so that should work out.", False),
     ],
     "dana@example.invalid": [
         message("dana@example.invalid", "n1", 1_700_000_300_000, "Are we still on for the walk on Sunday?", False),

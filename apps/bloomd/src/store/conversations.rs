@@ -126,6 +126,7 @@ mod tests {
             participants: vec![],
             created_at: 1,
             last_message_at,
+            preview: None,
         }
     }
 

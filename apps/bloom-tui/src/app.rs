@@ -7,7 +7,7 @@ use bloom_domain::{
 };
 use bloom_ipc::EventKind;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEventKind};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use unicode_segmentation::UnicodeSegmentation;
 
 /// Rows a single PageUp or PageDown moves through the transcript.
@@ -113,6 +113,37 @@ pub struct App {
     pub focus: Focus,
     /// The `?` shortcut sheet.
     pub help_open: bool,
+    /// Local titles, keyed by canonical conversation identity. Beats a nickname
+    /// and the engine's title, and is what the sidebar's Rename action writes.
+    pub titles: HashMap<String, String>,
+    /// Conversations closed locally. They stay in the store and can be restored
+    /// with `/unhide`; closing never deletes messages.
+    pub hidden: HashSet<String>,
+    /// The right-click menu for a conversation, when open.
+    pub context_menu: Option<ContextMenu>,
+    /// The conversation whose local title the composer is editing.
+    pub renaming: Option<ConversationId>,
+}
+
+/// A small right-click menu over a conversation.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ContextMenu {
+    pub conversation: ConversationId,
+    pub selection: usize,
+}
+
+/// The actions the conversation context menu offers.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ContextAction {
+    Rename,
+    Close,
+}
+
+impl ContextMenu {
+    pub const ACTIONS: [(&'static str, ContextAction); 2] = [
+        ("Rename", ContextAction::Rename),
+        ("Close", ContextAction::Close),
+    ];
 }
 
 /// The two focusable regions. Settings, the filter and the help sheet suspend
@@ -160,6 +191,10 @@ impl Default for App {
             leader_pending: false,
             focus: Focus::default(),
             help_open: false,
+            titles: HashMap::new(),
+            hidden: HashSet::new(),
+            context_menu: None,
+            renaming: None,
         }
     }
 }
@@ -327,12 +362,14 @@ impl App {
 
     /// The conversations the sidebar should show: everything, or the filtered set.
     pub fn visible_conversations(&self) -> Vec<&Conversation> {
+        let listed = self
+            .conversations
+            .iter()
+            .filter(|conversation| !self.hidden.contains(&conversation_key(&conversation.id)));
         match self.filter_query() {
-            None => self.conversations.iter().collect(),
-            Some(query) if query.trim().is_empty() => self.conversations.iter().collect(),
-            Some(query) => self
-                .conversations
-                .iter()
+            None => listed.collect(),
+            Some(query) if query.trim().is_empty() => listed.collect(),
+            Some(query) => listed
                 .filter(|conversation| {
                     conversation_matches(conversation, query)
                         || conversation.participants.iter().any(|participant| {
@@ -556,7 +593,10 @@ impl App {
     }
 
     fn update_command_menu(&mut self) {
-        self.command_menu = self.draft.trim_start().starts_with('/') && !self.draft.contains('\n');
+        // The popup picks a command; once arguments follow it, the draft is a
+        // command line and Enter must run it rather than autofill again.
+        let trimmed = self.draft.trim_start();
+        self.command_menu = trimmed.starts_with('/') && !trimmed.contains(char::is_whitespace);
         self.command_selection = 0;
     }
 
@@ -570,6 +610,7 @@ impl App {
             ("/new", "Start a new direct chat"),
             ("/filter", "Filter your conversations"),
             ("/compact", "Toggle sidebar density"),
+            ("/unhide", "Restore chats hidden with Close"),
             ("/cancel", "Close the composer"),
         ]
         .into_iter()
@@ -697,6 +738,12 @@ impl App {
                 self.error = None;
                 self.cancel_composition();
             }
+            ["/unhide"] => {
+                self.unhide_all();
+                self.error = None;
+                self.draft.clear();
+                self.draft_cursor = 0;
+            }
             ["/cancel"] => self.cancel_composition(),
             _ => self.error = Some("Unknown command or invalid syntax".into()),
         }
@@ -798,6 +845,30 @@ impl App {
             self.send_feedback = None;
         }
 
+        // The context menu owns the keyboard while it is open.
+        if self.context_menu.is_some() {
+            match key.code {
+                KeyCode::Esc => self.close_context_menu(),
+                KeyCode::Up => self.context_step(-1),
+                KeyCode::Down => self.context_step(1),
+                KeyCode::Enter => self.context_confirm(),
+                _ => {}
+            }
+            return Action::None;
+        }
+
+        // The rename prompt owns the keyboard while it is open.
+        if self.renaming.is_some() {
+            match key.code {
+                KeyCode::Esc => self.cancel_rename(),
+                KeyCode::Enter => self.apply_rename(),
+                _ => {
+                    self.edit_draft(key);
+                }
+            }
+            return Action::None;
+        }
+
         // The shortcut sheet owns the keyboard while it is open.
         if self.help_open {
             if matches!(
@@ -875,18 +946,9 @@ impl App {
                     self.command_selection = self.command_selection.saturating_add(1).min(last);
                 }
                 KeyCode::Tab => self.complete_command(),
-                KeyCode::Enter => {
-                    let token = self.draft.split_whitespace().next().unwrap_or("");
-                    let exact = self
-                        .command_suggestions()
-                        .iter()
-                        .any(|(name, _)| *name == token);
-                    if exact || self.command_suggestions().is_empty() {
-                        self.execute_command();
-                    } else {
-                        self.complete_command();
-                    }
-                }
+                // Enter acts on the highlighted command: mode-opening commands run
+                // immediately, argument-taking ones autofill for editing.
+                KeyCode::Enter => self.activate_selected_command(),
                 _ => {
                     self.edit_draft(key);
                 }
@@ -1032,10 +1094,25 @@ impl App {
                     self.scroll_forward(WHEEL_ROWS);
                 }
             }
+            MouseEventKind::Down(MouseButton::Right) => {
+                if let Some(Hit::SidebarChat(id)) = hits.at(column, row) {
+                    self.select(Some(id.clone()));
+                    self.open_context_menu(id);
+                } else {
+                    self.close_context_menu();
+                }
+            }
             MouseEventKind::Down(MouseButton::Left) => match hits.at(column, row) {
+                Some(Hit::ContextMenuRow(index)) => {
+                    if let Some(menu) = self.context_menu.as_mut() {
+                        menu.selection = index;
+                    }
+                    self.context_confirm();
+                }
                 Some(Hit::SidebarChat(id)) => {
                     self.select(Some(id));
                     self.focus = Focus::Sidebar;
+                    self.close_context_menu();
                 }
                 Some(Hit::Composer) => {
                     self.focus = Focus::Composer;
@@ -1108,6 +1185,128 @@ impl App {
         true
     }
 
+    /// A stable local key for a conversation, used for titles and hidden ids.
+    pub fn conversation_key(id: &ConversationId) -> String {
+        conversation_key(id)
+    }
+
+    pub fn open_context_menu(&mut self, conversation: ConversationId) {
+        self.context_menu = Some(ContextMenu {
+            conversation,
+            selection: 0,
+        });
+        self.focus = Focus::Sidebar;
+    }
+
+    pub fn close_context_menu(&mut self) {
+        self.context_menu = None;
+    }
+
+    pub fn context_step(&mut self, delta: isize) {
+        if let Some(menu) = self.context_menu.as_mut() {
+            let last = ContextMenu::ACTIONS.len().saturating_sub(1) as isize;
+            menu.selection = (menu.selection as isize + delta).clamp(0, last) as usize;
+        }
+    }
+
+    pub fn context_confirm(&mut self) {
+        let Some(menu) = self.context_menu.take() else {
+            return;
+        };
+        let index = menu
+            .selection
+            .min(ContextMenu::ACTIONS.len().saturating_sub(1));
+        match ContextMenu::ACTIONS[index].1 {
+            ContextAction::Rename => self.begin_rename(menu.conversation),
+            ContextAction::Close => self.close_conversation(menu.conversation),
+        }
+    }
+
+    /// Start editing a local title for a conversation, seeded with its current name.
+    pub fn begin_rename(&mut self, id: ConversationId) {
+        let current = self
+            .conversations
+            .iter()
+            .find(|conversation| conversation.id == id)
+            .map(|conversation| self.conversation_name(conversation))
+            .unwrap_or_default();
+        self.renaming = Some(id);
+        self.draft = current;
+        self.draft_cursor = self.draft.graphemes(true).count();
+        self.command_menu = false;
+        self.composing = true;
+        self.focus = Focus::Composer;
+    }
+
+    pub fn cancel_rename(&mut self) {
+        self.renaming = None;
+        self.draft.clear();
+        self.draft_cursor = 0;
+    }
+
+    fn apply_rename(&mut self) {
+        let Some(id) = self.renaming.take() else {
+            return;
+        };
+        let name = self.draft.trim().to_owned();
+        self.draft.clear();
+        self.draft_cursor = 0;
+        if name.is_empty() {
+            self.titles.remove(&conversation_key(&id));
+            self.notice = Some("Local title cleared.".into());
+        } else if crate::config::valid_nickname(&name) {
+            self.titles.insert(conversation_key(&id), name.clone());
+            self.notice = Some(format!("Renamed to {name}."));
+        } else {
+            self.error = Some("Names must be 1-80 characters with no control characters.".into());
+        }
+    }
+
+    /// Hide a conversation locally. The messages are untouched; `/unhide` restores
+    /// everything at once, so this can never destroy data.
+    pub fn close_conversation(&mut self, id: ConversationId) {
+        self.hidden.insert(conversation_key(&id));
+        let visible = self.visible_ids();
+        if !visible
+            .iter()
+            .any(|candidate| Some(candidate) == self.selected.as_ref())
+        {
+            self.selected = visible.first().cloned();
+            self.scroll = 0;
+        }
+        self.notice = Some("Chat hidden. /unhide restores hidden chats.".into());
+    }
+
+    pub fn unhide_all(&mut self) {
+        let restored = self.hidden.len();
+        self.hidden.clear();
+        self.notice = Some(match restored {
+            0 => "No hidden chats.".into(),
+            1 => "Restored 1 hidden chat.".into(),
+            count => format!("Restored {count} hidden chats."),
+        });
+    }
+
+    /// Commands that take an argument autofill into the composer; commands that
+    /// open a mode run the moment they are chosen.
+    fn command_needs_argument(name: &str) -> bool {
+        matches!(name, "/nickname" | "/theme")
+    }
+
+    /// Run (or autofill) the highlighted command from the popup.
+    fn activate_selected_command(&mut self) {
+        let suggestions = self.command_suggestions();
+        match suggestions.get(self.command_selection).copied() {
+            Some((name, _)) if Self::command_needs_argument(name) => self.complete_command(),
+            Some((name, _)) => {
+                self.draft = name.to_owned();
+                self.draft_cursor = name.graphemes(true).count();
+                self.execute_command();
+            }
+            None => self.execute_command(),
+        }
+    }
+
     /// Keep the selection inside the filtered set as the query changes.
     fn reconcile_selection_with_visible(&mut self) {
         let visible = self.visible_ids();
@@ -1127,6 +1326,10 @@ impl App {
     }
 
     pub fn conversation_name(&self, conversation: &Conversation) -> String {
+        // A local Rename wins over everything, including a participant nickname.
+        if let Some(title) = self.titles.get(&conversation_key(&conversation.id)) {
+            return title.clone();
+        }
         if conversation.kind == ConversationKind::Direct {
             if let Some(nickname) = conversation
                 .participants
@@ -1266,6 +1469,12 @@ pub fn conversation_matches(conversation: &Conversation, query: &str) -> bool {
     })
 }
 
+/// A stable key for local per-conversation state (titles, hidden chats). It does
+/// not need to match the daemon's own key; it only has to be stable and unique.
+pub fn conversation_key(id: &ConversationId) -> String {
+    format!("{}|{}", id.transport().as_str(), id.value())
+}
+
 /// The people on the far side of a conversation, in the order the engine listed
 /// them. `is_me` is excluded, so the result is who the chat is *with*.
 pub fn others(conversation: &Conversation) -> impl Iterator<Item = &Participant> {
@@ -1351,6 +1560,46 @@ pub fn timestamp(created_at: i64) -> String {
         return "--:--".into();
     }
     format!("{:02}:{:02}", tm.tm_hour, tm.tm_min)
+}
+
+/// The local calendar day of a timestamp, as `(year, day of year, label)`. The
+/// label reads like Slack's dividers: `Tuesday, November 14`.
+pub fn day_label(created_at: i64) -> (i32, i32, String) {
+    const DAYS: [&str; 7] = [
+        "Sunday",
+        "Monday",
+        "Tuesday",
+        "Wednesday",
+        "Thursday",
+        "Friday",
+        "Saturday",
+    ];
+    const MONTHS: [&str; 12] = [
+        "January",
+        "February",
+        "March",
+        "April",
+        "May",
+        "June",
+        "July",
+        "August",
+        "September",
+        "October",
+        "November",
+        "December",
+    ];
+    let seconds = (created_at.max(0) / 1000) as libc::time_t;
+    let mut tm = unsafe { std::mem::zeroed::<libc::tm>() };
+    if unsafe { libc::localtime_r(&seconds, &mut tm) }.is_null() {
+        return (0, 0, String::new());
+    }
+    let day = DAYS.get(tm.tm_wday as usize).copied().unwrap_or("");
+    let month = MONTHS.get(tm.tm_mon as usize).copied().unwrap_or("");
+    (
+        tm.tm_year,
+        tm.tm_yday,
+        format!("{day}, {month} {}", tm.tm_mday),
+    )
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -1503,6 +1752,7 @@ mod tests {
             }],
             created_at: 1,
             last_message_at: last,
+            preview: None,
         }
     }
 
@@ -2156,10 +2406,7 @@ mod tests {
         assert_eq!(app.draft, "hello brave ");
 
         // Alt+Backspace does the same, skipping the trailing space first.
-        app.edit_draft(KeyEvent::new(
-            KeyCode::Backspace,
-            KeyModifiers::ALT,
-        ));
+        app.edit_draft(KeyEvent::new(KeyCode::Backspace, KeyModifiers::ALT));
         assert_eq!(app.draft, "hello ");
 
         // Word movement then Ctrl+K kills the rest of the line.
@@ -2186,41 +2433,162 @@ mod tests {
         app.set_conversations(vec![first.clone(), second.clone()]);
         app.selected = Some(first.id.clone());
 
-        let mut hits = HitMap::default();
-        hits.sidebar = Rect::new(0, 0, 20, 10);
-        hits.sidebar_rows = vec![
-            (Rect::new(1, 1, 18, 1), first.id.clone()),
-            (Rect::new(1, 2, 18, 1), second.id.clone()),
-        ];
-        hits.transcript = Rect::new(21, 1, 60, 20);
-        hits.composer = Rect::new(21, 24, 60, 1);
+        let hits = HitMap {
+            sidebar: Rect::new(0, 0, 20, 10),
+            sidebar_rows: vec![
+                (Rect::new(1, 1, 18, 1), first.id.clone()),
+                (Rect::new(1, 2, 18, 1), second.id.clone()),
+            ],
+            transcript: Rect::new(21, 1, 60, 20),
+            composer: Rect::new(21, 24, 60, 1),
+            ..Default::default()
+        };
 
         // A click on the second row selects that chat and focuses the list.
-        app.handle_mouse(
-            MouseEventKind::Down(MouseButton::Left),
-            5,
-            2,
-            &hits,
-        );
+        app.handle_mouse(MouseEventKind::Down(MouseButton::Left), 5, 2, &hits);
         assert_eq!(app.selected, Some(second.id.clone()));
         assert_eq!(app.focus, Focus::Sidebar);
 
         // The wheel over the transcript scrolls messages, not the selection.
         app.handle_mouse(MouseEventKind::ScrollUp, 30, 5, &hits);
-        assert!(app.is_scrolled_back(), "wheel over the transcript scrolls it");
+        assert!(
+            app.is_scrolled_back(),
+            "wheel over the transcript scrolls it"
+        );
         assert_eq!(app.selected, Some(second.id.clone()));
 
         // The wheel over the chat list moves the selection instead.
         app.handle_mouse(MouseEventKind::ScrollUp, 5, 2, &hits);
-        assert_eq!(app.selected, Some(first.id.clone()), "wheel moves selection");
+        assert_eq!(
+            app.selected,
+            Some(first.id.clone()),
+            "wheel moves selection"
+        );
 
         // Clicking the composer hands focus back to it.
-        app.handle_mouse(
-            MouseEventKind::Down(MouseButton::Left),
-            30,
-            24,
-            &hits,
-        );
+        app.handle_mouse(MouseEventKind::Down(MouseButton::Left), 30, 24, &hits);
         assert_eq!(app.focus, Focus::Composer);
+    }
+
+    fn typed(app: &mut App, text: &str) {
+        for character in text.chars() {
+            draft_key(app, KeyCode::Char(character));
+        }
+    }
+
+    #[test]
+    fn popup_enter_runs_mode_commands_and_autofills_argument_commands() {
+        let mut app = App::default();
+        app.set_conversations(vec![conversation("a", Some(1))]);
+        typed(&mut app, "/se");
+        assert!(app.command_menu);
+        draft_key(&mut app, KeyCode::Enter);
+        assert!(
+            app.settings_open,
+            "the highlighted /settings runs on the first Enter"
+        );
+
+        let mut app = App::default();
+        app.set_conversations(vec![conversation("a", Some(1))]);
+        typed(&mut app, "/nick");
+        draft_key(&mut app, KeyCode::Enter);
+        assert_eq!(app.draft, "/nickname ", "an argument command autofills");
+        assert!(!app.command_menu);
+        assert!(app.nicknames.is_empty());
+
+        // With arguments typed the popup is closed, so Enter runs the command line.
+        typed(&mut app, "Maya");
+        assert!(!app.command_menu);
+        draft_key(&mut app, KeyCode::Enter);
+        assert_eq!(
+            app.nicknames.values().next().map(String::as_str),
+            Some("Maya")
+        );
+    }
+
+    #[test]
+    fn context_menu_renames_and_closes_without_deleting_messages() {
+        let mut app = App::default();
+        let first = conversation("first", Some(2));
+        let second = conversation("second", Some(1));
+        app.set_conversations(vec![first.clone(), second.clone()]);
+        app.upsert(first.id.clone(), message(&first, "m1", 1, "hello"));
+
+        // Rename: a local title beats the engine name, and an empty one clears it.
+        app.open_context_menu(first.id.clone());
+        draft_key(&mut app, KeyCode::Enter);
+        assert_eq!(app.renaming, Some(first.id.clone()));
+        assert_eq!(
+            app.draft, "first",
+            "the prompt is seeded with the current name"
+        );
+        app.draft = "Pinned".into();
+        app.draft_cursor = 6;
+        draft_key(&mut app, KeyCode::Enter);
+        assert_eq!(app.conversation_name(&first), "Pinned");
+        app.begin_rename(first.id.clone());
+        app.draft.clear();
+        app.draft_cursor = 0;
+        draft_key(&mut app, KeyCode::Enter);
+        assert_eq!(app.conversation_name(&first), "first");
+
+        // Esc leaves the menu without acting.
+        app.open_context_menu(first.id.clone());
+        draft_key(&mut app, KeyCode::Esc);
+        assert!(app.context_menu.is_none());
+        assert!(app.renaming.is_none());
+
+        // Close hides the chat and moves the selection, but keeps its messages.
+        app.selected = Some(first.id.clone());
+        app.open_context_menu(first.id.clone());
+        draft_key(&mut app, KeyCode::Down);
+        draft_key(&mut app, KeyCode::Enter);
+        assert!(!app.visible_ids().contains(&first.id));
+        assert_eq!(app.selected, Some(second.id.clone()));
+        assert_eq!(app.messages.get(&first.id).map(Vec::len), Some(1));
+
+        typed(&mut app, "/unhide");
+        draft_key(&mut app, KeyCode::Enter);
+        assert!(app.visible_ids().contains(&first.id));
+    }
+
+    #[test]
+    fn right_click_on_a_chat_opens_its_context_menu() {
+        use ratatui::layout::Rect;
+        let mut app = App::default();
+        let first = conversation("first", Some(2));
+        let second = conversation("second", Some(1));
+        app.set_conversations(vec![first.clone(), second.clone()]);
+        let hits = HitMap {
+            sidebar_rows: vec![
+                (Rect::new(0, 1, 20, 2), first.id.clone()),
+                (Rect::new(0, 3, 20, 2), second.id.clone()),
+            ],
+            ..Default::default()
+        };
+        app.handle_mouse(MouseEventKind::Down(MouseButton::Right), 4, 4, &hits);
+        assert_eq!(app.selected, Some(second.id.clone()));
+        assert_eq!(
+            app.context_menu
+                .as_ref()
+                .map(|menu| menu.conversation.clone()),
+            Some(second.id.clone())
+        );
+    }
+
+    #[test]
+    fn day_labels_name_the_weekday_and_date() {
+        let (_, _, label) = day_label(1_700_000_000_000);
+        assert!(label.contains(", "), "{label}");
+        assert!(
+            ["Monday", "Tuesday", "Wednesday"]
+                .iter()
+                .any(|day| label.starts_with(day)),
+            "{label}"
+        );
+        assert_eq!(
+            day_label(1_700_000_000_000).1,
+            day_label(1_700_000_060_000).1
+        );
     }
 }

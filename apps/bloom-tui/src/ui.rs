@@ -29,6 +29,8 @@ struct Palette {
     green: Color,
     yellow: Color,
     red: Color,
+    /// A third speaker colour, so sender names separate at a glance.
+    magenta: Color,
 }
 
 const DARK: Palette = Palette {
@@ -41,6 +43,7 @@ const DARK: Palette = Palette {
     cyan: Color::Rgb(137, 220, 235),
     green: Color::Rgb(166, 227, 161),
     yellow: Color::Rgb(249, 226, 175),
+    magenta: Color::Rgb(203, 166, 247),
     red: Color::Rgb(243, 139, 168),
 };
 const LIGHT: Palette = Palette {
@@ -53,6 +56,7 @@ const LIGHT: Palette = Palette {
     cyan: Color::Rgb(0, 117, 138),
     green: Color::Rgb(40, 117, 47),
     yellow: Color::Rgb(128, 78, 0),
+    magenta: Color::Rgb(130, 60, 170),
     red: Color::Rgb(160, 30, 45),
 };
 
@@ -147,6 +151,15 @@ impl ComposerLayout {
 }
 
 fn composer_content(app: &App, width: usize) -> (String, String, usize, bool, bool) {
+    if app.renaming.is_some() {
+        return (
+            "›  rename: ".to_owned(),
+            app.draft.clone(),
+            app.draft_cursor_byte(),
+            true,
+            false,
+        );
+    }
     if let Some(query) = app.filter_query() {
         return (
             "›  filter: ".to_owned(),
@@ -239,33 +252,33 @@ fn body_prefix(address: &str, width: usize) -> String {
     format!("{LEAD}{shown_address}{TAIL}")
 }
 
-fn sidebar_entry_line(
+/// The chat's name with its participant count flush right on the same line.
+fn sidebar_name_line(
     app: &App,
     conversation: &bloom_domain::Conversation,
     width: usize,
     palette: Palette,
 ) -> Line<'static> {
     let selected = Some(&conversation.id) == app.selected.as_ref();
-    let marker_width = 1usize.min(width);
     let count = conversation.participants.len().to_string();
     let count_width = unicode_width::UnicodeWidthStr::width(count.as_str()).min(width);
-    let gap_width = usize::from(width > marker_width + count_width);
-    let name_budget = width.saturating_sub(marker_width + count_width + gap_width);
+    let gap_width = usize::from(width > count_width + 1);
+    let name_budget = width.saturating_sub(count_width + gap_width);
     let name = truncate_display_graphemes(&app.conversation_name(conversation), name_budget);
     let name_width = unicode_width::UnicodeWidthStr::width(name.as_str());
-    let gap = width.saturating_sub(marker_width + name_width + count_width);
-    let marker = if selected { "▎" } else { " " };
-    let name_style = Style::default()
-        .fg(if selected { palette.cyan } else { palette.text })
-        .add_modifier(if selected {
-            Modifier::BOLD
-        } else {
-            Modifier::empty()
-        });
+    let pad = width.saturating_sub(name_width + count_width);
     Line::from(vec![
-        Span::styled(marker, Style::default().fg(palette.cyan)),
-        Span::styled(name, name_style),
-        Span::raw(" ".repeat(gap)),
+        Span::styled(
+            name,
+            Style::default()
+                .fg(if selected { palette.cyan } else { palette.text })
+                .add_modifier(if selected {
+                    Modifier::BOLD
+                } else {
+                    Modifier::empty()
+                }),
+        ),
+        Span::raw(" ".repeat(pad)),
         Span::styled(
             count,
             Style::default().fg(if selected {
@@ -275,6 +288,31 @@ fn sidebar_entry_line(
             }),
         ),
     ])
+}
+
+/// The newest message, clipped with an ellipsis when it cannot fit.
+fn sidebar_preview_line(
+    conversation: &bloom_domain::Conversation,
+    width: usize,
+    palette: Palette,
+) -> Line<'static> {
+    let preview = conversation.preview.as_deref().unwrap_or("");
+    let single_line = preview.split_whitespace().collect::<Vec<_>>().join(" ");
+    let shown = truncate_with_ellipsis(&single_line, width);
+    Line::from(Span::styled(shown, Style::default().fg(palette.muted)))
+}
+
+/// Clip to `width` display columns, ending with an ellipsis when something was cut.
+fn truncate_with_ellipsis(value: &str, width: usize) -> String {
+    if width == 0 {
+        return String::new();
+    }
+    if unicode_width::UnicodeWidthStr::width(value) <= width {
+        return value.to_owned();
+    }
+    let mut result = truncate_display_graphemes(value, width.saturating_sub(1));
+    result.push('…');
+    result
 }
 
 fn footer_hints(width: usize, palette: Palette, app: &App) -> Line<'static> {
@@ -293,8 +331,7 @@ fn footer_hints(width: usize, palette: Palette, app: &App) -> Line<'static> {
         ("/", " commands"),
         ("?", " help"),
     ];
-    const HOME_COMPACT: [(&str, &str); 3] =
-        [("↑↓", " scroll"), ("/", " cmds"), ("?", " help")];
+    const HOME_COMPACT: [(&str, &str); 3] = [("↑↓", " scroll"), ("/", " cmds"), ("?", " help")];
     const HOME_NARROW: [(&str, &str); 2] = [("↑↓", " scroll"), ("/", " cmds")];
     const HOME_TIGHT: [(&str, &str); 1] = [("↑↓", "")];
     const LEADER_FULL: [(&str, &str); 6] = [
@@ -329,6 +366,8 @@ fn footer_hints(width: usize, palette: Palette, app: &App) -> Line<'static> {
     const SETTINGS_FULL: [(&str, &str); 3] =
         [("↑↓", " select"), ("Enter", " change"), ("Esc", " close")];
     const SETTINGS_TIGHT: [(&str, &str); 1] = [("Esc", " close")];
+    const RENAME_FULL: [(&str, &str); 2] = [("Enter", " save"), ("Esc", " cancel")];
+    const RENAME_TIGHT: [(&str, &str); 1] = [("Esc", " cancel")];
 
     let hints: &[(&str, &str)] = if app.leader_pending {
         if width >= 64 {
@@ -343,6 +382,12 @@ fn footer_hints(width: usize, palette: Palette, app: &App) -> Line<'static> {
             &SETTINGS_FULL
         } else {
             &SETTINGS_TIGHT
+        }
+    } else if app.renaming.is_some() {
+        if width >= 30 {
+            &RENAME_FULL
+        } else {
+            &RENAME_TIGHT
         }
     } else if app.command_menu {
         if width >= 37 {
@@ -452,8 +497,9 @@ fn render_command_menu(
         .min(item_count.saturating_sub(visible));
     let panel_width = content.width.min(64);
     let panel_height = (visible + 2).min(content.height as usize) as u16;
+    // Left-aligned with the chat, the way Codex anchors its pickers.
     let area = Rect::new(
-        content.x + (content.width - panel_width) / 2,
+        content.x,
         content.y + content.height.saturating_sub(panel_height),
         panel_width,
         panel_height,
@@ -461,7 +507,10 @@ fn render_command_menu(
     frame.render_widget(Clear, area);
     frame.render_widget(
         Block::default()
-            .title(Span::styled(" Commands ", Style::default().fg(palette.muted)))
+            .title(Span::styled(
+                " Commands ",
+                Style::default().fg(palette.muted),
+            ))
             .borders(Borders::ALL)
             .border_type(BorderType::Rounded)
             .border_style(Style::default().fg(palette.rule))
@@ -484,12 +533,22 @@ fn render_command_menu(
             menu_rows.push((row_area, row_index));
         }
         let selected = !suggestions.is_empty() && row_index == app.command_selection;
-        let row_bg = if selected { palette.cyan } else { palette.surface };
-        frame.render_widget(Block::default().style(Style::default().bg(row_bg)), row_area);
+        let row_bg = if selected {
+            palette.cyan
+        } else {
+            palette.surface
+        };
+        frame.render_widget(
+            Block::default().style(Style::default().bg(row_bg)),
+            row_area,
+        );
         if suggestions.is_empty() {
             frame.render_widget(
-                Paragraph::new(truncate_display_graphemes("No matching commands", row_width))
-                    .style(Style::default().fg(palette.muted).bg(row_bg)),
+                Paragraph::new(truncate_display_graphemes(
+                    "No matching commands",
+                    row_width,
+                ))
+                .style(Style::default().fg(palette.muted).bg(row_bg)),
                 row_area,
             );
             continue;
@@ -536,7 +595,6 @@ fn render_command_menu(
     let _ = composer;
     Some((area, menu_rows))
 }
-
 
 /// Draw the settings panel and return the rect of each selectable row, so the
 /// mouse layer can toggle exactly what was drawn.
@@ -591,10 +649,7 @@ fn render_settings(
             palette.surface
         };
         let foreground = if selected { palette.bg } else { palette.text };
-        frame.render_widget(
-            Block::default().style(Style::default().bg(background)),
-            row,
-        );
+        frame.render_widget(Block::default().style(Style::default().bg(background)), row);
         let label_width = 12usize.min(width.saturating_sub(2) as usize);
         let value_width = (width as usize).saturating_sub(label_width + 2);
         frame.render_widget(
@@ -642,7 +697,6 @@ fn render_settings(
     }
     rows
 }
-
 
 /// Wrap text into display rows the way the transcript paragraph does, breaking at
 /// whitespace and splitting a word only when it cannot fit on a row by itself.
@@ -733,6 +787,7 @@ pub enum Hit {
     Transcript,
     MenuRow(usize),
     SettingsRow(usize),
+    ContextMenuRow(usize),
     HeaderSettings,
     HeaderHelp,
     CloseOverlay,
@@ -748,6 +803,9 @@ pub struct HitMap {
     pub menu: Option<Rect>,
     pub menu_rows: Vec<(Rect, usize)>,
     pub settings_rows: Vec<(Rect, usize)>,
+    /// The conversation context menu and its items.
+    pub context_menu: Option<Rect>,
+    pub context_menu_rows: Vec<(Rect, usize)>,
     pub help: Option<Rect>,
     pub header_settings: Option<Rect>,
     pub header_help: Option<Rect>,
@@ -781,6 +839,14 @@ impl HitMap {
                     .map(Hit::MenuRow)
                     .or(Some(Hit::CloseOverlay));
             }
+        }
+        if self
+            .context_menu
+            .is_some_and(|area| Self::contains(area, column, row))
+        {
+            return Self::row_at(&self.context_menu_rows, column, row)
+                .map(Hit::ContextMenuRow)
+                .or(Some(Hit::CloseOverlay));
         }
         if let Some(index) = Self::row_at(&self.settings_rows, column, row) {
             return Some(Hit::SettingsRow(index));
@@ -833,6 +899,7 @@ fn render_with_mode(frame: &mut Frame<'_>, app: &App, monochrome: bool) -> HitMa
         palette.cyan = Color::Reset;
         palette.green = Color::Reset;
         palette.yellow = Color::Reset;
+        palette.magenta = Color::Reset;
         palette.red = Color::Reset;
     }
     let area = frame.area();
@@ -873,7 +940,11 @@ fn render_with_mode(frame: &mut Frame<'_>, app: &App, monochrome: bool) -> HitMa
 
     // Measured from the mockup: the rail is about 21% of the window. Compact mode
     // gives more room to the transcript and uses one-line sidebar entries.
-    let rail_percent = if app.compact_sidebar { 15 } else { 21 };
+    // Below this width a two-line rail leaves only fragments of names and previews,
+    // so the sidebar collapses to one-line entries on its own.
+    const COMFORTABLE_RAIL_MIN_WIDTH: u16 = 70;
+    let compact = app.compact_sidebar || inner.width < COMFORTABLE_RAIL_MIN_WIDTH;
+    let rail_percent = if compact { 15 } else { 25 };
     let desired = (inner.width as u32 * rail_percent + 50) / 100;
     // Preserve transcript room on narrow terminals; each chat remains identifiable
     // even when the title is clipped to a smaller responsive rail.
@@ -885,7 +956,7 @@ fn render_with_mode(frame: &mut Frame<'_>, app: &App, monochrome: bool) -> HitMa
         16
     };
     let sidebar_width = desired
-        .clamp(sidebar_min, 28)
+        .clamp(sidebar_min, 34)
         .min(inner.width.saturating_sub(3) as u32) as u16;
     let body = Layout::horizontal([
         Constraint::Length(sidebar_width),
@@ -926,15 +997,19 @@ fn render_with_mode(frame: &mut Frame<'_>, app: &App, monochrome: bool) -> HitMa
         Paragraph::new(display_truncate(&label, label_width)).style(label_style),
         Rect::new(body[0].x, body[0].y, body[0].width, 1),
     );
+    // The rail carries one item per chat: a name line and, unless the sidebar is
+    // compact, a preview of the newest message. The selection fills both lines.
+    const SELECTION_MARKER_WIDTH: usize = 2;
+    let entry_height = if compact { 1u16 } else { 2u16 };
+    let entry_width = (body[0].width as usize).saturating_sub(SELECTION_MARKER_WIDTH);
     let entries = visible
         .iter()
         .map(|conversation| {
-            ListItem::new(sidebar_entry_line(
-                app,
-                conversation,
-                body[0].width as usize,
-                palette,
-            ))
+            let mut lines = vec![sidebar_name_line(app, conversation, entry_width, palette)];
+            if !compact {
+                lines.push(sidebar_preview_line(conversation, entry_width, palette));
+            }
+            ListItem::new(lines)
         })
         .collect::<Vec<_>>();
     // Render with state so a selection deep in a long list scrolls into view
@@ -953,22 +1028,30 @@ fn render_with_mode(frame: &mut Frame<'_>, app: &App, monochrome: bool) -> HitMa
         body[0].height.saturating_sub(1),
     );
     frame.render_stateful_widget(
-        List::new(entries).style(Style::default().bg(palette.bg)),
+        List::new(entries)
+            .style(Style::default().bg(palette.bg))
+            .highlight_style(Style::default().bg(palette.input_surface))
+            .highlight_symbol("▎ "),
         list_area,
         &mut list_state,
     );
-    // The list scrolls itself, so derive each chat's row from the state it drew
-    // with. A row scrolled out of view simply gets no hitbox.
+    // The list scrolls itself, so derive each chat's rows from the state it drew
+    // with. A chat scrolled out of view simply gets no hitbox.
     let offset = list_state.offset();
     hits.sidebar = body[0];
     hits.sidebar_rows = visible
         .iter()
         .enumerate()
         .filter_map(|(index, conversation)| {
-            let row = index.checked_sub(offset)? as u16;
-            (row < list_area.height).then(|| {
+            let row = (index.checked_sub(offset)? as u16).checked_mul(entry_height)?;
+            (row + entry_height <= list_area.height).then(|| {
                 (
-                    Rect::new(list_area.x, list_area.y + row, list_area.width, 1),
+                    Rect::new(
+                        list_area.x,
+                        list_area.y + row,
+                        list_area.width,
+                        entry_height,
+                    ),
                     conversation.id.clone(),
                 )
             })
@@ -1009,51 +1092,50 @@ fn render_with_mode(frame: &mut Frame<'_>, app: &App, monochrome: bool) -> HitMa
     hits.transcript = content;
     hits.composer = composer;
     let selected = app.selected_conversation();
-    let mut heading = vec![Span::styled(
-        "Bloom",
-        Style::default()
-            .fg(palette.text)
-            .add_modifier(Modifier::BOLD),
-    )];
+    // The left of the header leads with the chat itself; the app name lives on the
+    // right, next to the other quiet affordances.
+    let mut heading = Vec::new();
     if app.settings_open {
-        heading.extend([
-            Span::raw(" / "),
-            Span::styled(
-                "Settings",
-                Style::default()
-                    .fg(palette.text)
-                    .add_modifier(Modifier::BOLD),
-            ),
-        ]);
-    } else if right[0].width >= 38 {
-        if let Some(c) = selected {
-            let name = app.conversation_name(c);
-            let subtitle = conversation_subtitle(c);
+        heading.push(Span::styled(
+            "Settings",
+            Style::default()
+                .fg(palette.text)
+                .add_modifier(Modifier::BOLD),
+        ));
+    } else if let Some(c) = selected {
+        let name = app.conversation_name(c);
+        let subtitle = conversation_subtitle(c);
+        heading.push(Span::styled(
+            name.clone(),
+            Style::default()
+                .fg(palette.text)
+                .add_modifier(Modifier::BOLD),
+        ));
+        // An untitled direct chat is named after the handle already, so a second
+        // copy would just repeat it.
+        if subtitle != name && right[0].width >= 32 {
             heading.extend([
-                Span::raw(" / "),
-                Span::styled(
-                    name.clone(),
-                    Style::default()
-                        .fg(palette.text)
-                        .add_modifier(Modifier::BOLD),
-                ),
+                Span::raw("  "),
+                Span::styled(subtitle, Style::default().fg(palette.muted)),
             ]);
-            // An untitled direct chat is named after the handle already, so a
-            // second copy would just repeat it.
-            if subtitle != name {
-                heading.extend([
-                    Span::raw("  "),
-                    Span::styled(subtitle, Style::default().fg(palette.muted)),
-                ]);
-            }
         }
     }
     let mut title_width = right[0].width;
     let mut theme_control = None;
     let mut status_control = None;
     // Small clickable controls at the right edge, the way Codex tucks its
-    // affordances there: `?` for the shortcut sheet, `⚙` for settings.
+    // affordances there: `Bloom` next to `?` for the shortcut sheet and `⚙` for
+    // settings.
     let mut cursor = right[0].x.saturating_add(right[0].width);
+    if right[0].width >= 32 {
+        let width = 5u16;
+        let area = Rect::new(cursor.saturating_sub(width), right[0].y, width, 1);
+        frame.render_widget(
+            Paragraph::new("Bloom").style(Style::default().fg(palette.muted)),
+            area,
+        );
+        cursor = area.x.saturating_sub(1);
+    }
     if right[0].width >= 26 {
         let area = Rect::new(cursor.saturating_sub(1), right[0].y, 1, 1);
         hits.header_help = Some(area);
@@ -1120,6 +1202,15 @@ fn render_with_mode(frame: &mut Frame<'_>, app: &App, monochrome: bool) -> HitMa
             }
         }
     }
+    // A subtitle is a nicety: drop it whole rather than clip it mid-word when the
+    // status and controls leave too little room.
+    let heading_width: usize = heading
+        .iter()
+        .map(|span| unicode_width::UnicodeWidthStr::width(span.content.as_ref()))
+        .sum();
+    if heading_width > title_width as usize && heading.len() > 1 {
+        heading.truncate(1);
+    }
     frame.render_widget(
         Paragraph::new(Line::from(heading)),
         Rect::new(right[0].x, right[0].y, title_width, 1),
@@ -1182,8 +1273,47 @@ fn render_with_mode(frame: &mut Frame<'_>, app: &App, monochrome: bool) -> HitMa
             .unwrap_or(0)
             .clamp(1, SPEAKER_COLUMN_CAP);
 
+        // Group consecutive messages from one sender the way Slack does: the name
+        // and time appear once per run, a day divider marks each new day, and a
+        // blank row separates runs. The boundary is the name, not just whitespace.
+        const GROUP_GAP_MS: i64 = 5 * 60 * 1000;
+        let mut previous: Option<(String, bool, i64, (i32, i32))> = None;
         for message in messages {
             let speaker = app.speaker_label_for(message, app.selected_conversation());
+            let (year, yday, day_text) = crate::app::day_label(message.created_at);
+            let new_day = previous
+                .as_ref()
+                .is_none_or(|(_, _, _, day)| *day != (year, yday));
+            let new_group = new_day
+                || previous.as_ref().is_some_and(|(name, mine, at, _)| {
+                    *name != speaker
+                        || *mine != message.from_me
+                        || message.created_at - at > GROUP_GAP_MS
+                });
+            if new_day && !day_text.is_empty() {
+                if previous.is_some() {
+                    lines.push(Line::raw(""));
+                }
+                let label = format!(" {day_text} ");
+                let label_width = unicode_width::UnicodeWidthStr::width(label.as_str());
+                let side = transcript_width.saturating_sub(label_width) / 2;
+                let rule = "─".repeat(side.min(6));
+                let pad = " ".repeat(side.saturating_sub(side.min(6)));
+                lines.push(Line::from(vec![
+                    Span::raw(pad),
+                    Span::styled(rule.clone(), Style::default().fg(palette.rule)),
+                    Span::styled(label, Style::default().fg(palette.muted)),
+                    Span::styled(rule, Style::default().fg(palette.rule)),
+                ]));
+            } else if new_group {
+                lines.push(Line::raw(""));
+            }
+            previous = Some((
+                speaker.clone(),
+                message.from_me,
+                message.created_at,
+                (year, yday),
+            ));
             let padded = display_pad(&speaker, speaker_column);
             let timestamp = timestamp(message.created_at);
             let message_surface = if message.from_me {
@@ -1195,7 +1325,7 @@ fn render_with_mode(frame: &mut Frame<'_>, app: &App, monochrome: bool) -> HitMa
                 Span::styled(
                     padded.clone(),
                     Style::default()
-                        .fg(palette.text)
+                        .fg(speaker_color(&speaker, message.from_me, &palette))
                         .bg(message_surface)
                         .add_modifier(Modifier::BOLD),
                 ),
@@ -1215,9 +1345,11 @@ fn render_with_mode(frame: &mut Frame<'_>, app: &App, monochrome: bool) -> HitMa
                 ));
             }
             // Remember where each byline lands, so the viewport can avoid ending on one
-            // with its body below the fold.
-            header_lines.push(lines.len());
-            lines.push(Line::from(header));
+            // with its body below the fold. A continuing run has no byline at all.
+            if new_group {
+                header_lines.push(lines.len());
+                lines.push(Line::from(header));
+            }
 
             let text = message_text(message);
             let mut body_style = Style::default().fg(palette.text);
@@ -1264,8 +1396,6 @@ fn render_with_mode(frame: &mut Frame<'_>, app: &App, monochrome: bool) -> HitMa
                 }
             }
             lines.push(Line::from(body));
-            // One quiet spacer keeps messages distinct without leaving a large void.
-            lines.push(Line::raw(""));
         }
     }
     // Show the newest messages by default and let the user scroll back. Rows are
@@ -1364,6 +1494,10 @@ fn render_with_mode(frame: &mut Frame<'_>, app: &App, monochrome: bool) -> HitMa
         hits.menu = Some(panel);
         hits.menu_rows = rows;
     }
+    if let Some((panel, rows)) = render_context_menu(frame, app, &hits, palette) {
+        hits.context_menu = Some(panel);
+        hits.context_menu_rows = rows;
+    }
     hits.help = render_help(frame, app, content, palette);
     let (prefix, value, cursor_byte, editable, muted) = if app.settings_open {
         // The settings pane carries its own copy; leave the composer row quiet and
@@ -1391,7 +1525,9 @@ fn render_with_mode(frame: &mut Frame<'_>, app: &App, monochrome: bool) -> HitMa
     if let Some(footer_area) = layout.footer {
         if footer_area.width > 0 && footer_area.height > 0 {
             let feedback = composer_feedback(app, &palette, back);
-            let row = |offset: u16| Rect::new(footer_area.x, footer_area.y + offset, footer_area.width, 1);
+            let row = |offset: u16| {
+                Rect::new(footer_area.x, footer_area.y + offset, footer_area.width, 1)
+            };
             let two_rows = footer_area.height >= 2;
             match (two_rows, feedback) {
                 (true, Some((message, color))) => {
@@ -1407,7 +1543,9 @@ fn render_with_mode(frame: &mut Frame<'_>, app: &App, monochrome: bool) -> HitMa
                         row(1),
                     );
                 }
-                (false, Some((message, color))) => render_footer_row(frame, row(0), &message, color),
+                (false, Some((message, color))) => {
+                    render_footer_row(frame, row(0), &message, color)
+                }
                 (false, None) => {
                     frame.render_widget(
                         Paragraph::new(footer_hints(footer_area.width as usize, palette, app)),
@@ -1451,7 +1589,10 @@ fn render_help(frame: &mut Frame<'_>, app: &App, content: Rect, palette: Palette
     frame.render_widget(Clear, panel);
     frame.render_widget(
         Block::default()
-            .title(Span::styled(" Keyboard shortcuts ", Style::default().fg(palette.cyan)))
+            .title(Span::styled(
+                " Keyboard shortcuts ",
+                Style::default().fg(palette.cyan),
+            ))
             .borders(Borders::ALL)
             .border_type(BorderType::Rounded)
             .border_style(Style::default().fg(palette.rule))
@@ -1500,6 +1641,75 @@ fn render_help(frame: &mut Frame<'_>, app: &App, content: Rect, palette: Palette
         );
     }
     Some(panel)
+}
+
+/// A stable colour per speaker, so consecutive senders are easy to tell apart the
+/// way a Slack-style client reads. Our own messages always use the same colour.
+fn speaker_color(label: &str, from_me: bool, palette: &Palette) -> Color {
+    if from_me {
+        return palette.green;
+    }
+    let hash = label.bytes().fold(2166136261u32, |acc, byte| {
+        (acc ^ byte as u32).wrapping_mul(16777619)
+    });
+    [palette.cyan, palette.yellow, palette.magenta][hash as usize % 3]
+}
+
+/// The right-click menu for a chat, drawn beside its sidebar row so it reads as
+/// belonging to that row. Returns the panel and each action's hitbox.
+fn render_context_menu(
+    frame: &mut Frame<'_>,
+    app: &App,
+    hits: &HitMap,
+    palette: Palette,
+) -> Option<(Rect, Vec<(Rect, usize)>)> {
+    let menu = app.context_menu.as_ref()?;
+    let row = hits
+        .sidebar_rows
+        .iter()
+        .find(|(_, id)| *id == menu.conversation)
+        .map(|(area, _)| *area)?;
+    let area = frame.area();
+    let width = 14u16.min(area.width);
+    let height = (crate::app::ContextMenu::ACTIONS.len() as u16 + 2).min(area.height);
+    // Open just past the rail so the chat's name stays readable underneath.
+    let x = (row.x + row.width).min(area.width.saturating_sub(width));
+    let y = row.y.min(area.height.saturating_sub(height));
+    let panel = Rect::new(x, y, width, height);
+    frame.render_widget(Clear, panel);
+    frame.render_widget(
+        Block::default()
+            .borders(Borders::ALL)
+            .border_type(BorderType::Rounded)
+            .border_style(Style::default().fg(palette.rule))
+            .style(Style::default().bg(palette.surface)),
+        panel,
+    );
+    let inner = panel.inner(Margin {
+        horizontal: 1,
+        vertical: 1,
+    });
+    let mut rows = Vec::new();
+    for (index, (label, _)) in crate::app::ContextMenu::ACTIONS.iter().enumerate() {
+        if index as u16 >= inner.height {
+            break;
+        }
+        let item = Rect::new(inner.x, inner.y + index as u16, inner.width, 1);
+        let selected = index == menu.selection;
+        let bg = if selected {
+            palette.cyan
+        } else {
+            palette.surface
+        };
+        let fg = if selected { palette.bg } else { palette.text };
+        frame.render_widget(
+            Paragraph::new(format!("{} {label}", if selected { "›" } else { " " }))
+                .style(Style::default().fg(fg).bg(bg)),
+            item,
+        );
+        rows.push((item, index));
+    }
+    Some((panel, rows))
 }
 
 fn render_footer_row(frame: &mut Frame<'_>, area: Rect, message: &str, color: Color) {

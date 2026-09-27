@@ -149,6 +149,16 @@ async fn daemon_persists_inbound_and_sends_outbound_through_the_sidecar() {
         assert_eq!(stored.parts(), &[MessagePart::Text("reply".to_owned())]);
     }
 
+    // The listing carries a preview of the newest stored message for the sidebar.
+    let listed = service
+        .list_conversations()
+        .await
+        .expect("listing succeeds")
+        .into_iter()
+        .find(|conversation| conversation.id == conversation_id)
+        .expect("conversation listed");
+    assert_eq!(listed.preview.as_deref(), Some("You: reply"));
+
     // A duplicate delivery must not create a second row.
     let outcome = {
         let mut guard = store.lock().unwrap();
@@ -344,6 +354,7 @@ async fn starting_a_conversation_creates_then_reuses_it_and_normalises_addresses
         ],
         created_at: 1,
         last_message_at: None,
+        preview: None,
     };
     store::upsert_conversation(&mut store.lock().unwrap(), &group).unwrap();
     let before = store::list_conversations(&store.lock().unwrap())

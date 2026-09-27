@@ -232,6 +232,7 @@ mod tests {
             participants: vec![],
             created_at: 1,
             last_message_at: None,
+            preview: None,
         };
         super::super::conversations::upsert_conversation(&mut store, &conversation).unwrap();
         (dir, store, cid)

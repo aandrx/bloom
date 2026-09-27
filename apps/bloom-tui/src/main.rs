@@ -173,6 +173,8 @@ async fn main() -> Result<()> {
         theme_override,
         compact_sidebar: config.compact_sidebar,
         nicknames: config.nicknames.clone(),
+        titles: config.titles.clone(),
+        hidden: config.hidden.iter().cloned().collect(),
         error: config_warning,
         connection: ConnectionState::Connecting.label().to_owned(),
         connection_state: ConnectionState::Connecting,
@@ -350,6 +352,12 @@ async fn main() -> Result<()> {
                     }),
                     compact_sidebar: app.compact_sidebar,
                     nicknames: app.nicknames.clone(),
+                    titles: app.titles.clone(),
+                    hidden: {
+                        let mut hidden: Vec<String> = app.hidden.iter().cloned().collect();
+                        hidden.sort();
+                        hidden
+                    },
                 };
                 if updated_config != config {
                     match updated_config.save(&config_path) {
