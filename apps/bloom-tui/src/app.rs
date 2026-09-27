@@ -1,6 +1,6 @@
 //! UI state for the Bloom TUI. Rendering lives in `ui.rs`.
 
-use crate::daemon::Snapshot;
+use crate::daemon::{ConnectionState, Snapshot};
 use bloom_domain::{Conversation, ConversationId, HandleKind, Message};
 use bloom_ipc::EventKind;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
@@ -50,6 +50,9 @@ pub struct App {
     pub selected: Option<ConversationId>,
     pub messages: HashMap<ConversationId, Vec<Message>>,
     pub connection: String,
+    pub connection_state: ConnectionState,
+    pub frame: u64,
+    pub thread_loading: bool,
     pub session: String,
     pub draft: String,
     /// Display rows scrolled back from the newest message. Zero pins the transcript
@@ -69,6 +72,21 @@ pub struct App {
 }
 
 impl App {
+    pub fn is_animating(&self) -> bool {
+        matches!(
+            self.connection_state,
+            ConnectionState::Connecting | ConnectionState::Disconnected
+        ) || !matches!(self.session.as_str(), "" | "Active")
+            || self.thread_loading
+            || self.messages.values().flatten().any(|message| {
+                message.from_me && matches!(message.delivery, bloom_domain::DeliveryState::Queued)
+            })
+    }
+
+    pub fn advance(&mut self) {
+        self.frame = self.frame.wrapping_add(1);
+    }
+
     /// Apply a store snapshot. History is replaced, not merged, because the store is
     /// authoritative. The current selection is kept while it still exists.
     pub fn apply_snapshot(&mut self, snapshot: Snapshot) {
@@ -657,6 +675,25 @@ mod tests {
             None,
         )
         .unwrap()
+    }
+
+    #[test]
+    fn animation_triggers_and_idle_state() {
+        let mut app = App {
+            connection_state: ConnectionState::Connected,
+            ..Default::default()
+        };
+        assert!(!app.is_animating());
+        app.connection_state = ConnectionState::Connecting;
+        assert!(app.is_animating());
+        app.connection_state = ConnectionState::Disconnected;
+        assert!(app.is_animating());
+        app.connection_state = ConnectionState::Connected;
+        app.session = "Starting".into();
+        assert!(app.is_animating());
+        app.session.clear();
+        app.thread_loading = true;
+        assert!(app.is_animating());
     }
 
     #[test]

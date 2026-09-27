@@ -7,6 +7,16 @@ use crate::app::{
 const HINTS: &str = "↑↓ chats · Enter open · / filter · n new · Esc close · t theme";
 use bloom_domain::DeliveryState;
 use ratatui::{prelude::*, widgets::*};
+use std::sync::OnceLock;
+
+fn monochrome_from(value: Option<std::ffi::OsString>) -> bool {
+    value.is_some_and(|value| !value.is_empty())
+}
+
+fn monochrome() -> bool {
+    static NO_COLOR: OnceLock<bool> = OnceLock::new();
+    *NO_COLOR.get_or_init(|| monochrome_from(std::env::var_os("NO_COLOR")))
+}
 
 #[derive(Clone, Copy)]
 struct Palette {
@@ -110,11 +120,28 @@ fn display_pad(value: &str, width: usize) -> String {
     result
 }
 
+pub fn spinner_frame(tick: u64) -> &'static str {
+    const FRAMES: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+    FRAMES[tick as usize % FRAMES.len()]
+}
+
 pub fn render(frame: &mut Frame<'_>, app: &App) {
-    let palette = match app.theme {
+    render_with_mode(frame, app, monochrome());
+}
+
+fn render_with_mode(frame: &mut Frame<'_>, app: &App, monochrome: bool) {
+    let mut palette = match app.theme {
         Theme::Dark => DARK,
         Theme::Light => LIGHT,
     };
+    if monochrome {
+        palette.cyan = palette.text;
+        palette.green = palette.text;
+        palette.yellow = palette.text;
+        palette.red = palette.text;
+        palette.muted = palette.text;
+        palette.rule = palette.text;
+    }
     let area = frame.area();
     frame.render_widget(
         Block::default()
@@ -321,6 +348,15 @@ pub fn render(frame: &mut Frame<'_>, app: &App) {
         if status_tone(app) != StatusTone::Healthy {
             if let Some(status) = status_text(app) {
                 let tone = status_tone(app);
+                let status = if matches!(
+                    app.connection_state,
+                    crate::daemon::ConnectionState::Connecting
+                        | crate::daemon::ConnectionState::Disconnected
+                ) {
+                    format!("{} {status}", spinner_frame(app.frame))
+                } else {
+                    status.to_owned()
+                };
                 let label = format!(" {status} ");
                 let width = label.chars().count() as u16 + 2;
                 x = x.saturating_sub(width + 1);
@@ -390,23 +426,28 @@ pub fn render(frame: &mut Frame<'_>, app: &App) {
             )];
             if message.from_me {
                 let state = match message.delivery {
-                    DeliveryState::Queued => "sending",
-                    DeliveryState::Sent => "sent",
+                    DeliveryState::Queued => "⠋ queued",
+                    DeliveryState::Sent => "✓ sent",
                     DeliveryState::Delivered => "✓ delivered",
                     DeliveryState::Read => "✓ read",
                     DeliveryState::Failed => "failed",
                 };
-                content.extend([
-                    Span::raw("  "),
-                    Span::styled(
-                        state,
-                        Style::default().fg(if state.starts_with('✓') {
-                            palette.green
-                        } else {
-                            palette.muted
-                        }),
-                    ),
-                ]);
+                let state_style = match message.delivery {
+                    DeliveryState::Queued => Style::default().add_modifier(Modifier::DIM),
+                    DeliveryState::Sent => Style::default().add_modifier(Modifier::DIM),
+                    DeliveryState::Delivered | DeliveryState::Read => {
+                        Style::default().add_modifier(Modifier::BOLD)
+                    }
+                    DeliveryState::Failed => {
+                        Style::default().add_modifier(Modifier::BOLD | Modifier::UNDERLINED)
+                    }
+                }
+                .fg(if state.starts_with('✓') {
+                    palette.green
+                } else {
+                    palette.muted
+                });
+                content.extend([Span::raw("  "), Span::styled(state, state_style)]);
             }
             lines.push(Line::from(content));
             lines.push(Line::raw(""));
@@ -516,4 +557,53 @@ pub fn render(frame: &mut Frame<'_>, app: &App) {
         Paragraph::new(footer).style(footer_style),
         Rect::new(composer.x, composer.y + 2, composer.width, 1),
     );
+}
+
+#[cfg(test)]
+mod animation_accessibility_tests {
+    use super::*;
+    use std::ffi::OsString;
+
+    #[test]
+    fn no_color_decision_handles_unset_empty_and_nonempty() {
+        assert!(!monochrome_from(None));
+        assert!(!monochrome_from(Some(OsString::new())));
+        assert!(monochrome_from(Some(OsString::from("1"))));
+    }
+
+    #[test]
+    fn spinner_cycles_through_all_frames() {
+        let frames = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+        for (tick, expected) in frames.iter().enumerate() {
+            assert_eq!(spinner_frame(tick as u64), *expected);
+        }
+        assert_eq!(spinner_frame(10), frames[0]);
+    }
+
+    #[test]
+    fn monochrome_preserves_rendered_text_but_changes_styles() {
+        let app = App {
+            connection: "Connecting".into(),
+            connection_state: crate::daemon::ConnectionState::Connecting,
+            ..Default::default()
+        };
+        let render = |mono| {
+            let backend = ratatui::backend::TestBackend::new(100, 30);
+            let mut terminal = ratatui::Terminal::new(backend).unwrap();
+            terminal
+                .draw(|frame| render_with_mode(frame, &app, mono))
+                .unwrap();
+            terminal.backend().buffer().clone()
+        };
+        let color = render(false);
+        let mono = render(true);
+        for y in 0..30 {
+            for x in 0..100 {
+                let a = &color[(x, y)];
+                let b = &mono[(x, y)];
+                assert_eq!(a.symbol(), b.symbol());
+            }
+        }
+        assert!((0..30).any(|y| (0..100).any(|x| color[(x, y)].fg != mono[(x, y)].fg)));
+    }
 }

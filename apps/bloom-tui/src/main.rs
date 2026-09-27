@@ -12,11 +12,105 @@ use crossterm::{
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
 use ratatui::{backend::CrosstermBackend, Terminal};
+use std::io::{Read, Write};
 use std::{io, path::PathBuf, time::Duration};
 use tokio::sync::{mpsc, watch};
 
 const FIRST_RETRY: Duration = Duration::from_millis(250);
 const MAX_RETRY: Duration = Duration::from_secs(8);
+const OSC_TIMEOUT: Duration = Duration::from_millis(200);
+
+fn parse_osc11_reply(reply: Option<&[u8]>) -> Option<(u8, u8, u8)> {
+    let bytes = reply?;
+    if let Some(index) = bytes.windows(1).position(|window| window == b"#") {
+        let hex = std::str::from_utf8(bytes.get(index + 1..index + 7)?).ok()?;
+        if bytes
+            .get(index + 7)
+            .is_some_and(|byte| byte.is_ascii_hexdigit())
+        {
+            return None;
+        }
+        return Some((
+            u8::from_str_radix(&hex[0..2], 16).ok()?,
+            u8::from_str_radix(&hex[2..4], 16).ok()?,
+            u8::from_str_radix(&hex[4..6], 16).ok()?,
+        ));
+    }
+    let start = bytes.windows(4).position(|window| window == b"rgb:")? + 4;
+    let payload = std::str::from_utf8(&bytes[start..])
+        .ok()?
+        .trim_end_matches(['\u{7}', '\u{1b}', '\\']);
+    let mut channels = payload.split('/');
+    let parse = |value: &str| -> Option<u8> {
+        if value.is_empty() || value.len() > 4 {
+            return None;
+        }
+        let raw = u16::from_str_radix(value, 16).ok()?;
+        Some((raw as u32 * 255 / ((1u32 << (value.len() * 4)) - 1)) as u8)
+    };
+    let rgb = (
+        parse(channels.next()?)?,
+        parse(channels.next()?)?,
+        parse(channels.next()?)?,
+    );
+    if channels.next().is_some() {
+        return None;
+    }
+    Some(rgb)
+}
+
+fn theme_for_rgb((r, g, b): (u8, u8, u8)) -> bloom_tui::app::Theme {
+    if (r as u16 + g as u16 + b as u16) / 3 >= 128 {
+        bloom_tui::app::Theme::Light
+    } else {
+        bloom_tui::app::Theme::Dark
+    }
+}
+
+fn query_background_theme() -> Option<bloom_tui::app::Theme> {
+    if !std::io::IsTerminal::is_terminal(&io::stdin())
+        || !std::io::IsTerminal::is_terminal(&io::stdout())
+    {
+        return None;
+    }
+    let mut tty = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open("/dev/tty")
+        .ok()?;
+    tty.write_all(b"\x1b]11;?\x07").ok()?;
+    tty.flush().ok()?;
+    let start = std::time::Instant::now();
+    let mut reply = Vec::new();
+    while start.elapsed() < OSC_TIMEOUT && reply.len() < 128 {
+        let remaining = OSC_TIMEOUT.saturating_sub(start.elapsed());
+        let fd = std::os::fd::AsRawFd::as_raw_fd(&tty);
+        let mut poll_fd = libc::pollfd {
+            fd,
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        let ready = unsafe {
+            libc::poll(
+                &mut poll_fd,
+                1,
+                remaining.as_millis().min(i32::MAX as u128) as i32,
+            )
+        };
+        if ready <= 0 {
+            break;
+        }
+        let mut byte = [0];
+        if tty.read(&mut byte).ok()? == 0 {
+            break;
+        }
+        reply.push(byte[0]);
+        if byte[0] == 7 || reply.ends_with(b"\\") {
+            break;
+        }
+    }
+    parse_osc11_reply(Some(&reply)).map(theme_for_rgb)
+}
 
 /// Restores the terminal even when the UI exits through an error path.
 struct TerminalGuard;
@@ -61,9 +155,12 @@ async fn main() -> Result<()> {
 
     let client = BloomClient::new(socket_path());
     let _guard = TerminalGuard::enter()?;
+    let initial_theme = query_background_theme().unwrap_or_default();
     let mut terminal = Terminal::new(CrosstermBackend::new(io::stdout()))?;
     let mut app = App {
+        theme: initial_theme,
         connection: ConnectionState::Connecting.label().to_owned(),
+        connection_state: ConnectionState::Connecting,
         ..Default::default()
     };
 
@@ -120,10 +217,10 @@ async fn main() -> Result<()> {
     let mut last_visible = app.selected.clone();
     loop {
         terminal.draw(|frame| ui::render(frame, &app))?;
-        terminal.draw(|frame| ui::render(frame, &app))?;
 
         tokio::select! {
             Some(snapshot) = snapshot_rx.recv() => {
+                app.thread_loading = false;
                 app.apply_snapshot(snapshot);
                 last_visible = app.selected.clone();
                 let _ = visible_tx.send(last_visible.clone());
@@ -131,6 +228,7 @@ async fn main() -> Result<()> {
             Some(conversations) = conversation_rx.recv() => app.set_conversations(conversations),
             Some(state) = status_rx.recv() => {
                 app.connection = state.label().to_owned();
+                app.connection_state = state;
             }
             Some(event) = event_rx.recv() => {
                 app.apply_event(event);
@@ -189,12 +287,43 @@ async fn main() -> Result<()> {
                 // A selection change is a request for a fresh read, not an event.
                 if app.selected != last_visible {
                     last_visible = app.selected.clone();
+                    app.thread_loading = last_visible.is_some();
                     let _ = visible_tx.send(last_visible.clone());
                 }
             }
-            _ = tokio::time::sleep(Duration::from_millis(50)) => {}
+            _ = tokio::time::sleep(if app.is_animating() { Duration::from_millis(33) } else { Duration::from_secs(2) }) => {
+                if app.is_animating() {
+                    app.advance();
+                    terminal.draw(|frame| ui::render(frame, &app))?;
+                }
+            }
         }
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod accessibility_tests {
+    use super::*;
+
+    #[test]
+    fn parses_osc11_rgb_and_hex_replies() {
+        assert_eq!(
+            parse_osc11_reply(Some(b"\x1b]11;rgb:ffff/ffff/ffff\x07")),
+            Some((255, 255, 255))
+        );
+        assert_eq!(
+            parse_osc11_reply(Some(b"\x1b]11;#102030\x07")),
+            Some((16, 32, 48))
+        );
+        assert_eq!(parse_osc11_reply(Some(b"\x1b]11;garbage\x07")), None);
+        assert_eq!(parse_osc11_reply(None), None);
+    }
+
+    #[test]
+    fn initial_theme_uses_background_luminance() {
+        assert_eq!(theme_for_rgb((250, 250, 250)), bloom_tui::app::Theme::Light);
+        assert_eq!(theme_for_rgb((10, 10, 10)), bloom_tui::app::Theme::Dark);
+    }
 }

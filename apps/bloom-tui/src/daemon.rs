@@ -12,8 +12,9 @@ use tokio::sync::{mpsc, watch};
 /// How much thread history a snapshot requests.
 pub const HISTORY_LIMIT: u32 = 200;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum ConnectionState {
+    #[default]
     Connecting,
     Connected,
     Disconnected,
