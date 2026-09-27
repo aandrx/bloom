@@ -97,6 +97,17 @@ String _uuid4() {
       '${hex.substring(12, 16)}-${hex.substring(16, 20)}-${hex.substring(20)}';
 }
 
+/// The engine's handle form: `mailto:` for an address, `tel:` for a number.
+///
+/// The daemon already sends this form. Re-prefixing an already prefixed handle
+/// produces `mailto:mailto:...`, which resolves to no IDS target and fails the
+/// send with "No valid IDS targets for message", so the prefix is only added
+/// when it is missing.
+String engineHandle(String value) {
+  if (value.startsWith('mailto:') || value.startsWith('tel:')) return value;
+  return value.contains('@') ? 'mailto:$value' : 'tel:$value';
+}
+
 /// Pick a sending address whose scheme matches the recipient's.
 String? chooseSender(List<String> handles, String recipient) {
   if (handles.isEmpty) return null;
@@ -107,22 +118,27 @@ String? chooseSender(List<String> handles, String recipient) {
   return handles.first;
 }
 
-api.MessageInst buildMessage({
+/// Build a sendable message through the engine's own constructor.
+///
+/// `api.newMsg` runs `MessageInst::new`, which derives the IDS target list from
+/// the conversation participants. Constructing `MessageInst` by hand leaves
+/// `target` null and the engine then rejects the send with
+/// "No valid IDS targets for message".
+Future<api.MessageInst> buildMessage({
   required String recipient,
   required String sender,
   required String text,
   String? chatGuid,
 }) {
-  final scheme = recipient.contains('@') ? 'mailto' : 'tel';
-  return api.MessageInst(
-    id: _uuid4(),
-    sender: sender,
+  final target = engineHandle(recipient);
+  return api.newMsg(
     conversation: api.ConversationData(
-      participants: <String>['$scheme:$recipient', sender],
+      participants: <String>[target, sender],
       cvName: null,
       senderGuid: chatGuid ?? _uuid4(),
       afterGuid: null,
     ),
+    sender: sender,
     message: api.Message.message(
       api.NormalMessage(
         parts: api.MessageParts(
@@ -134,9 +150,6 @@ api.MessageInst buildMessage({
         voice: false,
       ),
     ),
-    sentTimestamp: DateTime.now().millisecondsSinceEpoch,
-    sendDelivered: false,
-    verificationFailed: false,
   );
 }
 
@@ -394,7 +407,7 @@ Future<void> _handleCommand({
           );
           return;
         }
-        final inst = buildMessage(
+        final inst = await buildMessage(
           recipient: command.recipient,
           sender: sender,
           text: command.text,

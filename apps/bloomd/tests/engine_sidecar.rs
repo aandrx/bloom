@@ -507,3 +507,133 @@ async fn listing_frames_upsert_conversations_and_publish_one_refresh() {
     assert!(!report.drain_incomplete);
     persistence.abort();
 }
+
+/// A fake sidecar that records every frame the daemon writes to its stdin. The
+/// engine form of the recipient is a contract the real sidecar depends on: a
+/// double-prefixed handle (`mailto:mailto:...`) resolves to no IDS target and
+/// fails every send.
+fn fake_sidecar_recording(dir: &std::path::Path, log: &std::path::Path) -> PathBuf {
+    let path = dir.join("fake_engine_recording.sh");
+    let script = format!(
+        r#"#!/bin/sh
+cat <<'FRAMES'
+{{"version":1,"type":"ready","engine_version":"fake","handles":["mailto:me@example.invalid"],"capabilities":{{"send":true,"history":false}}}}
+FRAMES
+while IFS= read -r line; do
+  printf '%s\n' "$line" >> '{log}'
+  case "$line" in
+    *'"type":"send"'*)
+      id=$(printf '%s' "$line" | sed -n 's/.*"request_id":\([0-9]*\).*/\1/p')
+      printf '{{"version":1,"type":"send_confirmation","request_id":%s,"message_id":"outbound-%s","accepted":true}}\n' "$id" "$id"
+      ;;
+    *'"type":"shutdown"'*)
+      printf '{{"version":1,"type":"shutdown_ack","request_id":1}}\n'
+      exit 0
+      ;;
+  esac
+done
+"#,
+        log = log.display()
+    );
+    fs::write(&path, script).unwrap();
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o700)).unwrap();
+    path
+}
+
+#[tokio::test]
+async fn the_daemon_sends_engine_form_recipients_exactly_once_prefixed() {
+    let dir = tempfile::tempdir().unwrap();
+    let private = dir.path().join("private");
+    fs::create_dir(&private).unwrap();
+    fs::set_permissions(&private, fs::Permissions::from_mode(0o700)).unwrap();
+    let log = dir.path().join("frames.log");
+    let fake = fake_sidecar_recording(dir.path(), &log);
+
+    let store = EncryptedStore::open(private.join("store.db"), &TestSecrets).unwrap();
+    let store = Arc::new(Mutex::new(store));
+    let hub = SubscriptionHub::with_default_capacity();
+
+    let engine = Arc::new(Engine::new(EngineConfig {
+        sync_chats: false,
+        dart_executable: fake,
+        script: PathBuf::from("ignored"),
+        state_dir: private.clone(),
+        library: PathBuf::from("ignored"),
+    }));
+
+    let (sink, mut events) = mpsc::channel(64);
+    let mut supervisor = Supervisor::new(engine.clone(), sink);
+    let service = Arc::new(Service::new(store.clone(), engine.clone(), hub.clone()));
+    let persistence = {
+        let service = service.clone();
+        tokio::spawn(async move {
+            while let Some(event) = events.recv().await {
+                let _ = service.persist(&event);
+            }
+        })
+    };
+    supervisor.start().await.expect("engine starts");
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while engine.my_handles().is_empty() && std::time::Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+
+    // Start a conversation, then reply to it. Both paths must hand the sidecar a
+    // single-prefix handle.
+    service
+        .start_conversation(
+            "person@example.test".to_owned(),
+            OutgoingBody {
+                parts: vec![MessagePart::Text("first".to_owned())],
+            },
+        )
+        .await
+        .expect("start conversation sends");
+
+    let conversation_id = {
+        let guard = store.lock().unwrap();
+        store::list_conversations(&guard)
+            .expect("store readable")
+            .into_iter()
+            .find(|conversation| {
+                conversation
+                    .participants
+                    .iter()
+                    .any(|participant| participant.handle.value() == "person@example.test")
+            })
+            .expect("conversation created")
+            .id
+    };
+    service
+        .send(
+            conversation_id,
+            OutgoingBody {
+                parts: vec![MessagePart::Text("reply".to_owned())],
+            },
+        )
+        .await
+        .expect("reply sends");
+
+    supervisor
+        .shutdown(Duration::from_secs(5))
+        .await
+        .expect("shutdown completes");
+    persistence.abort();
+
+    let frames = fs::read_to_string(&log).expect("frames recorded");
+    let sends: Vec<&str> = frames
+        .lines()
+        .filter(|line| line.contains("\"type\":\"send\""))
+        .collect();
+    assert_eq!(sends.len(), 2, "both sends reached the sidecar: {frames}");
+    for frame in sends {
+        assert!(
+            frame.contains("\"recipient\":\"mailto:person@example.test\""),
+            "recipient must be engine form with one prefix: {frame}"
+        );
+        assert!(
+            !frame.contains("mailto:mailto:"),
+            "recipient must not be double prefixed: {frame}"
+        );
+    }
+}

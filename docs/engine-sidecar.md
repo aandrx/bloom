@@ -158,6 +158,18 @@ Phase 3, first write, user authorized:
     participant handles, the local chat guid and the previous message guid;
     `newMsg` returns a `MessageInst` whose `id` keys the send confirmation.
 
+    **Handle form is a contract.** The daemon resolves the recipient to the engine
+    form (`mailto:` for an address, `tel:` for a number) and puts that exact string
+    in the `send` frame, from both `start_conversation` and `send`. The sidecar must
+    pass it through unchanged. Re-prefixing an already prefixed handle produced
+    `mailto:mailto:...`, which resolves to zero IDS targets: the engine rejected
+    every reply with `No valid IDS targets for message`. `sidecar.engineHandle`
+    normalises idempotently, `test/handle_test.dart` guards the rule, and
+    `the_daemon_sends_engine_form_recipients_exactly_once_prefixed` in
+    `apps/bloomd/tests/engine_sidecar.rs` guards the other end. A read-only probe
+    against the real state confirmed a single-prefix handle resolves one IDS target
+    and the double-prefixed form resolves none.
+
 Remaining:
 
 12. **Restart and resume: PASSED.** Two consecutive runs after the send each
