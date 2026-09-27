@@ -21,6 +21,34 @@ use tokio::sync::mpsc;
 
 const SHUTDOWN_DRAIN: Duration = Duration::from_secs(10);
 
+/// Name the signal that ended the run, so the log says how the daemon stopped.
+///
+/// The launcher stops the daemon with SIGTERM on exit, so handling only Ctrl+C
+/// would take the ungraceful path on every normal shutdown: no drain, and no
+/// record of why it stopped.
+#[cfg(unix)]
+async fn termination_signal() -> &'static str {
+    use tokio::signal::unix::{signal, SignalKind};
+    let mut terminate = match signal(SignalKind::terminate()) {
+        Ok(stream) => stream,
+        // If the SIGTERM stream cannot be installed, Ctrl+C still stops the daemon.
+        Err(_) => {
+            let _ = tokio::signal::ctrl_c().await;
+            return "SIGINT";
+        }
+    };
+    tokio::select! {
+        _ = tokio::signal::ctrl_c() => "SIGINT",
+        _ = terminate.recv() => "SIGTERM",
+    }
+}
+
+#[cfg(not(unix))]
+async fn termination_signal() -> &'static str {
+    let _ = tokio::signal::ctrl_c().await;
+    "SIGINT"
+}
+
 #[tokio::main]
 async fn main() -> ExitCode {
     let config = match DaemonConfig::from_env() {
@@ -101,8 +129,8 @@ async fn main() -> ExitCode {
                 }
                 Err(_) => continue,
             },
-            _ = tokio::signal::ctrl_c() => {
-                eprintln!("bloomd: termination signal received");
+            signal = termination_signal() => {
+                eprintln!("bloomd: termination signal received ({signal})");
                 break;
             }
         }
