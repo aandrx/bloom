@@ -138,7 +138,10 @@ def to_html(screen: pyte.Screen, cols: int, rows: int) -> str:
             if style != current:
                 if current is not None:
                     spans.append("</span>")
-                spans.append(f'<span style="color:{fg};background:{bg};font-weight:{"700" if char.bold else "400"}">')
+                spans.append(
+                    f'<span style="color:{fg};background:{bg};'
+                    f'font-weight:{"700" if char.bold else "400"};padding:0.11em 0">'
+                )
                 current = style
             text = char.data or " "
             spans.append(
@@ -152,7 +155,7 @@ def to_html(screen: pyte.Screen, cols: int, rows: int) -> str:
   body {{ margin:0; background:{DEFAULT_BG}; }}
   pre {{
     margin:0; padding:14px 16px;
-    font: 15px/1.45 "JetBrains Mono","Geist Mono",ui-monospace,SFMono-Regular,Menlo,monospace;
+    font: 15px/1.22 "JetBrains Mono","Geist Mono",ui-monospace,SFMono-Regular,Menlo,monospace;
     white-space: pre; color:{DEFAULT_FG}; background:{DEFAULT_BG};
   }}
 </style></head><body><pre>{content}</pre></body></html>

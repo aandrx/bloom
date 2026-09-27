@@ -42,9 +42,9 @@ pub fn render(frame: &mut Frame<'_>, app: &App) {
         return;
     }
 
-    // Keep the sidebar inside the available width and leave room for the divider
-    // and at least one column of transcript.
-    let sidebar_width = 24.min(inner.width.saturating_sub(2));
+    // The mockup's sidebar is roughly a sixth of the panel, so size it as a
+    // proportion with sane bounds rather than a fixed 24 columns.
+    let sidebar_width = ((inner.width / 6).clamp(14, 22)).min(inner.width.saturating_sub(3));
     let body = Layout::horizontal([
         Constraint::Length(sidebar_width),
         Constraint::Length(1),
@@ -140,19 +140,22 @@ pub fn render(frame: &mut Frame<'_>, app: &App) {
         Rect::new(right[0].x, right[0].y, right[0].width, 1),
     );
     // The mockup keeps a status badge in the header rather than in the hint line.
-    if let Some(status) = status_text(app) {
-        let width = status.chars().count() as u16 + 1;
-        frame.render_widget(
-            Paragraph::new(status)
-                .alignment(Alignment::Right)
-                .style(Style::default().fg(MUTED)),
-            Rect::new(
-                right[0].x + right[0].width.saturating_sub(width),
-                right[0].y,
-                width,
-                1,
-            ),
-        );
+    // On narrow terminals the identity needs the room more than the badge does.
+    if inner.width >= 60 {
+        if let Some(status) = status_text(app) {
+            let width = status.chars().count() as u16 + 1;
+            frame.render_widget(
+                Paragraph::new(status)
+                    .alignment(Alignment::Right)
+                    .style(Style::default().fg(MUTED)),
+                Rect::new(
+                    right[0].x + right[0].width.saturating_sub(width),
+                    right[0].y,
+                    width,
+                    1,
+                ),
+            );
+        }
     }
     frame.render_widget(
         Paragraph::new("─".repeat(right[0].width as usize)).style(Style::default().fg(RULE)),
@@ -228,8 +231,14 @@ pub fn render(frame: &mut Frame<'_>, app: &App) {
             ),
         Rect::new(composer.x, composer.y, composer.width, 2),
     );
+    // Shorten the hints rather than truncating them mid-word on a narrow terminal.
+    let hints = if composer.width >= HINTS.chars().count() as u16 {
+        HINTS
+    } else {
+        "↑↓ · Enter · Esc"
+    };
     frame.render_widget(
-        Paragraph::new(HINTS).style(Style::default().fg(MUTED)),
+        Paragraph::new(hints).style(Style::default().fg(MUTED)),
         Rect::new(composer.x, composer.y + 2, composer.width, 1),
     );
 }
