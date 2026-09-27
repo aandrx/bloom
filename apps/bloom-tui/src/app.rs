@@ -16,6 +16,9 @@ pub struct App {
     /// Set when the daemon reports a conversation listing change; the caller then
     /// re-reads the conversation list without disturbing the open thread.
     pub resync_conversations: bool,
+    /// Active filter query. `Some` means the filter prompt is open; an empty query
+    /// lists everything.
+    pub filter: Option<String>,
     pub composing: bool,
     /// Recipient address captured before the first message of a new conversation.
     pub pending_address: Option<String>,
@@ -109,17 +112,95 @@ impl App {
     }
 
     pub fn select_step(&mut self, step: isize) {
-        if self.conversations.is_empty() {
+        let visible = self.visible_ids();
+        if visible.is_empty() {
             self.selected = None;
             return;
         }
         let at = self
             .selected
             .as_ref()
-            .and_then(|id| self.conversations.iter().position(|c| &c.id == id))
+            .and_then(|id| visible.iter().position(|candidate| candidate == id))
             .unwrap_or(0);
-        let next = (at as isize + step).clamp(0, self.conversations.len() as isize - 1) as usize;
-        self.selected = Some(self.conversations[next].id.clone());
+        let next = (at as isize + step).clamp(0, visible.len() as isize - 1) as usize;
+        self.selected = Some(visible[next].clone());
+    }
+
+    /// The conversations the sidebar should show: everything, or the filtered set.
+    pub fn visible_conversations(&self) -> Vec<&Conversation> {
+        match self.filter_query() {
+            None => self.conversations.iter().collect(),
+            Some(query) if query.trim().is_empty() => self.conversations.iter().collect(),
+            Some(query) => self
+                .conversations
+                .iter()
+                .filter(|conversation| conversation_matches(conversation, query))
+                .collect(),
+        }
+    }
+
+    pub fn visible_ids(&self) -> Vec<ConversationId> {
+        self.visible_conversations()
+            .into_iter()
+            .map(|conversation| conversation.id.clone())
+            .collect()
+    }
+
+    /// The filter query, or None when the filter is closed.
+    pub fn filter_query(&self) -> Option<&str> {
+        self.filter.as_deref()
+    }
+
+    /// True when a query is narrowing the list and nothing matches it.
+    pub fn filter_has_no_matches(&self) -> bool {
+        matches!(self.filter_query(), Some(query) if !query.trim().is_empty())
+            && self.visible_conversations().is_empty()
+    }
+
+    /// Open the filter without touching an in-progress draft, so `/` cannot lose
+    /// what the user was typing.
+    pub fn begin_filter(&mut self) {
+        self.filter = Some(String::new());
+        self.composing = false;
+        self.new_conversation = false;
+        self.pending_address = None;
+    }
+
+    pub fn cancel_filter(&mut self) {
+        self.filter = None;
+    }
+
+    pub fn filter_input(&mut self, character: char) {
+        if let Some(query) = self.filter.as_mut() {
+            query.push(character);
+            self.reconcile_selection_with_visible();
+        }
+    }
+
+    pub fn filter_backspace(&mut self) {
+        if let Some(query) = self.filter.as_mut() {
+            query.pop();
+            self.reconcile_selection_with_visible();
+        }
+    }
+
+    /// Close the filter and return the conversation the user chose.
+    pub fn confirm_filter(&mut self) -> Option<ConversationId> {
+        let selected = self.selected.clone();
+        self.filter = None;
+        selected
+    }
+
+    /// Keep the selection inside the filtered set as the query changes.
+    fn reconcile_selection_with_visible(&mut self) {
+        let visible = self.visible_ids();
+        if !self
+            .selected
+            .as_ref()
+            .is_some_and(|id| visible.iter().any(|candidate| candidate == id))
+        {
+            self.selected = visible.first().cloned();
+        }
     }
 
     pub fn selected_conversation(&self) -> Option<&Conversation> {
@@ -188,6 +269,33 @@ impl App {
             .map(message_text)
             .unwrap_or_default()
     }
+}
+
+/// Does a conversation match a filter query?
+///
+/// Matches the title and every participant handle or display name, case
+/// insensitively. Deliberately does NOT match the raw conversation id or remote id:
+/// those carry the service prefix `iMessage;-;`, so matching them would make a query
+/// as short as "s" or "i" match every conversation.
+pub fn conversation_matches(conversation: &Conversation, query: &str) -> bool {
+    let needle = query.trim().to_lowercase();
+    if needle.is_empty() {
+        return true;
+    }
+    if conversation
+        .title
+        .as_deref()
+        .is_some_and(|title| title.to_lowercase().contains(&needle))
+    {
+        return true;
+    }
+    conversation.participants.iter().any(|participant| {
+        participant.handle.value().to_lowercase().contains(&needle)
+            || participant
+                .display_name
+                .as_deref()
+                .is_some_and(|name| name.to_lowercase().contains(&needle))
+    })
 }
 
 pub fn chat_name(conversation: &Conversation) -> &str {
@@ -516,6 +624,101 @@ mod tests {
             state: bloom_domain::SessionState::Disconnected,
         });
         assert!(app.selected_conversation().is_none());
+    }
+
+    #[test]
+    fn filtering_matches_names_handles_and_is_case_insensitive() {
+        let mut app = App::default();
+        let weekend = conversation("Weekend crew", Some(30));
+        let jules = conversation("Jules", Some(20));
+        app.set_conversations(vec![weekend.clone(), jules.clone()]);
+
+        // By title, case-insensitively.
+        app.begin_filter();
+        for character in "weekend".chars() {
+            app.filter_input(character);
+        }
+        assert_eq!(app.visible_ids(), vec![weekend.id.clone()]);
+
+        // By participant handle.
+        app.cancel_filter();
+        app.begin_filter();
+        for character in "JULES".chars() {
+            app.filter_input(character);
+        }
+        assert_eq!(app.visible_ids(), vec![jules.id.clone()]);
+
+        // Clearing restores everything.
+        app.cancel_filter();
+        assert_eq!(app.visible_ids().len(), 2);
+    }
+
+    #[test]
+    fn a_filter_with_no_matches_reports_that_and_selects_nothing() {
+        let mut app = App::default();
+        app.set_conversations(vec![conversation("Weekend crew", Some(1))]);
+        app.begin_filter();
+        for character in "zzz".chars() {
+            app.filter_input(character);
+        }
+        assert!(app.visible_conversations().is_empty());
+        assert!(app.filter_has_no_matches());
+        assert_eq!(app.selected, None, "no matches means nothing is selected");
+    }
+
+    #[test]
+    fn confirming_the_filter_returns_the_chosen_conversation() {
+        let mut app = App::default();
+        let first = conversation("Weekend crew", Some(30));
+        let second = conversation("Jules", Some(20));
+        app.set_conversations(vec![first.clone(), second.clone()]);
+        app.begin_filter();
+        for character in "jul".chars() {
+            app.filter_input(character);
+        }
+        // The selection follows the narrowed list.
+        assert_eq!(app.selected.as_ref(), Some(&second.id));
+        assert_eq!(app.confirm_filter(), Some(second.id.clone()));
+        assert_eq!(app.filter_query(), None, "confirming closes the filter");
+        assert_eq!(app.visible_ids().len(), 2, "closing restores the full list");
+    }
+
+    #[test]
+    fn opening_the_filter_keeps_an_in_progress_draft() {
+        let mut app = App {
+            composing: true,
+            draft: "half written".into(),
+            ..Default::default()
+        };
+        app.begin_filter();
+        assert_eq!(app.draft, "half written", "the draft must survive");
+        assert!(!app.composing, "the composer yields to the filter prompt");
+        app.cancel_filter();
+        assert_eq!(app.draft, "half written");
+    }
+
+    #[test]
+    fn selection_steps_through_the_filtered_set_only() {
+        let mut app = App::default();
+        let first = conversation("Weekend crew", Some(30));
+        let second = conversation("Jules", Some(20));
+        let third = conversation("Design systems", Some(10));
+        app.set_conversations(vec![first, second, third]);
+        app.begin_filter();
+        app.filter_input('s');
+        let visible = app.visible_ids();
+        assert!(
+            visible.len() < 3,
+            "the filter must narrow the list, query={:?} visible={}",
+            app.filter_query(),
+            visible.len()
+        );
+        app.select_step(1);
+        let selected = app.selected.clone().expect("something is selected");
+        assert!(
+            visible.contains(&selected),
+            "stepping must stay inside the filtered results"
+        );
     }
 
     #[test]

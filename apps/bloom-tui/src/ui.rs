@@ -4,7 +4,7 @@ use crate::app::{
 };
 
 /// Key hints, exactly as the mockup shows them.
-const HINTS: &str = "↑↓ chats · Enter open · Esc close";
+const HINTS: &str = "↑↓ chats · Enter open · / filter · n new · Esc close";
 use bloom_domain::DeliveryState;
 use ratatui::{prelude::*, widgets::*};
 
@@ -15,6 +15,31 @@ const TEXT: Color = Color::Rgb(205, 214, 244);
 const MUTED: Color = Color::Rgb(166, 173, 200);
 const CYAN: Color = Color::Rgb(137, 220, 235);
 const GREEN: Color = Color::Rgb(166, 227, 161);
+
+/// Keep only the trailing lines that fit the available height, so the newest
+/// content stays visible. Wrapped rows are counted so nothing is silently clipped.
+fn tail_that_fits(lines: Vec<Line<'_>>, width: u16, height: u16) -> Vec<Line<'_>> {
+    if height == 0 || lines.is_empty() {
+        return Vec::new();
+    }
+    let width = width.max(1) as usize;
+    let mut used = 0usize;
+    let mut start = lines.len();
+    for (index, line) in lines.iter().enumerate().rev() {
+        let text: String = line
+            .spans
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect();
+        let rows = text.chars().count().div_ceil(width).max(1);
+        if used + rows > height as usize {
+            break;
+        }
+        used += rows;
+        start = index;
+    }
+    lines.into_iter().skip(start).collect()
+}
 
 pub fn render(frame: &mut Frame<'_>, app: &App) {
     let area = frame.area();
@@ -55,8 +80,8 @@ pub fn render(frame: &mut Frame<'_>, app: &App) {
         Paragraph::new("CHATS").style(Style::default().fg(MUTED).add_modifier(Modifier::BOLD)),
         Rect::new(body[0].x, body[0].y, body[0].width, 1),
     );
-    let entries = app
-        .conversations
+    let visible = app.visible_conversations();
+    let entries = visible
         .iter()
         .map(|c| {
             let selected = Some(&c.id) == app.selected.as_ref();
@@ -84,7 +109,16 @@ pub fn render(frame: &mut Frame<'_>, app: &App) {
             ])
         })
         .collect::<Vec<_>>();
-    frame.render_widget(
+    // Render with state so a selection deep in a long list scrolls into view
+    // rather than moving off-screen invisibly.
+    let selected_index = app.selected.as_ref().and_then(|id| {
+        visible
+            .iter()
+            .position(|conversation| &conversation.id == id)
+    });
+    let mut list_state = ListState::default();
+    list_state.select(selected_index);
+    frame.render_stateful_widget(
         List::new(entries).style(Style::default().bg(BG)),
         Rect::new(
             body[0].x,
@@ -92,7 +126,30 @@ pub fn render(frame: &mut Frame<'_>, app: &App) {
             body[0].width,
             body[0].height.saturating_sub(1),
         ),
+        &mut list_state,
     );
+
+    // Filter feedback replaces the plain label so the state is never ambiguous.
+    if let Some(query) = app.filter_query() {
+        let label = if query.trim().is_empty() {
+            "FILTER".to_owned()
+        } else if app.filter_has_no_matches() {
+            // Short enough to survive the narrow sidebar; the query is already
+            // visible in the filter prompt.
+            "NO MATCHES".to_owned()
+        } else {
+            match visible.len() {
+                1 => "1 MATCH".to_owned(),
+                count => format!("{count} MATCHES"),
+            }
+        };
+        let width = (body[0].width as usize).min(label.chars().count());
+        frame.render_widget(
+            Paragraph::new(label.chars().take(width).collect::<String>())
+                .style(Style::default().fg(CYAN).add_modifier(Modifier::BOLD)),
+            Rect::new(body[0].x, body[0].y, body[0].width, 1),
+        );
+    }
     frame.render_widget(
         Block::default()
             .borders(Borders::LEFT)
@@ -201,8 +258,11 @@ pub fn render(frame: &mut Frame<'_>, app: &App) {
             lines.push(Line::raw(""));
         }
     }
+    // Show the tail of the thread: a long conversation must display its newest
+    // messages, not its oldest.
+    let fitted = tail_that_fits(lines, content.width, content.height);
     frame.render_widget(
-        Paragraph::new(lines)
+        Paragraph::new(fitted)
             .wrap(Wrap { trim: false })
             .style(Style::default().bg(SURFACE)),
         content,
@@ -221,9 +281,13 @@ pub fn render(frame: &mut Frame<'_>, app: &App) {
     } else {
         prompt
     };
+    let (prompt, prompt_text) = match app.filter_query() {
+        Some(query) => (format!("›  filter: {query}"), query.to_owned()),
+        None => (prompt, app.draft.clone()),
+    };
     frame.render_widget(
         Paragraph::new(prompt)
-            .style(Style::default().fg(if app.draft.is_empty() { MUTED } else { TEXT }))
+            .style(Style::default().fg(if prompt_text.is_empty() { MUTED } else { TEXT }))
             .block(
                 Block::default()
                     .borders(Borders::TOP)
@@ -235,7 +299,7 @@ pub fn render(frame: &mut Frame<'_>, app: &App) {
     let hints = if composer.width >= HINTS.chars().count() as u16 {
         HINTS
     } else {
-        "↑↓ · Enter · Esc"
+        "↑↓ · / · Esc"
     };
     frame.render_widget(
         Paragraph::new(hints).style(Style::default().fg(MUTED)),

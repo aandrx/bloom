@@ -157,6 +157,25 @@ async fn main() -> Result<()> {
                 if quit {
                     break;
                 }
+                if app.filter_query().is_some() {
+                    // The filter prompt owns the keyboard while it is open.
+                    match key.code {
+                        KeyCode::Esc => app.cancel_filter(),
+                        KeyCode::Enter => {
+                            if let Some(id) = app.confirm_filter() {
+                                app.selected = Some(id);
+                                last_visible = app.selected.clone();
+                                let _ = visible_tx.send(last_visible.clone());
+                            }
+                        }
+                        KeyCode::Up => app.select_step(-1),
+                        KeyCode::Down => app.select_step(1),
+                        KeyCode::Backspace => app.filter_backspace(),
+                        KeyCode::Char(character) => app.filter_input(character),
+                        _ => {}
+                    }
+                    continue;
+                }
                 if app.composing {
                     match key.code {
                         KeyCode::Esc => app.cancel_composition(),
@@ -219,6 +238,7 @@ async fn main() -> Result<()> {
                         KeyCode::Down => app.select_step(1),
                         KeyCode::Up => app.select_step(-1),
                         KeyCode::Char('n') => app.begin_new_conversation(),
+                        KeyCode::Char('/') => app.begin_filter(),
                         KeyCode::Enter => app.composing = true,
                         _ => {}
                     }

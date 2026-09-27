@@ -243,3 +243,107 @@ fn new_conversation_mode_asks_for_a_recipient() {
         "new message mode must ask for an address:\n{text}"
     );
 }
+
+#[test]
+fn a_selection_deep_in_a_long_list_is_scrolled_into_view() {
+    // The daemon lists hundreds of conversations, so a selection must never move
+    // off-screen invisibly.
+    let mut app = App::default();
+    let conversations: Vec<_> = (0..300)
+        .map(|index| conversation(&format!("chat {index:03}"), 2, 300 - index as i64))
+        .collect();
+    app.set_conversations(conversations.clone());
+    let target = conversations[250].id.clone();
+    app.selected = Some(target.clone());
+    app.upsert(
+        target.clone(),
+        message(
+            &conversations[250],
+            "deep",
+            1_700_000_000_000,
+            "deep message",
+            false,
+        ),
+    );
+
+    let text = rendered(&app);
+    assert!(
+        text.contains("chat 250"),
+        "the selected conversation must be visible:\n{text}"
+    );
+    assert!(
+        !text.contains("chat 000"),
+        "the list must have scrolled away from the top:\n{text}"
+    );
+}
+
+#[test]
+fn a_long_thread_shows_its_newest_messages() {
+    let mut app = App::default();
+    let only = conversation("Long thread", 2, 1);
+    app.set_conversations(vec![only.clone()]);
+    app.selected = Some(only.id.clone());
+    for index in 0..120 {
+        app.upsert(
+            only.id.clone(),
+            message(
+                &only,
+                &format!("m{index:03}"),
+                1_700_000_000_000 + index,
+                &format!("message number {index:03}"),
+                false,
+            ),
+        );
+    }
+
+    let text = rendered(&app);
+    assert!(
+        text.contains("message number 119"),
+        "the newest message must be visible:\n{text}"
+    );
+    assert!(
+        !text.contains("message number 000"),
+        "the oldest message must have scrolled away:\n{text}"
+    );
+}
+
+#[test]
+fn the_filter_reports_matches_and_an_empty_state() {
+    let mut app = App::default();
+    let weekend = conversation("Weekend crew", 2, 30);
+    let jules = conversation("Jules Lee", 2, 20);
+    app.set_conversations(vec![weekend, jules]);
+
+    app.begin_filter();
+    for character in "jules".chars() {
+        app.filter_input(character);
+    }
+    let filtered = rendered(&app);
+    assert!(
+        filtered.contains("1 MATCHES"),
+        "match count missing:\n{filtered}"
+    );
+    assert!(
+        filtered.contains("Jules Lee"),
+        "the match must still be listed"
+    );
+    assert!(
+        !filtered.contains("Weekend crew"),
+        "non-matches must be hidden"
+    );
+
+    app.cancel_filter();
+    app.begin_filter();
+    for character in "zzzz".chars() {
+        app.filter_input(character);
+    }
+    let empty = rendered(&app);
+    assert!(
+        empty.contains("NO MATCHES"),
+        "an empty result needs an explicit state:\n{empty}"
+    );
+    assert!(
+        empty.contains("filter: zzzz"),
+        "the prompt must show the query being filtered on:\n{empty}"
+    );
+}
