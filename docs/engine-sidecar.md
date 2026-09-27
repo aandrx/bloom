@@ -67,8 +67,13 @@ Android/AIDL-specific and does not expose conversation history or general send.
   and a closed validation component. Personal local use of the installed app is
   one thing; redistributing a sidecar that depends on that binary is a separate
   licensing question that must be settled before any distribution.
-- Account risk. Re-registering the same hardware can affect the existing
-  registration, and Apple can throttle or block accounts.
+- Account risk. Registration identity is the pair of Apple ID and the hardware
+  identity in the `OABS` payload, so the same payload with the same Apple ID is the
+  same device, not an additional one. Re-registering issues new keys and
+  certificates that supersede the existing ones, which can break the working app
+  until it re-registers, shows additional sign-ins to the account, and risks
+  throttling if repeated. Reusing the existing state avoids a new sign-in and a
+  new registration entirely.
 - Do not run the sidecar and the OpenBubbles app against the same state directory
   concurrently.
 - The engine's event loop and callbacks must be driven correctly; an incorrect
@@ -83,11 +88,15 @@ Phase 1, no account state, no credentials:
    `frb_get_rust_content_hash`, and invokes a pure local function such as
    `newNgmIdentity`. Passing proves headless bridge initialization.
 
-Phase 2, dedicated identity, user authorized:
+Phase 2, restored state, read-only, user authorized:
 
-3. Import the user's `OABS` payload, create an identity, and run local Anisette.
-4. Register, connect, list conversations, fetch history, send and receive.
-5. Restart the sidecar and confirm state reload and continued operation.
+3. Restore the existing state, connect, and list conversations and history without
+   registering or sending anything. Nothing changes at Apple in this step.
+
+Phase 3, first write, user authorized:
+
+4. Send one outbound message and confirm delivery.
+5. Restart the sidecar and confirm inbound messages still arrive.
 6. Confirm renewal behavior after the scheduled re-registration.
 
 Phase 3, integration:
@@ -97,11 +106,13 @@ Phase 3, integration:
 
 ## Open decision
 
-Which state directory the engine uses, because it determines whether Bloom shares
-the existing registration or creates a second one:
+Which state directory the engine uses:
 
-- Reuse the existing app state: same registration, no new Apple device, but the
-  sidecar must read the app's private data directory and must not run
-  concurrently with the app.
-- Fresh dedicated state: no contact with existing app data, but it is a new
-  registration that Apple will see as another device.
+- **Reuse the existing app state (recommended).** No new Apple sign-in, no new
+  registration, no new keys; the engine restores the session and registration the
+  app already holds. The sidecar must not run concurrently with the app, and the
+  engine will read and update that private state directory while it owns it.
+- Fresh dedicated state. No contact with existing app data, but the engine must
+  sign in to Apple again and re-register the same hardware identity, which
+  supersedes the current keys for that Apple ID. Only appropriate with a throwaway
+  Apple ID, or a hardware code that differs from the one in use.
