@@ -186,7 +186,18 @@ Future<void> main(List<String> arguments) async {
   var sequence = 0;
   var stopping = false;
 
-  final handles = await api.getHandles(state: deskState.client);
+  // A failure here must not stop the sidecar from becoming ready: the daemon treats
+  // a missing ready frame as an engine failure and the whole client refuses to
+  // start. Handles only affect how the daemon labels our own messages, so an empty
+  // list degrades that label rather than the session.
+  var handles = const <String>[];
+  try {
+    handles = await api.getHandles(state: deskState.client);
+  } catch (_) {
+    stderr.writeln(
+      'could not read account handles; own messages may be labelled incorrectly',
+    );
+  }
   stdout.writeln(
     readyFrame(
       engineVersion: engineVersion,
