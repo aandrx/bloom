@@ -30,18 +30,22 @@ class SidecarConfig {
 }
 
 SidecarConfig? parseConfig(List<String> arguments) {
-  final state = _option(arguments, '--state') ??
+  final state =
+      _option(arguments, '--state') ??
       Platform.environment['BLOOM_ENGINE_STATE'];
-  final library = _option(arguments, '--library') ??
+  final library =
+      _option(arguments, '--library') ??
       Platform.environment['BLOOM_ENGINE_LIBRARY'];
   if (state == null || state.isEmpty) {
     stderr.writeln(
-        'error: explicit state directory required (--state or BLOOM_ENGINE_STATE)');
+      'error: explicit state directory required (--state or BLOOM_ENGINE_STATE)',
+    );
     return null;
   }
   if (library == null || library.isEmpty) {
     stderr.writeln(
-        'error: engine library required (--library or BLOOM_ENGINE_LIBRARY)');
+      'error: engine library required (--library or BLOOM_ENGINE_LIBRARY)',
+    );
     return null;
   }
   if (!Directory(state).existsSync()) {
@@ -94,6 +98,7 @@ api.MessageInst buildMessage({
   required String recipient,
   required String sender,
   required String text,
+  String? chatGuid,
 }) {
   final scheme = recipient.contains('@') ? 'mailto' : 'tel';
   return api.MessageInst(
@@ -102,7 +107,7 @@ api.MessageInst buildMessage({
     conversation: api.ConversationData(
       participants: <String>['$scheme:$recipient', sender],
       cvName: null,
-      senderGuid: _uuid4(),
+      senderGuid: chatGuid ?? _uuid4(),
       afterGuid: null,
     ),
     message: api.Message.message(
@@ -123,16 +128,16 @@ api.MessageInst buildMessage({
 }
 
 api.MessagePart textPart(String text) => api.MessagePart.text(
-      text,
-      api.TextFormat.flags(
-        api.TextFlags(
-          bold: false,
-          italic: false,
-          underline: false,
-          strikethrough: false,
-        ),
-      ),
-    );
+  text,
+  api.TextFormat.flags(
+    api.TextFlags(
+      bold: false,
+      italic: false,
+      underline: false,
+      strikethrough: false,
+    ),
+  ),
+);
 
 Future<void> main(List<String> arguments) async {
   final config = parseConfig(arguments);
@@ -141,15 +146,17 @@ Future<void> main(List<String> arguments) async {
     return;
   }
   if (await anotherOwnerIsRunning()) {
-    stderr
-        .writeln('error: OpenBubbles is running; refusing shared-state access');
+    stderr.writeln(
+      'error: OpenBubbles is running; refusing shared-state access',
+    );
     exitCode = 2;
     return;
   }
 
   await RustLib.init(externalLibrary: ExternalLibrary.open(config.libraryPath));
-  final restored =
-      await api.SharedPushState.restore(path: config.stateDirectory);
+  final restored = await api.SharedPushState.restore(
+    path: config.stateDirectory,
+  );
   if (restored == null) {
     stdout.writeln(errorFrame(code: ProtocolCodes.engineUnavailable));
     exitCode = 3;
@@ -162,24 +169,28 @@ Future<void> main(List<String> arguments) async {
   var sequence = 0;
   var stopping = false;
 
-  stdout.writeln(readyFrame(
-    engineVersion: engineVersion,
-    canSend: true,
-    canReadHistory: false,
-  ));
+  stdout.writeln(
+    readyFrame(
+      engineVersion: engineVersion,
+      canSend: true,
+      canReadHistory: false,
+    ),
+  );
 
   final commands = stdin
       .transform(utf8.decoder)
       .transform(const LineSplitter())
-      .listen((line) => _handleCommand(
-            line: line,
-            deskState: deskState,
-            sends: sends,
-            stop: () {
-              stopping = true;
-              api.cancelPoll(cancel: deskState.cancelPoll);
-            },
-          ));
+      .listen(
+        (line) => _handleCommand(
+          line: line,
+          deskState: deskState,
+          sends: sends,
+          stop: () {
+            stopping = true;
+            api.cancelPoll(cancel: deskState.cancelPoll);
+          },
+        ),
+      );
 
   while (!stopping) {
     final api.PollResult result;
@@ -188,7 +199,8 @@ Future<void> main(List<String> arguments) async {
     } catch (error) {
       stderr.writeln('poll failed: $error');
       stdout.writeln(
-          errorFrame(code: ProtocolCodes.engineUnavailable, retryable: true));
+        errorFrame(code: ProtocolCodes.engineUnavailable, retryable: true),
+      );
       await Future<void>.delayed(const Duration(seconds: 1));
       continue;
     }
@@ -203,12 +215,14 @@ Future<void> main(List<String> arguments) async {
           final uuid = payload['uuid'];
           final requestId = uuid is String ? sends.remove(uuid) : null;
           if (requestId != null) {
-            stdout.writeln(sendConfirmFrame(
-              requestId: requestId,
-              messageId: uuid as String,
-              accepted: payload['error'] == null,
-              error: payload['error'] as String?,
-            ));
+            stdout.writeln(
+              sendConfirmFrame(
+                requestId: requestId,
+                messageId: uuid as String,
+                accepted: payload['error'] == null,
+                error: payload['error'] as String?,
+              ),
+            );
             return;
           }
         }
@@ -248,16 +262,19 @@ Future<void> _handleCommand({
         final handles = await api.getHandles(state: deskState.client);
         final sender = chooseSender(handles, command.recipient);
         if (sender == null) {
-          stdout.writeln(errorFrame(
-            requestId: command.requestId,
-            code: ProtocolCodes.noSenderHandle,
-          ));
+          stdout.writeln(
+            errorFrame(
+              requestId: command.requestId,
+              code: ProtocolCodes.noSenderHandle,
+            ),
+          );
           return;
         }
         final inst = buildMessage(
           recipient: command.recipient,
           sender: sender,
           text: command.text,
+          chatGuid: command.chatGuid,
         );
         sends[inst.id] = command.requestId;
         final accepted = await api.send(
@@ -265,18 +282,22 @@ Future<void> _handleCommand({
           local: deskState.localBroadcast,
           msg: inst,
         );
-        stdout.writeln(sendConfirmFrame(
-          requestId: command.requestId,
-          messageId: inst.id,
-          accepted: accepted,
-        ));
+        stdout.writeln(
+          sendConfirmFrame(
+            requestId: command.requestId,
+            messageId: inst.id,
+            accepted: accepted,
+          ),
+        );
       } catch (error) {
         stderr.writeln('send failed: $error');
-        stdout.writeln(errorFrame(
-          requestId: command.requestId,
-          code: ProtocolCodes.sendFailed,
-          retryable: true,
-        ));
+        stdout.writeln(
+          errorFrame(
+            requestId: command.requestId,
+            code: ProtocolCodes.sendFailed,
+            retryable: true,
+          ),
+        );
       }
   }
 }

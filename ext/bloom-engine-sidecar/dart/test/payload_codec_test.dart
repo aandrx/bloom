@@ -9,85 +9,92 @@ import 'package:bloom_engine_sidecar/upstream/api/api.dart' as api;
 import 'package:test/test.dart';
 
 api.MMCSFile _mmcs() => api.MMCSFile(
-      signature: Uint8List.fromList(<int>[1, 2, 3]),
-      object: 'object',
-      url: 'https://example.invalid/file',
-      key: Uint8List.fromList(<int>[4, 5, 6]),
-      size: 128,
-    );
+  signature: Uint8List.fromList(<int>[1, 2, 3]),
+  object: 'object',
+  url: 'https://example.invalid/file',
+  key: Uint8List.fromList(<int>[4, 5, 6]),
+  size: 128,
+);
 
 api.MessagePart textPart(String text) => api.MessagePart.text(
-      text,
-      api.TextFormat.flags(
-        api.TextFlags(
-          bold: false,
-          italic: false,
-          underline: false,
-          strikethrough: false,
-        ),
-      ),
-    );
+  text,
+  api.TextFormat.flags(
+    api.TextFlags(
+      bold: false,
+      italic: false,
+      underline: false,
+      strikethrough: false,
+    ),
+  ),
+);
 
 api.MessageInst fullInstance({
   String id = 'message-uuid',
   String sender = 'tel:+15550000001',
-}) =>
-    api.MessageInst(
-      id: id,
-      sender: sender,
-      conversation: api.ConversationData(
-        participants: <String>[sender, 'mailto:self@example.invalid'],
-        cvName: null,
-        senderGuid: 'iMessage;-;$sender',
-        afterGuid: null,
-      ),
-      message: api.Message.message(
-        api.NormalMessage(
-          parts: api.MessageParts(
-            field0: <api.IndexedMessagePart>[
-              api.IndexedMessagePart(part_: textPart('hello'), idx: 0),
-              api.IndexedMessagePart(
-                part_: api.MessagePart.attachment(
-                  api.Attachment(
-                    aType: api.AttachmentType.mmcs(_mmcs()),
-                    part_: 1,
-                    utiType: 'public.jpeg',
-                    mime: 'image/jpeg',
-                    name: 'photo.jpg',
-                    iris: false,
-                  ),
-                ),
-                idx: 1,
+}) => api.MessageInst(
+  id: id,
+  sender: sender,
+  conversation: api.ConversationData(
+    participants: <String>[sender, 'mailto:self@example.invalid'],
+    cvName: null,
+    senderGuid: 'iMessage;-;$sender',
+    afterGuid: null,
+  ),
+  message: api.Message.message(
+    api.NormalMessage(
+      parts: api.MessageParts(
+        field0: <api.IndexedMessagePart>[
+          api.IndexedMessagePart(part_: textPart('hello'), idx: 0),
+          api.IndexedMessagePart(
+            part_: api.MessagePart.attachment(
+              api.Attachment(
+                aType: api.AttachmentType.mmcs(_mmcs()),
+                part_: 1,
+                utiType: 'public.jpeg',
+                mime: 'image/jpeg',
+                name: 'photo.jpg',
+                iris: false,
               ),
-              api.IndexedMessagePart(
-                part_:
-                    const api.MessagePart.mention('@bob', 'tel:+15550000002'),
-                idx: 2,
-              ),
-            ],
+            ),
+            idx: 1,
           ),
-          service: const api.MessageType.iMessage(),
-          voice: false,
-        ),
+          api.IndexedMessagePart(
+            part_: const api.MessagePart.mention('@bob', 'tel:+15550000002'),
+            idx: 2,
+          ),
+        ],
       ),
-      sentTimestamp: 1700000000000,
-      sendDelivered: true,
-      verificationFailed: false,
-    );
+      service: const api.MessageType.iMessage(),
+      voice: false,
+    ),
+  ),
+  sentTimestamp: 1700000000000,
+  sendDelivered: true,
+  verificationFailed: false,
+);
 
 /// The contract every encoded payload must satisfy: it names its variant and either
 /// carries complete content or an explicit unsupported marker. Silent degradation
 /// such as "Instance of ..." must never appear.
 void expectCompleteOrMarked(Map<String, Object?> encoded) {
-  expect(encoded['variant'], isA<String>(),
-      reason: 'payload must name its variant');
+  expect(
+    encoded['variant'],
+    isA<String>(),
+    reason: 'payload must name its variant',
+  );
   final complete = encoded['complete'];
   expect(complete, isA<bool>(), reason: 'payload must declare completeness');
   if (complete == false) {
-    expect(encoded[kUnsupported], isNotNull,
-        reason: 'incomplete payloads must carry an explicit marker');
-    expect(encoded['reason'], isNotNull,
-        reason: 'incomplete payloads must explain why');
+    expect(
+      encoded[kUnsupported],
+      isNotNull,
+      reason: 'incomplete payloads must carry an explicit marker',
+    );
+    expect(
+      encoded['reason'],
+      isNotNull,
+      reason: 'incomplete payloads must explain why',
+    );
   }
   expect(jsonEncode(encoded), isNot(contains('Instance of')));
 }
@@ -142,12 +149,16 @@ void main() {
     });
 
     test('distinct messages stay distinct', () {
-      final first = jsonEncode(encodePushMessage(
-        api.PushMessage.iMessage(fullInstance(id: 'uuid-one')),
-      ));
-      final second = jsonEncode(encodePushMessage(
-        api.PushMessage.iMessage(fullInstance(id: 'uuid-two')),
-      ));
+      final first = jsonEncode(
+        encodePushMessage(
+          api.PushMessage.iMessage(fullInstance(id: 'uuid-one')),
+        ),
+      );
+      final second = jsonEncode(
+        encodePushMessage(
+          api.PushMessage.iMessage(fullInstance(id: 'uuid-two')),
+        ),
+      );
       expect(first, isNot(second));
     });
 
@@ -195,8 +206,9 @@ void main() {
         sendDelivered: false,
         verificationFailed: false,
       );
-      final encoded =
-          encodePushMessage(api.PushMessage.iMessage(attachmentOnly));
+      final encoded = encodePushMessage(
+        api.PushMessage.iMessage(attachmentOnly),
+      );
       expect(textFromEncoded(encoded), isNull);
     });
   });
@@ -247,7 +259,9 @@ void main() {
       final encoded = encodePushMessage(
         api.PushMessage.statusUpdate(
           const api.StatusKitMessage.statusChanged(
-              user: 'someone', allowed: true),
+            user: 'someone',
+            allowed: true,
+          ),
         ),
       );
       expectCompleteOrMarked(encoded);
@@ -286,42 +300,48 @@ void main() {
 
   group('outbound message variants', () {
     api.MessageInst withMessage(api.Message message) => api.MessageInst(
-          id: 'uuid',
-          sender: 'mailto:me@example.invalid',
-          conversation: null,
-          message: message,
-          sentTimestamp: 5,
-          sendDelivered: false,
-          verificationFailed: false,
-        );
+      id: 'uuid',
+      sender: 'mailto:me@example.invalid',
+      conversation: null,
+      message: message,
+      sentTimestamp: 5,
+      sendDelivered: false,
+      verificationFailed: false,
+    );
 
     test('unsend and edit encode their fields', () {
-      final unsend = encodePushMessage(api.PushMessage.iMessage(
-        withMessage(
-          const api.Message.unsend(api.UnsendMessage(tuuid: 't', editPart: 1)),
+      final unsend = encodePushMessage(
+        api.PushMessage.iMessage(
+          withMessage(
+            const api.Message.unsend(
+              api.UnsendMessage(tuuid: 't', editPart: 1),
+            ),
+          ),
         ),
-      ));
+      );
       expectCompleteOrMarked(unsend);
       final unsendMessage = messageBody(unsend);
       expect(unsendMessage['type'], 'unsend');
       expect(unsendMessage['tuuid'], 't');
       expect(unsendMessage['complete'], isTrue);
 
-      final edit = encodePushMessage(api.PushMessage.iMessage(
-        withMessage(
-          api.Message.edit(
-            api.EditMessage(
-              tuuid: 't',
-              editPart: 1,
-              newParts: api.MessageParts(
-                field0: <api.IndexedMessagePart>[
-                  api.IndexedMessagePart(part_: textPart('edited'), idx: 0),
-                ],
+      final edit = encodePushMessage(
+        api.PushMessage.iMessage(
+          withMessage(
+            api.Message.edit(
+              api.EditMessage(
+                tuuid: 't',
+                editPart: 1,
+                newParts: api.MessageParts(
+                  field0: <api.IndexedMessagePart>[
+                    api.IndexedMessagePart(part_: textPart('edited'), idx: 0),
+                  ],
+                ),
               ),
             ),
           ),
         ),
-      ));
+      );
       expectCompleteOrMarked(edit);
       final editMessage = messageBody(edit);
       expect(editMessage['type'], 'edit');
@@ -330,11 +350,15 @@ void main() {
     });
 
     test('unmodelled message variants are marked', () {
-      final encoded = encodePushMessage(api.PushMessage.iMessage(
-        withMessage(
-          const api.Message.iconChange(api.IconChangeMessage(groupVersion: 1)),
+      final encoded = encodePushMessage(
+        api.PushMessage.iMessage(
+          withMessage(
+            const api.Message.iconChange(
+              api.IconChangeMessage(groupVersion: 1),
+            ),
+          ),
         ),
-      ));
+      );
       expectCompleteOrMarked(encoded);
       final value = messageBody(encoded);
       expect(value['type'], 'iconChange');
@@ -347,8 +371,9 @@ void main() {
         const api.Message.delivered(),
         const api.Message.read(),
       ]) {
-        final encoded =
-            encodePushMessage(api.PushMessage.iMessage(withMessage(message)));
+        final encoded = encodePushMessage(
+          api.PushMessage.iMessage(withMessage(message)),
+        );
         expectCompleteOrMarked(encoded);
         expect(messageBody(encoded)['complete'], isTrue);
       }

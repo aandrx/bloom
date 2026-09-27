@@ -11,13 +11,15 @@ Map<String, Object?> decodeFrame(String line) =>
 void main() {
   group('commands', () {
     test('accepts a well formed send', () {
-      final command = decodeCommand(jsonEncode(<String, Object?>{
-        'version': protocolVersion,
-        'type': 'send',
-        'request_id': 7,
-        'recipient': 'someone@example.com',
-        'text': 'hello',
-      }));
+      final command = decodeCommand(
+        jsonEncode(<String, Object?>{
+          'version': protocolVersion,
+          'type': 'send',
+          'request_id': 7,
+          'recipient': 'someone@example.com',
+          'text': 'hello',
+        }),
+      );
       expect(command, isA<SendCommand>());
       final send = command as SendCommand;
       expect(send.requestId, 7);
@@ -25,12 +27,51 @@ void main() {
       expect(send.text, 'hello');
     });
 
+    test('accepts an optional chat guid for threading', () {
+      final command = decodeCommand(
+        jsonEncode(<String, Object?>{
+          'version': protocolVersion,
+          'type': 'send',
+          'request_id': 8,
+          'recipient': 'someone@example.com',
+          'text': 'hi',
+          'chat_guid': 'iMessage;-;someone@example.com',
+        }),
+      );
+      expect(
+        (command as SendCommand).chatGuid,
+        'iMessage;-;someone@example.com',
+      );
+
+      expect(
+        () => decodeCommand(
+          jsonEncode(<String, Object?>{
+            'version': protocolVersion,
+            'type': 'send',
+            'request_id': 8,
+            'recipient': 'someone@example.com',
+            'text': 'hi',
+            'chat_guid': 5,
+          }),
+        ),
+        throwsA(
+          isA<ProtocolException>().having(
+            (e) => e.code,
+            'code',
+            ProtocolCodes.invalidFrame,
+          ),
+        ),
+      );
+    });
+
     test('accepts shutdown', () {
-      final command = decodeCommand(jsonEncode(<String, Object?>{
-        'version': protocolVersion,
-        'type': 'shutdown',
-        'request_id': 1,
-      }));
+      final command = decodeCommand(
+        jsonEncode(<String, Object?>{
+          'version': protocolVersion,
+          'type': 'shutdown',
+          'request_id': 1,
+        }),
+      );
       expect(command, isA<ShutdownCommand>());
     });
 
@@ -65,8 +106,9 @@ void main() {
       for (final entry in cases.entries) {
         expect(
           () => decodeCommand(entry.key),
-          throwsA(isA<ProtocolException>()
-              .having((e) => e.code, 'code', entry.value)),
+          throwsA(
+            isA<ProtocolException>().having((e) => e.code, 'code', entry.value),
+          ),
           reason: 'input: ${entry.key}',
         );
       }
@@ -76,8 +118,13 @@ void main() {
       final huge = 'x' * (maxFrameBytes + 1);
       expect(
         () => decodeCommand(huge),
-        throwsA(isA<ProtocolException>()
-            .having((e) => e.code, 'code', ProtocolCodes.frameTooLarge)),
+        throwsA(
+          isA<ProtocolException>().having(
+            (e) => e.code,
+            'code',
+            ProtocolCodes.frameTooLarge,
+          ),
+        ),
       );
     });
   });
@@ -100,11 +147,13 @@ void main() {
     });
 
     test('ready advertises capabilities', () {
-      final frame = decodeFrame(readyFrame(
-        engineVersion: 'openbubbles-v1',
-        canSend: true,
-        canReadHistory: false,
-      ));
+      final frame = decodeFrame(
+        readyFrame(
+          engineVersion: 'openbubbles-v1',
+          canSend: true,
+          canReadHistory: false,
+        ),
+      );
       expect(frame['type'], 'ready');
       expect(frame['engine_version'], 'openbubbles-v1');
       expect(frame['capabilities'], <String, Object?>{
@@ -114,12 +163,14 @@ void main() {
     });
 
     test('send confirmation correlates the request', () {
-      final frame = decodeFrame(sendConfirmFrame(
-        requestId: 42,
-        messageId: 'uuid',
-        accepted: false,
-        error: 'not delivered',
-      ));
+      final frame = decodeFrame(
+        sendConfirmFrame(
+          requestId: 42,
+          messageId: 'uuid',
+          accepted: false,
+          error: 'not delivered',
+        ),
+      );
       expect(frame['type'], 'send_confirmation');
       expect(frame['request_id'], 42);
       expect(frame['accepted'], isFalse);

@@ -21,65 +21,65 @@ const String _opaqueHandleReason =
     'carries opaque engine handles; not serializable outside the engine process';
 
 Map<String, Object?> encodePushMessage(api.PushMessage value) => value.map(
-      iMessage: (variant) => <String, Object?>{
-        'variant': 'iMessage',
-        'complete': true,
-        'inst': encodeMessageInst(variant.field0),
-      },
-      sendConfirm: (variant) => <String, Object?>{
-        'variant': 'sendConfirm',
-        'complete': true,
-        'uuid': variant.uuid,
-        'error': variant.error,
-      },
-      registrationState: (variant) => <String, Object?>{
-        'variant': 'registrationState',
-        'complete': true,
-        'state': encodeRegisterState(variant.field0),
-      },
-      twoFaAuthEvent: (variant) => <String, Object?>{
-        'variant': 'twoFaAuthEvent',
-        'complete': true,
-        'value': variant.field0,
-      },
-      circleFinishEvent: (_) => <String, Object?>{
-        'variant': 'circleFinishEvent',
-        'complete': true,
-      },
-      beaconShared: (variant) => <String, Object?>{
-        'variant': 'beaconShared',
-        'complete': true,
-        'sender': variant.sender,
-        'beacon': variant.beacon,
-        'attributes': encodeBeaconAttributes(variant.attributes),
-      },
-      newPhotostream: (variant) => <String, Object?>{
-        'variant': 'newPhotostream',
-        'complete': false,
-        kUnsupported: 'newPhotostream',
-        'reason': _opaqueHandleReason,
-        'album': encodeAlbumMeta(variant.field0),
-      },
-      faceTime: (variant) => <String, Object?>{
-        'variant': 'faceTime',
-        'complete': false,
-        kUnsupported: 'faceTime',
-        'reason': 'FaceTime signalling not modelled yet',
-        'message': encodeFtMessage(variant.field0),
-      },
-      statusUpdate: (variant) => <String, Object?>{
-        'variant': 'statusUpdate',
-        'complete': true,
-        'message': encodeStatusKit(variant.field0),
-      },
-      idms: (variant) => <String, Object?>{
-        'variant': 'idms',
-        'complete': false,
-        kUnsupported: 'idms',
-        'reason': 'IDMS sign-in signalling not modelled yet',
-        'message': encodeIdms(variant.field0),
-      },
-    );
+  iMessage: (variant) => <String, Object?>{
+    'variant': 'iMessage',
+    'complete': true,
+    'inst': encodeMessageInst(variant.field0),
+  },
+  sendConfirm: (variant) => <String, Object?>{
+    'variant': 'sendConfirm',
+    'complete': true,
+    'uuid': variant.uuid,
+    'error': variant.error,
+  },
+  registrationState: (variant) => <String, Object?>{
+    'variant': 'registrationState',
+    'complete': true,
+    'state': encodeRegisterState(variant.field0),
+  },
+  twoFaAuthEvent: (variant) => <String, Object?>{
+    'variant': 'twoFaAuthEvent',
+    'complete': true,
+    'value': variant.field0,
+  },
+  circleFinishEvent: (_) => <String, Object?>{
+    'variant': 'circleFinishEvent',
+    'complete': true,
+  },
+  beaconShared: (variant) => <String, Object?>{
+    'variant': 'beaconShared',
+    'complete': true,
+    'sender': variant.sender,
+    'beacon': variant.beacon,
+    'attributes': encodeBeaconAttributes(variant.attributes),
+  },
+  newPhotostream: (variant) => <String, Object?>{
+    'variant': 'newPhotostream',
+    'complete': false,
+    kUnsupported: 'newPhotostream',
+    'reason': _opaqueHandleReason,
+    'album': encodeAlbumMeta(variant.field0),
+  },
+  faceTime: (variant) => <String, Object?>{
+    'variant': 'faceTime',
+    'complete': false,
+    kUnsupported: 'faceTime',
+    'reason': 'FaceTime signalling not modelled yet',
+    'message': encodeFtMessage(variant.field0),
+  },
+  statusUpdate: (variant) => <String, Object?>{
+    'variant': 'statusUpdate',
+    'complete': true,
+    'message': encodeStatusKit(variant.field0),
+  },
+  idms: (variant) => <String, Object?>{
+    'variant': 'idms',
+    'complete': false,
+    kUnsupported: 'idms',
+    'reason': 'IDMS sign-in signalling not modelled yet',
+    'message': encodeIdms(variant.field0),
+  },
+);
 
 Map<String, Object?> encodeMessageInst(api.MessageInst value) =>
     <String, Object?>{
@@ -103,110 +103,112 @@ Map<String, Object?> encodeConversation(api.ConversationData value) =>
     };
 
 Map<String, Object?> _unmodelled(String name) => <String, Object?>{
-      'type': name,
-      'complete': false,
-      kUnsupported: name,
-      'reason': 'message variant not modelled yet',
-    };
+  'type': name,
+  'complete': false,
+  kUnsupported: name,
+  'reason': 'message variant not modelled yet',
+};
 
 Map<String, Object?> encodeMessage(api.Message value) => value.map(
-      message: (variant) => <String, Object?>{
-        'type': 'normal',
-        'complete': true,
-        'value': encodeNormalMessage(variant.field0),
-      },
-      react: (variant) => <String, Object?>{
-        'type': 'react',
-        'complete': true,
-        'to_uuid': variant.field0.toUuid,
-        'to_part': variant.field0.toPart,
-        'reaction': variant.field0.reaction.map(
-          react: (r) => <String, Object?>{
-            'kind': 'react',
-            'reaction': r.reaction.map(
-              heart: (_) => 'heart',
-              like: (_) => 'like',
-              dislike: (_) => 'dislike',
-              laugh: (_) => 'laugh',
-              emphasize: (_) => 'emphasize',
-              question: (_) => 'question',
-              emoji: (v) => v.field0,
-              sticker: (_) => 'sticker',
-            ),
-            'enable': r.enable,
-          },
-          extension_: (r) => <String, Object?>{
-            'kind': 'extension',
-            'is_meta': r.isMeta,
-            'body': encodeParts(r.body),
-          },
+  message: (variant) => <String, Object?>{
+    'type': 'normal',
+    'complete': true,
+    'value': encodeNormalMessage(variant.field0),
+  },
+  react: (variant) => <String, Object?>{
+    'type': 'react',
+    'complete': true,
+    'to_uuid': variant.field0.toUuid,
+    'to_part': variant.field0.toPart,
+    'reaction': variant.field0.reaction.map(
+      react: (r) => <String, Object?>{
+        'kind': 'react',
+        'reaction': r.reaction.map(
+          heart: (_) => 'heart',
+          like: (_) => 'like',
+          dislike: (_) => 'dislike',
+          laugh: (_) => 'laugh',
+          emphasize: (_) => 'emphasize',
+          question: (_) => 'question',
+          emoji: (v) => v.field0,
+          sticker: (_) => 'sticker',
         ),
-        'to_text': variant.field0.toText,
+        'enable': r.enable,
       },
-      unsend: (variant) => <String, Object?>{
-        'type': 'unsend',
-        'complete': true,
-        'tuuid': variant.field0.tuuid,
-        'edit_part': variant.field0.editPart,
+      extension_: (r) => <String, Object?>{
+        'kind': 'extension',
+        'is_meta': r.isMeta,
+        'body': encodeParts(r.body),
       },
-      edit: (variant) => <String, Object?>{
-        'type': 'edit',
-        'complete': true,
-        'tuuid': variant.field0.tuuid,
-        'edit_part': variant.field0.editPart,
-        'new_parts': encodeParts(variant.field0.newParts),
-      },
-      renameMessage: (variant) => <String, Object?>{
-        'type': 'rename',
-        'complete': true,
-        'new_name': variant.field0.newName,
-      },
-      changeParticipants: (variant) => <String, Object?>{
-        'type': 'changeParticipants',
-        'complete': true,
-        'new_participants': variant.field0.newParticipants,
-        'group_version': variant.field0.groupVersion,
-      },
-      delivered: (_) =>
-          <String, Object?>{'type': 'delivered', 'complete': true},
-      read: (_) => <String, Object?>{'type': 'read', 'complete': true},
-      markUnread: (_) =>
-          <String, Object?>{'type': 'markUnread', 'complete': true},
-      typing: (variant) => <String, Object?>{
-        'type': 'typing',
-        'complete': true,
-        'typing': variant.field0,
-      },
-      enableSmsActivation: (variant) => <String, Object?>{
-        'type': 'enableSmsActivation',
-        'complete': true,
-        'value': variant.field0,
-      },
-      smsConfirmSent: (variant) => <String, Object?>{
-        'type': 'smsConfirmSent',
-        'complete': true,
-        'value': variant.field0,
-      },
-      messageReadOnDevice: (_) =>
-          <String, Object?>{'type': 'messageReadOnDevice', 'complete': true},
-      peerCacheInvalidate: (_) =>
-          <String, Object?>{'type': 'peerCacheInvalidate', 'complete': true},
-      unschedule: (_) =>
-          <String, Object?>{'type': 'unschedule', 'complete': true},
-      notifyAnyways: (_) =>
-          <String, Object?>{'type': 'notifyAnyways', 'complete': true},
-      iconChange: (variant) => _unmodelled('iconChange'),
-      updateExtension: (variant) => _unmodelled('updateExtension'),
-      error: (variant) => _unmodelled('error'),
-      moveToRecycleBin: (variant) => _unmodelled('moveToRecycleBin'),
-      recoverChat: (variant) => _unmodelled('recoverChat'),
-      permanentDelete: (variant) => _unmodelled('permanentDelete'),
-      updateProfile: (variant) => _unmodelled('updateProfile'),
-      updateProfileSharing: (variant) => _unmodelled('updateProfileSharing'),
-      shareProfile: (variant) => _unmodelled('shareProfile'),
-      setTranscriptBackground: (variant) =>
-          _unmodelled('setTranscriptBackground'),
-    );
+    ),
+    'to_text': variant.field0.toText,
+  },
+  unsend: (variant) => <String, Object?>{
+    'type': 'unsend',
+    'complete': true,
+    'tuuid': variant.field0.tuuid,
+    'edit_part': variant.field0.editPart,
+  },
+  edit: (variant) => <String, Object?>{
+    'type': 'edit',
+    'complete': true,
+    'tuuid': variant.field0.tuuid,
+    'edit_part': variant.field0.editPart,
+    'new_parts': encodeParts(variant.field0.newParts),
+  },
+  renameMessage: (variant) => <String, Object?>{
+    'type': 'rename',
+    'complete': true,
+    'new_name': variant.field0.newName,
+  },
+  changeParticipants: (variant) => <String, Object?>{
+    'type': 'changeParticipants',
+    'complete': true,
+    'new_participants': variant.field0.newParticipants,
+    'group_version': variant.field0.groupVersion,
+  },
+  delivered: (_) => <String, Object?>{'type': 'delivered', 'complete': true},
+  read: (_) => <String, Object?>{'type': 'read', 'complete': true},
+  markUnread: (_) => <String, Object?>{'type': 'markUnread', 'complete': true},
+  typing: (variant) => <String, Object?>{
+    'type': 'typing',
+    'complete': true,
+    'typing': variant.field0,
+  },
+  enableSmsActivation: (variant) => <String, Object?>{
+    'type': 'enableSmsActivation',
+    'complete': true,
+    'value': variant.field0,
+  },
+  smsConfirmSent: (variant) => <String, Object?>{
+    'type': 'smsConfirmSent',
+    'complete': true,
+    'value': variant.field0,
+  },
+  messageReadOnDevice: (_) => <String, Object?>{
+    'type': 'messageReadOnDevice',
+    'complete': true,
+  },
+  peerCacheInvalidate: (_) => <String, Object?>{
+    'type': 'peerCacheInvalidate',
+    'complete': true,
+  },
+  unschedule: (_) => <String, Object?>{'type': 'unschedule', 'complete': true},
+  notifyAnyways: (_) => <String, Object?>{
+    'type': 'notifyAnyways',
+    'complete': true,
+  },
+  iconChange: (variant) => _unmodelled('iconChange'),
+  updateExtension: (variant) => _unmodelled('updateExtension'),
+  error: (variant) => _unmodelled('error'),
+  moveToRecycleBin: (variant) => _unmodelled('moveToRecycleBin'),
+  recoverChat: (variant) => _unmodelled('recoverChat'),
+  permanentDelete: (variant) => _unmodelled('permanentDelete'),
+  updateProfile: (variant) => _unmodelled('updateProfile'),
+  updateProfileSharing: (variant) => _unmodelled('updateProfileSharing'),
+  shareProfile: (variant) => _unmodelled('shareProfile'),
+  setTranscriptBackground: (variant) => _unmodelled('setTranscriptBackground'),
+);
 
 Map<String, Object?> encodeNormalMessage(api.NormalMessage value) =>
     <String, Object?>{
@@ -224,15 +226,15 @@ Map<String, Object?> encodeNormalMessage(api.NormalMessage value) =>
     };
 
 Map<String, Object?> encodeService(api.MessageType value) => value.map(
-      iMessage: (_) => <String, Object?>{'type': 'iMessage', 'complete': true},
-      sms: (variant) => <String, Object?>{
-        'type': 'sms',
-        'complete': true,
-        'is_phone': variant.isPhone,
-        'using_number': variant.usingNumber,
-        'from_handle': variant.fromHandle,
-      },
-    );
+  iMessage: (_) => <String, Object?>{'type': 'iMessage', 'complete': true},
+  sms: (variant) => <String, Object?>{
+    'type': 'sms',
+    'complete': true,
+    'is_phone': variant.isPhone,
+    'using_number': variant.usingNumber,
+    'from_handle': variant.fromHandle,
+  },
+);
 
 List<Map<String, Object?>> encodeParts(api.MessageParts value) =>
     value.field0.map(encodeIndexedPart).toList();
@@ -296,17 +298,17 @@ Map<String, Object?> encodeIndexedPart(api.IndexedMessagePart value) =>
     };
 
 Map<String, Object?> encodeRegisterState(api.RegisterState value) => value.map(
-      registered: (variant) => <String, Object?>{
-        'state': 'registered',
-        'next_s': variant.nextS.toString(),
-      },
-      registering: (variant) => <String, Object?>{'state': 'registering'},
-      failed: (variant) => <String, Object?>{
-        'state': 'failed',
-        'error': variant.error,
-        'retry_wait': variant.retryWait?.toString(),
-      },
-    );
+  registered: (variant) => <String, Object?>{
+    'state': 'registered',
+    'next_s': variant.nextS.toString(),
+  },
+  registering: (variant) => <String, Object?>{'state': 'registering'},
+  failed: (variant) => <String, Object?>{
+    'state': 'failed',
+    'error': variant.error,
+    'retry_wait': variant.retryWait?.toString(),
+  },
+);
 
 Map<String, Object?> encodeBeaconAttributes(api.BeaconAttributes value) =>
     <String, Object?>{
@@ -331,32 +333,31 @@ Map<String, Object?> encodeAlbumMeta(api.SharedAlbum value) =>
     };
 
 Map<String, Object?> encodeFtMessage(api.FTMessage value) => value.map(
-      letMeInRequest: (_) => <String, Object?>{'variant': 'letMeInRequest'},
-      linkChanged: (_) => <String, Object?>{'variant': 'linkChanged'},
-      joinEvent: (_) => <String, Object?>{'variant': 'joinEvent'},
-      addMembers: (_) => <String, Object?>{'variant': 'addMembers'},
-      removeMembers: (_) => <String, Object?>{'variant': 'removeMembers'},
-      leaveEvent: (_) => <String, Object?>{'variant': 'leaveEvent'},
-      ring: (_) => <String, Object?>{'variant': 'ring'},
-      decline: (_) => <String, Object?>{'variant': 'decline'},
-      respondedElsewhere: (_) =>
-          <String, Object?>{'variant': 'respondedElsewhere'},
-    );
+  letMeInRequest: (_) => <String, Object?>{'variant': 'letMeInRequest'},
+  linkChanged: (_) => <String, Object?>{'variant': 'linkChanged'},
+  joinEvent: (_) => <String, Object?>{'variant': 'joinEvent'},
+  addMembers: (_) => <String, Object?>{'variant': 'addMembers'},
+  removeMembers: (_) => <String, Object?>{'variant': 'removeMembers'},
+  leaveEvent: (_) => <String, Object?>{'variant': 'leaveEvent'},
+  ring: (_) => <String, Object?>{'variant': 'ring'},
+  decline: (_) => <String, Object?>{'variant': 'decline'},
+  respondedElsewhere: (_) => <String, Object?>{'variant': 'respondedElsewhere'},
+);
 
 Map<String, Object?> encodeStatusKit(api.StatusKitMessage value) => value.map(
-      statusChanged: (variant) => <String, Object?>{
-        'variant': 'statusChanged',
-        'user': variant.user,
-        'mode': variant.mode,
-        'allowed': variant.allowed,
-      },
-    );
+  statusChanged: (variant) => <String, Object?>{
+    'variant': 'statusChanged',
+    'user': variant.user,
+    'mode': variant.mode,
+    'allowed': variant.allowed,
+  },
+);
 
 Map<String, Object?> encodeIdms(api.IdmsMessage value) => value.map(
-      requestedSignIn: (_) => <String, Object?>{'variant': 'requestedSignIn'},
-      teardownSignIn: (_) => <String, Object?>{'variant': 'teardownSignIn'},
-      circleRequest: (_) => <String, Object?>{'variant': 'circleRequest'},
-    );
+  requestedSignIn: (_) => <String, Object?>{'variant': 'requestedSignIn'},
+  teardownSignIn: (_) => <String, Object?>{'variant': 'teardownSignIn'},
+  circleRequest: (_) => <String, Object?>{'variant': 'circleRequest'},
+);
 
 /// Concatenate text parts of an encoded inbound message, if any.
 String? textFromEncoded(Map<String, Object?> encoded) {
@@ -383,6 +384,6 @@ String? textFromEncoded(Map<String, Object?> encoded) {
 
 /// Encode raw bytes for transport without lossy conversion.
 Map<String, Object?> encodeBytes(Uint8List bytes) => <String, Object?>{
-      'bytes_base64': base64.encode(bytes),
-      'length': bytes.length,
-    };
+  'bytes_base64': base64.encode(bytes),
+  'length': bytes.length,
+};

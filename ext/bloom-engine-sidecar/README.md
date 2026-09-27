@@ -46,6 +46,9 @@ Sidecar to daemon:
 - `inbound_message` - `sequence` plus the encoded engine payload
 - `send_confirmation` - `request_id`, `message_id`, `accepted`, optional `error`
 - `shutdown_ack` - `request_id`
+- `conversation` - one imported conversation (`sequence`, `conversation`)
+- `history_message` - one imported historical message (`sequence`, `message`)
+- `history_complete` - `conversations`, `messages`, `limited`
 - `session_state` - `state` plus an optional `reason`
 - `error` - bounded `code`, `retryable`, optional `request_id`
 
@@ -57,6 +60,7 @@ so content is never silently replaced by a `toString()` placeholder.
 ## Status
 
 Implemented and covered by offline tests: encoder, protocol, configuration guards.
+The startup history import frames are defined but not yet produced.
 Not yet implemented: daemon integration, writing into Bloom's encrypted store, and
 reading pre-existing OpenBubbles history (which lives in the app's Dart ObjectBox
 database, not in the engine).
