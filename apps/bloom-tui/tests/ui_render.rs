@@ -585,3 +585,58 @@ fn the_scrolled_state_explains_itself_without_changing_the_default_hint_row() {
         "a scrolled transcript must say how to get back:\n{scrolled}"
     );
 }
+
+#[test]
+fn no_scroll_position_ends_the_transcript_on_a_bare_byline() {
+    // A byline whose body is below the fold reads as a rendering fault. Walk every
+    // scroll position and assert the row above the composer rule is never a byline.
+    let mut app = App::default();
+    let only = conversation("Long thread", 2, 1);
+    app.set_conversations(vec![only.clone()]);
+    app.selected = Some(only.id.clone());
+    for index in 0..24 {
+        app.upsert(
+            only.id.clone(),
+            message(
+                &only,
+                &format!("m{index:03}"),
+                1_700_000_000_000 + index * 60_000,
+                &format!("message number {index:03} with some words in it"),
+                index % 2 == 0,
+            ),
+        );
+    }
+
+    let mut checked = 0;
+    for back in 0..60 {
+        app.scroll = back;
+        let text = rendered(&app);
+        let rows: Vec<&str> = text.lines().collect();
+        // The composer rule is the lowest long horizontal run inside the window,
+        // above the frame's own bottom border.
+        let rule = rows
+            .iter()
+            .enumerate()
+            .rev()
+            .skip(1)
+            .find(|(_, row)| row.matches('─').count() > 40)
+            .map(|(index, _)| index)
+            .expect("the composer rule must be drawn");
+        let above = rows[rule - 1];
+        let has_clock = above
+            .split(|c: char| !c.is_ascii_digit() && c != ':')
+            .any(|token| {
+                let parts: Vec<&str> = token.split(':').collect();
+                parts.len() == 2
+                    && parts[0].len() == 2
+                    && parts[1].len() == 2
+                    && !parts[0].is_empty()
+            });
+        assert!(
+            !has_clock,
+            "scroll position {back} ends the transcript on a bare byline:\n{text}"
+        );
+        checked += 1;
+    }
+    assert!(checked > 40, "the test must actually walk scroll positions");
+}

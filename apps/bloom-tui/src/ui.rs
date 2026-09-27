@@ -287,6 +287,7 @@ pub fn render(frame: &mut Frame<'_>, app: &App) {
         Rect::new(right[0].x, right[0].y + 1, right[0].width, 1),
     );
     let mut lines = Vec::new();
+    let mut header_lines: Vec<usize> = Vec::new();
     if let Some(messages) = app.selected.as_ref().and_then(|id| app.messages.get(id)) {
         // Pad speaker names to a common column so timestamps line up, the way the
         // mockup's transcript does. Capped so one long name cannot push the times
@@ -305,6 +306,9 @@ pub fn render(frame: &mut Frame<'_>, app: &App) {
         for message in messages {
             let speaker = speaker_label(message, app.selected_conversation());
             let padded = display_pad(&speaker, speaker_column);
+            // Remember where each byline lands, so the viewport can avoid ending on one
+            // with its body below the fold.
+            header_lines.push(lines.len());
             lines.push(Line::from(vec![
                 Span::styled(
                     padded,
@@ -347,21 +351,39 @@ pub fn render(frame: &mut Frame<'_>, app: &App) {
     // the row the renderer will actually use; scroll 0 pins to the newest content
     // and an over-height message therefore shows its tail rather than vanishing.
     let width = content.width.max(1) as usize;
-    let rows: usize = lines
-        .iter()
-        .map(|line| {
-            let text: String = line
-                .spans
-                .iter()
-                .map(|span| span.content.as_ref())
-                .collect();
-            wrap_text(&text, width).len().max(1)
-        })
-        .sum();
+    let mut line_starts: Vec<usize> = Vec::with_capacity(lines.len());
+    let mut rows = 0usize;
+    for line in &lines {
+        let text: String = line
+            .spans
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect();
+        let count = wrap_text(&text, width).len().max(1);
+        line_starts.push(rows);
+        rows += count;
+    }
     let max_scroll = rows.saturating_sub(content.height as usize);
     // `Paragraph::scroll` offsets from the top, so a reading position of zero rows
     // back from the newest message is the bottom of the transcript.
-    let back = app.scroll.min(max_scroll);
+    let mut back = app.scroll.min(max_scroll);
+    // A byline on the last visible row reads as a fault: the header is shown but its
+    // message is not. Step one row so the row above it ends the view; at the very top
+    // of the transcript there is nothing older to show, so step towards the newer
+    // side instead and reveal the body.
+    if content.height > 0 {
+        let last_row = max_scroll.saturating_sub(back) + content.height as usize - 1;
+        let line = line_starts
+            .partition_point(|start| *start <= last_row)
+            .saturating_sub(1);
+        if header_lines.contains(&line) && line_starts.get(line) == Some(&last_row) {
+            if back < max_scroll {
+                back += 1;
+            } else {
+                back = back.saturating_sub(1);
+            }
+        }
+    }
     let scroll = max_scroll.saturating_sub(back).min(u16::MAX as usize) as u16;
     frame.render_widget(
         Paragraph::new(lines)
