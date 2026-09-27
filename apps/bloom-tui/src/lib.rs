@@ -1,6 +1,7 @@
 pub mod app;
 pub mod config;
 pub mod daemon;
+pub mod diagnostics;
 pub mod ui;
 
 /// Re-exported so callers and integration tests can build key events without

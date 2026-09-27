@@ -14,6 +14,12 @@ From the repository, run:
 
 The launcher rebuilds the binaries when their sources changed, starts `bloomd` unless a daemon is already answering on the socket, then opens the UI. When you quit, it stops the daemon it started. Diagnostics go to `~/.local/share/bloom/bloomd.log` (or the corresponding state-home directory if configured). Paths are discovered automatically; override them in a trusted `.env` file next to the script. The file is sourced as shell code, so keep it to path settings and never put secrets there.
 
+## TUI diagnostics
+
+The TUI writes a private diagnostic log to `~/.local/state/bloom/tui.log` (Linux and other Unix systems; `$XDG_STATE_HOME/bloom/tui.log` when configured), `~/Library/Logs/bloom/tui.log` on macOS, or `%LOCALAPPDATA%\\bloom\\tui.log` on Windows. On Unix the directory is mode 0700 and log files mode 0600. The active log is bounded to 256 KiB with one rotated `tui.log.1`; unsafe symlink paths and logging errors are ignored so logging cannot interrupt the UI.
+
+Entries include connection disconnection, request begin/result, an ephemeral attempt number, operation stage, elapsed time, and allowlisted IPC error category. They never include message bodies, recipient/conversation identifiers, credentials, raw IPC frames, or arbitrary error text. Timeout and transport failures are reported as uncertain rather than claiming the message was delivered. If a send looks wrong, inspect this file and share only the relevant sanitized lines.
+
 ## One rule that matters
 
 Only one process may own the engine state: it holds your real registration. Close the OpenBubbles app before starting Bloom. To check for a leftover owner, run:
@@ -31,7 +37,7 @@ and the arrow keys scroll the transcript rather than moving the selection.
 | --- | --- |
 | Up / Down | Scroll the transcript one row |
 | PageUp / PageDown | Scroll a screenful |
-| Ctrl+Home / Ctrl+End | Jump to the oldest / newest message |
+| Ctrl+Home / End | Jump to the oldest / newest message |
 | Tab | Focus the chat list; Up / Down select, Enter opens |
 | Enter | Send the message |
 | Esc | Clear the draft, or close the open overlay |
@@ -67,9 +73,9 @@ The window has no outer frame; content runs to the edges like Codex.
 - **Header:** leads with the selected conversation, with the recipient handle for a direct chat or the participant count for a group (dropped whole when it does not fit). The right side shows the status, the theme control, `⚙`, `?`, and `Bloom`. A status dot and label show the engine session or connection state: green for healthy, yellow for attention, and red for failure. A braille spinner beside Connecting or Disconnected indicates connection/retry activity.
 - **Transcript:** consecutive messages from one sender within five minutes share a single byline (a bold, per-speaker colored name and a timestamp), a centered divider marks each new day, and a blank row separates senders. Your messages also show delivery state, such as queued, sent, delivered, read, or failed. An outgoing message still queued for delivery has a spinner beside “queued”.
 - **Composer:** a bare `›` prompt, always focused. For a new conversation, the prompt first asks for a recipient and then a message. Sending shows `Sending…`; `Message sent.` appears only after IPC accepts the message. A failure is shown in red. Bloom does not claim Delivered or Read without transport events.
-- **Hint row:** shows available shortcuts. While reading older messages, it instead says that you are reading back and that End returns to the newest. If a send fails, a red error line replaces the hints.
+- **Hint row:** shows available shortcuts. While reading older messages, it instead says that you are reading back and that End returns to the newest without moving the draft cursor. If a send fails, a red error line replaces the hints.
 
-The filter prompt appears in the composer area and narrows the sidebar as you type. Its match count is shown in the sidebar label. The command menu opens as a bordered popup above the composer, left-aligned with the chat, and takes priority over the transcript. Enter acts on the highlighted command: commands that open something (`/settings`, `/filter`, `/new`, `/compact`, `/unhide`, `/help`, `/cancel`) run immediately, while `/nickname` and `/theme` fill the composer so you can type an argument. Tab always fills the composer. The shortcut sheet opens the same way.
+The filter prompt appears in the composer area and narrows the sidebar as you type. Its match count is shown in the sidebar label. The command menu opens as a full-width, borderless list above the composer, left-aligned with the chat, and takes priority over the transcript. Enter acts on the highlighted command: commands that open something (`/settings`, `/filter`, `/new`, `/compact`, `/unhide`, `/help`, `/cancel`) run immediately, while `/nickname` and `/theme` fill the composer so you can type an argument. Tab always fills the composer. The shortcut sheet opens the same way.
 
 Right-click a chat in the sidebar for **Rename** and **Close**. Rename sets a local title, which wins over nicknames and the engine's title (an empty name clears it). Close only hides the chat locally; its messages are kept, and `/unhide` restores every hidden chat. Both are stored in `tui.json`.
 

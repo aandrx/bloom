@@ -4,3 +4,5 @@ theme-padding|apps/bloom-tui/src/ui.rs|let width = unicode_width::UnicodeWidthSt
 theme-narrow|apps/bloom-tui/src/ui.rs|if right[0].width >= THEME_MIN_WIDTH {|if false {|bloom-tui|ui_render|the_theme_control_stays_visible_on_a_narrow_terminal
 frame-bound|apps/bloomd/src/engine.rs|if bytes.len().saturating_add(take) > MAX_FRAME_BYTES + 1 {|if false {|bloomd|lib|engine::tests::an_oversized_frame_neither_returns_nor_drains_the_stream
 filter-q|apps/bloom-tui/src/app.rs|if self.filter_query().is_some() {|if false {|bloom-tui|interaction|q_is_text_while_the_filter_is_open_and_quits_from_the_list
+composer-band|apps/bloom-tui/src/ui.rs|let pad_bottom = pads.saturating_sub(pad_top).min(1);|let pad_bottom = 0;|bloom-tui|ui_render|composer_band_shades_one_row_above_and_below_the_input
+sidebar-marker|apps/bloom-tui/src/ui.rs|.highlight_symbol("▎ ")|.highlight_symbol("  ")|bloom-tui|ui_render|sidebar_entries_show_a_clipped_preview_and_highlight_both_rows

@@ -57,6 +57,14 @@ field; variants that are not modelled yet are emitted with
 `"complete": false` and an `unsupported` marker naming the variant and the reason,
 so content is never silently replaced by a `toString()` placeholder.
 
+`send_confirmation` has two sources and exactly one is emitted per request. When
+the engine finishes the send synchronously it returns `false` from its send call,
+which means no asynchronous completion is pending; the sidecar then confirms
+`accepted: true` directly. When the engine returns `true` it will push a
+`SendConfirm` later, and the sidecar waits for that push before confirming (with
+`accepted: false` plus `error` when the push reports one). Interpreting the
+synchronous `false` as a rejection is the bug this coordinator prevents.
+
 ## Formatting caveat
 
 Run `dart pub get` before checking formatting. The formatter selects its style from

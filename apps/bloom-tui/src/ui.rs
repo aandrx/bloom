@@ -68,39 +68,13 @@ const THEME_MIN_WIDTH: u16 = 38;
 #[derive(Clone)]
 struct ComposerLayout {
     input: Rect,
-    footer: Option<Rect>,
     prompt: String,
     cursor: Option<(u16, u16)>,
 }
 
 impl ComposerLayout {
-    fn new(
-        rect: Rect,
-        prefix: &str,
-        value: &str,
-        cursor_byte: usize,
-        editable: bool,
-        allow_border: bool,
-    ) -> Self {
-        let bordered = allow_border && rect.height >= 2;
-        let input_height = rect.height.min(if bordered {
-            if rect.height >= 4 {
-                3
-            } else {
-                2
-            }
-        } else {
-            1
-        });
-        let input = Rect::new(rect.x, rect.y, rect.width, input_height);
-        let footer = (rect.height > input_height).then(|| {
-            Rect::new(
-                rect.x,
-                rect.y + input_height,
-                rect.width,
-                rect.height - input_height,
-            )
-        });
+    fn new(rect: Rect, prefix: &str, value: &str, cursor_byte: usize, editable: bool) -> Self {
+        let input = Rect::new(rect.x, rect.y, rect.width, 1.min(rect.height));
         let width = usize::from(rect.width);
         let prefix_limit = width.saturating_sub(if editable { width.min(10) } else { 0 });
         let visible_prefix = truncate_display_graphemes(prefix, prefix_limit);
@@ -132,18 +106,15 @@ impl ComposerLayout {
         }
         let mut prompt = visible_prefix;
         prompt.push_str(&visible_value);
-        let text_y = rect.y.saturating_add(u16::from(bordered));
-        let cursor =
-            (editable && rect.width > 0 && input_height > u16::from(bordered)).then(|| {
-                let column = prefix_width.saturating_add(cursor_width);
-                let x = rect
-                    .x
-                    .saturating_add(column.min(width.saturating_sub(1)) as u16);
-                (x, text_y)
-            });
+        let cursor = (editable && rect.width > 0).then(|| {
+            let column = prefix_width.saturating_add(cursor_width);
+            let x = rect
+                .x
+                .saturating_add(column.min(width.saturating_sub(1)) as u16);
+            (x, rect.y)
+        });
         Self {
             input,
-            footer,
             prompt,
             cursor,
         }
@@ -472,6 +443,39 @@ fn footer_hints(width: usize, palette: Palette, app: &App) -> Line<'static> {
     Line::from(spans)
 }
 
+/// Composer geometry: a shaded band with padding above and below the single
+/// input row, plus footer rows for status and hints kept outside the band.
+#[derive(Clone, Copy)]
+struct ComposerGeometry {
+    band: Rect,
+    input: Rect,
+    footer: Option<Rect>,
+}
+
+fn composer_geometry(area: Rect) -> ComposerGeometry {
+    // Always reserve a row for the input; the rest may hold up to two footer rows
+    // (status plus hints) and at most one padding row on each side of the input.
+    let footer_rows = 2u16.min(area.height.saturating_sub(1));
+    let pads = area.height.saturating_sub(1 + footer_rows);
+    let pad_top = u16::from(pads >= 2);
+    let pad_bottom = pads.saturating_sub(pad_top).min(1);
+    let band = Rect::new(area.x, area.y, area.width, 1 + pad_top + pad_bottom);
+    let input = Rect::new(area.x, area.y.saturating_add(pad_top), area.width, 1);
+    let footer = (footer_rows > 0).then(|| {
+        Rect::new(
+            area.x,
+            area.y.saturating_add(band.height),
+            area.width,
+            footer_rows,
+        )
+    });
+    ComposerGeometry {
+        band,
+        input,
+        footer,
+    }
+}
+
 /// The slash-command popup. It floats above the composer over a cleared panel so
 /// it takes priority over the transcript, the way a command palette should. The
 /// returned rectangle is the hitbox the mouse layer uses.
@@ -479,52 +483,45 @@ fn render_command_menu(
     frame: &mut Frame<'_>,
     app: &App,
     content: Rect,
-    composer: Rect,
+    pane: Rect,
     palette: Palette,
 ) -> Option<(Rect, Vec<(Rect, usize)>)> {
-    if !app.command_menu || content.height < 3 || content.width < 12 {
+    if !app.command_menu || content.height < 1 || content.width < 1 {
         return None;
     }
     let suggestions = app.command_suggestions();
     let item_count = suggestions.len().max(1);
-    let visible = item_count
-        .min(8)
-        .min((content.height as usize).saturating_sub(2))
-        .max(1);
+    let visible = item_count.min(8).min(content.height as usize);
     let first = app
         .command_selection
         .saturating_sub(visible.saturating_sub(1))
         .min(item_count.saturating_sub(visible));
-    let panel_width = content.width.min(64);
-    let panel_height = (visible + 2).min(content.height as usize) as u16;
+    let panel_width = pane.width;
+    let panel_height = visible.min(content.height as usize) as u16;
     // Left-aligned with the chat, the way Codex anchors its pickers.
     let area = Rect::new(
-        content.x,
+        pane.x,
         content.y + content.height.saturating_sub(panel_height),
         panel_width,
         panel_height,
     );
     frame.render_widget(Clear, area);
     frame.render_widget(
-        Block::default()
-            .title(Span::styled(
-                " Commands ",
-                Style::default().fg(palette.muted),
-            ))
-            .borders(Borders::ALL)
-            .border_type(BorderType::Rounded)
-            .border_style(Style::default().fg(palette.rule))
-            .style(Style::default().bg(palette.surface)),
+        Block::default().style(Style::default().bg(palette.surface)),
         area,
     );
-    let inner = area.inner(Margin {
-        horizontal: 1,
-        vertical: 1,
-    });
-    let row_width = inner.width as usize;
+    let inner = area;
+    let text_area = Rect::new(
+        inner.x.saturating_add(2),
+        inner.y,
+        inner.width.saturating_sub(2),
+        inner.height,
+    );
+    let row_width = text_area.width as usize;
     let mut menu_rows: Vec<(Rect, usize)> = Vec::new();
     for row in 0..visible {
         let row_area = Rect::new(inner.x, inner.y + row as u16, inner.width, 1);
+        let text_row = Rect::new(text_area.x, row_area.y, text_area.width, 1);
         if row_area.y >= inner.y + inner.height {
             break;
         }
@@ -549,7 +546,7 @@ fn render_command_menu(
                     row_width,
                 ))
                 .style(Style::default().fg(palette.muted).bg(row_bg)),
-                row_area,
+                text_row,
             );
             continue;
         }
@@ -589,10 +586,9 @@ fn render_command_menu(
                     .bg(row_bg),
             ),
         ]);
-        frame.render_widget(Paragraph::new(Line::from(spans)), row_area);
+        frame.render_widget(Paragraph::new(Line::from(spans)), text_row);
     }
     // The panel sits above the composer; its hitbox is the panel itself.
-    let _ = composer;
     Some((area, menu_rows))
 }
 
@@ -917,7 +913,13 @@ fn render_with_mode(frame: &mut Frame<'_>, app: &App, monochrome: bool) -> HitMa
         let (prefix, value, cursor_byte, editable, muted) =
             composer_content(app, inner.width as usize);
         let compact = Rect::new(inner.x, inner.y, inner.width, u16::from(inner.height > 0));
-        let layout = ComposerLayout::new(compact, &prefix, &value, cursor_byte, editable, false);
+        let layout = ComposerLayout::new(compact, &prefix, &value, cursor_byte, editable);
+        if inner.width > 0 && inner.height > 0 {
+            frame.render_widget(
+                Block::default().style(Style::default().bg(palette.input_surface)),
+                compact,
+            );
+        }
         if layout.input.width > 0 && layout.input.height > 0 {
             frame.render_widget(
                 Paragraph::new(layout.prompt).style(
@@ -1031,7 +1033,8 @@ fn render_with_mode(frame: &mut Frame<'_>, app: &App, monochrome: bool) -> HitMa
         List::new(entries)
             .style(Style::default().bg(palette.bg))
             .highlight_style(Style::default().bg(palette.input_surface))
-            .highlight_symbol("▎ "),
+            .highlight_symbol("▎ ")
+            .repeat_highlight_symbol(true),
         list_area,
         &mut list_state,
     );
@@ -1067,7 +1070,9 @@ fn render_with_mode(frame: &mut Frame<'_>, app: &App, monochrome: bool) -> HitMa
     // Shrink the header and composer blocks on short terminals so their heights can
     // never exceed the area they are given.
     let (header_height, composer_height) = if inner.height >= 12 {
-        (2u16, 3u16)
+        (2u16, 5u16)
+    } else if inner.height >= 10 {
+        (1u16, 4u16)
     } else if inner.height >= 6 {
         (1u16, 3u16)
     } else if inner.height >= 5 {
@@ -1087,10 +1092,22 @@ fn render_with_mode(frame: &mut Frame<'_>, app: &App, monochrome: bool) -> HitMa
         horizontal: 2,
         vertical: 0,
     };
-    let content = right[1].inner(gutter);
-    let composer = right[2].inner(gutter);
+    let spacer_rows = u16::from(inner.height >= 6 && !app.settings_open && !app.help_open);
+    let transcript_area = if right[1].height > spacer_rows {
+        Rect::new(
+            right[1].x,
+            right[1].y,
+            right[1].width,
+            right[1].height - spacer_rows,
+        )
+    } else {
+        right[1]
+    };
+    let content = transcript_area.inner(gutter);
+    let composer_area = right[2].inner(gutter);
+    let geometry = composer_geometry(composer_area);
     hits.transcript = content;
-    hits.composer = composer;
+    hits.composer = geometry.input;
     let selected = app.selected_conversation();
     // The left of the header leads with the chat itself; the app name lives on the
     // right, next to the other quiet affordances.
@@ -1490,7 +1507,7 @@ fn render_with_mode(frame: &mut Frame<'_>, app: &App, monochrome: bool) -> HitMa
             content,
         );
     }
-    if let Some((panel, rows)) = render_command_menu(frame, app, content, composer, palette) {
+    if let Some((panel, rows)) = render_command_menu(frame, app, content, body[2], palette) {
         hits.menu = Some(panel);
         hits.menu_rows = rows;
     }
@@ -1504,25 +1521,38 @@ fn render_with_mode(frame: &mut Frame<'_>, app: &App, monochrome: bool) -> HitMa
         // keep the footer hints visible underneath it.
         (String::new(), String::new(), 0, false, true)
     } else {
-        composer_content(app, composer.width as usize)
+        composer_content(app, geometry.input.width as usize)
     };
-    // Codex's composer is bare: a prompt glyph and the draft, no frame and no
-    // filled box. The feedback and hint rows sit underneath.
-    let layout = ComposerLayout::new(composer, &prefix, &value, cursor_byte, editable, false);
+    let layout = ComposerLayout::new(geometry.input, &prefix, &value, cursor_byte, editable);
+    // The input surface is a band with padding above and below the input row.
+    // Footer rows stay outside the shaded band.
+    // The shaded band spans the full chat pane; the input text keeps its gutter.
+    let input_band = Rect::new(
+        body[2].x,
+        geometry.band.y,
+        body[2].width,
+        geometry.band.height,
+    );
+    if input_band.width > 0 && input_band.height > 0 {
+        frame.render_widget(
+            Block::default().style(Style::default().bg(palette.input_surface)),
+            input_band,
+        );
+    }
     if layout.input.width > 0 && layout.input.height > 0 {
         frame.render_widget(
-            Paragraph::new(layout.prompt.clone()).style(Style::default().fg(if muted {
-                palette.muted
-            } else {
-                palette.text
-            })),
+            Paragraph::new(layout.prompt.clone()).style(
+                Style::default()
+                    .fg(if muted { palette.muted } else { palette.text })
+                    .bg(palette.input_surface),
+            ),
             layout.input,
         );
     }
     if let Some(cursor) = layout.cursor {
         frame.set_cursor_position(cursor);
     }
-    if let Some(footer_area) = layout.footer {
+    if let Some(footer_area) = geometry.footer {
         if footer_area.width > 0 && footer_area.height > 0 {
             let feedback = composer_feedback(app, &palette, back);
             let row = |offset: u16| {

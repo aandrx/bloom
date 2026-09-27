@@ -798,7 +798,7 @@ fn composer_and_own_messages_use_codex_style_surfaces() {
     let input_column = column_of(&grid, input_row, "›").unwrap();
     assert_eq!(
         grid[(input_column, input_row)].bg,
-        ratatui::style::Color::Rgb(24, 24, 37)
+        ratatui::style::Color::Rgb(49, 50, 68)
     );
 
     let message_row = (0..grid.area.height)
@@ -1464,6 +1464,139 @@ fn sidebar_entries_show_a_clipped_preview_and_highlight_both_rows() {
         selected_bg,
         "other chats are not highlighted"
     );
+    assert_eq!(grid[(0, name_row)].symbol(), "▎");
+    assert_eq!(
+        grid[(0, name_row + 1)].symbol(),
+        "▎",
+        "marker repeats on preview row"
+    );
+}
+
+#[test]
+fn composer_band_shades_one_row_above_and_below_the_input() {
+    let selected = conversation("Weekend crew", 3, 40);
+    let mut app = App {
+        selected: Some(selected.id.clone()),
+        ..Default::default()
+    };
+    app.set_conversations(vec![selected.clone()]);
+    let (width, height) = (100u16, 30u16);
+    let grid = buffer(&app, width, height);
+    let prompt_y = (0..height)
+        .find(|y| row_text(&grid, *y).contains("›"))
+        .expect("composer prompt row");
+    let surface = grid[(width - 1, prompt_y)].bg;
+    for offset in [-1i32, 0, 1] {
+        let y = (prompt_y as i32 + offset) as u16;
+        assert_eq!(
+            grid[(width - 1, y)].bg,
+            surface,
+            "band row at offset {offset}"
+        );
+    }
+    let divider = column_of(&grid, prompt_y, "│").expect("sidebar divider");
+    for offset in [-1i32, 0, 1] {
+        let y = (prompt_y as i32 + offset) as u16;
+        assert_eq!(
+            grid[(divider + 1, y)].bg,
+            surface,
+            "band reaches pane edge at offset {offset}"
+        );
+    }
+    let footer_y = prompt_y + 3;
+    assert_ne!(
+        grid[(width - 1, footer_y)].bg,
+        surface,
+        "footer row sits outside the band"
+    );
+}
+
+#[test]
+fn tiny_composer_surface_only_shades_the_input_row() {
+    for theme in [Theme::Dark, Theme::Light] {
+        let app = App {
+            theme,
+            ..Default::default()
+        };
+        for (width, height) in [(19, 8), (40, 4)] {
+            let grid = buffer(&app, width, height);
+            let input_bg = grid[(0, 0)].bg;
+            for x in 0..width {
+                assert_eq!(grid[(x, 0)].bg, input_bg);
+                for y in 1..height {
+                    assert_ne!(
+                        grid[(x, y)].bg,
+                        input_bg,
+                        "only input row shaded at {width}x{height}, ({x},{y})"
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn composer_surface_fills_chat_width_and_transcript_keeps_a_blank_separator() {
+    let selected = conversation("Weekend crew", 3, 40);
+    let mut app = App {
+        selected: Some(selected.id.clone()),
+        ..Default::default()
+    };
+    app.set_conversations(vec![selected.clone()]);
+    app.upsert(
+        selected.id.clone(),
+        message(&selected, "m1", 1_700_000_000_000, "latest", false),
+    );
+    for (width, height) in [(100, 30), (44, 12)] {
+        for theme in [Theme::Dark, Theme::Light] {
+            app.theme = theme;
+            let grid = buffer(&app, width, height);
+            let mut composer_y = None;
+            let mut transcript_y = None;
+            for y in 0..height {
+                let text = row_text(&grid, y);
+                if text.contains("›") {
+                    composer_y = Some(y);
+                }
+                if text.contains("latest") {
+                    transcript_y = Some(y);
+                }
+            }
+            let composer_y = composer_y.expect("composer row");
+            let transcript_y = transcript_y.expect("transcript row");
+            assert!(
+                composer_y > transcript_y + 1,
+                "separator row exists, width={width}, height={height}"
+            );
+            let bg = grid[(width - 3, composer_y)].bg;
+            assert_ne!(
+                bg,
+                grid[(width - 3, transcript_y)].bg,
+                "composer surface distinguishes theme {theme:?}"
+            );
+            assert_eq!(
+                grid[(width - 1, composer_y)].bg,
+                bg,
+                "input reaches pane edge"
+            );
+            let footer_y = composer_y + 2;
+            if footer_y < height {
+                assert_ne!(
+                    grid[(width - 3, footer_y)].bg,
+                    bg,
+                    "footer outside input surface"
+                );
+            }
+            app.scroll = 1;
+            let scrolled = buffer(&app, width, height);
+            assert_eq!(
+                scrolled[(width - 3, composer_y)].bg,
+                bg,
+                "scroll does not move composer surface"
+            );
+            app.scroll = 0;
+        }
+    }
 }
 
 #[test]
@@ -1500,15 +1633,27 @@ fn the_command_popup_aligns_with_the_chat_not_the_center() {
     };
     app.set_conversations(vec![selected]);
     let grid = buffer(&app, 100, 30);
-    let title_row = (0..30)
-        .find(|y| row_text(&grid, *y).contains("Commands"))
-        .expect("popup title");
-    let panel_x = column_of(&grid, title_row, "╭").expect("popup corner");
+    let panel_row = (0..30)
+        .find(|y| row_text(&grid, *y).contains("/help"))
+        .expect("popup row");
+    let panel_x = column_of(&grid, panel_row, "›").expect("selected marker");
     let prompt_row = (0..30)
         .find(|y| row_text(&grid, *y).contains("›  /"))
         .expect("composer prompt");
     let prompt_x = column_of(&grid, prompt_row, "›").expect("prompt glyph");
-    assert_eq!(panel_x, prompt_x, "popup starts at the chat's left edge");
+    assert_eq!(panel_x, prompt_x, "popup text retains chat padding");
+    assert_eq!(
+        grid[(99, panel_row)].bg,
+        grid[(50, panel_row)].bg,
+        "selection reaches pane edge"
+    );
+    let narrow = buffer(&app, 44, 12);
+    assert!(rendered(&app).contains("/help"));
+    assert!(
+        row_text(&narrow, 9).contains("/help")
+            || (0..12).any(|y| row_text(&narrow, y).contains("/help")),
+        "menu survives narrow short layout"
+    );
 }
 
 #[test]

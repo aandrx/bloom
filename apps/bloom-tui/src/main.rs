@@ -1,11 +1,15 @@
 //! Bloom TUI: a Bloom-native client for the daemon over its Unix-socket IPC.
 
-use anyhow::{Context, Result};
+use anyhow::Result;
 use bloom_domain::{MessagePart, OutgoingBody};
 use bloom_ipc::{client::BloomClient, EventKind};
 use bloom_tui::app::{App, Theme};
 use bloom_tui::config::Config;
 use bloom_tui::daemon::{self, ConnectionState, Snapshot};
+use bloom_tui::diagnostics::{self, Stage};
+use std::sync::atomic::{AtomicU64, Ordering};
+
+static NEXT_ATTEMPT: AtomicU64 = AtomicU64::new(1);
 use bloom_tui::ui;
 use bloom_tui::RedrawScheduler;
 use crossterm::{
@@ -206,6 +210,7 @@ async fn main() -> Result<()> {
                 {
                     Ok(()) => delay = FIRST_RETRY,
                     Err(_) => {
+                        diagnostics::record("connection state=disconnected");
                         let _ = status_tx.send(ConnectionState::Disconnected);
                         tokio::time::sleep(delay).await;
                         delay = (delay * 2).min(MAX_RETRY);
@@ -314,14 +319,14 @@ async fn main() -> Result<()> {
                         let client = client.clone();
                         let send_tx = send_tx.clone();
                         tokio::spawn(async move {
-                            let result = client
-                                .send(conversation, OutgoingBody {
-                                    parts: vec![MessagePart::Text(body)],
-                                })
-                                .await
-                                .context("send failed")
-                                .map(|_| ())
-                                .map_err(|error| error.to_string());
+                            let attempt = NEXT_ATTEMPT.fetch_add(1, Ordering::Relaxed);
+                            let started = std::time::Instant::now();
+                            diagnostics::record(&format!("request begin attempt={attempt} stage=send"));
+                            let result = client.send(conversation, OutgoingBody {
+                                parts: vec![MessagePart::Text(body)],
+                            }).await;
+                            diagnostics::request_result(Stage::Send, attempt, started.elapsed(), result.as_ref().err());
+                            let result = result.map(|_| ()).map_err(|error| diagnostics::safe_reason(&error).to_owned());
                             let _ = send_tx.send((target, result));
                         });
                     }
@@ -331,14 +336,14 @@ async fn main() -> Result<()> {
                         let client = client.clone();
                         let send_tx = send_tx.clone();
                         tokio::spawn(async move {
-                            let result = client
-                                .start_conversation(address, OutgoingBody {
-                                    parts: vec![MessagePart::Text(body)],
-                                })
-                                .await
-                                .context("start conversation failed")
-                                .map(|_| ())
-                                .map_err(|error| error.to_string());
+                            let attempt = NEXT_ATTEMPT.fetch_add(1, Ordering::Relaxed);
+                            let started = std::time::Instant::now();
+                            diagnostics::record(&format!("request begin attempt={attempt} stage=start_conversation"));
+                            let result = client.start_conversation(address, OutgoingBody {
+                                parts: vec![MessagePart::Text(body)],
+                            }).await;
+                            diagnostics::request_result(Stage::StartConversation, attempt, started.elapsed(), result.as_ref().err());
+                            let result = result.map(|_| ()).map_err(|error| diagnostics::safe_reason(&error).to_owned());
                             let _ = send_tx.send((target, result));
                         });
                     }

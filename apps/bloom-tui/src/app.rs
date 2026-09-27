@@ -1032,14 +1032,12 @@ impl App {
                 KeyCode::Down => self.scroll_forward(1),
                 KeyCode::PageUp => self.scroll_back(SCROLL_PAGE),
                 KeyCode::PageDown => self.scroll_forward(SCROLL_PAGE),
-                // Codex binds the transcript extremes to Ctrl+Home / Ctrl+End and
-                // leaves Home / End to the composer line.
+                // Home moves the draft cursor; End returns to the newest transcript
+                // while preserving the draft cursor. Ctrl+E remains cursor-end.
                 KeyCode::Home if key.modifiers.contains(KeyModifiers::CONTROL) => {
                     self.scroll_to_oldest()
                 }
-                KeyCode::End if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                    self.scroll_to_newest()
-                }
+                KeyCode::End => self.scroll_to_newest(),
                 _ => {
                     // Typing always aims at the composer.
                     if matches!(key.code, KeyCode::Char(_)) {
@@ -1793,6 +1791,11 @@ mod tests {
         draft_key(&mut app, KeyCode::Right);
         draft_state(&app, "abc", 1, 1);
         draft_key(&mut app, KeyCode::End);
+        draft_state(&app, "abc", 1, 1);
+        assert_eq!(
+            app.handle_key(KeyEvent::new(KeyCode::Char('e'), KeyModifiers::CONTROL,)),
+            Action::None
+        );
         draft_state(&app, "abc", 3, 3);
         draft_key(&mut app, KeyCode::Right);
         draft_state(&app, "abc", 3, 3);

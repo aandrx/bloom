@@ -629,12 +629,14 @@ fn page_keys_move_the_reading_position_and_clamp_at_the_newest() {
         "Ctrl+End returns to the newest message"
     );
 
-    // Home and End belong to the composer line now.
+    // End returns to newest without moving the draft cursor; Ctrl+E moves it.
     app.draft = "a draft".into();
     app.draft_cursor = 3;
-    app.handle_key(key(KeyCode::Home));
-    assert_eq!(app.draft_cursor, 0, "Home moves the draft cursor");
+    app.handle_key(key(KeyCode::PageUp));
     app.handle_key(key(KeyCode::End));
+    assert!(!app.is_scrolled_back());
+    assert_eq!(app.draft_cursor, 3, "End preserves draft cursor");
+    app.handle_key(ctrl(KeyCode::Char('e')));
     assert_eq!(app.draft_cursor, "a draft".chars().count());
 
     // A new message in the open thread pins the view back to the newest.

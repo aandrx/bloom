@@ -18,6 +18,7 @@ import 'package:flutter_rust_bridge/flutter_rust_bridge_for_generated_io.dart';
 
 import '../lib/payload_codec.dart';
 import '../lib/protocol.dart';
+import '../lib/send_coordinator.dart';
 import '../lib/upstream/api/api.dart' as api;
 import '../lib/upstream/lib.dart' as upstream;
 import '../lib/upstream/frb_generated.dart';
@@ -195,7 +196,7 @@ Future<void> main(List<String> arguments) async {
   // app itself reads the client from its desktop state for the same reason.
   final cloudMessagesClient = deskState.icloudServices?.cloudMessagesClient;
 
-  final sends = <String, int>{}; // message id -> originating request id
+  late final SendCoordinator sends = SendCoordinator(stdout.writeln);
   var sequence = 0;
   var stopping = false;
 
@@ -271,16 +272,11 @@ Future<void> main(List<String> arguments) async {
         final payload = encodePushMessage(message);
         if (payload['variant'] == 'sendConfirm') {
           final uuid = payload['uuid'];
-          final requestId = uuid is String ? sends.remove(uuid) : null;
-          if (requestId != null) {
-            stdout.writeln(
-              sendConfirmFrame(
-                requestId: requestId,
-                messageId: uuid as String,
-                accepted: payload['error'] == null,
+          if (uuid is String &&
+              sends.completePush(
+                messageId: uuid,
                 error: payload['error'] as String?,
-              ),
-            );
+              )) {
             return;
           }
         }
@@ -378,7 +374,7 @@ Future<void> _syncChats(
 Future<void> _handleCommand({
   required String line,
   required dynamic deskState,
-  required Map<String, int> sends,
+  required SendCoordinator sends,
   required void Function() stop,
 }) async {
   final Command command;
@@ -395,6 +391,7 @@ Future<void> _handleCommand({
       stdout.writeln(shutdownAckFrame(requestId: command.requestId));
       stop();
     case SendCommand():
+      String? messageId;
       try {
         final handles = await api.getHandles(state: deskState.client);
         final sender = chooseSender(handles, command.recipient);
@@ -413,20 +410,18 @@ Future<void> _handleCommand({
           text: command.text,
           chatGuid: command.chatGuid,
         );
-        sends[inst.id] = command.requestId;
-        final accepted = await api.send(
+        messageId = inst.id;
+        sends.register(inst.id, command.requestId);
+        final stillRunning = await api.send(
           state: deskState.client,
           local: deskState.localBroadcast,
           msg: inst,
         );
-        stdout.writeln(
-          sendConfirmFrame(
-            requestId: command.requestId,
-            messageId: inst.id,
-            accepted: accepted,
-          ),
-        );
+        // `false` means synchronous completion, not rejection. The coordinator
+        // suppresses this if a confirmation push already consumed the request.
+        sends.sendReturned(messageId: inst.id, stillRunning: stillRunning);
       } catch (error) {
+        if (messageId != null) sends.discard(messageId);
         stderr.writeln('send failed: $error');
         stdout.writeln(
           errorFrame(

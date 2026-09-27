@@ -551,6 +551,188 @@ done
     path
 }
 
+/// Holds the first synthetic send until the test observes the fixed timeout,
+/// then emits its late confirmation before immediately confirming a second send.
+fn fake_sidecar_delayed_confirmation(dir: &std::path::Path, marker: &std::path::Path) -> PathBuf {
+    let path = dir.join("fake_engine_delayed.sh");
+    let script = format!(
+        r#"#!/bin/sh
+cat <<'FRAMES'
+{{"version":1,"type":"ready","engine_version":"fake","handles":["mailto:me@example.invalid"],"capabilities":{{"send":true,"history":false}}}}
+FRAMES
+while IFS= read -r line; do
+  case "$line" in
+    *'"type":"send"'*)
+      id=$(printf '%s' "$line" | sed -n 's/.*"request_id":\([0-9]*\).*/\1/p')
+      if [ ! -e '{marker}.received' ]; then
+        printf 'received\n' > '{marker}.received'
+        while [ ! -e '{marker}.release' ]; do sleep 0.05; done
+        printf '{{"version":1,"type":"send_confirmation","request_id":%s,"message_id":"late-outbound","accepted":true}}\n' "$id"
+        printf 'confirmed\n' > '{marker}.confirmed'
+      else
+        printf '{{"version":1,"type":"send_confirmation","request_id":%s,"message_id":"second-outbound","accepted":true}}\n' "$id"
+      fi
+      ;;
+    *'"type":"shutdown"'*)
+      printf '{{"version":1,"type":"shutdown_ack","request_id":1}}\n'
+      exit 0
+      ;;
+  esac
+done
+"#,
+        marker = marker.display()
+    );
+    fs::write(&path, script).unwrap();
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o700)).unwrap();
+    path
+}
+
+#[tokio::test]
+async fn late_confirmation_after_send_timeout_is_not_reconciled() {
+    let dir = tempfile::tempdir().unwrap();
+    let private = dir.path().join("private");
+    fs::create_dir(&private).unwrap();
+    fs::set_permissions(&private, fs::Permissions::from_mode(0o700)).unwrap();
+    let marker = dir.path().join("send-marker");
+    let fake = fake_sidecar_delayed_confirmation(dir.path(), &marker);
+
+    let store = EncryptedStore::open(private.join("store.db"), &TestSecrets).unwrap();
+    let store = Arc::new(Mutex::new(store));
+    let hub = SubscriptionHub::with_default_capacity();
+    let engine = Arc::new(Engine::new(EngineConfig {
+        sync_chats: false,
+        dart_executable: fake,
+        script: PathBuf::from("ignored"),
+        state_dir: private.clone(),
+        library: PathBuf::from("ignored"),
+    }));
+    let (sink, mut events) = mpsc::channel(64);
+    let mut supervisor = Supervisor::new(engine.clone(), sink);
+    let service = Arc::new(Service::new(store.clone(), engine.clone(), hub));
+    let persistence = {
+        let service = service.clone();
+        tokio::spawn(async move {
+            while let Some(event) = events.recv().await {
+                let _ = service.persist(&event);
+            }
+        })
+    };
+    supervisor.start().await.expect("engine starts");
+
+    let ready_deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    while engine.my_handles().is_empty() && tokio::time::Instant::now() < ready_deadline {
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(
+        !engine.my_handles().is_empty(),
+        "sidecar readiness observed"
+    );
+
+    let conversation_id =
+        bloom_domain::ConversationId::new(bloomd::engine::transport_id(), "synthetic-chat")
+            .unwrap();
+    let conversation = bloom_domain::Conversation {
+        id: conversation_id.clone(),
+        remote_id: "synthetic-chat".to_owned(),
+        kind: bloom_domain::ConversationKind::Direct,
+        title: None,
+        participants: vec![
+            bloom_domain::Participant {
+                handle: bloom_domain::Handle::new(
+                    bloom_domain::HandleKind::Email,
+                    "person@example.invalid",
+                )
+                .unwrap(),
+                display_name: None,
+                is_me: false,
+            },
+            bloom_domain::Participant {
+                handle: bloom_domain::Handle::new(
+                    bloom_domain::HandleKind::Email,
+                    "me@example.invalid",
+                )
+                .unwrap(),
+                display_name: None,
+                is_me: true,
+            },
+        ],
+        created_at: 1,
+        last_message_at: None,
+        preview: None,
+    };
+    store::upsert_conversation(&mut store.lock().unwrap(), &conversation).unwrap();
+
+    let send_service = service.clone();
+    let send_started = std::time::Instant::now();
+    let send = tokio::spawn(async move {
+        send_service
+            .send(
+                conversation_id,
+                OutgoingBody {
+                    parts: vec![MessagePart::Text(
+                        "synthetic timeout reproduction".to_owned(),
+                    )],
+                },
+            )
+            .await
+    });
+    let received = tokio::time::Instant::now() + Duration::from_secs(5);
+    while !marker.with_extension("received").exists() && tokio::time::Instant::now() < received {
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(
+        marker.with_extension("received").exists(),
+        "fake sidecar received send"
+    );
+    let result = tokio::time::timeout(Duration::from_secs(35), send)
+        .await
+        .expect("send returns within timeout bound")
+        .expect("send task completes");
+    assert_eq!(result, Err(bloom_ipc::ProtocolError::Protocol));
+    assert!(
+        send_started.elapsed() >= Duration::from_secs(30),
+        "waited for the configured send timeout"
+    );
+    fs::write(marker.with_extension("release"), "release").unwrap();
+    assert!(
+        store::history(&store.lock().unwrap(), &conversation.id, 10)
+            .unwrap()
+            .is_empty(),
+        "failed send was not persisted"
+    );
+
+    let confirmed = tokio::time::Instant::now() + Duration::from_secs(5);
+    while !marker.with_extension("confirmed").exists() && tokio::time::Instant::now() < confirmed {
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(
+        marker.with_extension("confirmed").exists(),
+        "valid late confirmation emitted"
+    );
+
+    // A subsequent valid response proves the reader consumed the late frame and
+    // remained synchronized, rather than closing on malformed protocol output.
+    let second = service
+        .send(
+            conversation.id.clone(),
+            OutgoingBody {
+                parts: vec![MessagePart::Text("second synthetic send".to_owned())],
+            },
+        )
+        .await
+        .expect("second send succeeds after late confirmation");
+    assert_eq!(second.value(), "second-outbound");
+    let history = store::history(&store.lock().unwrap(), &conversation.id, 10).unwrap();
+    assert_eq!(history.len(), 1);
+    assert_eq!(history[0].id().value(), "second-outbound");
+
+    supervisor
+        .shutdown(Duration::from_secs(5))
+        .await
+        .expect("shutdown completes");
+    persistence.abort();
+}
+
 #[tokio::test]
 async fn the_daemon_sends_engine_form_recipients_exactly_once_prefixed() {
     let dir = tempfile::tempdir().unwrap();

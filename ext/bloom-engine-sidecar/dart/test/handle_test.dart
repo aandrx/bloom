@@ -47,7 +47,8 @@ void main() {
         sidecar.chooseSender(handles, 'mailto:person@example.invalid'),
         'mailto:me@example.invalid',
       );
-      expect(sidecar.chooseSender(handles, 'tel:+15551111111'), 'tel:+15550000000');
+      expect(sidecar.chooseSender(handles, 'tel:+15551111111'),
+          'tel:+15550000000');
     });
 
     test('falls back to the first account handle', () {
