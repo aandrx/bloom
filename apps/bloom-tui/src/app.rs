@@ -27,8 +27,25 @@ pub enum Action {
     },
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum Theme {
+    #[default]
+    Dark,
+    Light,
+}
+
+impl Theme {
+    pub fn toggle(&mut self) {
+        *self = match self {
+            Self::Dark => Self::Light,
+            Self::Light => Self::Dark,
+        };
+    }
+}
+
 #[derive(Default)]
 pub struct App {
+    pub theme: Theme,
     pub conversations: Vec<Conversation>,
     pub selected: Option<ConversationId>,
     pub messages: HashMap<ConversationId, Vec<Message>>,
@@ -258,6 +275,10 @@ impl App {
     /// Ctrl+C always quits. Otherwise the open prompt owns the keyboard: while the
     /// filter is open its characters are query text, and while composing they are
     /// message text, so `q` only quits from the plain conversation list.
+    pub fn toggle_theme(&mut self) {
+        self.theme.toggle();
+    }
+
     pub fn handle_key(&mut self, key: KeyEvent) -> Action {
         if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
             return Action::Quit;
@@ -328,6 +349,7 @@ impl App {
             KeyCode::PageDown => self.scroll_forward(SCROLL_PAGE),
             KeyCode::Home => self.scroll_to_oldest(),
             KeyCode::End => self.scroll_to_newest(),
+            KeyCode::Char('t') => self.toggle_theme(),
             KeyCode::Char('n') => self.begin_new_conversation(),
             KeyCode::Char('/') => self.begin_filter(),
             KeyCode::Enter => self.composing = true,

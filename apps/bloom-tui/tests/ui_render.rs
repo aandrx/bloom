@@ -8,7 +8,10 @@ use bloom_domain::{
     Conversation, ConversationId, ConversationKind, DeliveryState, Handle, HandleKind, Message,
     MessageId, MessagePart, Participant, TransportId,
 };
-use bloom_tui::{app::App, ui};
+use bloom_tui::{
+    app::{App, Theme},
+    ui,
+};
 use ratatui::{backend::TestBackend, Terminal};
 
 fn buffer(app: &App, width: u16, height: u16) -> ratatui::buffer::Buffer {
@@ -188,7 +191,7 @@ fn layout_matches_the_mockup_structure() {
         "delivered",              // delivery marker
         "Write a message",        // composer placeholder
         "↑↓ chats",               // footer hints
-        "Active",                 // engine session in the header
+        "Dark",                   // current theme in the header
     ] {
         assert!(text.contains(expected), "missing {expected:?} in:\n{text}");
     }
@@ -639,4 +642,40 @@ fn no_scroll_position_ends_the_transcript_on_a_bare_byline() {
         checked += 1;
     }
     assert!(checked > 40, "the test must actually walk scroll positions");
+}
+
+#[test]
+fn the_theme_control_sits_one_column_inside_the_frame() {
+    // The mockup's header control has padding inside the window. The chip must be
+    // right-aligned with a gap, not flush against the frame edge.
+    let mut app = App::default();
+    app.set_conversations(vec![conversation("Weekend crew", 3, 40)]);
+    app.selected = app.conversations.first().map(|c| c.id.clone());
+    app.connection = "Connected".into();
+    app.session = "Active".into();
+
+    for (theme, expected) in [(Theme::Dark, "Dark"), (Theme::Light, "Light")] {
+        app.theme = theme;
+        let text = rendered(&app);
+        let header = text.lines().nth(1).expect("a header row");
+        let label = format!(" {expected} ");
+        let at = header
+            .find(&label)
+            .unwrap_or_else(|| panic!("the {expected} control must be in the header:\n{text}"));
+        let right_border = header[..at].rfind('│').expect("the chip's left border");
+        let end = at + label.len();
+        let chip_right = header[end..]
+            .find('│')
+            .map(|offset| end + offset)
+            .expect("the chip's right border");
+        let trailing = header[chip_right + '│'.len_utf8()..].chars().count();
+        assert!(
+            trailing >= 2,
+            "the {expected} control must keep a gap inside the frame, found {trailing} trailing cells"
+        );
+        assert!(
+            right_border < at,
+            "the chip must be drawn as a bordered control"
+        );
+    }
 }

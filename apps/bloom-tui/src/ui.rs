@@ -1,22 +1,48 @@
 use crate::app::{
     chat_name, message_text, participant_count, speaker_label, status_text, status_tone, timestamp,
-    App, ComposerPrompt, StatusTone,
+    App, ComposerPrompt, StatusTone, Theme,
 };
 
 /// Key hints, exactly as the mockup shows them.
-const HINTS: &str = "↑↓ chats · Enter open · / filter · n new · Esc close";
+const HINTS: &str = "↑↓ chats · Enter open · / filter · n new · Esc close · t theme";
 use bloom_domain::DeliveryState;
 use ratatui::{prelude::*, widgets::*};
 
-const BG: Color = Color::Rgb(30, 30, 46);
-const SURFACE: Color = Color::Rgb(24, 24, 37);
-const RULE: Color = Color::Rgb(69, 71, 90);
-const TEXT: Color = Color::Rgb(205, 214, 244);
-const MUTED: Color = Color::Rgb(166, 173, 200);
-const CYAN: Color = Color::Rgb(137, 220, 235);
-const GREEN: Color = Color::Rgb(166, 227, 161);
-const YELLOW: Color = Color::Rgb(249, 226, 175);
-const RED: Color = Color::Rgb(243, 139, 168);
+#[derive(Clone, Copy)]
+struct Palette {
+    bg: Color,
+    surface: Color,
+    rule: Color,
+    text: Color,
+    muted: Color,
+    cyan: Color,
+    green: Color,
+    yellow: Color,
+    red: Color,
+}
+
+const DARK: Palette = Palette {
+    bg: Color::Rgb(30, 30, 46),
+    surface: Color::Rgb(24, 24, 37),
+    rule: Color::Rgb(69, 71, 90),
+    text: Color::Rgb(205, 214, 244),
+    muted: Color::Rgb(166, 173, 200),
+    cyan: Color::Rgb(137, 220, 235),
+    green: Color::Rgb(166, 227, 161),
+    yellow: Color::Rgb(249, 226, 175),
+    red: Color::Rgb(243, 139, 168),
+};
+const LIGHT: Palette = Palette {
+    bg: Color::Rgb(255, 255, 255),
+    surface: Color::Rgb(255, 255, 255),
+    rule: Color::Rgb(199, 199, 199),
+    text: Color::Rgb(0, 0, 0),
+    muted: Color::Rgb(127, 127, 127),
+    cyan: Color::Rgb(0, 117, 138),
+    green: Color::Rgb(40, 117, 47),
+    yellow: Color::Rgb(128, 78, 0),
+    red: Color::Rgb(160, 30, 45),
+};
 
 /// The mockup caps its transcript and composer at roughly 780px of a ~1300px panel,
 /// about 60%. A terminal has no px, so cap in columns: a full-width transcript was
@@ -85,13 +111,17 @@ fn display_pad(value: &str, width: usize) -> String {
 }
 
 pub fn render(frame: &mut Frame<'_>, app: &App) {
+    let palette = match app.theme {
+        Theme::Dark => DARK,
+        Theme::Light => LIGHT,
+    };
     let area = frame.area();
     frame.render_widget(
         Block::default()
-            .style(Style::default().bg(SURFACE).fg(TEXT))
+            .style(Style::default().bg(palette.surface).fg(palette.text))
             .borders(Borders::ALL)
             .border_type(BorderType::Rounded)
-            .border_style(Style::default().fg(RULE)),
+            .border_style(Style::default().fg(palette.rule)),
         area,
     );
     let inner = area.inner(Margin {
@@ -104,7 +134,7 @@ pub fn render(frame: &mut Frame<'_>, app: &App) {
     if inner.width < 20 || inner.height < 5 {
         frame.render_widget(
             Paragraph::new(format!("Bloom  {}", app.connection))
-                .style(Style::default().fg(TEXT).bg(SURFACE)),
+                .style(Style::default().fg(palette.text).bg(palette.surface)),
             inner,
         );
         return;
@@ -128,7 +158,7 @@ pub fn render(frame: &mut Frame<'_>, app: &App) {
     // spaces are inserted explicitly, and the label stays muted rather than bold so
     // it reads as a quiet section label.
     frame.render_widget(
-        Paragraph::new("C H A T S").style(Style::default().fg(MUTED)),
+        Paragraph::new("C H A T S").style(Style::default().fg(palette.muted)),
         Rect::new(body[0].x, body[0].y, body[0].width, 1),
     );
     let visible = app.visible_conversations();
@@ -138,11 +168,14 @@ pub fn render(frame: &mut Frame<'_>, app: &App) {
             let selected = Some(&c.id) == app.selected.as_ref();
             ListItem::new(vec![
                 Line::from(vec![
-                    Span::styled(if selected { "▎" } else { " " }, Style::default().fg(CYAN)),
+                    Span::styled(
+                        if selected { "▎" } else { " " },
+                        Style::default().fg(palette.cyan),
+                    ),
                     Span::styled(
                         chat_name(c),
                         Style::default()
-                            .fg(if selected { CYAN } else { TEXT })
+                            .fg(if selected { palette.cyan } else { palette.text })
                             .add_modifier(if selected {
                                 Modifier::BOLD
                             } else {
@@ -154,7 +187,7 @@ pub fn render(frame: &mut Frame<'_>, app: &App) {
                     Span::raw("  "),
                     Span::styled(
                         participant_count(c.participants.len()),
-                        Style::default().fg(MUTED),
+                        Style::default().fg(palette.muted),
                     ),
                 ]),
             ])
@@ -170,7 +203,7 @@ pub fn render(frame: &mut Frame<'_>, app: &App) {
     let mut list_state = ListState::default();
     list_state.select(selected_index);
     frame.render_stateful_widget(
-        List::new(entries).style(Style::default().bg(BG)),
+        List::new(entries).style(Style::default().bg(palette.bg)),
         Rect::new(
             body[0].x,
             body[0].y + 1,
@@ -197,15 +230,18 @@ pub fn render(frame: &mut Frame<'_>, app: &App) {
         let width =
             (body[0].width as usize).min(unicode_width::UnicodeWidthStr::width(label.as_str()));
         frame.render_widget(
-            Paragraph::new(display_truncate(&label, width))
-                .style(Style::default().fg(CYAN).add_modifier(Modifier::BOLD)),
+            Paragraph::new(display_truncate(&label, width)).style(
+                Style::default()
+                    .fg(palette.cyan)
+                    .add_modifier(Modifier::BOLD),
+            ),
             Rect::new(body[0].x, body[0].y, body[0].width, 1),
         );
     }
     frame.render_widget(
         Block::default()
             .borders(Borders::LEFT)
-            .border_style(Style::default().fg(RULE)),
+            .border_style(Style::default().fg(palette.rule)),
         body[1],
     );
     // Shrink the header and composer blocks on short terminals so their heights can
@@ -233,18 +269,20 @@ pub fn render(frame: &mut Frame<'_>, app: &App) {
     let content = cap(right[1].inner(gutter));
     let composer = cap(right[2].inner(gutter));
     let selected = app.selected_conversation();
-    let mut heading = vec![Span::styled("Bloom", Style::default().fg(TEXT))];
+    let mut heading = vec![Span::styled("Bloom", Style::default().fg(palette.text))];
     if let Some(c) = selected {
         heading.extend([
             Span::raw(" / "),
             Span::styled(
                 chat_name(c),
-                Style::default().fg(TEXT).add_modifier(Modifier::BOLD),
+                Style::default()
+                    .fg(palette.text)
+                    .add_modifier(Modifier::BOLD),
             ),
             Span::raw("  "),
             Span::styled(
                 participant_count(c.participants.len()),
-                Style::default().fg(MUTED),
+                Style::default().fg(palette.muted),
             ),
         ]);
     }
@@ -252,38 +290,57 @@ pub fn render(frame: &mut Frame<'_>, app: &App) {
         Paragraph::new(Line::from(heading)),
         Rect::new(right[0].x, right[0].y, right[0].width, 1),
     );
-    // The mockup keeps a status badge in the header rather than in the hint line.
-    // On narrow terminals the identity needs the room more than the badge does.
+    // Status is only surfaced when it needs attention; the theme control remains visible.
     if inner.width >= 60 {
-        if let Some(status) = status_text(app) {
-            let tone = status_tone(app);
-            let label = format!(" {status} ");
-            let width = label.chars().count() as u16 + 2;
-            frame.render_widget(
-                Paragraph::new(label)
-                    .alignment(Alignment::Center)
-                    .style(Style::default().fg(match tone {
-                        StatusTone::Healthy => MUTED,
-                        StatusTone::Attention => YELLOW,
-                        StatusTone::Failure => RED,
-                    }))
-                    .block(
-                        Block::default()
-                            .borders(Borders::LEFT | Borders::RIGHT)
-                            .border_type(BorderType::Rounded)
-                            .border_style(Style::default().fg(RULE)),
-                    ),
-                Rect::new(
-                    right[0].x + right[0].width.saturating_sub(width + 1),
-                    right[0].y,
-                    width,
-                    1,
+        let mut x = right[0].x + right[0].width;
+        let theme_label = match app.theme {
+            Theme::Dark => " Dark ",
+            Theme::Light => " Light ",
+        };
+        let theme_width = theme_label.chars().count() as u16 + 2;
+        // One column of breathing room before the frame edge, as the status chip had
+        // and as the mockup's control has inside its header.
+        x = x.saturating_sub(theme_width + 1);
+        frame.render_widget(
+            Paragraph::new(theme_label)
+                .alignment(Alignment::Center)
+                .style(Style::default().fg(palette.muted))
+                .block(
+                    Block::default()
+                        .borders(Borders::LEFT | Borders::RIGHT)
+                        .border_type(BorderType::Rounded)
+                        .border_style(Style::default().fg(palette.rule)),
                 ),
-            );
+            Rect::new(x, right[0].y, theme_width, 1),
+        );
+        if status_tone(app) != StatusTone::Healthy {
+            if let Some(status) = status_text(app) {
+                let tone = status_tone(app);
+                let label = format!(" {status} ");
+                let width = label.chars().count() as u16 + 2;
+                x = x.saturating_sub(width + 1);
+                frame.render_widget(
+                    Paragraph::new(label)
+                        .alignment(Alignment::Center)
+                        .style(Style::default().fg(match tone {
+                            StatusTone::Healthy => palette.muted,
+                            StatusTone::Attention => palette.yellow,
+                            StatusTone::Failure => palette.red,
+                        }))
+                        .block(
+                            Block::default()
+                                .borders(Borders::LEFT | Borders::RIGHT)
+                                .border_type(BorderType::Rounded)
+                                .border_style(Style::default().fg(palette.rule)),
+                        ),
+                    Rect::new(x, right[0].y, width, 1),
+                );
+            }
         }
     }
     frame.render_widget(
-        Paragraph::new("─".repeat(right[0].width as usize)).style(Style::default().fg(RULE)),
+        Paragraph::new("─".repeat(right[0].width as usize))
+            .style(Style::default().fg(palette.rule)),
         Rect::new(right[0].x, right[0].y + 1, right[0].width, 1),
     );
     let mut lines = Vec::new();
@@ -312,14 +369,19 @@ pub fn render(frame: &mut Frame<'_>, app: &App) {
             lines.push(Line::from(vec![
                 Span::styled(
                     padded,
-                    Style::default().fg(TEXT).add_modifier(Modifier::BOLD),
+                    Style::default()
+                        .fg(palette.text)
+                        .add_modifier(Modifier::BOLD),
                 ),
                 Span::raw("  "),
-                Span::styled(timestamp(message.created_at), Style::default().fg(MUTED)),
+                Span::styled(
+                    timestamp(message.created_at),
+                    Style::default().fg(palette.muted),
+                ),
             ]));
             let mut content = vec![Span::styled(
                 message_text(message),
-                Style::default().fg(TEXT),
+                Style::default().fg(palette.text),
             )];
             if message.from_me {
                 let state = match message.delivery {
@@ -334,9 +396,9 @@ pub fn render(frame: &mut Frame<'_>, app: &App) {
                     Span::styled(
                         state,
                         Style::default().fg(if state.starts_with('✓') {
-                            GREEN
+                            palette.green
                         } else {
-                            MUTED
+                            palette.muted
                         }),
                     ),
                 ]);
@@ -389,7 +451,7 @@ pub fn render(frame: &mut Frame<'_>, app: &App) {
         Paragraph::new(lines)
             .wrap(Wrap { trim: false })
             .scroll((scroll, 0))
-            .style(Style::default().bg(SURFACE)),
+            .style(Style::default().bg(palette.surface)),
         content,
     );
     let prompt = match app.composer_prompt() {
@@ -412,11 +474,15 @@ pub fn render(frame: &mut Frame<'_>, app: &App) {
     };
     frame.render_widget(
         Paragraph::new(prompt)
-            .style(Style::default().fg(if prompt_text.is_empty() { MUTED } else { TEXT }))
+            .style(Style::default().fg(if prompt_text.is_empty() {
+                palette.muted
+            } else {
+                palette.text
+            }))
             .block(
                 Block::default()
                     .borders(Borders::TOP)
-                    .border_style(Style::default().fg(RULE)),
+                    .border_style(Style::default().fg(palette.rule)),
             ),
         Rect::new(composer.x, composer.y, composer.width, 2),
     );
@@ -429,14 +495,14 @@ pub fn render(frame: &mut Frame<'_>, app: &App) {
     // A failure has to be visible and must say what went wrong; a silent send
     // failure is worse than an ugly line. It takes the hint row while it lasts.
     let (footer, footer_style) = match app.error.as_deref() {
-        Some(message) => (message.to_owned(), Style::default().fg(RED)),
+        Some(message) => (message.to_owned(), Style::default().fg(palette.red)),
         // Reading back is a state the mockup does not show, so rather than change
         // its hint row this explains how to leave that state when it happens.
         None if app.is_scrolled_back() => (
             "↑ reading back · End returns to the newest".to_owned(),
-            Style::default().fg(CYAN),
+            Style::default().fg(palette.cyan),
         ),
-        None => (hints.to_owned(), Style::default().fg(MUTED)),
+        None => (hints.to_owned(), Style::default().fg(palette.muted)),
     };
     frame.render_widget(
         Paragraph::new(footer).style(footer_style),
