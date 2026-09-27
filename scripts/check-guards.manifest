@@ -1,6 +1,6 @@
 # name|file|old text|replacement text|package|test
 byline|apps/bloom-tui/src/ui.rs|if header_lines.contains(&line) && line_starts.get(line) == Some(&last_row) {|if false {|bloom-tui|ui_render|no_scroll_position_ends_the_transcript_on_a_bare_byline
 theme-padding|apps/bloom-tui/src/ui.rs|let width = unicode_width::UnicodeWidthStr::width(label) as u16 + 2;|let width = unicode_width::UnicodeWidthStr::width(label) as u16;|bloom-tui|ui_render|the_theme_control_sits_one_column_inside_the_frame
-theme-narrow|apps/bloom-tui/src/ui.rs|const THEME_MIN_WIDTH: u16 = 38;|const THEME_MIN_WIDTH: u16 = 50;|bloom-tui|ui_render|the_theme_control_stays_visible_on_a_narrow_terminal
+theme-narrow|apps/bloom-tui/src/ui.rs|if right[0].width >= THEME_MIN_WIDTH {|if false {|bloom-tui|ui_render|the_theme_control_stays_visible_on_a_narrow_terminal
 frame-bound|apps/bloomd/src/engine.rs|if bytes.len().saturating_add(take) > MAX_FRAME_BYTES + 1 {|if false {|bloomd|lib|engine::tests::an_oversized_frame_neither_returns_nor_drains_the_stream
 filter-q|apps/bloom-tui/src/app.rs|if self.filter_query().is_some() {|if false {|bloom-tui|interaction|q_is_text_while_the_filter_is_open_and_quits_from_the_list

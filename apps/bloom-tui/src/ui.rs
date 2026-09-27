@@ -1075,7 +1075,7 @@ fn render_with_mode(frame: &mut Frame<'_>, app: &App, monochrome: bool) -> HitMa
         cursor = area.x;
     }
     let mut status_edge = cursor;
-    if right[0].width >= 38 {
+    if right[0].width >= THEME_MIN_WIDTH {
         let label = match app.theme {
             Theme::Dark => " Dark ",
             Theme::Light => " Light ",

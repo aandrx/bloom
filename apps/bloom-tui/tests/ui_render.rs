@@ -1306,16 +1306,11 @@ fn no_scroll_position_ends_the_transcript_on_a_bare_byline() {
         app.scroll = back;
         let text = rendered(&app);
         let rows: Vec<&str> = text.lines().collect();
-        // The composer rule is the lowest long horizontal run inside the window,
-        // above the frame's own bottom border.
+        // The composer is bare now, so the row above it is the last transcript row.
         let rule = rows
             .iter()
-            .enumerate()
-            .rev()
-            .skip(1)
-            .find(|(_, row)| row.matches('─').count() > 40)
-            .map(|(index, _)| index)
-            .expect("the composer rule must be drawn");
+            .position(|row| row.contains('›'))
+            .expect("the composer prompt must be drawn");
         let above = rows[rule - 1];
         let has_clock = above
             .split(|c: char| !c.is_ascii_digit() && c != ':')
