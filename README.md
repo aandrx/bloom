@@ -6,6 +6,8 @@ Bloom is a keyboard-first messaging concept pairing a calm desktop conversation 
 
 The offline, illustrative prototype is at [`design/mockup/index.html`](design/mockup/index.html); preview PNGs are in [`design/previews/`](design/previews/). It is a static reference, not a live service.
 
+For keyboard controls, screen details, and troubleshooting, see the [terminal client guide](docs/tui.md). For what is built, what is verified and what is blocked, see the [status page](docs/status.md).
+
 ## Staged direction
 
 1. Build an auth-first foundation, establishing secure identity and session flows before messaging functionality.

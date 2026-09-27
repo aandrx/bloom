@@ -4,6 +4,8 @@ Companion to `docs/system-design.md`. This document exists so that independent
 subagents can work in parallel without colliding. Read section 2 before touching
 anything.
 
+Current project status: [docs/status.md](status.md).
+
 ## 1. Measured constraints
 
 These are facts about this machine, not preferences.
