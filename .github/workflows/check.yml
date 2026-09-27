@@ -5,6 +5,13 @@ on:
   pull_request:
 
 jobs:
+  source-guard:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: No emptied or stubbed sources
+        run: ./scripts/check-sources
+
   rust:
     runs-on: ubuntu-latest
     steps:

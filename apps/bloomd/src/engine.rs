@@ -49,6 +49,10 @@ pub struct EngineConfig {
     pub script: PathBuf,
     pub state_dir: PathBuf,
     pub library: PathBuf,
+    /// Ask the engine to list the account's existing conversations. Set when the
+    /// store is empty, so a fresh install is usable without paying for a full
+    /// account listing on every subsequent start.
+    pub sync_chats: bool,
 }
 
 impl EngineConfig {
@@ -60,7 +64,11 @@ impl EngineConfig {
             .arg("--state")
             .arg(&self.state_dir)
             .arg("--library")
-            .arg(&self.library)
+            .arg(&self.library);
+        if self.sync_chats {
+            command.arg("--sync-chats");
+        }
+        command
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::inherit())

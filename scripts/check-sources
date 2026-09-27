@@ -1,0 +1,46 @@
+#!/bin/sh
+# Fail when a tracked source file has been emptied or replaced with a placeholder.
+#
+# Two real incidents motivated this: one agent overwrote a module with an empty
+# file, and another replaced a working module with a `// placeholder` stub. Both
+# were only caught later by hand. This runs in CI and locally.
+set -eu
+
+root=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
+cd "$root"
+
+fail=0
+
+for file in $(git ls-files '*.rs' '*.dart' '*.py' '*.sh' '*.toml' '*.yml' '*.yaml'); do
+  if [ ! -s "$file" ]; then
+    echo "empty source file: $file" >&2
+    fail=1
+    continue
+  fi
+
+  # Strip blank lines and comments, then look for a body that is only a placeholder.
+  body=$(sed -e 's/[[:space:]]*$//' -e '/^[[:space:]]*$/d' \
+              -e '/^[[:space:]]*\/\//d' -e '/^[[:space:]]*#/d' \
+              -e '/^[[:space:]]*\/\*.*\*\/[[:space:]]*$/d' "$file" | tr -d '\r')
+  # A file whose only content is comments is a stub in disguise, as long as it is
+  # small: real modules always have some code.
+  if [ -z "$body" ] && [ "$(wc -c < "$file")" -lt 400 ]; then
+    echo "comment-only source file: $file" >&2
+    fail=1
+    continue
+  fi
+
+  case "$body" in
+    "placeholder"|"// placeholder"|"TODO"|"todo"|"unimplemented"|"WIP"|"stub")
+      echo "placeholder source file: $file" >&2
+      fail=1
+      ;;
+  esac
+done
+
+if [ "$fail" -ne 0 ]; then
+  echo "refusing: a source file looks emptied or stubbed" >&2
+  exit 1
+fi
+
+echo "source guard: no empty or placeholder files"

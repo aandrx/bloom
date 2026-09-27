@@ -45,8 +45,16 @@ async fn main() -> ExitCode {
             return ExitCode::from(2);
         }
     };
+    // Only ask the engine for a full conversation listing when this store has none.
+    let store_is_empty = {
+        let guard = store.lock().unwrap();
+        bloomd::store::list_conversations(&guard).map_or(true, |rows| rows.is_empty())
+    };
+    let mut engine_config = config.engine.clone();
+    engine_config.sync_chats = store_is_empty;
+
     let hub = SubscriptionHub::with_default_capacity();
-    let engine = Arc::new(Engine::new(config.engine.clone()));
+    let engine = Arc::new(Engine::new(engine_config));
 
     let (sink, mut events) = mpsc::channel(EVENT_CAPACITY);
     let mut supervisor = Supervisor::new(engine.clone(), sink);

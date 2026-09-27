@@ -74,6 +74,7 @@ async fn daemon_persists_inbound_and_sends_outbound_through_the_sidecar() {
     let mut subscriber = hub.subscribe();
 
     let engine = Arc::new(Engine::new(EngineConfig {
+        sync_chats: false,
         dart_executable: fake,
         script: PathBuf::from("ignored"),
         state_dir: private.clone(),
@@ -211,6 +212,7 @@ async fn starting_a_conversation_creates_then_reuses_it_and_normalises_addresses
     let hub = SubscriptionHub::with_default_capacity();
 
     let engine = Arc::new(Engine::new(EngineConfig {
+        sync_chats: false,
         dart_executable: fake,
         script: PathBuf::from("ignored"),
         state_dir: private.clone(),
@@ -362,6 +364,7 @@ async fn listing_frames_upsert_conversations_and_publish_one_refresh() {
     let mut subscriber = hub.subscribe();
 
     let engine = Arc::new(Engine::new(EngineConfig {
+        sync_chats: false,
         dart_executable: fake,
         script: PathBuf::from("ignored"),
         state_dir: private.clone(),

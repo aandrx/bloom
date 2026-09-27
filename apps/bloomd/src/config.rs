@@ -167,6 +167,8 @@ impl DaemonConfig {
             socket_path,
             store_path,
             engine: EngineConfig {
+                // The daemon sets this when it finds its store empty.
+                sync_chats: false,
                 dart_executable,
                 script,
                 state_dir,

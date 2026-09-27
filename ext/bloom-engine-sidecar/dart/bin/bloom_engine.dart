@@ -34,8 +34,9 @@ class SidecarConfig {
   final String stateDirectory;
   final String libraryPath;
 
-  /// Listing the account's existing conversations is on by default: without it a
-  /// fresh store shows nothing at all.
+  /// Listing the account's existing conversations. The daemon asks for it when its
+  /// store has no conversations yet: a fresh store shows nothing otherwise, and an
+  /// established one should not pay for a full listing on every start.
   final bool syncChats;
 }
 
@@ -67,7 +68,7 @@ SidecarConfig? parseConfig(List<String> arguments) {
   return SidecarConfig(
     stateDirectory: state,
     libraryPath: library,
-    syncChats: !arguments.contains('--no-sync-chats'),
+    syncChats: arguments.contains('--sync-chats'),
   );
 }
 
