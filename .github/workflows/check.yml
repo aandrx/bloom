@@ -25,3 +25,28 @@ jobs:
         run: cargo test --workspace --all-targets
       - name: Clippy
         run: cargo clippy --workspace --all-targets -- -D warnings
+
+  engine-sidecar:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: ext/bloom-engine-sidecar/dart
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dart-lang/setup-dart@v1
+        with:
+          sdk: stable
+      - name: Resolve dependencies
+        run: dart pub get
+      - name: Formatting
+        run: dart format --output=none --set-exit-if-changed bin lib/payload_codec.dart lib/protocol.dart test
+      - name: Analyze
+        run: dart analyze bin lib/payload_codec.dart lib/protocol.dart test
+      - name: Tests
+        run: dart test
+      - name: Engine stays out of the repository
+        run: |
+          if find . -name '*.so' -o -name 'librust_lib_bluebubbles*' | grep -q .; then
+            echo 'the engine binary must never be vendored into this repository'
+            exit 1
+          fi
