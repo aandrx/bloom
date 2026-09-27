@@ -81,12 +81,16 @@ Android/AIDL-specific and does not expose conversation history or general send.
 
 ## Test plan
 
-Phase 1, no account state, no credentials:
+Phase 1, no account state, no credentials: **PASSED.**
 
-1. Install a Dart SDK (user-local download is enough; no system package needed).
-2. Run a headless program that loads the installed library, calls
-   `frb_get_rust_content_hash`, and invokes a pure local function such as
-   `newNgmIdentity`. Passing proves headless bridge initialization.
+1. A user-local Dart SDK is installed at `~/.cache/dart-sdk` (no system packages,
+   no sudo).
+2. The spike harness at `~/.cache/bloom-engine-spike` loads the installed engine
+   library through the public, ABI-matched generated bindings via
+   `RustLib.init(externalLibrary: ExternalLibrary.open(...))` and runs without a
+   Flutter engine. `newNgmIdentity()` and `generateUdid()` both executed.
+3. Verified engine artifact: `librust_lib_bluebubbles.so`, 33,912,920 bytes,
+   SHA-256 `67d91b7024ed94bcd0b2cb3b1bb295cc518065c43afd329b4fe71b8dfbcac7a3`.
 
 Phase 2, restored state, read-only, user authorized:
 
