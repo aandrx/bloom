@@ -110,9 +110,14 @@ pub fn render(frame: &mut Frame<'_>, app: &App) {
         return;
     }
 
-    // The mockup's sidebar is roughly a sixth of the panel, so size it as a
-    // proportion with sane bounds rather than a fixed 24 columns.
-    let sidebar_width = ((inner.width / 6).clamp(14, 22)).min(inner.width.saturating_sub(3));
+    // Measured from the mockup: the rail is 287px of the 1366px window, about 21%,
+    // so size it as that proportion with sane bounds rather than a fixed column
+    // count. The transcript keeps its own width cap, so the rail only takes room
+    // that was empty in the conversation column.
+    let desired = (inner.width as u32 * 21 + 50) / 100;
+    let sidebar_width = desired
+        .clamp(14, 28)
+        .min(inner.width.saturating_sub(3) as u32) as u16;
     let body = Layout::horizontal([
         Constraint::Length(sidebar_width),
         Constraint::Length(1),
