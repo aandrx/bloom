@@ -68,6 +68,22 @@ impl EngineConfig {
         if self.sync_chats {
             command.arg("--sync-chats");
         }
+        #[cfg(target_os = "linux")]
+        {
+            use libc;
+            use std::io;
+
+            // dart run launches another process; PDEATHSIG covers only that direct
+            // child, while stdin EOF remains the sidecar's actual shutdown path.
+            unsafe {
+                command.pre_exec(|| {
+                    if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGTERM) == -1 {
+                        return Err(io::Error::last_os_error());
+                    }
+                    Ok(())
+                });
+            }
+        }
         command
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
@@ -224,6 +240,7 @@ impl Transport for Engine {
             self.started.store(false, Ordering::SeqCst);
             TransportError::TransportUnavailable
         })?;
+        eprintln!("bloomd: engine child started pid={:?}", child.id());
         let stdout = child.stdout.take().ok_or(TransportError::Internal)?;
         let stdin = child.stdin.take().ok_or(TransportError::Internal)?;
         *self.stdin.lock().await = Some(stdin);
@@ -497,8 +514,12 @@ pub fn handle_from(raw: &str) -> Option<Handle> {
 fn text_of(parts: &[MessagePart]) -> Option<String> {
     let mut buffer = String::new();
     for part in parts {
-        if let MessagePart::Text(text) = part {
-            buffer.push_str(text);
+        match part {
+            MessagePart::Text(text) => buffer.push_str(text),
+            // Anything else cannot be carried by the text-only send path. Returning
+            // what we can would send a truncated message that looks successful, so
+            // reject the whole body instead.
+            _ => return None,
         }
     }
     if buffer.is_empty() {
@@ -955,5 +976,29 @@ mod tests {
             }),
             Ok("hi".to_owned())
         );
+        assert_eq!(
+            outgoing_text(&OutgoingBody {
+                parts: vec![
+                    MessagePart::Text("hi".to_owned()),
+                    MessagePart::Text(" there".to_owned())
+                ]
+            }),
+            Ok("hi there".to_owned())
+        );
+    }
+
+    #[test]
+    fn a_body_with_an_unsupported_part_is_rejected_rather_than_truncated() {
+        // Sending only the text of a mixed body would drop the attachment while
+        // reporting success, so the whole body must be refused.
+        let body = OutgoingBody {
+            parts: vec![
+                MessagePart::Text("look at this".to_owned()),
+                MessagePart::Unsupported {
+                    kind: "attachment".to_owned(),
+                },
+            ],
+        };
+        assert_eq!(outgoing_text(&body), Err(TransportError::Unsupported));
     }
 }

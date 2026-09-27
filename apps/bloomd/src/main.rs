@@ -53,6 +53,11 @@ async fn main() -> ExitCode {
     let mut engine_config = config.engine.clone();
     engine_config.sync_chats = store_is_empty;
 
+    eprintln!(
+        "bloomd: starting pid={} socket={}",
+        std::process::id(),
+        config.socket_path.display()
+    );
     let hub = SubscriptionHub::with_default_capacity();
     let engine = Arc::new(Engine::new(engine_config));
 
@@ -96,7 +101,10 @@ async fn main() -> ExitCode {
                 }
                 Err(_) => continue,
             },
-            _ = tokio::signal::ctrl_c() => break,
+            _ = tokio::signal::ctrl_c() => {
+                eprintln!("bloomd: termination signal received");
+                break;
+            }
         }
     }
 
@@ -106,6 +114,7 @@ async fn main() -> ExitCode {
     let _ = supervisor.shutdown(SHUTDOWN_DRAIN).await;
     drop(service);
     persistence.abort();
+    eprintln!("bloomd: clean shutdown");
     ExitCode::SUCCESS
 }
 

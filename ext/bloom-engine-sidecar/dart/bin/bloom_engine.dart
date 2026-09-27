@@ -205,17 +205,23 @@ Future<void> main(List<String> arguments) async {
     }
   }
 
+  // Explicit stop and stdin EOF (the parent daemon going away, which closes our
+  // stdin) both end the process. Without the EOF path the sidecar survives as an
+  // orphan and keeps owning the user's engine state with no daemon supervising it.
+  void stop() {
+    stopping = true;
+    api.cancelPoll(cancel: deskState.cancelPoll);
+  }
+
   final commands =
       stdin.transform(utf8.decoder).transform(const LineSplitter()).listen(
             (line) => _handleCommand(
               line: line,
               deskState: deskState,
               sends: sends,
-              stop: () {
-                stopping = true;
-                api.cancelPoll(cancel: deskState.cancelPoll);
-              },
+              stop: stop,
             ),
+            onDone: stop,
           );
 
   while (!stopping) {

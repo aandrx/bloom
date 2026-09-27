@@ -71,6 +71,10 @@ impl std::fmt::Display for ListenerError {
 }
 impl std::error::Error for ListenerError {}
 
+fn should_reclaim_socket(kind: io::ErrorKind) -> bool {
+    kind == io::ErrorKind::ConnectionRefused
+}
+
 /// Pure policy check, exposed so wrong-UID behavior can be tested without another OS user.
 pub fn credential_matches(expected_uid: u32, peer_uid: u32) -> bool {
     expected_uid == peer_uid
@@ -108,9 +112,10 @@ impl Listener {
                             "another daemon is already listening on this socket",
                         ));
                     }
-                    Err(_) => {
+                    Err(error) if should_reclaim_socket(error.kind()) => {
                         fs::remove_file(&path)?;
                     }
+                    Err(error) => return Err(ListenerError::Io(error)),
                 }
             }
             Err(e) if e.kind() == io::ErrorKind::NotFound => (),
@@ -187,6 +192,13 @@ impl Drop for Listener {
 mod tests {
     use super::*;
     use std::os::unix::fs::FileTypeExt;
+
+    #[test]
+    fn reclaim_policy_only_allows_connection_refused() {
+        assert!(should_reclaim_socket(io::ErrorKind::ConnectionRefused));
+        assert!(!should_reclaim_socket(io::ErrorKind::PermissionDenied));
+        assert!(!should_reclaim_socket(io::ErrorKind::Other));
+    }
 
     #[test]
     fn uid_policy() {
