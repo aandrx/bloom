@@ -19,6 +19,27 @@ use std::{fmt, io};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 pub const PROTOCOL_VERSION: u16 = 1;
+/// Default daemon socket, shared by the daemon and its clients so both sides
+/// agree without configuration.
+pub fn default_socket_path() -> std::path::PathBuf {
+    let base = std::env::var_os("XDG_RUNTIME_DIR")
+        .map(std::path::PathBuf::from)
+        .or_else(|| {
+            #[cfg(unix)]
+            {
+                Some(std::path::PathBuf::from(format!("/run/user/{}", unsafe {
+                    libc::geteuid()
+                })))
+            }
+            #[cfg(not(unix))]
+            {
+                None
+            }
+        })
+        .unwrap_or_else(|| std::path::PathBuf::from("/tmp"));
+    base.join("bloom/bloomd.sock")
+}
+
 pub const MAX_FRAME_LEN: usize = 1024 * 1024;
 
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]

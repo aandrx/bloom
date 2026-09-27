@@ -1,0 +1,67 @@
+#!/bin/sh
+# Start Bloom: runs the daemon if it is not already up, then opens the TUI.
+#
+# Everything is discovered automatically: the OpenBubbles Flatpak provides the
+# engine library and state, the sidecar script lives in this repository, and Dart
+# is taken from PATH or a user-local SDK. Override with BLOOM_ENGINE_STATE,
+# BLOOM_ENGINE_LIBRARY, BLOOM_ENGINE_SCRIPT, BLOOM_DART_EXECUTABLE or
+# BLOOM_SOCKET_PATH when your layout differs.
+
+set -eu
+
+root=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
+cd "$root"
+
+# Local overrides live in .env so your shell stays clean. Only paths belong here,
+# never secrets. The file is sourced, so it must be trusted like any shell script.
+if [ -f "$root/.env" ]; then
+  set -a
+  # shellcheck disable=SC1091
+  . "$root/.env"
+  set +a
+fi
+
+# Dart is often installed per-user rather than system-wide.
+if ! command -v dart >/dev/null 2>&1; then
+  for candidate in "$HOME/.cache/dart-sdk/dart-sdk/bin" "$HOME/.local/share/bloom/dart/bin"; do
+    if [ -x "$candidate/dart" ]; then
+      PATH="$candidate:$PATH"
+      export PATH
+      break
+    fi
+  done
+fi
+
+socket=${BLOOM_SOCKET_PATH:-${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/bloom/bloomd.sock}
+export BLOOM_SOCKET_PATH="$socket"
+
+if [ ! -x target/debug/bloomd ] || [ ! -x target/debug/bloom-tui ]; then
+  echo "building bloom..." >&2
+  CARGO_BUILD_JOBS=${CARGO_BUILD_JOBS:-2} cargo build -p bloomd -p bloom-tui
+fi
+
+started_daemon=""
+if [ ! -S "$socket" ]; then
+  target/debug/bloomd &
+  started_daemon=$!
+  # Wait for the socket, but fail loudly instead of opening an empty UI.
+  i=0
+  while [ ! -S "$socket" ]; do
+    i=$((i + 1))
+    if [ "$i" -gt 100 ]; then
+      echo "bloom: daemon did not come up; see its output above" >&2
+      exit 1
+    fi
+    sleep 0.1
+  done
+fi
+
+cleanup() {
+  if [ -n "$started_daemon" ]; then
+    kill "$started_daemon" 2>/dev/null || true
+    wait "$started_daemon" 2>/dev/null || true
+  fi
+}
+trap cleanup EXIT INT TERM
+
+target/debug/bloom-tui
