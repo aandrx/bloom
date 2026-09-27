@@ -120,26 +120,33 @@ Phase 2a, restored state, read-only, user authorized: **PASSED.**
    was identical before and after the probe, with 25 files unchanged.
 
 Phase 2b, live engine restore and bounded receive window, user authorized:
-**transport PASSED, payload capture FAILED and is being fixed.**
+**PASSED.**
 
 5. `bin/engine_restore.dart` restored the user's real state headlessly: push state
    restored, `ApsWatcher` created, iCloud services present, and the poll loop ran a
-   bounded 60 second window with the Mac off. It received 26 `PushMessage.iMessage`
-   items and shut down cleanly.
+   bounded window with the Mac off, then shut down cleanly.
 6. Inbound messages are delivered to whoever holds the push connection. The probe
    therefore consumes them, so it must only be run when Bloom can persist them.
-7. Payload capture was inadequate: the log recorded only the runtime type name, so
-   26 pushes were consumed without usable content. The capture path must serialize
-   the real message structure before any further receive run.
-8. State changes from that run: `hw_info.plist` rewritten at identical size, and
-   `facetime.plist` grew from 832 to 1253 bytes. These are the engine's normal
-   refreshed-registration writes, the same kind the app performs on launch.
+7. The first capture attempt was inadequate: the log recorded only the runtime type
+   name, so those pushes were consumed without usable content. `bin/payload_codec.dart`
+   now encodes `PushMessage` by discriminant with real nested fields, and
+   `bin/codec_test.dart` verifies it synthetically before any live run.
+8. Verified capture over a 20 second window: 7 iMessage pushes, 7 distinct payloads,
+   134 distinct key paths, 6 with message text captured (3 to 70 characters each),
+   no reflection errors and no unreadable fields. The remaining record had no text
+   parts. `hw_info.plist` was the only state file written.
+9. Payloads append to `~/.cache/bloom-engine-spike/received/payloads.jsonl`, with
+   directory mode 0700 and file mode 0600. No content is printed to stdout.
+
+The codec's mirror-based fallback is spike-grade. The production sidecar should use
+an explicit encoder per type and write straight into Bloom's encrypted store
+instead of a JSONL file.
 
 Phase 3, first write, user authorized:
 
-9. Send one outbound message and confirm delivery.
-10. Restart the sidecar and confirm inbound messages still arrive.
-11. Confirm renewal behavior after the scheduled re-registration.
+10. Send one outbound message and confirm delivery.
+11. Restart the sidecar and confirm inbound messages still arrive.
+12. Confirm renewal behavior after the scheduled re-registration.
 
 Phase 3, integration:
 
