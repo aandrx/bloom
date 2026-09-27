@@ -1316,13 +1316,14 @@ fn no_scroll_position_ends_the_transcript_on_a_bare_byline() {
         app.scroll = back;
         let text = rendered(&app);
         let rows: Vec<&str> = text.lines().collect();
-        // The composer is bare now, so the row above it is the last transcript row.
-        let rule = rows
+        // The shaded band has one top pad and the reserved transcript separator
+        // sits above it, so the transcript viewport's final row is three rows up.
+        let composer = rows
             .iter()
             .position(|row| row.contains('›'))
             .expect("the composer prompt must be drawn");
-        let above = rows[rule - 1];
-        let has_clock = above
+        let transcript_bottom = rows[composer - 3];
+        let has_clock = transcript_bottom
             .split(|c: char| !c.is_ascii_digit() && c != ':')
             .any(|token| {
                 let parts: Vec<&str> = token.split(':').collect();
