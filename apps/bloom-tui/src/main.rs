@@ -3,9 +3,11 @@
 use anyhow::{Context, Result};
 use bloom_domain::{MessagePart, OutgoingBody};
 use bloom_ipc::{client::BloomClient, EventKind};
-use bloom_tui::app::App;
+use bloom_tui::app::{App, Theme};
+use bloom_tui::config::Config;
 use bloom_tui::daemon::{self, ConnectionState, Snapshot};
 use bloom_tui::ui;
+use bloom_tui::RedrawScheduler;
 use crossterm::{
     event::{self, Event, KeyEvent},
     execute,
@@ -148,17 +150,30 @@ async fn main() -> Result<()> {
         println!(
             "Bloom TUI\nUsage: bloom-tui [--help]\n\
              Reads BLOOM_SOCKET_PATH (or BLOOM_SOCKET) for the socket path.\n\
-             Keys: up/down select, Enter compose, Enter send, Esc cancel, q quit."
+             Keys: up/down select, Enter compose/send, Esc cancel, q quit.\n\
+             Herdr-style: Ctrl+B then h/l changes chat, j/k scrolls, n starts, f filters, t themes."
         );
         return Ok(());
     }
 
     let client = BloomClient::new(socket_path());
+    let config_path = Config::path();
+    let (mut config, config_warning) = Config::load(&config_path);
     let _guard = TerminalGuard::enter()?;
-    let initial_theme = query_background_theme().unwrap_or_default();
+    let system_theme = query_background_theme().unwrap_or_default();
+    let theme_override = match config.theme.as_deref() {
+        Some("dark") => Some(Theme::Dark),
+        Some("light") => Some(Theme::Light),
+        _ => None,
+    };
     let mut terminal = Terminal::new(CrosstermBackend::new(io::stdout()))?;
     let mut app = App {
-        theme: initial_theme,
+        theme: theme_override.unwrap_or(system_theme),
+        system_theme,
+        theme_override,
+        compact_sidebar: config.compact_sidebar,
+        nicknames: config.nicknames.clone(),
+        error: config_warning,
         connection: ConnectionState::Connecting.label().to_owned(),
         connection_state: ConnectionState::Connecting,
         ..Default::default()
@@ -167,7 +182,8 @@ async fn main() -> Result<()> {
     let (event_tx, mut event_rx) = mpsc::unbounded_channel::<EventKind>();
     let (snapshot_tx, mut snapshot_rx) = mpsc::unbounded_channel::<Snapshot>();
     let (status_tx, mut status_rx) = mpsc::unbounded_channel::<ConnectionState>();
-    let (send_tx, mut send_rx) = mpsc::unbounded_channel::<Result<(), String>>();
+    let (send_tx, mut send_rx) =
+        mpsc::unbounded_channel::<(Option<bloom_domain::ConversationId>, Result<(), String>)>();
     let (conversation_tx, mut conversation_rx) =
         mpsc::unbounded_channel::<Vec<bloom_domain::Conversation>>();
     let (visible_tx, visible_rx) = watch::channel::<Option<bloom_domain::ConversationId>>(None);
@@ -215,23 +231,43 @@ async fn main() -> Result<()> {
     });
 
     let mut last_visible = app.selected.clone();
+    let mut redraw = RedrawScheduler::default();
+    redraw.request();
+    let mut next_animation = tokio::time::Instant::now();
     loop {
-        terminal.draw(|frame| ui::render(frame, &app))?;
+        if redraw.take_due(std::time::Instant::now()) {
+            terminal.draw(|frame| ui::render(frame, &app))?;
+        }
 
+        let redraw_delay = redraw.wake_after(std::time::Instant::now());
         tokio::select! {
+            _ = async {
+                if let Some(delay) = redraw_delay {
+                    tokio::time::sleep(delay).await;
+                } else {
+                    std::future::pending::<()>().await;
+                }
+            } => {}
             Some(snapshot) = snapshot_rx.recv() => {
                 app.thread_loading = false;
                 app.apply_snapshot(snapshot);
+                redraw.request();
                 last_visible = app.selected.clone();
                 let _ = visible_tx.send(last_visible.clone());
             }
-            Some(conversations) = conversation_rx.recv() => app.set_conversations(conversations),
+            Some(conversations) = conversation_rx.recv() => {
+                app.set_conversations(conversations);
+                redraw.request();
+            },
             Some(state) = status_rx.recv() => {
                 app.connection = state.label().to_owned();
                 app.connection_state = state;
+                redraw.request();
+                if app.is_animating() { next_animation = tokio::time::Instant::now() + Duration::from_millis(33); }
             }
             Some(event) = event_rx.recv() => {
                 app.apply_event(event);
+                redraw.request();
                 if app.resync_conversations {
                     app.resync_conversations = false;
                     let client = client.clone();
@@ -243,9 +279,9 @@ async fn main() -> Result<()> {
                     });
                 }
             }
-            Some(result) = send_rx.recv() => match result {
-                Ok(()) => app.error = None,
-                Err(error) => app.error = Some(error),
+            Some((conversation, result)) = send_rx.recv() => {
+                app.finish_send(conversation, result);
+                redraw.request();
             },
             Some(key) = key_rx.recv() => {
                 // All key semantics live in `App::handle_key` so the real key path is
@@ -253,6 +289,8 @@ async fn main() -> Result<()> {
                 match app.handle_key(key) {
                     bloom_tui::app::Action::Quit => break,
                     bloom_tui::app::Action::SendMessage { conversation, body } => {
+                        let target = Some(conversation.clone());
+                        app.begin_send(target.clone());
                         let client = client.clone();
                         let send_tx = send_tx.clone();
                         tokio::spawn(async move {
@@ -264,10 +302,12 @@ async fn main() -> Result<()> {
                                 .context("send failed")
                                 .map(|_| ())
                                 .map_err(|error| error.to_string());
-                            let _ = send_tx.send(result);
+                            let _ = send_tx.send((target, result));
                         });
                     }
                     bloom_tui::app::Action::StartConversation { address, body } => {
+                        let target = None;
+                        app.begin_send(target.clone());
                         let client = client.clone();
                         let send_tx = send_tx.clone();
                         tokio::spawn(async move {
@@ -279,10 +319,27 @@ async fn main() -> Result<()> {
                                 .context("start conversation failed")
                                 .map(|_| ())
                                 .map_err(|error| error.to_string());
-                            let _ = send_tx.send(result);
+                            let _ = send_tx.send((target, result));
                         });
                     }
                     bloom_tui::app::Action::None => {}
+                }
+                let updated_config = Config {
+                    version: 1,
+                    theme: app.theme_override.map(|theme| match theme {
+                        Theme::Dark => "dark".to_owned(),
+                        Theme::Light => "light".to_owned(),
+                    }),
+                    compact_sidebar: app.compact_sidebar,
+                    nicknames: app.nicknames.clone(),
+                };
+                if updated_config != config {
+                    match updated_config.save(&config_path) {
+                        Ok(()) => config = updated_config,
+                        Err(error) => {
+                            app.error = Some(format!("Could not save local settings: {error}"));
+                        }
+                    }
                 }
                 // A selection change is a request for a fresh read, not an event.
                 if app.selected != last_visible {
@@ -290,12 +347,19 @@ async fn main() -> Result<()> {
                     app.thread_loading = last_visible.is_some();
                     let _ = visible_tx.send(last_visible.clone());
                 }
+                redraw.request();
+                if app.is_animating() { next_animation = tokio::time::Instant::now() + Duration::from_millis(33); }
             }
-            _ = tokio::time::sleep(if app.is_animating() { Duration::from_millis(33) } else { Duration::from_secs(2) }) => {
+            _ = async {
                 if app.is_animating() {
-                    app.advance();
-                    terminal.draw(|frame| ui::render(frame, &app))?;
+                    tokio::time::sleep_until(next_animation).await;
+                } else {
+                    std::future::pending::<()>().await;
                 }
+            } => {
+                app.advance();
+                redraw.request();
+                next_animation = tokio::time::Instant::now() + Duration::from_millis(33);
             }
         }
     }

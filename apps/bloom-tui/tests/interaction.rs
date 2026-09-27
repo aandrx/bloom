@@ -8,7 +8,7 @@ use bloom_domain::{
 };
 use bloom_ipc::EventKind;
 use bloom_tui::{
-    app::{Action, App},
+    app::{Action, App, SendPhase},
     KeyCode, KeyEvent, KeyModifiers,
 };
 
@@ -74,6 +74,10 @@ fn key(code: KeyCode) -> KeyEvent {
     KeyEvent::new(code, KeyModifiers::NONE)
 }
 
+fn ctrl(code: KeyCode) -> KeyEvent {
+    KeyEvent::new(code, KeyModifiers::CONTROL)
+}
+
 fn app_with(titles: &[&str]) -> App {
     let mut app = App::default();
     let conversations: Vec<Conversation> =
@@ -104,6 +108,272 @@ fn q_is_text_while_composing_a_message() {
     app.composing = true;
     assert_eq!(app.handle_key(key(KeyCode::Char('q'))), Action::None);
     assert_eq!(app.draft, "q");
+}
+
+#[test]
+fn slash_picker_completes_commands_and_never_sends_command_text() {
+    let mut app = app_with(&["Jules Lee"]);
+    app.composing = true;
+    for character in "/th".chars() {
+        assert_eq!(app.handle_key(key(KeyCode::Char(character))), Action::None);
+    }
+    assert!(app.command_menu);
+    assert_eq!(
+        app.command_suggestions(),
+        vec![("/theme", "Choose system, dark, or light theme")]
+    );
+
+    // Enter completes the highlighted partial command instead of submitting it.
+    assert_eq!(app.handle_key(key(KeyCode::Enter)), Action::None);
+    assert_eq!(app.draft, "/theme ");
+    assert!(app.composing);
+    for character in "dark".chars() {
+        app.handle_key(key(KeyCode::Char(character)));
+    }
+    assert_eq!(app.handle_key(key(KeyCode::Enter)), Action::None);
+    assert_eq!(app.theme, bloom_tui::app::Theme::Dark);
+    assert!(app.draft.is_empty());
+
+    // Unknown leading-slash input stays local even after the menu closes.
+    for character in "/unknown".chars() {
+        app.handle_key(key(KeyCode::Char(character)));
+    }
+    let draft = app.draft.clone();
+    assert_eq!(app.handle_key(key(KeyCode::Enter)), Action::None);
+    assert_eq!(app.draft, draft);
+    assert!(app.error.as_deref().unwrap().contains("Unknown command"));
+    assert_eq!(app.handle_key(key(KeyCode::Enter)), Action::None);
+    assert_eq!(app.draft, draft);
+}
+
+#[test]
+fn herdr_style_leader_chords_navigate_without_breaking_composition() {
+    let mut app = app_with(&["Weekend crew", "Jules Lee", "Design systems"]);
+    let first = app.selected.clone();
+    app.handle_key(ctrl(KeyCode::Char('b')));
+    assert!(app.leader_pending);
+    app.handle_key(key(KeyCode::Char('l')));
+    assert!(!app.leader_pending);
+    assert_ne!(app.selected, first);
+
+    app.handle_key(ctrl(KeyCode::Char('b')));
+    app.handle_key(key(KeyCode::Char('h')));
+    assert_eq!(app.selected, first);
+
+    app.handle_key(ctrl(KeyCode::Char('b')));
+    app.handle_key(key(KeyCode::Char('n')));
+    assert!(app.new_conversation);
+    assert!(app.composing);
+
+    let mut composing = app_with(&["Jules Lee"]);
+    composing.composing = true;
+    composing.handle_key(ctrl(KeyCode::Char('b')));
+    assert!(!composing.leader_pending);
+    assert!(composing.draft.is_empty());
+}
+
+#[test]
+fn slash_actions_open_new_chat_and_filter_or_toggle_the_sidebar() {
+    let mut new_chat = app_with(&["Jules Lee"]);
+    new_chat.composing = true;
+    for character in "/new".chars() {
+        new_chat.handle_key(key(KeyCode::Char(character)));
+    }
+    new_chat.handle_key(key(KeyCode::Enter));
+    assert!(new_chat.new_conversation);
+    assert!(new_chat.composing);
+    assert_eq!(
+        new_chat.composer_prompt(),
+        bloom_tui::app::ComposerPrompt::Recipient
+    );
+
+    let mut filter = app_with(&["Jules Lee"]);
+    filter.composing = true;
+    for character in "/filter".chars() {
+        filter.handle_key(key(KeyCode::Char(character)));
+    }
+    filter.handle_key(key(KeyCode::Enter));
+    assert_eq!(filter.filter_query(), Some(""));
+    assert!(!filter.composing);
+
+    let mut compact = app_with(&["Jules Lee"]);
+    compact.composing = true;
+    for character in "/compact".chars() {
+        compact.handle_key(key(KeyCode::Char(character)));
+    }
+    compact.handle_key(key(KeyCode::Enter));
+    assert!(compact.compact_sidebar);
+    assert!(!compact.composing);
+}
+
+#[test]
+fn send_feedback_is_contextual_and_never_claims_delivery() {
+    let mut app = app_with(&["Jules Lee", "Quinn Callahan"]);
+    let target = app.selected.clone();
+    app.begin_send(target.clone());
+    assert_eq!(
+        app.visible_send_feedback().unwrap().phase,
+        SendPhase::Sending
+    );
+
+    app.select_step(1);
+    assert!(app.visible_send_feedback().is_none());
+    app.finish_send(target.clone(), Ok(()));
+    assert!(app.visible_send_feedback().is_none());
+    app.selected = target;
+    assert_eq!(app.visible_send_feedback().unwrap().phase, SendPhase::Sent);
+    app.handle_key(key(KeyCode::Char('j')));
+    assert!(app.send_feedback.is_none());
+
+    app.finish_send(None, Err("transport unavailable".into()));
+    assert!(app
+        .error
+        .as_deref()
+        .unwrap()
+        .contains("transport unavailable"));
+    assert!(app.send_feedback.is_none());
+}
+
+#[test]
+fn local_settings_are_keyboard_accessible_and_theme_can_return_to_automatic() {
+    use bloom_tui::app::Theme;
+
+    let mut app = app_with(&["Jules Lee"]);
+    app.system_theme = Theme::Light;
+    app.theme = Theme::Light;
+    app.composing = true;
+    for character in "/settings".chars() {
+        app.handle_key(key(KeyCode::Char(character)));
+    }
+    assert_eq!(app.handle_key(key(KeyCode::Enter)), Action::None);
+    assert!(app.settings_open);
+    assert!(!app.composing);
+    assert_eq!(app.draft, "");
+
+    // Theme choice cycles from automatic to explicit dark, then light, then auto.
+    assert_eq!(app.theme, Theme::Light);
+    app.handle_key(key(KeyCode::Enter));
+    assert_eq!(app.theme_override, Some(Theme::Dark));
+    assert_eq!(app.theme, Theme::Dark);
+    app.handle_key(key(KeyCode::Enter));
+    app.handle_key(key(KeyCode::Down));
+    app.handle_key(key(KeyCode::Enter));
+    assert!(app.compact_sidebar);
+    app.handle_key(key(KeyCode::Up));
+    app.handle_key(key(KeyCode::Enter));
+    assert_eq!(app.theme_override, None);
+    assert_eq!(app.theme, Theme::Light);
+    app.handle_key(key(KeyCode::Esc));
+    assert!(!app.settings_open);
+}
+
+#[test]
+fn direct_chat_nicknames_are_local_filterable_and_clearable() {
+    let conversation = conversation("Jules Lee", 2);
+    let peer = conversation
+        .participants
+        .iter()
+        .find(|participant| !participant.is_me)
+        .unwrap()
+        .handle
+        .clone();
+    let peer_key = bloom_tui::app::nickname_key(&peer);
+    let mut app = app_with(&["Jules Lee"]);
+    app.composing = true;
+    for character in "/nickname Maya Chen".chars() {
+        app.handle_key(key(KeyCode::Char(character)));
+    }
+    assert_eq!(app.handle_key(key(KeyCode::Enter)), Action::None);
+    assert_eq!(
+        app.nicknames.get(&peer_key).map(String::as_str),
+        Some("Maya Chen")
+    );
+    assert_eq!(
+        app.conversation_name(app.selected_conversation().unwrap()),
+        "Maya Chen"
+    );
+    assert!(app.notice.as_deref().unwrap().contains("Maya Chen"));
+
+    app.filter = Some("maya".into());
+    assert_eq!(app.visible_conversations().len(), 1);
+    app.cancel_filter();
+
+    app.composing = true;
+    for character in "/nickname clear".chars() {
+        app.handle_key(key(KeyCode::Char(character)));
+    }
+    assert_eq!(app.handle_key(key(KeyCode::Enter)), Action::None);
+    assert!(!app.nicknames.contains_key(&peer_key));
+    assert_eq!(
+        app.conversation_name(app.selected_conversation().unwrap()),
+        "Jules Lee"
+    );
+
+    let mut incoming = message(&conversation, "nicknamed");
+    incoming.sender = peer;
+    assert_eq!(
+        app.speaker_label_for(&incoming, Some(&conversation)),
+        "Juleslee-1"
+    );
+}
+
+#[test]
+fn groups_reject_direct_chat_nickname_overrides() {
+    let mut app = App::default();
+    app.set_conversations(vec![conversation("Weekend crew", 3)]);
+    app.composing = true;
+    for character in "/nickname Maya".chars() {
+        app.handle_key(key(KeyCode::Char(character)));
+    }
+    app.handle_key(key(KeyCode::Enter));
+    assert!(app.nicknames.is_empty());
+    assert!(app.error.as_deref().unwrap().contains("direct chats only"));
+}
+
+#[test]
+fn escape_dismisses_command_menu_without_losing_draft_and_slashes_in_prose_send_normally() {
+    let mut app = app_with(&["Jules Lee"]);
+    app.composing = true;
+    for character in "/help".chars() {
+        app.handle_key(key(KeyCode::Char(character)));
+    }
+    let draft = app.draft.clone();
+    let cursor = app.draft_cursor;
+    assert!(app.command_menu);
+    assert_eq!(app.handle_key(key(KeyCode::Esc)), Action::None);
+    assert!(!app.command_menu);
+    assert!(app.composing);
+    assert_eq!(app.draft, draft);
+    assert_eq!(app.draft_cursor, cursor);
+
+    // Even after dismissing suggestions, Enter handles the command locally.
+    assert_eq!(app.handle_key(key(KeyCode::Enter)), Action::None);
+    assert!(app.error.as_deref().unwrap().contains("Commands:"));
+    assert!(app.draft.is_empty());
+
+    let mut prose = app_with(&["Jules Lee"]);
+    prose.composing = true;
+    let text = "See https://example.test/a";
+    for character in text.chars() {
+        prose.handle_key(key(KeyCode::Char(character)));
+    }
+    assert!(!prose.command_menu);
+    let expected_conversation = prose.selected.clone().unwrap();
+    assert_eq!(
+        prose.handle_key(key(KeyCode::Enter)),
+        Action::SendMessage {
+            conversation: expected_conversation,
+            body: text.to_owned(),
+        }
+    );
+}
+
+#[test]
+fn slash_in_list_mode_still_opens_the_conversation_filter() {
+    let mut app = app_with(&["Jules Lee"]);
+    assert_eq!(app.handle_key(key(KeyCode::Char('/'))), Action::None);
+    assert_eq!(app.filter_query(), Some(""));
+    assert!(!app.composing);
 }
 
 #[test]

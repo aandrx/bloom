@@ -7,7 +7,7 @@
 #
 # Usage: tui-shot.sh [output-dir] [cols] [rows] [keys]
 # Keys are whitespace-separated tokens: up down left right pageup pagedown home
-# end enter esc tab backspace space delete ctrl-c. Use text:... to type a
+# end enter esc tab backspace space delete ctrl-b ctrl-c. Use text:... to type a
 # literal ambiguous token; a single non-key token remains literal text.
 # Prints the path of the produced PNG.
 
@@ -45,7 +45,7 @@ BLOOM_SOCKET_PATH="$socket" "$tools" scripts/tui-shot.py \
 
 # Size the viewport to the content so the screenshot has no dead margin.
 width=$((cols * 9 + 34))
-height=$((rows * 22 + 30))
+height=$((rows * 18 + 36))
 browser=$HOME/.pi/agent/skills/browser-tools/browser.js
 node "$browser" start --headless >/dev/null 2>&1 || true
 node "$browser" nav "file://$out/screen.html" >/dev/null 2>&1

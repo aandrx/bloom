@@ -1,10 +1,11 @@
 //! UI state for the Bloom TUI. Rendering lives in `ui.rs`.
 
 use crate::daemon::{ConnectionState, Snapshot};
-use bloom_domain::{Conversation, ConversationId, HandleKind, Message};
+use bloom_domain::{Conversation, ConversationId, ConversationKind, Handle, HandleKind, Message};
 use bloom_ipc::EventKind;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use std::collections::HashMap;
+use unicode_segmentation::UnicodeSegmentation;
 
 /// Rows a single PageUp or PageDown moves through the transcript.
 const SCROLL_PAGE: usize = 10;
@@ -27,6 +28,18 @@ pub enum Action {
     },
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SendPhase {
+    Sending,
+    Sent,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SendFeedback {
+    pub conversation: Option<ConversationId>,
+    pub phase: SendPhase,
+}
+
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum Theme {
     #[default]
@@ -41,11 +54,25 @@ impl Theme {
             Self::Light => Self::Dark,
         };
     }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Dark => "Dark",
+            Self::Light => "Light",
+        }
+    }
 }
 
 #[derive(Default)]
 pub struct App {
     pub theme: Theme,
+    /// Terminal-detected theme used when the preference is automatic.
+    pub system_theme: Theme,
+    /// None means follow the terminal theme; Some pins a user preference.
+    pub theme_override: Option<Theme>,
+    pub compact_sidebar: bool,
+    pub settings_open: bool,
+    pub settings_selection: usize,
     pub conversations: Vec<Conversation>,
     pub selected: Option<ConversationId>,
     pub messages: HashMap<ConversationId, Vec<Message>>,
@@ -55,6 +82,8 @@ pub struct App {
     pub thread_loading: bool,
     pub session: String,
     pub draft: String,
+    /// Extended-grapheme insertion position in the draft.
+    pub draft_cursor: usize,
     /// Display rows scrolled back from the newest message. Zero pins the transcript
     /// to the newest content, which is what a chat client should do by default.
     pub scroll: usize,
@@ -69,6 +98,14 @@ pub struct App {
     pub pending_address: Option<String>,
     pub new_conversation: bool,
     pub error: Option<String>,
+    pub notice: Option<String>,
+    pub send_feedback: Option<SendFeedback>,
+    /// Local-only nickname overrides, keyed by stable participant handle.
+    pub nicknames: HashMap<String, String>,
+    /// Filterable command menu is only active while composing.
+    pub command_menu: bool,
+    pub command_selection: usize,
+    pub leader_pending: bool,
 }
 
 impl App {
@@ -122,6 +159,7 @@ impl App {
     pub fn select(&mut self, id: Option<ConversationId>) {
         if self.selected != id {
             self.scroll = 0;
+            self.send_feedback = None;
         }
         self.selected = id;
     }
@@ -153,17 +191,22 @@ impl App {
 
     /// Start a new conversation: first the recipient address, then the message.
     pub fn begin_new_conversation(&mut self) {
+        self.leader_pending = false;
+        self.command_menu = false;
         self.new_conversation = true;
         self.pending_address = None;
         self.composing = true;
         self.draft.clear();
+        self.draft_cursor = 0;
     }
 
     pub fn cancel_composition(&mut self) {
+        self.command_menu = false;
         self.new_conversation = false;
         self.pending_address = None;
         self.composing = false;
         self.draft.clear();
+        self.draft_cursor = 0;
     }
 
     /// Advance the composer one step. Address entry does not send anything; it
@@ -172,6 +215,7 @@ impl App {
     pub fn submit_intent(&mut self) -> CompositionIntent {
         let value = self.draft.trim().to_owned();
         self.draft.clear();
+        self.draft_cursor = 0;
         if self.new_conversation && self.pending_address.is_none() {
             if value.is_empty() {
                 self.cancel_composition();
@@ -231,7 +275,18 @@ impl App {
             Some(query) => self
                 .conversations
                 .iter()
-                .filter(|conversation| conversation_matches(conversation, query))
+                .filter(|conversation| {
+                    conversation_matches(conversation, query)
+                        || conversation.participants.iter().any(|participant| {
+                            self.nicknames
+                                .get(&nickname_key(&participant.handle))
+                                .is_some_and(|nickname| {
+                                    nickname
+                                        .to_lowercase()
+                                        .contains(&query.trim().to_lowercase())
+                                })
+                        })
+                })
                 .collect(),
         }
     }
@@ -257,6 +312,8 @@ impl App {
     /// Open the filter without touching an in-progress draft, so `/` cannot lose
     /// what the user was typing.
     pub fn begin_filter(&mut self) {
+        self.leader_pending = false;
+        self.command_menu = false;
         self.filter = Some(String::new());
         self.composing = false;
         self.new_conversation = false;
@@ -288,18 +345,327 @@ impl App {
         selected
     }
 
+    fn cursor_byte(&self) -> usize {
+        self.draft
+            .grapheme_indices(true)
+            .nth(self.draft_cursor)
+            .map_or(self.draft.len(), |(index, _)| index)
+    }
+
+    pub fn draft_cursor_byte(&self) -> usize {
+        self.cursor_byte()
+    }
+
+    fn insert_draft(&mut self, character: char) {
+        let byte = self.cursor_byte();
+        self.draft.insert(byte, character);
+        let insertion_byte = byte + character.len_utf8();
+        self.draft_cursor = self
+            .draft
+            .grapheme_indices(true)
+            .take_while(|(index, _)| *index < insertion_byte)
+            .count();
+        if insertion_byte == self.draft.len() {
+            self.draft_cursor = self.draft.graphemes(true).count();
+        }
+    }
+
+    fn move_draft_cursor(&mut self, delta: isize) {
+        self.draft_cursor = (self.draft_cursor as isize + delta)
+            .clamp(0, self.draft.graphemes(true).count() as isize)
+            as usize;
+    }
+
+    fn delete_before_cursor(&mut self) {
+        let cursor = self.cursor_byte();
+        if cursor == 0 {
+            return;
+        }
+        let start = self.draft[..cursor]
+            .grapheme_indices(true)
+            .next_back()
+            .map_or(0, |(index, _)| index);
+        self.draft.drain(start..cursor);
+        self.draft_cursor = self.draft[..start].graphemes(true).count();
+    }
+
+    fn delete_at_cursor(&mut self) {
+        let byte = self.cursor_byte();
+        if let Some(grapheme) = self.draft[byte..].graphemes(true).next() {
+            self.draft.drain(byte..byte + grapheme.len());
+            self.draft_cursor = self.draft[..byte].graphemes(true).count();
+        }
+    }
+
+    fn update_command_menu(&mut self) {
+        self.command_menu = self.draft.trim_start().starts_with('/') && !self.draft.contains('\n');
+        self.command_selection = 0;
+    }
+
+    pub fn command_suggestions(&self) -> Vec<(&'static str, &'static str)> {
+        let token = self.draft.split_whitespace().next().unwrap_or("/");
+        [
+            ("/help", "Show command help"),
+            ("/theme", "Choose system, dark, or light theme"),
+            ("/settings", "Open local display settings"),
+            ("/nickname", "Name this direct chat locally"),
+            ("/new", "Start a new direct chat"),
+            ("/filter", "Filter your conversations"),
+            ("/compact", "Toggle sidebar density"),
+            ("/cancel", "Close the composer"),
+        ]
+        .into_iter()
+        .filter(|(name, _)| name.starts_with(token) || token == *name)
+        .collect()
+    }
+
+    fn complete_command(&mut self) {
+        let suggestions = self.command_suggestions();
+        let Some((name, _)) = suggestions.get(self.command_selection).copied() else {
+            return;
+        };
+        let leading = self.draft.len() - self.draft.trim_start().len();
+        let command = &self.draft[leading..];
+        let token_end = command.find(char::is_whitespace).unwrap_or(command.len());
+        let old_cursor = self.cursor_byte();
+        let has_suffix = token_end < command.len();
+        let shift = name.len() as isize - token_end as isize;
+        self.draft.replace_range(leading..leading + token_end, name);
+        let new_cursor = if old_cursor <= leading + token_end {
+            leading + name.len()
+        } else {
+            (old_cursor as isize + shift).max(0) as usize
+        }
+        .min(self.draft.len());
+        self.draft_cursor = self.draft[..new_cursor].graphemes(true).count();
+        if !has_suffix {
+            self.draft.push(' ');
+            self.draft_cursor = self.draft.graphemes(true).count();
+        }
+        self.command_menu = false;
+    }
+
+    fn execute_nickname_command(&mut self) {
+        let nickname = self
+            .draft
+            .strip_prefix("/nickname")
+            .unwrap_or_default()
+            .trim();
+        let Some(conversation) = self.selected_conversation() else {
+            self.error = Some("Select a direct chat before setting a nickname.".into());
+            return;
+        };
+        if conversation.kind != ConversationKind::Direct {
+            self.error = Some("Nicknames are available in direct chats only.".into());
+            return;
+        }
+        let Some(participant) = conversation
+            .participants
+            .iter()
+            .find(|participant| !participant.is_me)
+        else {
+            self.error = Some("This direct chat has no other participant to name.".into());
+            return;
+        };
+        let key = nickname_key(&participant.handle);
+        if nickname.eq_ignore_ascii_case("clear") {
+            self.nicknames.remove(&key);
+            self.error = None;
+            self.notice = Some("Local nickname cleared.".into());
+        } else if !crate::config::valid_nickname(nickname) {
+            self.error = Some("Usage: /nickname <name> or /nickname clear".into());
+            return;
+        } else {
+            self.nicknames.insert(key, nickname.to_owned());
+            self.error = None;
+            self.notice = Some(format!("Local nickname set to {nickname}."));
+        }
+        self.cancel_composition();
+    }
+
+    fn execute_command(&mut self) {
+        let words: Vec<_> = self.draft.split_whitespace().collect();
+        self.command_menu = false;
+        match words.as_slice() {
+            ["/help"] => {
+                self.error =
+                    Some("Commands: /help, /theme [auto|dark|light], /settings, /nickname <name|clear>, /new, /filter, /compact, /cancel".into());
+                self.draft.clear();
+                self.draft_cursor = 0;
+            }
+            ["/theme"] => {
+                self.toggle_theme();
+                self.error = None;
+                self.draft.clear();
+                self.draft_cursor = 0;
+            }
+            ["/theme", "dark"] => {
+                self.set_theme_override(Some(Theme::Dark));
+                self.error = None;
+                self.draft.clear();
+                self.draft_cursor = 0;
+            }
+            ["/theme", "light"] => {
+                self.set_theme_override(Some(Theme::Light));
+                self.error = None;
+                self.draft.clear();
+                self.draft_cursor = 0;
+            }
+            ["/theme", "auto"] => {
+                self.set_theme_override(None);
+                self.error = None;
+                self.draft.clear();
+                self.draft_cursor = 0;
+            }
+            ["/settings"] => {
+                self.error = None;
+                self.open_settings();
+            }
+            ["/nickname", ..] => self.execute_nickname_command(),
+            ["/new"] => {
+                self.error = None;
+                self.begin_new_conversation();
+            }
+            ["/filter"] => {
+                self.error = None;
+                self.cancel_composition();
+                self.begin_filter();
+            }
+            ["/compact"] => {
+                self.compact_sidebar = !self.compact_sidebar;
+                self.error = None;
+                self.cancel_composition();
+            }
+            ["/cancel"] => self.cancel_composition(),
+            _ => self.error = Some("Unknown command or invalid syntax".into()),
+        }
+    }
+
     /// Apply a key press and report what the shell should do about it.
     ///
     /// Ctrl+C always quits. Otherwise the open prompt owns the keyboard: while the
     /// filter is open its characters are query text, and while composing they are
     /// message text, so `q` only quits from the plain conversation list.
+    pub fn begin_send(&mut self, conversation: Option<ConversationId>) {
+        self.error = None;
+        self.notice = None;
+        self.send_feedback = Some(SendFeedback {
+            conversation,
+            phase: SendPhase::Sending,
+        });
+    }
+
+    pub fn finish_send(
+        &mut self,
+        conversation: Option<ConversationId>,
+        result: Result<(), String>,
+    ) {
+        match result {
+            Ok(()) => {
+                self.error = None;
+                self.notice = None;
+                self.send_feedback = Some(SendFeedback {
+                    conversation,
+                    phase: SendPhase::Sent,
+                });
+            }
+            Err(error) => {
+                self.send_feedback = None;
+                self.error = Some(error);
+            }
+        }
+    }
+
+    pub fn visible_send_feedback(&self) -> Option<&SendFeedback> {
+        self.send_feedback.as_ref().filter(|feedback| {
+            feedback
+                .conversation
+                .as_ref()
+                .is_none_or(|conversation| Some(conversation) == self.selected.as_ref())
+        })
+    }
+
+    pub fn set_theme_override(&mut self, theme: Option<Theme>) {
+        self.theme_override = theme;
+        self.theme = theme.unwrap_or(self.system_theme);
+    }
+
     pub fn toggle_theme(&mut self) {
-        self.theme.toggle();
+        let mut theme = self.theme;
+        theme.toggle();
+        self.set_theme_override(Some(theme));
+    }
+
+    fn toggle_setting(&mut self) {
+        match self.settings_selection {
+            0 => {
+                let next = match self.theme_override {
+                    None => Some(Theme::Dark),
+                    Some(Theme::Dark) => Some(Theme::Light),
+                    Some(Theme::Light) => None,
+                };
+                self.set_theme_override(next);
+            }
+            1 => self.compact_sidebar = !self.compact_sidebar,
+            _ => {}
+        }
+    }
+
+    fn open_settings(&mut self) {
+        self.leader_pending = false;
+        self.settings_open = true;
+        self.settings_selection = 0;
+        self.command_menu = false;
+        self.composing = false;
+        self.new_conversation = false;
+        self.pending_address = None;
+        self.draft.clear();
+        self.draft_cursor = 0;
     }
 
     pub fn handle_key(&mut self, key: KeyEvent) -> Action {
         if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
             return Action::Quit;
+        }
+        self.notice = None;
+        if self
+            .send_feedback
+            .as_ref()
+            .is_some_and(|feedback| feedback.phase == SendPhase::Sent)
+        {
+            self.send_feedback = None;
+        }
+        if self.leader_pending {
+            self.leader_pending = false;
+            match key.code {
+                KeyCode::Esc => {}
+                KeyCode::Char('h') => self.select_step(-1),
+                KeyCode::Char('j') => self.scroll_forward(SCROLL_PAGE),
+                KeyCode::Char('k') => self.scroll_back(SCROLL_PAGE),
+                KeyCode::Char('l') => self.select_step(1),
+                KeyCode::Char('n') => self.begin_new_conversation(),
+                KeyCode::Char('f') => self.begin_filter(),
+                KeyCode::Char('t') => self.toggle_theme(),
+                _ => {}
+            }
+            return Action::None;
+        }
+        if key.code == KeyCode::Char('b') && key.modifiers.contains(KeyModifiers::CONTROL) {
+            if !self.settings_open && self.filter_query().is_none() && !self.composing {
+                self.leader_pending = true;
+            }
+            return Action::None;
+        }
+        if self.settings_open {
+            match key.code {
+                KeyCode::Esc => self.settings_open = false,
+                KeyCode::Up => self.settings_selection = self.settings_selection.saturating_sub(1),
+                KeyCode::Down => self.settings_selection = (self.settings_selection + 1).min(1),
+                KeyCode::Enter | KeyCode::Char(' ') => self.toggle_setting(),
+                KeyCode::Char('t') => self.toggle_theme(),
+                _ => {}
+            }
+            return Action::None;
         }
         if self.filter_query().is_some() {
             match key.code {
@@ -318,12 +684,64 @@ impl App {
             return Action::None;
         }
         if self.composing {
+            if self.command_menu {
+                match key.code {
+                    KeyCode::Esc => self.command_menu = false,
+                    KeyCode::Up => {
+                        self.command_selection = self.command_selection.saturating_sub(1)
+                    }
+                    KeyCode::Down => {
+                        let last = self.command_suggestions().len().saturating_sub(1);
+                        self.command_selection = self.command_selection.saturating_add(1).min(last);
+                    }
+                    KeyCode::Tab => self.complete_command(),
+                    KeyCode::Enter => {
+                        let token = self.draft.split_whitespace().next().unwrap_or("");
+                        let exact = self
+                            .command_suggestions()
+                            .iter()
+                            .any(|(name, _)| *name == token);
+                        if exact || self.command_suggestions().is_empty() {
+                            self.execute_command();
+                        } else {
+                            self.complete_command();
+                        }
+                    }
+                    KeyCode::Backspace => {
+                        self.delete_before_cursor();
+                        self.update_command_menu();
+                    }
+                    KeyCode::Delete => {
+                        self.delete_at_cursor();
+                        self.update_command_menu();
+                    }
+                    KeyCode::Left => self.move_draft_cursor(-1),
+                    KeyCode::Right => self.move_draft_cursor(1),
+                    KeyCode::Home => self.draft_cursor = 0,
+                    KeyCode::End => self.draft_cursor = self.draft.graphemes(true).count(),
+                    KeyCode::Char(character) => {
+                        self.insert_draft(character);
+                        self.update_command_menu();
+                    }
+                    _ => {}
+                }
+                return Action::None;
+            }
             match key.code {
                 KeyCode::Esc => {
                     self.cancel_composition();
                     return Action::None;
                 }
                 KeyCode::Enter => {
+                    if self
+                        .draft
+                        .split_whitespace()
+                        .next()
+                        .is_some_and(|token| token.starts_with('/'))
+                    {
+                        self.execute_command();
+                        return Action::None;
+                    }
                     let action = match self.submit_intent() {
                         CompositionIntent::None => Action::None,
                         CompositionIntent::SendMessage(body) => {
@@ -351,9 +769,18 @@ impl App {
                     return action;
                 }
                 KeyCode::Backspace => {
-                    self.draft.pop();
+                    self.delete_before_cursor();
+                    self.update_command_menu();
                 }
-                KeyCode::Char(character) => self.draft.push(character),
+                KeyCode::Delete => self.delete_at_cursor(),
+                KeyCode::Left => self.move_draft_cursor(-1),
+                KeyCode::Right => self.move_draft_cursor(1),
+                KeyCode::Home => self.draft_cursor = 0,
+                KeyCode::End => self.draft_cursor = self.draft.graphemes(true).count(),
+                KeyCode::Char(character) => {
+                    self.insert_draft(character);
+                    self.update_command_menu();
+                }
                 _ => {}
             }
             return Action::None;
@@ -392,6 +819,33 @@ impl App {
         self.conversations
             .iter()
             .find(|c| Some(&c.id) == self.selected.as_ref())
+    }
+
+    pub fn conversation_name(&self, conversation: &Conversation) -> String {
+        if conversation.kind == ConversationKind::Direct {
+            if let Some(nickname) = conversation
+                .participants
+                .iter()
+                .find(|participant| !participant.is_me)
+                .and_then(|participant| self.nicknames.get(&nickname_key(&participant.handle)))
+            {
+                return nickname.clone();
+            }
+        }
+        chat_name(conversation).to_owned()
+    }
+
+    pub fn speaker_label_for(
+        &self,
+        message: &Message,
+        conversation: Option<&Conversation>,
+    ) -> String {
+        if !message.from_me {
+            if let Some(nickname) = self.nicknames.get(&nickname_key(&message.sender)) {
+                return nickname.clone();
+            }
+        }
+        speaker_label(message, conversation)
     }
 
     pub fn apply_event(&mut self, event: EventKind) {
@@ -468,6 +922,16 @@ impl App {
             .map(message_text)
             .unwrap_or_default()
     }
+}
+
+/// Stable local-only key for a participant nickname. The value is never sent to a transport.
+pub fn nickname_key(handle: &Handle) -> String {
+    let kind = match handle.kind() {
+        HandleKind::Tel => "tel",
+        HandleKind::Email => "email",
+        HandleKind::Opaque => "opaque",
+    };
+    format!("{kind}:{}", handle.value())
 }
 
 /// Does a conversation match a filter query?
@@ -598,7 +1062,10 @@ pub fn status_text(app: &App) -> Option<String> {
     if session.is_empty() {
         return None;
     }
-    Some(session.to_owned())
+    Some(match session {
+        "RenewalDue" => "Renewal due".to_owned(),
+        _ => session.to_owned(),
+    })
 }
 
 /// Severity of the status shown in the header, so colour can carry meaning the way
@@ -613,7 +1080,15 @@ pub enum StatusTone {
 /// Session states that mean the engine needs the user's attention.
 pub fn status_tone(app: &App) -> StatusTone {
     if !app.connection.is_empty() && app.connection != "Connected" {
-        return StatusTone::Failure;
+        return if matches!(
+            app.connection_state,
+            crate::daemon::ConnectionState::Connecting
+                | crate::daemon::ConnectionState::Disconnected
+        ) {
+            StatusTone::Attention
+        } else {
+            StatusTone::Failure
+        };
     }
     match app.session.trim() {
         "" | "Active" | "Registered" => StatusTone::Healthy,
@@ -641,6 +1116,20 @@ mod tests {
     use bloom_domain::{
         ConversationKind, DeliveryState, Handle, HandleKind, MessageId, Participant, TransportId,
     };
+
+    fn draft_key(app: &mut App, code: KeyCode) {
+        assert_eq!(
+            app.handle_key(KeyEvent::new(code, KeyModifiers::NONE)),
+            Action::None
+        );
+    }
+
+    fn draft_state(app: &App, text: &str, cursor: usize, byte: usize) {
+        assert_eq!(app.draft, text);
+        assert_eq!(app.draft_cursor, cursor);
+        assert_eq!(app.draft_cursor_byte(), byte);
+        assert!(app.draft_cursor <= app.draft.graphemes(true).count());
+    }
 
     fn conversation(value: &str, last: Option<i64>) -> Conversation {
         let transport = TransportId::new("openbubbles").unwrap();
@@ -675,6 +1164,96 @@ mod tests {
             None,
         )
         .unwrap()
+    }
+
+    #[test]
+    fn draft_ascii_editing_tracks_grapheme_and_byte_positions() {
+        let mut app = App {
+            composing: true,
+            ..Default::default()
+        };
+        for ch in "abc".chars() {
+            draft_key(&mut app, KeyCode::Char(ch));
+        }
+        draft_state(&app, "abc", 3, 3);
+        draft_key(&mut app, KeyCode::Left);
+        draft_state(&app, "abc", 2, 2);
+        draft_key(&mut app, KeyCode::Home);
+        draft_state(&app, "abc", 0, 0);
+        draft_key(&mut app, KeyCode::Left);
+        draft_state(&app, "abc", 0, 0);
+        draft_key(&mut app, KeyCode::Right);
+        draft_state(&app, "abc", 1, 1);
+        draft_key(&mut app, KeyCode::End);
+        draft_state(&app, "abc", 3, 3);
+        draft_key(&mut app, KeyCode::Right);
+        draft_state(&app, "abc", 3, 3);
+        draft_key(&mut app, KeyCode::Backspace);
+        draft_state(&app, "ab", 2, 2);
+        draft_key(&mut app, KeyCode::Home);
+        draft_key(&mut app, KeyCode::Backspace);
+        draft_state(&app, "ab", 0, 0);
+        draft_key(&mut app, KeyCode::Home);
+        draft_key(&mut app, KeyCode::Delete);
+        draft_state(&app, "b", 0, 0);
+
+        app.draft = "abc".into();
+        app.draft_cursor = 0;
+        draft_key(&mut app, KeyCode::Delete);
+        draft_state(&app, "bc", 0, 0);
+        draft_key(&mut app, KeyCode::Right);
+        draft_key(&mut app, KeyCode::Delete);
+        draft_state(&app, "b", 1, 1);
+        draft_key(&mut app, KeyCode::End);
+        draft_key(&mut app, KeyCode::Delete);
+        draft_state(&app, "b", 1, 1);
+    }
+
+    #[test]
+    fn draft_edits_use_extended_grapheme_clusters() {
+        let family = "👨‍👩‍👧‍👦";
+        let combined = "e\u{301}";
+        let mut app = App {
+            composing: true,
+            ..Default::default()
+        };
+        for ch in combined.chars() {
+            draft_key(&mut app, KeyCode::Char(ch));
+        }
+        draft_state(&app, combined, 1, combined.len());
+        draft_key(&mut app, KeyCode::Home);
+        draft_key(&mut app, KeyCode::Delete);
+        draft_state(&app, "", 0, 0);
+        for ch in family.chars() {
+            draft_key(&mut app, KeyCode::Char(ch));
+        }
+        draft_state(&app, family, 1, family.len());
+        draft_key(&mut app, KeyCode::Home);
+        draft_key(&mut app, KeyCode::Right);
+        draft_key(&mut app, KeyCode::Backspace);
+        draft_state(&app, "", 0, 0);
+    }
+
+    #[test]
+    fn draft_cursor_stays_valid_when_insertions_or_deletions_merge_graphemes() {
+        let mut app = App {
+            composing: true,
+            draft: "ab".into(),
+            draft_cursor: 1,
+            ..Default::default()
+        };
+        draft_key(&mut app, KeyCode::Char('\u{301}'));
+        draft_state(&app, "a\u{301}b", 1, "a\u{301}".len());
+
+        app.draft = "a\u{301}b".into();
+        app.draft_cursor = 1;
+        draft_key(&mut app, KeyCode::Delete);
+        draft_state(&app, "a\u{301}", 1, "a\u{301}".len());
+
+        app.draft = "a\u{301}bc".into();
+        app.draft_cursor = 1;
+        draft_key(&mut app, KeyCode::Delete);
+        draft_state(&app, "a\u{301}c", 1, "a\u{301}".len());
     }
 
     #[test]
@@ -1057,13 +1636,14 @@ mod tests {
             assert_eq!(status_tone(&bad), StatusTone::Failure, "state {state}");
         }
 
-        // A dead daemon connection outranks whatever the session last was.
+        // An automatic reconnect deserves attention without alarming like a hard failure.
         let offline = App {
             connection: "Disconnected, retrying".into(),
+            connection_state: crate::daemon::ConnectionState::Disconnected,
             session: "Active".into(),
             ..Default::default()
         };
-        assert_eq!(status_tone(&offline), StatusTone::Failure);
+        assert_eq!(status_tone(&offline), StatusTone::Attention);
     }
 
     #[test]
@@ -1074,6 +1654,9 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(status_text(&app).as_deref(), Some("Active"));
+        app.session = "RenewalDue".into();
+        assert_eq!(status_text(&app).as_deref(), Some("Renewal due"));
+        app.session = "Active".into();
 
         // A broken daemon connection is more important than the last known session.
         app.connection = "Disconnected, retrying".into();

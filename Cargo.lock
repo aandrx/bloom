@@ -472,8 +472,11 @@ dependencies = [
  "crossterm",
  "libc",
  "ratatui",
+ "serde",
+ "serde_json",
  "tempfile",
  "tokio",
+ "unicode-segmentation",
  "unicode-width 0.2.0",
 ]
 

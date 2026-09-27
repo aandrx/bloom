@@ -35,19 +35,30 @@ pgrep -af 'bloomd|bloom_engine'
 | `t` | Toggle light and dark themes |
 | Esc | Cancel the filter or composition |
 | `q` | Quit from the conversation list |
+| Ctrl+B, then `h` / `l` | Select previous / next chat |
+| Ctrl+B, then `j` / `k` | Scroll transcript older / newer |
+| Ctrl+B, then `n` / `f` / `t` | Start a chat / filter / change theme |
 | Ctrl+C | Quit from anywhere |
 
-While the filter or composer is open, `q` is ordinary text. That is deliberate: the active prompt owns the keyboard.
+Ctrl+B is a leader: press it, then the indicated key. While the filter or composer is open, `q` is ordinary text. That is deliberate: the active prompt owns the keyboard.
 
 ## Screens
 
-- **Sidebar:** conversations are listed newest first, with each participant count shown as “person” or “people”. While filtering, the section label becomes the match count, or “NO MATCHES”.
-- **Header:** shows Bloom and the selected conversation identity and participant count. The theme control shows the current light or dark theme when there is room; status appears when it needs attention. A braille spinner beside Connecting or Disconnected indicates connection/retry activity.
+- **Sidebar:** conversations are listed newest first, with each participant count right-aligned on the same line as its name. While filtering, the section label becomes the match count, or “NO MATCHES”.
+- **Header:** shows Bloom and the selected conversation identity and participant count. The theme control shows the current light or dark theme when there is room. A status dot and label show the engine session or connection state: green for healthy, yellow for attention, and red for failure. A braille spinner beside Connecting or Disconnected indicates connection/retry activity.
 - **Transcript:** each message has a speaker label and timestamp aligned in columns. Your messages also show delivery state, such as queued, sent, delivered, read, or failed. An outgoing message still queued for delivery has a spinner beside “queued”.
-- **Composer:** type a message after opening a conversation. For a new conversation, the prompt first asks for a recipient and then a message.
+- **Composer:** type a message after opening a conversation. For a new conversation, the prompt first asks for a recipient and then a message. Sending shows `Sending…`; `Message sent.` appears only after IPC accepts the message. A failure is shown in red. Bloom does not claim Delivered or Read without transport events.
 - **Hint row:** shows available shortcuts. While reading older messages, it instead says that you are reading back and that End returns to the newest. If a send fails, a red error line replaces the hints.
 
 The filter prompt appears in the composer area and narrows the sidebar as you type. Its match count is shown in the sidebar label.
+
+## Commands and preferences
+
+Available slash commands are `/help`, `/theme [auto|dark|light]`, `/settings`, `/nickname <name|clear>`, `/new`, `/filter`, `/compact`, and `/cancel`. `/help` lists commands. `/theme` inspects or sets the theme: `auto` follows the detected terminal background, while `dark` and `light` select one explicitly. `/settings` opens local preferences for theme and sidebar density. `/new` starts a chat, `/filter` opens the conversation filter, `/compact` toggles sidebar density, and `/cancel` closes the composer. The `t` shortcut also toggles the theme.
+
+Use `/nickname <name>` to set a nickname for the selected direct chat, or `/nickname clear` to remove it. Nicknames apply only to that direct chat on this device. They are local display labels, not transport identities, and do not change how Bloom identifies or addresses anyone on the messaging transport.
+
+These TUI preferences are persisted in `$XDG_CONFIG_HOME/bloom/tui.json` when `XDG_CONFIG_HOME` is set, or `~/.config/bloom/tui.json` otherwise.
 
 ## Accessibility
 

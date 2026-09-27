@@ -43,6 +43,7 @@ KEY_SEQUENCES = {
     "backspace": b"\x7f",
     "space": b" ",
     "delete": b"\x1b[3~",
+    "ctrl-b": b"\x02",
     "ctrl-c": b"\x03",
 }
 
@@ -210,7 +211,7 @@ def main() -> int:
     parser.add_argument(
         "--keys", default="", metavar="TOKENS",
         help="whitespace-separated keys or text; key names: up down left right pageup "
-             "pagedown home end enter esc tab backspace space delete ctrl-c; "
+             "pagedown home end enter esc tab backspace space delete ctrl-b ctrl-c; "
              "use text:... to type an otherwise ambiguous token",
     )
     parser.add_argument("command", nargs=argparse.REMAINDER)

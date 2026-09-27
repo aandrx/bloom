@@ -9,10 +9,14 @@ use bloom_domain::{
     MessageId, MessagePart, Participant, TransportId,
 };
 use bloom_tui::{
-    app::{App, Theme},
+    app::{App, SendFeedback, SendPhase, Theme},
+    daemon::ConnectionState,
     ui,
 };
-use ratatui::{backend::TestBackend, Terminal};
+use ratatui::{
+    backend::{Backend, TestBackend},
+    Terminal,
+};
 
 fn buffer(app: &App, width: u16, height: u16) -> ratatui::buffer::Buffer {
     let backend = TestBackend::new(width, height);
@@ -168,13 +172,18 @@ fn layout_matches_the_mockup_structure() {
     assert!((1..29).filter(|y| symbol(0, *y) == "│").count() >= 25);
     assert!((1..29).filter(|y| symbol(99, *y) == "│").count() >= 25);
 
-    // Exactly one composer line, and the hints sit directly beneath it.
+    // The composer has a lower boundary before its separate hint row.
     let all = rendered(&app);
     assert_eq!(all.matches("›  Write a message...").count(), 1);
     let prompt_row = (1..29)
         .find(|y| (0..100).any(|x| symbol(x, *y) == "›"))
         .expect("the composer prompt must be drawn");
-    let hints_row = prompt_row + 1;
+    let bottom_rule: String = (0..100).map(|x| symbol(x, prompt_row + 1)).collect();
+    assert!(
+        bottom_rule.matches('─').count() > 50,
+        "composer bottom line must bound the input: {bottom_rule:?}"
+    );
+    let hints_row = prompt_row + 2;
     let hints: String = (0..100).map(|x| symbol(x, hints_row)).collect();
     assert!(
         hints.contains("chats"),
@@ -182,7 +191,7 @@ fn layout_matches_the_mockup_structure() {
     );
 
     for expected in [
-        "C H A T S",              // sidebar label
+        "Chats",                  // sidebar label
         "Bloom /",                // header prefix
         "Weekend crew",           // selected conversation title
         "3 people",               // participant count wording
@@ -191,6 +200,7 @@ fn layout_matches_the_mockup_structure() {
         "delivered",              // delivery marker
         "Write a message",        // composer placeholder
         "↑↓ chats",               // footer hints
+        "Enter compose",          // Enter starts the message composer
         "Dark",                   // current theme in the header
     ] {
         assert!(text.contains(expected), "missing {expected:?} in:\n{text}");
@@ -216,7 +226,7 @@ fn layout_matches_the_mockup_structure() {
 
     // The transcript is capped rather than running edge to edge, which is the
     // mockup's proportion: the columns before the frame edge stay empty.
-    for y in 4..26 {
+    for y in 4..prompt_row.saturating_sub(1) {
         for x in 94..99 {
             assert_eq!(
                 symbol(x, y),
@@ -251,7 +261,7 @@ fn empty_store_renders_a_usable_screen_rather_than_nothing() {
     let text = rendered(&app);
 
     assert!(
-        text.contains("C H A T S"),
+        text.contains("Chats"),
         "sidebar still present when empty:\n{text}"
     );
     assert!(
@@ -263,8 +273,641 @@ fn empty_store_renders_a_usable_screen_rather_than_nothing() {
         "composer still present when empty:\n{text}"
     );
     assert!(
-        text.contains("↑↓ chats"),
-        "footer hints still present when empty:\n{text}"
+        text.contains("n new"),
+        "empty-store action is visible:\n{text}"
+    );
+    assert!(
+        !text.contains("Enter open"),
+        "no invalid open hint:\n{text}"
+    );
+    assert!(
+        text.contains("No conversations yet"),
+        "empty-state guidance:\n{text}"
+    );
+    assert!(
+        text.contains("start a conversation"),
+        "empty-state action:\n{text}"
+    );
+}
+
+#[test]
+fn command_menu_renders_suggestions_and_compact_hints() {
+    let mut app = App {
+        composing: true,
+        draft: "/".into(),
+        draft_cursor: 1,
+        command_menu: true,
+        ..Default::default()
+    };
+
+    let desktop = buffer(&app, 100, 30);
+    let desktop_text: String = (0..desktop.area.height)
+        .map(|y| row_text(&desktop, y))
+        .collect::<Vec<_>>()
+        .join("\n");
+    for expected in [
+        "/help",
+        "Show command help",
+        "/theme",
+        "/settings",
+        "Open local display settings",
+        "/nickname",
+        "Name this direct chat locally",
+        "/new",
+        "Start a new direct chat",
+        "/filter",
+        "Filter your conversations",
+        "/compact",
+        "Toggle sidebar density",
+        "/cancel",
+        "↑↓ select",
+        "Enter run",
+    ] {
+        assert!(
+            desktop_text.contains(expected),
+            "missing {expected:?}:\n{desktop_text}"
+        );
+    }
+
+    let compact = buffer(&app, 40, 8);
+    let compact_text: String = (0..compact.area.height)
+        .map(|y| row_text(&compact, y))
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(
+        compact_text.contains("/help"),
+        "compact popup remains visible:\n{compact_text}"
+    );
+    assert!(
+        compact_text.contains("run"),
+        "compact menu hint remains visible:\n{compact_text}"
+    );
+
+    app.draft = "/not-a-command".into();
+    app.draft_cursor = app.draft.chars().count();
+    let unmatched = rendered(&app);
+    assert!(
+        unmatched.contains("No matching commands"),
+        "unknown command has visible menu feedback:\n{unmatched}"
+    );
+}
+
+#[test]
+fn session_status_dot_changes_color_with_status_tone() {
+    let mut colors = Vec::new();
+    for (session, label) in [
+        ("Active", "Active"),
+        ("RenewalDue", "Renewal due"),
+        ("Blocked", "Blocked"),
+    ] {
+        let app = App {
+            connection: "Connected".into(),
+            connection_state: ConnectionState::Connected,
+            session: session.into(),
+            ..Default::default()
+        };
+        let grid = buffer(&app, 100, 30);
+        let x = column_of(&grid, 1, "●").expect("session status dot in header");
+        colors.push(grid[(x, 1)].fg);
+        assert!(row_text(&grid, 1).contains(label));
+    }
+    assert_ne!(colors[0], colors[1], "healthy and attention colors differ");
+    assert_ne!(colors[1], colors[2], "attention and failure colors differ");
+}
+
+#[test]
+fn leader_hint_explains_herdr_style_navigation() {
+    let app = App {
+        leader_pending: true,
+        ..Default::default()
+    };
+    let screen = rendered(&app);
+    assert!(screen.contains("h/l chats"), "leader keys:\n{screen}");
+    assert!(screen.contains("j/k scroll"), "leader keys:\n{screen}");
+    assert!(screen.contains("Esc cancel"), "leader keys:\n{screen}");
+}
+
+#[test]
+fn send_feedback_is_visible_but_delivery_claims_stay_event_driven() {
+    let pending = App {
+        send_feedback: Some(SendFeedback {
+            conversation: None,
+            phase: SendPhase::Sending,
+        }),
+        ..Default::default()
+    };
+    assert!(rendered(&pending).contains("Sending…"));
+
+    let accepted = App {
+        send_feedback: Some(SendFeedback {
+            conversation: None,
+            phase: SendPhase::Sent,
+        }),
+        ..Default::default()
+    };
+    let screen = rendered(&accepted);
+    assert!(screen.contains("Message sent."));
+    assert!(!screen.contains("delivered"));
+}
+
+#[test]
+fn session_status_remains_visible_when_the_theme_control_is_hidden() {
+    let selected = conversation("Weekend crew", 3, 40);
+    let mut app = App {
+        selected: Some(selected.id.clone()),
+        connection: "Connected".into(),
+        connection_state: ConnectionState::Connected,
+        session: "Active".into(),
+        ..Default::default()
+    };
+    app.set_conversations(vec![selected]);
+    let grid = buffer(&app, 40, 12);
+    let header = row_text(&grid, 1);
+    assert!(header.contains("● Active"), "status is visible: {header:?}");
+    assert!(
+        !header.contains("Weekend"),
+        "the selected chat title yields space to the status: {header:?}"
+    );
+    assert!(
+        !header.contains("Dark"),
+        "theme control yields space: {header:?}"
+    );
+}
+
+#[test]
+fn short_narrow_view_keeps_the_start_of_the_latest_message_visible() {
+    let selected = conversation("Weekend crew", 3, 40);
+    let mut app = App {
+        selected: Some(selected.id.clone()),
+        ..Default::default()
+    };
+    app.set_conversations(vec![selected.clone()]);
+    app.upsert(
+        selected.id.clone(),
+        message(
+            &selected,
+            "m1",
+            1_700_000_000_000,
+            "I'll check the tide times tonight and send the link here.",
+            false,
+        ),
+    );
+    let grid = buffer(&app, 40, 12);
+    let screen = (0..grid.area.height)
+        .map(|row| row_text(&grid, row))
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(
+        screen.contains("I'll check the tide"),
+        "latest message is readable:\n{screen}"
+    );
+}
+
+#[test]
+fn sidebar_people_counts_share_the_name_row_and_align_right() {
+    let mut app = App::default();
+    app.set_conversations(vec![
+        conversation("Weekend crew", 3, 40),
+        conversation("Jules Lee", 2, 20),
+    ]);
+    let grid = buffer(&app, 100, 30);
+    let sidebar_row = |title: &str| {
+        (0..grid.area.height)
+            .map(|y| {
+                row_text(&grid, y)
+                    .split('│')
+                    .nth(1)
+                    .unwrap_or_default()
+                    .to_owned()
+            })
+            .find(|sidebar| sidebar.contains(title))
+            .expect("sidebar conversation row")
+    };
+    let weekend = sidebar_row("Weekend crew");
+    let jules = sidebar_row("Jules Lee");
+    assert!(weekend.contains("Weekend crew"));
+    assert!(weekend.trim_end().ends_with('3'));
+    assert!(jules.trim_end().ends_with('2'));
+    assert_eq!(
+        weekend[..weekend.rfind('3').unwrap()].chars().count(),
+        jules[..jules.rfind('2').unwrap()].chars().count(),
+        "counter columns differ: {weekend:?} vs {jules:?}"
+    );
+}
+
+#[test]
+fn settings_panel_shows_selected_local_preferences() {
+    let app = App {
+        settings_open: true,
+        settings_selection: 1,
+        compact_sidebar: true,
+        ..Default::default()
+    };
+    let screen = rendered(&app);
+    assert!(
+        screen.contains("Display settings"),
+        "settings panel:\n{screen}"
+    );
+    assert!(
+        screen.contains("Automatic (Dark)"),
+        "theme value:\n{screen}"
+    );
+    assert!(screen.contains("Sidebar"), "sidebar setting:\n{screen}");
+    assert!(screen.contains("Compact"), "compact value:\n{screen}");
+    assert!(
+        screen.contains("stored locally"),
+        "settings composer:\n{screen}"
+    );
+    assert!(screen.contains("Esc close"), "settings help:\n{screen}");
+}
+
+#[test]
+fn settings_remain_actionable_on_a_short_terminal() {
+    let app = App {
+        settings_open: true,
+        ..Default::default()
+    };
+    let compact = buffer(&app, 40, 8);
+    let screen = (0..compact.area.height)
+        .map(|row| row_text(&compact, row))
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(
+        screen.contains("Theme: Auto"),
+        "compact settings:\n{screen}"
+    );
+    assert!(
+        screen.contains("Sidebar: Comfy"),
+        "compact settings:\n{screen}"
+    );
+    assert!(screen.contains("Esc close"), "compact controls:\n{screen}");
+}
+
+#[test]
+fn footer_hints_follow_the_active_mode() {
+    let normal = rendered(&App::default());
+    assert!(normal.contains("n new"), "empty-store action:\n{normal}");
+    assert!(normal.contains("q quit"), "normal quit action:\n{normal}");
+    assert!(
+        !normal.contains("Enter open"),
+        "no selection to open:\n{normal}"
+    );
+    assert!(!normal.contains("Esc close"), "unsupported hint:\n{normal}");
+
+    let composing = App {
+        composing: true,
+        draft: "hello".into(),
+        draft_cursor: 5,
+        ..Default::default()
+    };
+    let composing_text = rendered(&composing);
+    assert!(
+        composing_text.contains("Enter send"),
+        "send hint:\n{composing_text}"
+    );
+    assert!(
+        composing_text.contains("Esc cancel"),
+        "cancel hint:\n{composing_text}"
+    );
+    assert!(
+        composing_text.contains("←→ move"),
+        "cursor hint:\n{composing_text}"
+    );
+    assert!(
+        !composing_text.contains("Enter open"),
+        "stale nav hint:\n{composing_text}"
+    );
+
+    let mut recipient = App::default();
+    recipient.begin_new_conversation();
+    let recipient_text = rendered(&recipient);
+    assert!(
+        recipient_text.contains("Enter continue"),
+        "recipient hint:\n{recipient_text}"
+    );
+
+    recipient.draft = "person@example.test".into();
+    let _ = recipient.submit_intent();
+    let body_text = rendered(&recipient);
+    assert!(
+        body_text.contains("Enter start"),
+        "new-chat body hint:\n{body_text}"
+    );
+
+    let mut filter = App::default();
+    filter.begin_filter();
+    filter.filter_input('z');
+    let filter_text = rendered(&filter);
+    assert!(
+        filter_text.contains("↑↓ select"),
+        "filter select hint:\n{filter_text}"
+    );
+    assert!(
+        filter_text.contains("Enter open"),
+        "filter open hint:\n{filter_text}"
+    );
+    assert!(
+        filter_text.contains("Esc cancel"),
+        "filter cancel hint:\n{filter_text}"
+    );
+    assert!(
+        !filter_text.contains("/ filter"),
+        "stale filter hint:\n{filter_text}"
+    );
+    assert!(
+        filter_text.contains("No matching conversations"),
+        "filter empty state:\n{filter_text}"
+    );
+}
+
+#[test]
+fn short_terminal_keeps_compact_footer_hints() {
+    let selected = conversation("Weekend crew", 3, 40);
+    let mut app = App::default();
+    app.set_conversations(vec![selected]);
+    let compact = buffer(&app, 40, 8);
+    let compact_text = (0..compact.area.height)
+        .map(|y| row_text(&compact, y))
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(
+        compact_text.contains("Write a message..."),
+        "compact prompt:\n{compact_text}"
+    );
+    assert!(
+        compact_text.contains("↑↓ chats"),
+        "compact navigation hint:\n{compact_text}"
+    );
+    assert!(
+        compact_text.contains("t theme"),
+        "compact theme hint:\n{compact_text}"
+    );
+    let compact_prompt = (0..compact.area.height)
+        .find(|y| (0..compact.area.width).any(|x| compact[(x, *y)].symbol() == "›"))
+        .unwrap();
+    assert!(
+        row_text(&compact, compact_prompt + 1).contains("─"),
+        "compact composer has a lower boundary:\n{compact_text}"
+    );
+    assert!(
+        row_text(&compact, compact_prompt + 2).contains("t theme"),
+        "compact footer remains below the boundary:\n{compact_text}"
+    );
+    let sidebar_divider = (1..compact.area.width - 1)
+        .find(|x| compact[(*x, 3)].symbol() == "│")
+        .expect("compact sidebar divider");
+    assert!(
+        sidebar_divider < 14,
+        "compact sidebar preserves transcript width: {sidebar_divider}"
+    );
+
+    let composing = App {
+        composing: true,
+        draft: "hello".into(),
+        draft_cursor: 5,
+        ..Default::default()
+    };
+    let compose_small = buffer(&composing, 34, 8);
+    let compose_text = (0..compose_small.area.height)
+        .map(|y| row_text(&compose_small, y))
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(
+        compose_text.contains("↵ send"),
+        "small send hint:\n{compose_text}"
+    );
+    assert!(
+        compose_text.contains("Esc"),
+        "small cancel key:\n{compose_text}"
+    );
+
+    let mut filtering = App::default();
+    filtering.begin_filter();
+    filtering.filter_input('z');
+    let filter_small = buffer(&filtering, 34, 8);
+    let filter_text = (0..filter_small.area.height)
+        .map(|y| row_text(&filter_small, y))
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(
+        filter_text.contains("↑↓ select"),
+        "small filter hint:\n{filter_text}"
+    );
+    assert!(
+        filter_text.contains("Esc"),
+        "small filter cancel key:\n{filter_text}"
+    );
+
+    let narrow = buffer(&app, 60, 10);
+    let narrow_text = (0..narrow.area.height)
+        .map(|y| row_text(&narrow, y))
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(
+        narrow_text.contains("↑↓ chats"),
+        "narrow footer:\n{narrow_text}"
+    );
+}
+
+#[test]
+fn long_header_title_does_not_overlap_status_or_theme() {
+    let selected = conversation(
+        "A conversation title that is much longer than the available header width",
+        4,
+        40,
+    );
+    let mut app = App {
+        selected: Some(selected.id.clone()),
+        connection: "Disconnected, retrying".into(),
+        connection_state: ConnectionState::Disconnected,
+        ..Default::default()
+    };
+    app.set_conversations(vec![selected]);
+
+    let grid = buffer(&app, 100, 30);
+    let header = row_text(&grid, 1);
+    let title = column_of(&grid, 1, "Bloom").expect("product title is visible");
+    let status = column_of(&grid, 1, "⠋ Disconnected").expect("status follows title");
+    let theme = column_of(&grid, 1, "Dark").expect("theme chip remains visible");
+    assert!(title + 6 <= status, "title/status overlap in {header:?}");
+    assert!(status < theme, "status/theme overlap in {header:?}");
+    assert!(
+        header.contains("A conversation title"),
+        "selected title is shown: {header:?}"
+    );
+    assert!(
+        !header.contains("much longer than the available header width"),
+        "title is clipped before controls, not painted underneath them: {header:?}"
+    );
+
+    let narrow = buffer(&app, 60, 10);
+    let narrow_header = row_text(&narrow, 1);
+    let narrow_title = column_of(&narrow, 1, "Bloom").expect("narrow product title");
+    let narrow_status = column_of(&narrow, 1, "⠋ Disconnected").expect("narrow status");
+    let narrow_theme = column_of(&narrow, 1, "Dark").expect("narrow theme chip");
+    assert!(
+        narrow_title + 6 <= narrow_status,
+        "narrow title/status overlap: {narrow_header:?}"
+    );
+    assert!(
+        narrow_status < narrow_theme,
+        "narrow status/theme overlap: {narrow_header:?}"
+    );
+}
+
+#[test]
+fn long_recipient_does_not_hide_new_message_draft() {
+    let draft = "The message stays visible until I finish typing";
+    let app = App {
+        composing: true,
+        pending_address: Some(format!(
+            "person.{}.example.test",
+            "long-address-".repeat(12)
+        )),
+        draft: draft.into(),
+        draft_cursor: draft.chars().count(),
+        ..Default::default()
+    };
+
+    let text = rendered(&app);
+    assert!(
+        text.contains(draft),
+        "the recipient prefix must not obscure the body draft:\n{text}"
+    );
+}
+
+#[test]
+fn composer_and_own_messages_use_codex_style_surfaces() {
+    let selected = conversation("Weekend crew", 3, 40);
+    let mut app = App {
+        selected: Some(selected.id.clone()),
+        connection: "Connected".into(),
+        ..Default::default()
+    };
+    app.set_conversations(vec![selected.clone()]);
+    app.upsert(
+        selected.id.clone(),
+        message(
+            &selected,
+            "m1",
+            1_700_000_000_000,
+            "A user message highlighted like Codex.",
+            true,
+        ),
+    );
+
+    let grid = buffer(&app, 100, 30);
+    let expected_surface = if std::env::var_os("NO_COLOR").is_some_and(|value| !value.is_empty()) {
+        ratatui::style::Color::Reset
+    } else {
+        ratatui::style::Color::Rgb(49, 50, 68)
+    };
+    let input_row = (0..grid.area.height)
+        .find(|y| (0..grid.area.width).any(|x| grid[(x, *y)].symbol() == "›"))
+        .unwrap();
+    let input_column = column_of(&grid, input_row, "›").unwrap();
+    assert_eq!(grid[(input_column, input_row)].bg, expected_surface);
+
+    let message_row = (0..grid.area.height)
+        .find(|y| row_text(&grid, *y).contains("A user message highlighted"))
+        .unwrap();
+    let message_column = column_of(&grid, message_row, "A user message").unwrap();
+    assert_eq!(grid[(message_column, message_row)].bg, expected_surface);
+    assert_eq!(
+        grid[(grid.area.width - 5, message_row)].bg,
+        expected_surface
+    );
+}
+
+#[test]
+fn composer_cursor_aligns_with_ascii_draft() {
+    let app = App {
+        composing: true,
+        draft: "abc".into(),
+        draft_cursor: 2,
+        ..Default::default()
+    };
+    let backend = TestBackend::new(100, 30);
+    let mut terminal = Terminal::new(backend).unwrap();
+    terminal.draw(|frame| ui::render(frame, &app)).unwrap();
+    let grid = terminal.backend().buffer().clone();
+    let row = (0..grid.area.height)
+        .find(|y| (0..grid.area.width).any(|x| grid[(x, *y)].symbol() == "›"))
+        .unwrap();
+    let prefix_column = column_of(&grid, row, "›  ").unwrap();
+    let cursor = terminal.backend_mut().get_cursor_position().unwrap();
+    assert_eq!(cursor.y, row);
+    assert_eq!(cursor.x, prefix_column + 3 + 2);
+}
+
+#[test]
+fn composer_cursor_tracks_wide_graphemes_and_long_drafts() {
+    let mut app = App {
+        composing: true,
+        draft: "x👨‍👩‍👧‍👦y".into(),
+        draft_cursor: 2,
+        ..Default::default()
+    };
+    let backend = TestBackend::new(100, 30);
+    let mut terminal = Terminal::new(backend).unwrap();
+    terminal.draw(|frame| ui::render(frame, &app)).unwrap();
+    let grid = terminal.backend().buffer().clone();
+    let row = (0..grid.area.height)
+        .find(|y| (0..grid.area.width).any(|x| grid[(x, *y)].symbol() == "›"))
+        .unwrap();
+    let prefix_column = column_of(&grid, row, "›  ").unwrap();
+    let cursor = terminal.backend_mut().get_cursor_position().unwrap();
+    let expected_prefix_width = unicode_width::UnicodeWidthStr::width("›  x👨‍👩‍👧‍👦");
+    assert_eq!(
+        (cursor.x, cursor.y),
+        (prefix_column + expected_prefix_width as u16, row)
+    );
+
+    app.draft = "abcdefghijklmnopqrstuvwxyz".into();
+    app.draft_cursor = app.draft.chars().count();
+    let backend = TestBackend::new(40, 8);
+    let mut terminal = Terminal::new(backend).unwrap();
+    terminal.draw(|frame| ui::render(frame, &app)).unwrap();
+    let grid = terminal.backend().buffer().clone();
+    let screen = (0..grid.area.height)
+        .map(|y| row_text(&grid, y))
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(
+        screen.contains("pqrstuvwxyz"),
+        "draft tail is visible:\n{screen}"
+    );
+    let cursor = terminal.backend_mut().get_cursor_position().unwrap();
+    assert!(cursor.x < grid.area.width && cursor.y < grid.area.height);
+}
+
+#[test]
+fn small_composer_keeps_prompt_cursor_and_footer_in_bounds() {
+    let app = App {
+        composing: true,
+        draft: "draft".into(),
+        draft_cursor: 5,
+        ..Default::default()
+    };
+    let backend = TestBackend::new(40, 8);
+    let mut terminal = Terminal::new(backend).unwrap();
+    terminal.draw(|frame| ui::render(frame, &app)).unwrap();
+    let grid = terminal.backend().buffer().clone();
+    let cursor = terminal.backend_mut().get_cursor_position().unwrap();
+    assert!(cursor.x < grid.area.width && cursor.y < grid.area.height);
+    assert!(
+        (0..grid.area.height).any(|y| (0..grid.area.width).any(|x| grid[(x, y)].symbol() == "›"))
+    );
+    assert!(grid.area.height <= 8);
+
+    let backend = TestBackend::new(16, 5);
+    let mut terminal = Terminal::new(backend).unwrap();
+    terminal.draw(|frame| ui::render(frame, &app)).unwrap();
+    let grid = terminal.backend().buffer().clone();
+    let cursor = terminal.backend_mut().get_cursor_position().unwrap();
+    assert!(cursor.x < grid.area.width && cursor.y < grid.area.height);
+    assert!(
+        (0..grid.area.height).any(|y| (0..grid.area.width).any(|x| grid[(x, y)].symbol() == "›"))
     );
 }
 
@@ -274,6 +917,19 @@ fn rendering_at_small_sizes_does_not_panic() {
     for (width, height) in [(100, 30), (60, 20), (20, 5)] {
         let _ = buffer(&app, width, height);
     }
+}
+
+#[test]
+fn an_empty_active_composer_keeps_its_message_placeholder() {
+    let app = App {
+        composing: true,
+        ..Default::default()
+    };
+    let screen = rendered(&app);
+    assert!(
+        screen.contains("Write a message..."),
+        "composer prompt:\n{screen}"
+    );
 }
 
 #[test]
@@ -576,8 +1232,8 @@ fn the_scrolled_state_explains_itself_without_changing_the_default_hint_row() {
     // The default view keeps the mockup's hint row untouched.
     let pinned = rendered(&app);
     assert!(
-        pinned.contains("Enter open"),
-        "the default hint row must stay as the mockup shows it:\n{pinned}"
+        pinned.contains("Enter compose"),
+        "the default hint row must describe the composer action:\n{pinned}"
     );
     assert!(!pinned.contains("reading back"));
 
@@ -586,6 +1242,35 @@ fn the_scrolled_state_explains_itself_without_changing_the_default_hint_row() {
     assert!(
         scrolled.contains("reading back") && scrolled.contains("End returns"),
         "a scrolled transcript must say how to get back:\n{scrolled}"
+    );
+}
+
+#[test]
+fn short_thread_with_stale_scroll_does_not_claim_to_be_reading_back() {
+    let mut app = App::default();
+    let only = conversation("Short thread", 2, 1);
+    app.set_conversations(vec![only.clone()]);
+    app.selected = Some(only.id.clone());
+    app.upsert(
+        only.id.clone(),
+        message(
+            &only,
+            "only",
+            1_700_000_000_000,
+            "One short message.",
+            false,
+        ),
+    );
+    app.scroll = 50;
+
+    let text = rendered(&app);
+    assert!(
+        text.contains("Enter compose"),
+        "normal hints remain visible:\n{text}"
+    );
+    assert!(
+        !text.contains("reading back"),
+        "clamped scroll must not claim an older view:\n{text}"
     );
 }
 
@@ -682,7 +1367,7 @@ fn the_theme_control_sits_one_column_inside_the_frame() {
 
 #[test]
 fn a_single_match_heading_is_not_followed_by_leftovers() {
-    // The filter heading used to be drawn over the plain `C H A T S` label, and the
+    // The filter heading used to be drawn over the plain `Chats` label, and the
     // shorter text left the end of the old label showing, so it read `1 MATCH S`.
     let mut app = App::default();
     app.set_conversations(vec![

@@ -2,7 +2,9 @@
 """Fake Bloom daemon serving fixed fixtures, for reviewing the TUI's look.
 
 It speaks the real IPC framing so the TUI cannot tell the difference, and it serves
-synthetic content only, so screenshots never contain real messages or handles.
+synthetic content only, so screenshots never contain real messages or handles. Set
+BLOOM_FAKE_SESSION_STATE to a SessionState value (for example, renewal_due) to
+exercise the status indicator; it defaults to active.
 
 Usage: fake-daemon.py <socket path>
 """
@@ -18,6 +20,7 @@ import threading
 import time
 
 PROTOCOL_VERSION = 1
+SESSION_STATE = os.environ.get("BLOOM_FAKE_SESSION_STATE", "active")
 
 
 def frame(payload: dict) -> bytes:
@@ -157,7 +160,7 @@ def serve_client(conn: socket.socket) -> None:
             })
         elif op == "subscribe":
             conn.sendall(frame({"request_id": request_id, "response": {"result": "subscribed"}}))
-            conn.sendall(frame({"event": {"event": "session", "state": "active"}}))
+            conn.sendall(frame({"event": {"event": "session", "state": SESSION_STATE}}))
             subscribers.append(conn)
             while True:
                 time.sleep(1)
