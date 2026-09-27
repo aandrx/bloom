@@ -281,6 +281,19 @@ fn capitalise(value: &str) -> String {
     }
 }
 
+/// The status shown in the header: the daemon connection when it is not healthy,
+/// otherwise the engine session. None when there is nothing worth showing.
+pub fn status_text(app: &App) -> Option<String> {
+    if !app.connection.is_empty() && app.connection != "Connected" {
+        return Some(app.connection.clone());
+    }
+    let session = app.session.trim();
+    if session.is_empty() {
+        return None;
+    }
+    Some(session.to_owned())
+}
+
 pub fn message_text(message: &Message) -> String {
     message
         .parts()
@@ -568,6 +581,25 @@ mod tests {
         .unwrap();
         assert_eq!(speaker_label(&phone, Some(&conversation)), "+15550000001");
         assert_eq!(speaker_label(&named, None), "Maya");
+    }
+
+    #[test]
+    fn header_status_prefers_connection_trouble_over_the_session() {
+        let mut app = App {
+            connection: "Connected".into(),
+            session: "Active".into(),
+            ..Default::default()
+        };
+        assert_eq!(status_text(&app).as_deref(), Some("Active"));
+
+        // A broken daemon connection is more important than the last known session.
+        app.connection = "Disconnected, retrying".into();
+        assert_eq!(status_text(&app).as_deref(), Some("Disconnected, retrying"));
+
+        // Nothing worth showing yields nothing.
+        app.connection = "Connected".into();
+        app.session = "  ".into();
+        assert_eq!(status_text(&app), None);
     }
 
     #[test]

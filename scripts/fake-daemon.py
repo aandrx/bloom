@@ -78,16 +78,24 @@ CONVERSATIONS = [
 ]
 
 
-def message(conversation_value: str, ident: str, at: int, text: str, mine: bool) -> dict:
+def message(
+    conversation_value: str,
+    ident: str,
+    at: int,
+    text: str,
+    mine: bool,
+    sender: str = "maya@example.invalid",
+    delivery: str | None = None,
+) -> dict:
     return {
         "id": cid(ident),
         "conversation_id": cid(conversation_value),
         "remote_id": None,
-        "sender": handle("me@example.invalid" if mine else "maya@example.invalid"),
+        "sender": handle("me@example.invalid" if mine else sender),
         "parts": [{"type": "text", "value": text}],
         "created_at": at,
         "sent_at": None,
-        "delivery": "read" if mine else "delivered",
+        "delivery": delivery or ("read" if mine else "delivered"),
         "from_me": mine,
         "edited_at": None,
         "reactions": [],
@@ -98,8 +106,22 @@ def message(conversation_value: str, ident: str, at: int, text: str, mine: bool)
 HISTORY = {
     "weekend@example.invalid": [
         message("weekend@example.invalid", "m1", 1_700_000_100_000, "Saturday looks perfect for the coast. Should we take the early train?", False),
-        message("weekend@example.invalid", "m2", 1_700_000_200_000, "I can bring coffee and the little thermos. Meet at the station?", False),
-        message("weekend@example.invalid", "m3", 1_700_000_300_000, "Yes, 8:40 works. I'll grab pastries on the way.", True),
+        message(
+            "weekend@example.invalid",
+            "m2",
+            1_700_000_200_000,
+            "I can bring coffee and the little thermos. Meet at the station?",
+            False,
+            sender="jules@example.invalid",
+        ),
+        message(
+            "weekend@example.invalid",
+            "m3",
+            1_700_000_300_000,
+            "Yes, 8:40 works. I'll grab pastries on the way.",
+            True,
+            delivery="delivered",
+        ),
         message("weekend@example.invalid", "m4", 1_700_000_400_000, "I'll check the tide times tonight and send the link here.", False),
     ],
     "jules@example.invalid": [

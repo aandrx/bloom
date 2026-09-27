@@ -167,10 +167,20 @@ fn layout_matches_the_mockup_structure() {
         "delivered",              // delivery marker
         "Write a message",        // composer placeholder
         "↑↓ chats",               // footer hints
-        "Connected",              // connection state
+        "Active",                 // engine session in the header
     ] {
         assert!(text.contains(expected), "missing {expected:?} in:\n{text}");
     }
+
+    // The hint line matches the mockup and no longer carries connection state.
+    let hints_row = (0..30)
+        .find(|y| (0..100).any(|x| symbol(x, *y) == "↑"))
+        .expect("the hint line must be drawn");
+    let hint_text: String = (0..100).map(|x| symbol(x, hints_row)).collect();
+    assert!(
+        !hint_text.contains("Connected"),
+        "connection state belongs in the header, found: {hint_text:?}"
+    );
 
     // The old boxed layout and debug output must be gone.
     for unwanted in [

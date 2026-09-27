@@ -1,6 +1,10 @@
 use crate::app::{
-    chat_name, message_text, participant_count, speaker_label, timestamp, App, ComposerPrompt,
+    chat_name, message_text, participant_count, speaker_label, status_text, timestamp, App,
+    ComposerPrompt,
 };
+
+/// Key hints, exactly as the mockup shows them.
+const HINTS: &str = "↑↓ chats · Enter open · Esc close";
 use bloom_domain::DeliveryState;
 use ratatui::{prelude::*, widgets::*};
 
@@ -108,6 +112,13 @@ pub fn render(frame: &mut Frame<'_>, app: &App) {
         Constraint::Length(composer_height),
     ])
     .split(body[2]);
+    // The mockup gives the transcript clear separation from the sidebar divider.
+    let gutter = ratatui::layout::Margin {
+        horizontal: 2,
+        vertical: 0,
+    };
+    let content = right[1].inner(gutter);
+    let composer = right[2].inner(gutter);
     let selected = app.selected_conversation();
     let mut heading = vec![Span::styled("Bloom", Style::default().fg(TEXT))];
     if let Some(c) = selected {
@@ -128,6 +139,21 @@ pub fn render(frame: &mut Frame<'_>, app: &App) {
         Paragraph::new(Line::from(heading)),
         Rect::new(right[0].x, right[0].y, right[0].width, 1),
     );
+    // The mockup keeps a status badge in the header rather than in the hint line.
+    if let Some(status) = status_text(app) {
+        let width = status.chars().count() as u16 + 1;
+        frame.render_widget(
+            Paragraph::new(status)
+                .alignment(Alignment::Right)
+                .style(Style::default().fg(MUTED)),
+            Rect::new(
+                right[0].x + right[0].width.saturating_sub(width),
+                right[0].y,
+                width,
+                1,
+            ),
+        );
+    }
     frame.render_widget(
         Paragraph::new("─".repeat(right[0].width as usize)).style(Style::default().fg(RULE)),
         Rect::new(right[0].x, right[0].y + 1, right[0].width, 1),
@@ -152,15 +178,15 @@ pub fn render(frame: &mut Frame<'_>, app: &App) {
                 let state = match message.delivery {
                     DeliveryState::Queued => "sending",
                     DeliveryState::Sent => "sent",
-                    DeliveryState::Delivered => "delivered",
-                    DeliveryState::Read => "read",
+                    DeliveryState::Delivered => "✓ delivered",
+                    DeliveryState::Read => "✓ read",
                     DeliveryState::Failed => "failed",
                 };
                 content.extend([
                     Span::raw("  "),
                     Span::styled(
                         state,
-                        Style::default().fg(if state == "delivered" || state == "read" {
+                        Style::default().fg(if state.starts_with('✓') {
                             GREEN
                         } else {
                             MUTED
@@ -176,7 +202,7 @@ pub fn render(frame: &mut Frame<'_>, app: &App) {
         Paragraph::new(lines)
             .wrap(Wrap { trim: false })
             .style(Style::default().bg(SURFACE)),
-        right[1],
+        content,
     );
     let prompt = match app.composer_prompt() {
         ComposerPrompt::Recipient => "›  To: recipient address...".to_owned(),
@@ -200,14 +226,10 @@ pub fn render(frame: &mut Frame<'_>, app: &App) {
                     .borders(Borders::TOP)
                     .border_style(Style::default().fg(RULE)),
             ),
-        Rect::new(right[2].x, right[2].y, right[2].width, 2),
+        Rect::new(composer.x, composer.y, composer.width, 2),
     );
     frame.render_widget(
-        Paragraph::new(format!(
-            "{}  ·  ↑↓ chats · Enter open · Esc close",
-            app.connection
-        ))
-        .style(Style::default().fg(MUTED)),
-        Rect::new(right[2].x, right[2].y + 2, right[2].width, 1),
+        Paragraph::new(HINTS).style(Style::default().fg(MUTED)),
+        Rect::new(composer.x, composer.y + 2, composer.width, 1),
     );
 }
