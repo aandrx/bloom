@@ -23,46 +23,6 @@ const RED: Color = Color::Rgb(243, 139, 168);
 /// the main reason the UI read as denser than the mockup.
 const MAX_CONTENT_WIDTH: u16 = 72;
 
-/// Keep only the trailing lines that fit the available height, so the newest
-/// content stays visible. Wrapped rows are counted so nothing is silently clipped.
-fn tail_that_fits(lines: Vec<Line<'_>>, width: u16, height: u16) -> Vec<Line<'_>> {
-    if height == 0 || lines.is_empty() {
-        return Vec::new();
-    }
-    let width = width.max(1) as usize;
-    let height = height as usize;
-    let mut used = 0usize;
-    let mut start = lines.len();
-    for (index, line) in lines.iter().enumerate().rev() {
-        let text: String = line
-            .spans
-            .iter()
-            .map(|span| span.content.as_ref())
-            .collect();
-        let rows = wrap_text(&text, width).len().max(1);
-        if used + rows > height {
-            // Nothing but blank spacers fits above this line, which means the newest
-            // message is taller than the whole view. Rendering it whole would clip it
-            // from the top and show the start of a long message, or nothing at all
-            // when only the spacers after it fit, so show its final rows instead.
-            if lines[index + 1..]
-                .iter()
-                .all(|line| line.spans.iter().all(|span| span.content.trim().is_empty()))
-            {
-                let mut wrapped = wrap_text(&text, width);
-                let tail = wrapped.split_off(wrapped.len().saturating_sub(height));
-                if !tail.is_empty() {
-                    return tail.into_iter().map(Line::raw).collect();
-                }
-            }
-            break;
-        }
-        used += rows;
-        start = index;
-    }
-    lines.into_iter().skip(start).collect()
-}
-
 /// Wrap text into display rows the way the transcript paragraph does, breaking at
 /// whitespace and splitting a word only when it cannot fit on a row by itself.
 /// The count is what the paragraph will actually occupy, so the tail can be
@@ -377,12 +337,31 @@ pub fn render(frame: &mut Frame<'_>, app: &App) {
             lines.push(Line::raw(""));
         }
     }
-    // Show the tail of the thread: a long conversation must display its newest
-    // messages, not its oldest.
-    let fitted = tail_that_fits(lines, content.width, content.height);
+    // Show the newest messages by default and let the user scroll back. Rows are
+    // counted with the same wrap the paragraph performs, so the offset lands on
+    // the row the renderer will actually use; scroll 0 pins to the newest content
+    // and an over-height message therefore shows its tail rather than vanishing.
+    let width = content.width.max(1) as usize;
+    let rows: usize = lines
+        .iter()
+        .map(|line| {
+            let text: String = line
+                .spans
+                .iter()
+                .map(|span| span.content.as_ref())
+                .collect();
+            wrap_text(&text, width).len().max(1)
+        })
+        .sum();
+    let max_scroll = rows.saturating_sub(content.height as usize);
+    // `Paragraph::scroll` offsets from the top, so a reading position of zero rows
+    // back from the newest message is the bottom of the transcript.
+    let back = app.scroll.min(max_scroll);
+    let scroll = max_scroll.saturating_sub(back).min(u16::MAX as usize) as u16;
     frame.render_widget(
-        Paragraph::new(fitted)
+        Paragraph::new(lines)
             .wrap(Wrap { trim: false })
+            .scroll((scroll, 0))
             .style(Style::default().bg(SURFACE)),
         content,
     );
@@ -424,6 +403,12 @@ pub fn render(frame: &mut Frame<'_>, app: &App) {
     // failure is worse than an ugly line. It takes the hint row while it lasts.
     let (footer, footer_style) = match app.error.as_deref() {
         Some(message) => (message.to_owned(), Style::default().fg(RED)),
+        // Reading back is a state the mockup does not show, so rather than change
+        // its hint row this explains how to leave that state when it happens.
+        None if app.is_scrolled_back() => (
+            "↑ reading back · End returns to the newest".to_owned(),
+            Style::default().fg(CYAN),
+        ),
         None => (hints.to_owned(), Style::default().fg(MUTED)),
     };
     frame.render_widget(

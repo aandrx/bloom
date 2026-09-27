@@ -296,3 +296,63 @@ fn an_unknown_conversation_event_asks_for_a_refresh() {
         "a message for a thread we have never listed must trigger a refresh"
     );
 }
+
+#[test]
+fn page_keys_move_the_reading_position_and_clamp_at_the_newest() {
+    let mut app = app_with(&["Jules Lee"]);
+    let selected = app.selected.clone().expect("selected");
+
+    assert!(
+        !app.is_scrolled_back(),
+        "a thread opens pinned to the newest"
+    );
+    app.handle_key(key(KeyCode::PageDown));
+    assert_eq!(app.scroll, 0, "scrolling forward from the newest stays put");
+
+    app.handle_key(key(KeyCode::PageUp));
+    app.handle_key(key(KeyCode::PageUp));
+    let two_pages = app.scroll;
+    assert!(two_pages >= 20, "each page moves ten rows, got {two_pages}");
+
+    app.handle_key(key(KeyCode::PageDown));
+    assert_eq!(
+        app.scroll,
+        two_pages - 10,
+        "a page forward moves one page back"
+    );
+
+    app.handle_key(key(KeyCode::Home));
+    assert!(app.scroll > 0, "Home requests the oldest content");
+
+    app.handle_key(key(KeyCode::End));
+    assert!(!app.is_scrolled_back(), "End returns to the newest message");
+
+    // A new message in the open thread pins the view back to the newest.
+    app.handle_key(key(KeyCode::PageUp));
+    assert!(app.is_scrolled_back());
+    app.apply_event(EventKind::Message {
+        conversation_id: selected.clone(),
+        message: message(&conversation("Jules Lee", 2), "m1"),
+    });
+    assert!(
+        !app.is_scrolled_back(),
+        "a new message must not leave the reader stranded in the past"
+    );
+}
+
+#[test]
+fn scrolling_does_not_disturb_the_composer_or_the_filter() {
+    let mut app = app_with(&["Jules Lee"]);
+
+    // While the filter owns the keyboard, page keys are not scroll keys.
+    app.begin_filter();
+    app.handle_key(key(KeyCode::PageUp));
+    assert_eq!(app.scroll, 0);
+
+    // And while composing, the draft is what keys act on.
+    app.cancel_filter();
+    app.composing = true;
+    app.handle_key(key(KeyCode::PageUp));
+    assert_eq!(app.scroll, 0);
+    assert_eq!(app.draft, "");
+}

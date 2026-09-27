@@ -484,3 +484,104 @@ fn a_send_failure_is_visible_rather_than_silent() {
         "an error must be shown somewhere visible:\n{text}"
     );
 }
+
+#[test]
+fn scrolling_back_reveals_older_messages_and_returning_shows_the_newest() {
+    let mut app = App::default();
+    let only = conversation("Long thread", 2, 1);
+    app.set_conversations(vec![only.clone()]);
+    app.selected = Some(only.id.clone());
+    for index in 0..120 {
+        app.upsert(
+            only.id.clone(),
+            message(
+                &only,
+                &format!("m{index:03}"),
+                1_700_000_000_000 + index,
+                &format!("message number {index:03}"),
+                false,
+            ),
+        );
+    }
+
+    // Default is pinned to the newest content.
+    assert!(rendered(&app).contains("message number 119"));
+
+    app.scroll_to_oldest();
+    let oldest = rendered(&app);
+    assert!(
+        oldest.contains("message number 000"),
+        "scrolling back must reach the oldest message:\n{oldest}"
+    );
+    assert!(
+        !oldest.contains("message number 119"),
+        "the newest message must scroll out of view:\n{oldest}"
+    );
+
+    app.scroll_to_newest();
+    assert!(rendered(&app).contains("message number 119"));
+}
+
+#[test]
+fn a_single_over_height_message_still_shows_its_tail_when_pinned() {
+    // The transcript no longer drops an over-height message: at the default
+    // position its final rows are what the viewport shows.
+    let mut app = App::default();
+    let only = conversation("Huge", 2, 1);
+    app.set_conversations(vec![only.clone()]);
+    app.selected = Some(only.id.clone());
+    app.upsert(
+        only.id.clone(),
+        message(
+            &only,
+            "huge",
+            1_700_000_000_000,
+            &"end of the message ".repeat(200),
+            false,
+        ),
+    );
+    let text = rendered(&app);
+    assert!(
+        text.contains("end of the message"),
+        "an over-height message must render, not vanish:\n{text}"
+    );
+    assert!(
+        !text.contains("message number"),
+        "this conversation has only the one message"
+    );
+}
+
+#[test]
+fn the_scrolled_state_explains_itself_without_changing_the_default_hint_row() {
+    let mut app = App::default();
+    let only = conversation("Long thread", 2, 1);
+    app.set_conversations(vec![only.clone()]);
+    app.selected = Some(only.id.clone());
+    for index in 0..40 {
+        app.upsert(
+            only.id.clone(),
+            message(
+                &only,
+                &format!("m{index:03}"),
+                1_700_000_000_000 + index,
+                &format!("message number {index:03}"),
+                false,
+            ),
+        );
+    }
+
+    // The default view keeps the mockup's hint row untouched.
+    let pinned = rendered(&app);
+    assert!(
+        pinned.contains("Enter open"),
+        "the default hint row must stay as the mockup shows it:\n{pinned}"
+    );
+    assert!(!pinned.contains("reading back"));
+
+    app.scroll_to_oldest();
+    let scrolled = rendered(&app);
+    assert!(
+        scrolled.contains("reading back") && scrolled.contains("End returns"),
+        "a scrolled transcript must say how to get back:\n{scrolled}"
+    );
+}

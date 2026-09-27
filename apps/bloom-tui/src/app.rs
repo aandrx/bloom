@@ -6,6 +6,9 @@ use bloom_ipc::EventKind;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use std::collections::HashMap;
 
+/// Rows a single PageUp or PageDown moves through the transcript.
+const SCROLL_PAGE: usize = 10;
+
 /// What a key press wants the shell to do.
 ///
 /// The key semantics live here rather than inside the event loop so the real key
@@ -32,6 +35,9 @@ pub struct App {
     pub connection: String,
     pub session: String,
     pub draft: String,
+    /// Display rows scrolled back from the newest message. Zero pins the transcript
+    /// to the newest content, which is what a chat client should do by default.
+    pub scroll: usize,
     /// Set when the daemon reports a conversation listing change; the caller then
     /// re-reads the conversation list without disturbing the open thread.
     pub resync_conversations: bool,
@@ -70,7 +76,35 @@ impl App {
             .is_some_and(|id| self.conversations.iter().any(|c| &c.id == id))
         {
             self.selected = self.conversations.first().map(|c| c.id.clone());
+            // A different thread is on screen now, so the reading position from the
+            // previous one must not carry over.
+            self.scroll = 0;
         }
+    }
+
+    /// Scroll the transcript back through older messages, in display rows.
+    pub fn scroll_back(&mut self, rows: usize) {
+        self.scroll = self.scroll.saturating_add(rows);
+    }
+
+    /// Scroll forward towards the newest message. Zero means pinned to the newest.
+    pub fn scroll_forward(&mut self, rows: usize) {
+        self.scroll = self.scroll.saturating_sub(rows);
+    }
+
+    /// Request the oldest content. The renderer clamps this to what exists.
+    pub fn scroll_to_oldest(&mut self) {
+        self.scroll = usize::MAX;
+    }
+
+    /// Return to the newest message.
+    pub fn scroll_to_newest(&mut self) {
+        self.scroll = 0;
+    }
+
+    /// True while the transcript is showing something other than the newest message.
+    pub fn is_scrolled_back(&self) -> bool {
+        self.scroll > 0
     }
 
     /// Start a new conversation: first the recipient address, then the message.
@@ -277,6 +311,11 @@ impl App {
             KeyCode::Char('q') => return Action::Quit,
             KeyCode::Down => self.select_step(1),
             KeyCode::Up => self.select_step(-1),
+            // Reading back through a thread, a screenful at a time.
+            KeyCode::PageUp => self.scroll_back(SCROLL_PAGE),
+            KeyCode::PageDown => self.scroll_forward(SCROLL_PAGE),
+            KeyCode::Home => self.scroll_to_oldest(),
+            KeyCode::End => self.scroll_to_newest(),
             KeyCode::Char('n') => self.begin_new_conversation(),
             KeyCode::Char('/') => self.begin_filter(),
             KeyCode::Enter => self.composing = true,
@@ -313,6 +352,11 @@ impl App {
                 conversation_id,
                 message,
             } => {
+                // Reading back through a thread should not be interrupted by a new
+                // message arriving in it; the user is pinned back to the newest.
+                if self.selected.as_ref() == Some(&conversation_id) {
+                    self.scroll = 0;
+                }
                 // A message for a conversation we do not know about means our list is
                 // stale: ask for a refresh rather than caching it invisibly.
                 if !self
