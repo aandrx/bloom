@@ -42,8 +42,8 @@ While the filter or composer is open, `q` is ordinary text. That is deliberate: 
 ## Screens
 
 - **Sidebar:** conversations are listed newest first, with each participant count shown as “person” or “people”. While filtering, the section label becomes the match count, or “NO MATCHES”.
-- **Header:** shows Bloom and the selected conversation identity and participant count. The theme control shows the current light or dark theme when there is room; status appears when it needs attention.
-- **Transcript:** each message has a speaker label and timestamp aligned in columns. Your messages also show delivery state, such as queued, sent, delivered, read, or failed.
+- **Header:** shows Bloom and the selected conversation identity and participant count. The theme control shows the current light or dark theme when there is room; status appears when it needs attention. A braille spinner beside Connecting or Disconnected indicates connection/retry activity.
+- **Transcript:** each message has a speaker label and timestamp aligned in columns. Your messages also show delivery state, such as queued, sent, delivered, read, or failed. An outgoing message still queued for delivery has a spinner beside “queued”.
 - **Composer:** type a message after opening a conversation. For a new conversation, the prompt first asks for a recipient and then a message.
 - **Hint row:** shows available shortcuts. While reading older messages, it instead says that you are reading back and that End returns to the newest. If a send fails, a red error line replaces the hints.
 
@@ -51,7 +51,7 @@ The filter prompt appears in the composer area and narrows the sidebar as you ty
 
 ## Accessibility
 
-Setting `NO_COLOR` to any non-empty value disables the UI's palette distinctions. State is also expressed with text and symbols, not colour alone: delivery states have labels and symbols, the filter identifies matches in text, and errors are written in the footer. Choose light or dark with `t`; the UI does not automatically detect the terminal theme.
+Setting `NO_COLOR` to any non-empty value disables the UI's palette distinctions. State remains readable through text and symbols, not colour alone: delivery states have labels and symbols, the filter identifies matches in text, and errors are written in the footer; bold and dim styling also distinguish delivery states. At startup the UI queries the terminal background and chooses a light or dark theme based on its brightness. If detection gets no reply, it uses the default theme. Press `t` to toggle themes; your choice takes precedence over the detected theme.
 
 ## Troubleshooting
 
