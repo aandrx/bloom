@@ -320,7 +320,7 @@ fn the_filter_reports_matches_and_an_empty_state() {
     }
     let filtered = rendered(&app);
     assert!(
-        filtered.contains("1 MATCHES"),
+        filtered.contains("1 MATCH"),
         "match count missing:\n{filtered}"
     );
     assert!(
