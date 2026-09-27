@@ -186,11 +186,13 @@ Future<void> main(List<String> arguments) async {
   var sequence = 0;
   var stopping = false;
 
+  final handles = await api.getHandles(state: deskState.client);
   stdout.writeln(
     readyFrame(
       engineVersion: engineVersion,
       canSend: true,
       canReadHistory: config.syncChats,
+      handles: handles,
     ),
   );
 

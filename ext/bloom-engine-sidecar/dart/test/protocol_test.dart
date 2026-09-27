@@ -152,9 +152,11 @@ void main() {
           engineVersion: 'openbubbles-v1',
           canSend: true,
           canReadHistory: false,
+          handles: const ['mailto:me@example.invalid'],
         ),
       );
       expect(frame['type'], 'ready');
+      expect(frame['handles'], ['mailto:me@example.invalid']);
       expect(frame['engine_version'], 'openbubbles-v1');
       expect(frame['capabilities'], <String, Object?>{
         'send': true,

@@ -151,10 +151,12 @@ String readyFrame({
   required String engineVersion,
   required bool canSend,
   required bool canReadHistory,
+  List<String> handles = const [],
 }) =>
     _frame(<String, Object?>{
       'type': 'ready',
       'engine_version': engineVersion,
+      'handles': handles,
       'capabilities': <String, Object?>{
         'send': canSend,
         'history': canReadHistory

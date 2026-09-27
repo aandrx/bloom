@@ -309,6 +309,66 @@ impl Transport for Engine {
     }
 }
 
+/// Why the frame reader stopped, so a dead engine is distinguishable from a quiet
+/// stream end and neither is mistaken for the other.
+enum FrameRead {
+    /// One frame's bytes, without its terminator.
+    Frame(Vec<u8>),
+    /// The engine closed the stream between frames.
+    Eof,
+    /// The frame exceeded `MAX_FRAME_BYTES` and the rest was not buffered.
+    TooLarge,
+    /// The underlying read failed.
+    Failed(std::io::Error),
+}
+
+/// Read one newline-terminated frame, never buffering more than the frame limit.
+///
+/// `AsyncBufRead::fill_buf` exposes only the bytes already in the buffer, so an
+/// oversized line is rejected without being accumulated first.
+async fn read_frame<R: tokio::io::AsyncBufRead + Unpin>(reader: &mut R) -> FrameRead {
+    let mut bytes: Vec<u8> = Vec::with_capacity(4096);
+    loop {
+        let buf = match reader.fill_buf().await {
+            Ok(buf) => buf,
+            Err(error) => return FrameRead::Failed(error),
+        };
+        if buf.is_empty() {
+            // The stream ended; a final frame without a terminator is still used.
+            return strip_terminator(bytes);
+        }
+        let take = buf
+            .iter()
+            .position(|byte| *byte == b'\n')
+            .map_or(buf.len(), |index| index + 1);
+        if bytes.len().saturating_add(take) > MAX_FRAME_BYTES + 1 {
+            reader.consume(take);
+            return FrameRead::TooLarge;
+        }
+        let ended = buf[take - 1] == b'\n';
+        bytes.extend_from_slice(&buf[..take]);
+        reader.consume(take);
+        if ended {
+            return strip_terminator(bytes);
+        }
+    }
+}
+
+fn strip_terminator(mut bytes: Vec<u8>) -> FrameRead {
+    if bytes.is_empty() {
+        return FrameRead::Eof;
+    }
+    if bytes.last() == Some(&b'\n') {
+        bytes.pop();
+    }
+    if bytes.last() == Some(&b'\r') {
+        bytes.pop();
+    }
+    // A blank line is left as an empty frame so the parser reports it as
+    // unparsable, which is what closing the engine connection on it means.
+    FrameRead::Frame(bytes)
+}
+
 async fn read_frames(
     stdout: tokio::process::ChildStdout,
     outgoing: mpsc::Sender<TransportEvent>,
@@ -316,15 +376,33 @@ async fn read_frames(
     id: TransportId,
     my_handles_store: Arc<Mutex<Vec<String>>>,
 ) {
-    let mut lines = BufReader::new(stdout).lines();
+    let mut reader = BufReader::new(stdout);
     let mut my_handles: Vec<String> = Vec::new();
     let mut skipped_conversations = 0usize;
     let mut skipped: HashMap<SkipReason, u64> = HashMap::new();
-    while let Ok(Some(line)) = lines.next_line().await {
-        if line.len() > MAX_FRAME_BYTES {
-            eprintln!("engine frame too large; closing engine connection");
-            break;
-        }
+    loop {
+        let bytes = match read_frame(&mut reader).await {
+            FrameRead::Frame(bytes) => bytes,
+            FrameRead::Eof => {
+                eprintln!("engine frame reader stopped: engine closed the stream");
+                break;
+            }
+            FrameRead::TooLarge => {
+                eprintln!("engine frame too large; closing engine connection");
+                break;
+            }
+            FrameRead::Failed(error) => {
+                eprintln!("engine frame reader stopped with error: {error}");
+                break;
+            }
+        };
+        let line = match String::from_utf8(bytes) {
+            Ok(line) => line,
+            Err(error) => {
+                eprintln!("engine frame reader stopped with invalid UTF-8: {error}");
+                break;
+            }
+        };
         let frame: Value = match serde_json::from_str(&line) {
             Ok(frame) => frame,
             Err(_) => {
@@ -962,6 +1040,117 @@ mod tests {
         assert_eq!(map_session_state("active"), SessionState::Active);
         assert_eq!(map_session_state("throttled"), SessionState::Throttled);
         assert_eq!(map_session_state("nonsense"), SessionState::Disconnected);
+    }
+
+    /// A reader that fails once, so the error path can be exercised without a
+    /// real broken pipe.
+    struct BrokenReader;
+
+    impl tokio::io::AsyncRead for BrokenReader {
+        fn poll_read(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+            _buf: &mut tokio::io::ReadBuf<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::task::Poll::Ready(Err(std::io::Error::other("synthetic read failure")))
+        }
+    }
+
+    #[tokio::test]
+    async fn frames_are_read_one_at_a_time_without_their_terminator() {
+        let input = b"{\"a\":1}\n{\"b\":2}\r\n";
+        let mut reader = tokio::io::BufReader::new(&input[..]);
+        match read_frame(&mut reader).await {
+            FrameRead::Frame(bytes) => assert_eq!(bytes, b"{\"a\":1}"),
+            _ => panic!("expected the first frame"),
+        }
+        match read_frame(&mut reader).await {
+            FrameRead::Frame(bytes) => assert_eq!(bytes, b"{\"b\":2}"),
+            _ => panic!("expected the second frame"),
+        }
+        assert!(matches!(read_frame(&mut reader).await, FrameRead::Eof));
+    }
+
+    #[tokio::test]
+    async fn a_final_frame_without_a_terminator_is_still_used() {
+        let input = b"{\"last\":true}";
+        let mut reader = tokio::io::BufReader::new(&input[..]);
+        match read_frame(&mut reader).await {
+            FrameRead::Frame(bytes) => assert_eq!(bytes, b"{\"last\":true}"),
+            _ => panic!("a trailing frame without a newline must still be read"),
+        }
+    }
+
+    /// An endless source that counts how many bytes were actually pulled, so the
+    /// bound can be measured instead of inferred from the returned variant.
+    struct CountingReader {
+        remaining: usize,
+        pulled: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl tokio::io::AsyncRead for CountingReader {
+        fn poll_read(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+            buf: &mut tokio::io::ReadBuf<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            let this = self.get_mut();
+            let count = this.remaining.min(buf.remaining()).min(4096);
+            let filler = vec![b'z'; count];
+            buf.put_slice(&filler);
+            this.remaining -= count;
+            this.pulled
+                .fetch_add(count, std::sync::atomic::Ordering::SeqCst);
+            std::task::Poll::Ready(Ok(()))
+        }
+    }
+
+    #[tokio::test]
+    async fn an_oversized_frame_neither_returns_nor_drains_the_stream() {
+        // The frame never ends, so a reader that accumulates first and checks the
+        // limit afterwards would pull the entire source before rejecting it.
+        let pulled = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let source = CountingReader {
+            remaining: 4 * MAX_FRAME_BYTES,
+            pulled: pulled.clone(),
+        };
+        let mut reader = tokio::io::BufReader::with_capacity(8192, source);
+        assert!(matches!(read_frame(&mut reader).await, FrameRead::TooLarge));
+        let pulled = pulled.load(std::sync::atomic::Ordering::SeqCst);
+        assert!(
+            pulled <= MAX_FRAME_BYTES + 64 * 1024,
+            "a bounded read must stop near the limit, but it pulled {pulled} bytes"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_frame_at_the_limit_is_accepted() {
+        let mut input = vec![b'y'; MAX_FRAME_BYTES];
+        input.push(b'\n');
+        let mut reader = tokio::io::BufReader::new(&input[..]);
+        match read_frame(&mut reader).await {
+            FrameRead::Frame(bytes) => assert_eq!(bytes.len(), MAX_FRAME_BYTES),
+            _ => panic!("a frame at the limit must be accepted"),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_read_error_is_reported_rather_than_looking_like_a_clean_end() {
+        let mut reader = tokio::io::BufReader::new(BrokenReader);
+        assert!(matches!(
+            read_frame(&mut reader).await,
+            FrameRead::Failed(_)
+        ));
+    }
+
+    #[tokio::test]
+    async fn a_blank_line_is_an_empty_frame_not_an_end_of_stream() {
+        let input = b"\n";
+        let mut reader = tokio::io::BufReader::new(&input[..]);
+        match read_frame(&mut reader).await {
+            FrameRead::Frame(bytes) => assert!(bytes.is_empty()),
+            _ => panic!("a blank line must be reported as an unparsable frame"),
+        }
     }
 
     #[test]
