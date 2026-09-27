@@ -158,6 +158,7 @@ impl RequestHandler for Service {
                 let found = store::list_conversations(&store)
                     .map_err(|_| ProtocolError::Internal)?
                     .into_iter()
+                    .filter(|c| c.kind == ConversationKind::Direct)
                     .find(|c| {
                         c.participants
                             .iter()

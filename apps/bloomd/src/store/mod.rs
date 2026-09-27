@@ -53,6 +53,7 @@ pub enum StoreError {
     Secret(SecretStoreError),
     InvalidKey,
     KeyUnavailable,
+    ExistingDatabaseKeyMissing,
     Sqlite(rusqlite::Error),
     SqlCipherUnavailable,
     InvalidDatabase,
@@ -73,6 +74,7 @@ impl fmt::Debug for StoreError {
             Self::Secret(_) => "StoreError::Secret(<redacted>)",
             Self::InvalidKey => "StoreError::InvalidKey",
             Self::KeyUnavailable => "StoreError::KeyUnavailable",
+            Self::ExistingDatabaseKeyMissing => "StoreError::ExistingDatabaseKeyMissing",
             Self::Sqlite(_) => "StoreError::Sqlite(<redacted>)",
             Self::SqlCipherUnavailable => "StoreError::SqlCipherUnavailable",
             Self::InvalidDatabase => "StoreError::InvalidDatabase",
@@ -94,6 +96,9 @@ impl fmt::Display for StoreError {
             Self::Secret(_) => f.write_str("store key service failed"),
             Self::InvalidKey => f.write_str("store key must be 32 bytes"),
             Self::KeyUnavailable => f.write_str("store key unavailable"),
+            Self::ExistingDatabaseKeyMissing => {
+                f.write_str("existing store database key is missing")
+            }
             Self::Sqlite(_) => f.write_str("encrypted store database operation failed"),
             Self::SqlCipherUnavailable => f.write_str("SQLCipher support unavailable"),
             Self::InvalidDatabase => f.write_str("store database is invalid or key is incorrect"),
@@ -181,6 +186,7 @@ impl EncryptedStore {
                 key.zeroize();
                 result
             }
+            None if path.as_ref().exists() => Err(StoreError::ExistingDatabaseKeyMissing),
             None => {
                 let mut key = generate_key()?;
                 let stored = secrets
@@ -475,6 +481,29 @@ mod tests {
                 Err(StoreError::UnsafePath)
             ));
         }
+    }
+
+    #[test]
+    fn existing_database_without_key_fails_without_provisioning() {
+        use crate::store::tests_support::MemorySecrets;
+
+        let owner = tempfile::tempdir().unwrap();
+        let private = owner.path().join("private");
+        fs::create_dir(&private).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&private, fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        let path = private.join("store.db");
+        EncryptedStore::open_with_key(&path, &[9; KEY_BYTES]).unwrap();
+        let secrets = MemorySecrets::default();
+        assert!(matches!(
+            EncryptedStore::open_or_create(&path, &secrets),
+            Err(StoreError::ExistingDatabaseKeyMissing)
+        ));
+        assert!(secrets.is_empty());
+        assert!(path.exists());
     }
 
     #[test]

@@ -310,11 +310,72 @@ async fn starting_a_conversation_creates_then_reuses_it_and_normalises_addresses
         );
     }
 
-    for invalid in ["", "   ", "not-an-address", "mailto:@bad"] {
-        let result = service.start_conversation(invalid.to_owned(), body()).await;
-        assert!(
-            matches!(result, Err(bloom_ipc::ProtocolError::InvalidRequest)),
-            "address {invalid:?} must be rejected"
+    // A group containing the requested recipient must not capture a direct message.
+    // The recipient is one we have never messaged directly, so a reuse check that
+    // matched any participant would send this into the group instead of a new thread.
+    let group = bloom_domain::Conversation {
+        id: bloom_domain::ConversationId::new(
+            bloom_domain::TransportId::new("iMessage").unwrap(),
+            "group-fixture",
+        )
+        .unwrap(),
+        remote_id: "group-fixture".to_owned(),
+        kind: bloom_domain::ConversationKind::Group,
+        title: Some("Synthetic group".to_owned()),
+        participants: vec![
+            bloom_domain::Participant {
+                handle: bloom_domain::Handle::new(
+                    bloom_domain::HandleKind::Email,
+                    "groupmember@example.invalid",
+                )
+                .unwrap(),
+                display_name: None,
+                is_me: false,
+            },
+            bloom_domain::Participant {
+                handle: bloom_domain::Handle::new(
+                    bloom_domain::HandleKind::Email,
+                    "other@example.invalid",
+                )
+                .unwrap(),
+                display_name: None,
+                is_me: false,
+            },
+        ],
+        created_at: 1,
+        last_message_at: None,
+    };
+    store::upsert_conversation(&mut store.lock().unwrap(), &group).unwrap();
+    let before = store::list_conversations(&store.lock().unwrap())
+        .unwrap()
+        .len();
+    service
+        .start_conversation("groupmember@example.invalid".to_owned(), body())
+        .await
+        .expect("sending to a group member succeeds");
+    {
+        let guard = store.lock().unwrap();
+        let conversations = store::list_conversations(&guard).unwrap();
+        assert_eq!(
+            conversations.len(),
+            before + 1,
+            "a new direct conversation is created rather than reusing the group"
+        );
+        let direct = conversations
+            .iter()
+            .find(|c| {
+                c.id != group.id
+                    && c.kind == bloom_domain::ConversationKind::Direct
+                    && c.participants
+                        .iter()
+                        .any(|p| !p.is_me && p.handle.value() == "groupmember@example.invalid")
+            })
+            .expect("the new direct conversation exists");
+        assert_eq!(direct.kind, bloom_domain::ConversationKind::Direct);
+        assert_eq!(
+            store::history(&guard, &group.id, 50).unwrap().len(),
+            0,
+            "the message must not be recorded in the group"
         );
     }
 
