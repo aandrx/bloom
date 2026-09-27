@@ -120,15 +120,26 @@ Phase 2a, restored state, read-only, user authorized: **PASSED.**
    was identical before and after the probe, with 25 files unchanged.
 
 Phase 2b, live engine restore and bounded receive window, user authorized:
+**transport PASSED, payload capture FAILED and is being fixed.**
 
-5. Restore the engine, poll for a bounded window, and durably append anything
-   received so no message is silently consumed and lost. No sends.
+5. `bin/engine_restore.dart` restored the user's real state headlessly: push state
+   restored, `ApsWatcher` created, iCloud services present, and the poll loop ran a
+   bounded 60 second window with the Mac off. It received 26 `PushMessage.iMessage`
+   items and shut down cleanly.
+6. Inbound messages are delivered to whoever holds the push connection. The probe
+   therefore consumes them, so it must only be run when Bloom can persist them.
+7. Payload capture was inadequate: the log recorded only the runtime type name, so
+   26 pushes were consumed without usable content. The capture path must serialize
+   the real message structure before any further receive run.
+8. State changes from that run: `hw_info.plist` rewritten at identical size, and
+   `facetime.plist` grew from 832 to 1253 bytes. These are the engine's normal
+   refreshed-registration writes, the same kind the app performs on launch.
 
 Phase 3, first write, user authorized:
 
-6. Send one outbound message and confirm delivery.
-7. Restart the sidecar and confirm inbound messages still arrive.
-8. Confirm renewal behavior after the scheduled re-registration.
+9. Send one outbound message and confirm delivery.
+10. Restart the sidecar and confirm inbound messages still arrive.
+11. Confirm renewal behavior after the scheduled re-registration.
 
 Phase 3, integration:
 
