@@ -187,18 +187,34 @@ behavior is restart/resume, coexistence with the app, and one observed renewal.
 
 ## Integration work still to do
 
-15. Wire `bloomd` to supervise the sidecar and expose it through Bloom IPC.
-16. End-to-end test through the TUI with the OpenBubbles app not running.
+15. Wire `bloomd` to supervise the sidecar and expose it through Bloom IPC. **DONE**:
+    `apps/bloomd/src/engine.rs` spawns the sidecar child process, maps payloads into
+    domain types, and is owned by the existing `Supervisor`; `service.rs` persists
+    before fanout; `main.rs` assembles store, listener, subscriptions and shutdown.
+16. End-to-end test through the TUI with the OpenBubbles app not running. The daemon
+    half is verified; the TUI is being rebound off Matrix.
 17. Read existing history from the app's ObjectBox store, or accept starting from
-    takeover and backfilling from Apple.
+    takeover and backfilling from Apple. **BLOCKED**: the app's model classes import
+    Flutter and app services, so they cannot be reused headlessly. A safe read-only
+    path has not been established, and the requirement is to open the database
+    read-only and stop rather than risk a schema migration against real history.
 18. Replace the spike's mirror-based encoder with explicit encoders and write into
-    Bloom's encrypted store instead of a JSONL file.
+    Bloom's encrypted store instead of a JSONL file. **DONE** for the encoder and for
+    store writes during daemon operation.
 
 The sidecar half of item 18 is done: `ext/bloom-engine-sidecar` holds the packaged
 sidecar with an explicit field-by-field encoder, a versioned stdio protocol, config
-guards, and 28 offline tests, and it was verified live against the real engine
-(ready frame, 37 inbound frames, clean shutdown). Writing into Bloom's encrypted
-store is the daemon half and is still outstanding.
+guards, and 29 offline tests, and it was verified live against the real engine
+(ready frame, inbound frames, clean shutdown).
+
+## Verified end to end through the daemon
+
+`apps/bloomd/tests/engine_e2e.rs` (ignored by default) starts the real `bloomd`
+binary against the real engine and drives it over the real socket. A run on this
+machine reported: conversations listed over IPC, session observed active, and an
+inbound message received, persisted, and served back through `history` before it was
+fanned out. The store key is provisioned into the OS keychain on first run and there
+is no plaintext fallback.
 
 ## Open decision
 
