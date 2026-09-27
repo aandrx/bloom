@@ -248,11 +248,27 @@ pub fn render(frame: &mut Frame<'_>, app: &App) {
     );
     let mut lines = Vec::new();
     if let Some(messages) = app.selected.as_ref().and_then(|id| app.messages.get(id)) {
+        // Pad speaker names to a common column so timestamps line up, the way the
+        // mockup's transcript does. Capped so one long name cannot push the times
+        // off the visible line.
+        const SPEAKER_COLUMN_CAP: usize = 12;
+        let speaker_column = messages
+            .iter()
+            .map(|message| {
+                speaker_label(message, app.selected_conversation())
+                    .chars()
+                    .count()
+            })
+            .max()
+            .unwrap_or(0)
+            .clamp(1, SPEAKER_COLUMN_CAP);
+
         for message in messages {
             let speaker = speaker_label(message, app.selected_conversation());
+            let padded = format!("{speaker:<speaker_column$}");
             lines.push(Line::from(vec![
                 Span::styled(
-                    speaker,
+                    padded,
                     Style::default().fg(TEXT).add_modifier(Modifier::BOLD),
                 ),
                 Span::raw("  "),
@@ -283,6 +299,7 @@ pub fn render(frame: &mut Frame<'_>, app: &App) {
                 ]);
             }
             lines.push(Line::from(content));
+            lines.push(Line::raw(""));
             lines.push(Line::raw(""));
         }
     }

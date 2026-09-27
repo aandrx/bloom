@@ -367,3 +367,62 @@ fn the_filter_reports_matches_and_an_empty_state() {
         "the prompt must show the query being filtered on:\n{empty}"
     );
 }
+
+#[test]
+fn speaker_names_and_timestamps_align_into_columns() {
+    let mut app = App::default();
+    let only = conversation("Aligned", 2, 10);
+    app.set_conversations(vec![only.clone()]);
+    app.selected = Some(only.id.clone());
+    // A short name and a long one: the timestamps must still line up.
+    for (index, sender) in ["a@example.invalid", "bartholomew@example.invalid"]
+        .into_iter()
+        .enumerate()
+    {
+        let message = Message::new(
+            MessageId::new(
+                TransportId::new("openbubbles").unwrap(),
+                format!("m{index}"),
+            )
+            .unwrap(),
+            only.id.clone(),
+            None,
+            Handle::new(HandleKind::Email, sender).unwrap(),
+            vec![MessagePart::Text(format!("body {index}"))],
+            1_700_000_000_000 + index as i64,
+            None,
+            DeliveryState::Delivered,
+            false,
+            None,
+            Vec::new(),
+            None,
+        )
+        .unwrap();
+        app.upsert(only.id.clone(), message);
+    }
+
+    let text = rendered(&app);
+    let rows: Vec<&str> = text.lines().collect();
+    // Both message headers must place their timestamp at the same column.
+    let header_rows: Vec<&str> = rows
+        .iter()
+        .copied()
+        .filter(|row| row.contains("17:") || row.contains("18:"))
+        .collect();
+    assert!(
+        header_rows.len() >= 2,
+        "expected two message headers, found {header_rows:?}"
+    );
+    let time_columns: Vec<usize> = header_rows
+        .iter()
+        .map(|row| {
+            row.find(":1")
+                .map(|position| position.saturating_sub(2))
+                .unwrap_or(usize::MAX)
+        })
+        .collect();
+    assert!(
+        time_columns.windows(2).all(|pair| pair[0] == pair[1]),
+        "timestamps must share a column, found {time_columns:?} in {header_rows:?}"
+    );
+}
