@@ -158,10 +158,19 @@ Phase 3, first write, user authorized:
 
 Remaining:
 
-12. Restart and resume, to confirm state reloads and messaging continues.
-13. Reopen the OpenBubbles app and confirm the user's normal setup still works after
-    the sidecar has written state.
+12. **Restart and resume: PASSED.** Two consecutive runs after the send each
+    restored state cleanly, reconnected, and received fresh inbound messages (2 then
+    3, all with text captured). Restore is repeatable and only rewrites
+    `hw_info.plist`.
+13. Confirm the user's normal OpenBubbles setup still works after the sidecar has
+    written state. Verified: the app started and ran normally afterwards, and the
+    user confirmed it behaved as usual.
 14. Confirm renewal after the scheduled re-registration.
+
+A consequence of the user not running the app any more: a Flatpak update would
+replace the engine library and break the content-hash match until the bindings are
+regenerated from the matching public tag. Pin or mask updates for that app, or plan
+the refresh step.
 
 ## Confidence
 
