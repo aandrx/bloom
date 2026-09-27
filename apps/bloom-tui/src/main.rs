@@ -9,7 +9,7 @@ use bloom_tui::daemon::{self, ConnectionState, Snapshot};
 use bloom_tui::ui;
 use bloom_tui::RedrawScheduler;
 use crossterm::{
-    event::{self, Event, KeyEvent},
+    event::{self, DisableMouseCapture, EnableMouseCapture, Event, KeyEventKind},
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
@@ -120,7 +120,7 @@ struct TerminalGuard;
 impl TerminalGuard {
     fn enter() -> Result<Self> {
         enable_raw_mode()?;
-        if let Err(error) = execute!(io::stdout(), EnterAlternateScreen) {
+        if let Err(error) = execute!(io::stdout(), EnterAlternateScreen, EnableMouseCapture) {
             let _ = disable_raw_mode();
             return Err(error.into());
         }
@@ -130,7 +130,7 @@ impl TerminalGuard {
 
 impl Drop for TerminalGuard {
     fn drop(&mut self) {
-        let _ = execute!(io::stdout(), LeaveAlternateScreen);
+        let _ = execute!(io::stdout(), DisableMouseCapture, LeaveAlternateScreen);
         let _ = disable_raw_mode();
     }
 }
@@ -214,13 +214,20 @@ async fn main() -> Result<()> {
     }
 
     // Read input on a dedicated thread. Reading on the main loop let a single
-    // blocking read freeze rendering, so the UI showed stale state.
-    let (key_tx, mut key_rx) = mpsc::unbounded_channel::<KeyEvent>();
+    // blocking read freeze rendering, so the UI showed stale state. Only key
+    // presses and repeats are forwarded: a terminal that reports key releases (the
+    // enhanced keyboard protocol) must not fire every binding twice.
+    let (input_tx, mut input_rx) = mpsc::unbounded_channel::<Event>();
     std::thread::spawn(move || loop {
         if event::poll(Duration::from_millis(100)).unwrap_or(false) {
             match event::read() {
-                Ok(Event::Key(key)) => {
-                    if key_tx.send(key).is_err() {
+                Ok(Event::Key(key)) if key.kind != KeyEventKind::Release => {
+                    if input_tx.send(Event::Key(key)).is_err() {
+                        return;
+                    }
+                }
+                Ok(event @ Event::Mouse(_)) => {
+                    if input_tx.send(event).is_err() {
                         return;
                     }
                 }
@@ -232,11 +239,16 @@ async fn main() -> Result<()> {
 
     let mut last_visible = app.selected.clone();
     let mut redraw = RedrawScheduler::default();
+    let mut hits = ui::HitMap::default();
     redraw.request();
     let mut next_animation = tokio::time::Instant::now();
     loop {
         if redraw.take_due(std::time::Instant::now()) {
-            terminal.draw(|frame| ui::render(frame, &app))?;
+            // Rendering returns the hitboxes it drew, so mouse input is resolved
+            // against the frame the user is actually looking at.
+            terminal.draw(|frame| {
+                hits = ui::render(frame, &app);
+            })?;
         }
 
         let redraw_delay = redraw.wake_after(std::time::Instant::now());
@@ -283,10 +295,16 @@ async fn main() -> Result<()> {
                 app.finish_send(conversation, result);
                 redraw.request();
             },
-            Some(key) = key_rx.recv() => {
-                // All key semantics live in `App::handle_key` so the real key path is
-                // testable; this loop only performs the async work an action asks for.
-                match app.handle_key(key) {
+            Some(input) = input_rx.recv() => {
+                // All input semantics live in `App::handle_key`/`handle_mouse` so the
+                // real path is testable; this loop only performs the async work an
+                // action asks for.
+                let action = match input {
+                    Event::Key(key) => app.handle_key(key),
+                    Event::Mouse(mouse) => app.handle_mouse(mouse.kind, mouse.column, mouse.row, &hits),
+                    _ => bloom_tui::app::Action::None,
+                };
+                match action {
                     bloom_tui::app::Action::Quit => break,
                     bloom_tui::app::Action::SendMessage { conversation, body } => {
                         let target = Some(conversation.clone());

@@ -76,6 +76,9 @@ def conversation(value: str, title: str, people: int, last: int) -> dict:
 
 CONVERSATIONS = [
     conversation("weekend@example.invalid", "Weekend crew", 3, 1_700_000_400_000),
+    # A direct chat the engine gave no title for: the UI must name it after the
+    # other participant rather than showing `Conversation`.
+    conversation("dana@example.invalid", None, 2, 1_700_000_300_000),
     conversation("jules@example.invalid", "Jules Lee", 2, 1_700_000_200_000),
     conversation("design@example.invalid", "Design systems", 4, 1_700_000_100_000),
 ]
@@ -126,6 +129,11 @@ HISTORY = {
             delivery="delivered",
         ),
         message("weekend@example.invalid", "m4", 1_700_000_400_000, "I'll check the tide times tonight and send the link here.", False),
+    ],
+    "dana@example.invalid": [
+        message("dana@example.invalid", "n1", 1_700_000_300_000, "Are we still on for the walk on Sunday?", False),
+        message("dana@example.invalid", "n2", 1_700_000_310_000, "Yes, morning works best for me.", True, delivery="delivered"),
+        message("dana@example.invalid", "n3", 1_700_000_320_000, "Perfect, see you at the usual spot.", False),
     ],
     "jules@example.invalid": [
         message("jules@example.invalid", "j1", 1_700_000_200_000, "Sending the revised deck over after lunch.", False),

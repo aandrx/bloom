@@ -24,33 +24,52 @@ pgrep -af 'bloomd|bloom_engine'
 
 ## Keys
 
+The composer is always focused, the way Codex opens: you can type immediately,
+and the arrow keys scroll the transcript rather than moving the selection.
+
 | Key | Action |
 | --- | --- |
-| Up / Down | Move through conversations |
-| Enter | Open the selected conversation, or send the composed message |
-| `/` | Open the conversation filter |
-| `n` | Start a conversation: enter the recipient first, then the message |
-| PageUp / PageDown | Scroll the transcript older / newer |
-| Home / End | Jump to the oldest / newest transcript content |
-| `t` | Toggle light and dark themes |
-| Esc | Cancel the filter or composition |
-| `q` | Quit from the conversation list |
-| Ctrl+B, then `h` / `l` | Select previous / next chat |
-| Ctrl+B, then `j` / `k` | Scroll transcript older / newer |
-| Ctrl+B, then `n` / `f` / `t` | Start a chat / filter / change theme |
+| Up / Down | Scroll the transcript one row |
+| PageUp / PageDown | Scroll a screenful |
+| Ctrl+Home / Ctrl+End | Jump to the oldest / newest message |
+| Tab | Focus the chat list; Up / Down select, Enter opens |
+| Enter | Send the message |
+| Esc | Clear the draft, or close the open overlay |
+| `/` | Command menu |
+| `?` | Keyboard-shortcut sheet |
+| `,` | Settings (also `Ctrl+B` then `s`) |
+| `n` | Start a conversation: recipient first, then the message |
+| Ctrl+W / Alt+Backspace | Delete the previous word |
+| Ctrl+U / Ctrl+K | Clear before the cursor / kill to the end |
+| Ctrl+A / Ctrl+E | Move to the start / end of the draft |
+| Ctrl+Left / Ctrl+Right | Move by word |
+| Ctrl+B, then `h` / `l` | Previous / next chat |
+| Ctrl+B, then `j` / `k` | Scroll the transcript |
+| Ctrl+B, then `n` / `f` / `s` / `t` | New chat / filter / settings / theme |
 | Ctrl+C | Quit from anywhere |
 
-Ctrl+B is a leader: press it, then the indicated key. While the filter or composer is open, `q` is ordinary text. That is deliberate: the active prompt owns the keyboard.
+Ctrl+B is a leader: press it, then the indicated key. `q` is ordinary text, as in
+Codex; Ctrl+C is the quit key.
+
+## Mouse
+
+Mouse reporting is on. The wheel scrolls whatever is under the pointer: the
+transcript in the pane, the selection in the chat list. Left click selects a chat,
+focuses the composer, runs a command from the popup, toggles a settings row, or
+opens the header's `⚙` settings and `?` shortcuts controls. The hitboxes come from
+the last frame that was drawn, so a click can only land on something visible.
 
 ## Screens
 
-- **Sidebar:** conversations are listed newest first, with each participant count right-aligned on the same line as its name. While filtering, the section label becomes the match count, or “NO MATCHES”.
-- **Header:** shows Bloom and the selected conversation identity and participant count. The theme control shows the current light or dark theme when there is room. A status dot and label show the engine session or connection state: green for healthy, yellow for attention, and red for failure. A braille spinner beside Connecting or Disconnected indicates connection/retry activity.
+The window has no outer frame; content runs to the edges like Codex.
+
+- **Sidebar:** conversations are listed newest first, with each participant count right-aligned on the same line as its name. A direct chat with no title is named after the other participant (their display name, or their handle when the engine has none), and an untitled group lists its people. While filtering, the section label becomes the match count, or “NO MATCHES”.
+- **Header:** shows Bloom and the selected conversation, with the recipient handle for a direct chat or the participant count for a group. The theme control shows the current light or dark theme when there is room, next to `⚙` and `?`. A status dot and label show the engine session or connection state: green for healthy, yellow for attention, and red for failure. A braille spinner beside Connecting or Disconnected indicates connection/retry activity.
 - **Transcript:** each message has a speaker label and timestamp aligned in columns. Your messages also show delivery state, such as queued, sent, delivered, read, or failed. An outgoing message still queued for delivery has a spinner beside “queued”.
-- **Composer:** type a message after opening a conversation. For a new conversation, the prompt first asks for a recipient and then a message. Sending shows `Sending…`; `Message sent.` appears only after IPC accepts the message. A failure is shown in red. Bloom does not claim Delivered or Read without transport events.
+- **Composer:** a bare `›` prompt, always focused. For a new conversation, the prompt first asks for a recipient and then a message. Sending shows `Sending…`; `Message sent.` appears only after IPC accepts the message. A failure is shown in red. Bloom does not claim Delivered or Read without transport events.
 - **Hint row:** shows available shortcuts. While reading older messages, it instead says that you are reading back and that End returns to the newest. If a send fails, a red error line replaces the hints.
 
-The filter prompt appears in the composer area and narrows the sidebar as you type. Its match count is shown in the sidebar label.
+The filter prompt appears in the composer area and narrows the sidebar as you type. Its match count is shown in the sidebar label. The command menu opens as a bordered popup above the composer and takes priority over the transcript; the shortcut sheet opens the same way.
 
 ## Commands and preferences
 

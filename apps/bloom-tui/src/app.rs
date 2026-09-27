@@ -1,9 +1,12 @@
 //! UI state for the Bloom TUI. Rendering lives in `ui.rs`.
 
 use crate::daemon::{ConnectionState, Snapshot};
-use bloom_domain::{Conversation, ConversationId, ConversationKind, Handle, HandleKind, Message};
+use crate::ui::{Hit, HitMap};
+use bloom_domain::{
+    Conversation, ConversationId, ConversationKind, Handle, HandleKind, Message, Participant,
+};
 use bloom_ipc::EventKind;
-use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEventKind};
 use std::collections::HashMap;
 use unicode_segmentation::UnicodeSegmentation;
 
@@ -63,7 +66,6 @@ impl Theme {
     }
 }
 
-#[derive(Default)]
 pub struct App {
     pub theme: Theme,
     /// Terminal-detected theme used when the preference is automatic.
@@ -106,6 +108,60 @@ pub struct App {
     pub command_menu: bool,
     pub command_selection: usize,
     pub leader_pending: bool,
+    /// Which region owns the arrow keys and the wheel. The composer is the
+    /// default, so scrolling scrolls the transcript, the way Codex behaves.
+    pub focus: Focus,
+    /// The `?` shortcut sheet.
+    pub help_open: bool,
+}
+
+/// The two focusable regions. Settings, the filter and the help sheet suspend
+/// both while they are open.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Focus {
+    #[default]
+    Composer,
+    Sidebar,
+}
+
+impl Default for App {
+    /// The composer starts active, the way Codex opens with its prompt focused:
+    /// you can type immediately, and the arrow keys scroll the transcript.
+    fn default() -> Self {
+        Self {
+            theme: Theme::default(),
+            system_theme: Theme::default(),
+            theme_override: None,
+            compact_sidebar: false,
+            settings_open: false,
+            settings_selection: 0,
+            conversations: Vec::new(),
+            selected: None,
+            messages: HashMap::new(),
+            connection: String::new(),
+            connection_state: ConnectionState::default(),
+            frame: 0,
+            thread_loading: false,
+            session: String::new(),
+            draft: String::new(),
+            draft_cursor: 0,
+            scroll: 0,
+            resync_conversations: false,
+            filter: None,
+            composing: true,
+            pending_address: None,
+            new_conversation: false,
+            error: None,
+            notice: None,
+            send_feedback: None,
+            nicknames: HashMap::new(),
+            command_menu: false,
+            command_selection: 0,
+            leader_pending: false,
+            focus: Focus::default(),
+            help_open: false,
+        }
+    }
 }
 
 impl App {
@@ -200,11 +256,13 @@ impl App {
         self.draft_cursor = 0;
     }
 
+    /// Abandon a draft or the new-conversation flow. The composer stays active,
+    /// because it is always active; `Esc` should not take typing away.
     pub fn cancel_composition(&mut self) {
         self.command_menu = false;
         self.new_conversation = false;
         self.pending_address = None;
-        self.composing = false;
+        self.composing = true;
         self.draft.clear();
         self.draft_cursor = 0;
     }
@@ -225,7 +283,7 @@ impl App {
             self.composing = true;
             return CompositionIntent::None;
         }
-        self.composing = false;
+        self.composing = true;
         if let Some(address) = self.pending_address.take() {
             self.new_conversation = false;
             if value.is_empty() {
@@ -322,6 +380,7 @@ impl App {
 
     pub fn cancel_filter(&mut self) {
         self.filter = None;
+        self.composing = true;
     }
 
     pub fn filter_input(&mut self, character: char) {
@@ -342,6 +401,7 @@ impl App {
     pub fn confirm_filter(&mut self) -> Option<ConversationId> {
         let selected = self.selected.clone();
         self.filter = None;
+        self.composing = true;
         selected
     }
 
@@ -395,6 +455,104 @@ impl App {
             self.draft.drain(byte..byte + grapheme.len());
             self.draft_cursor = self.draft[..byte].graphemes(true).count();
         }
+    }
+
+    /// The byte index where the previous word starts: trailing whitespace is
+    /// skipped first, then the run of non-whitespace before the cursor.
+    fn word_start_before(&self, cursor: usize) -> usize {
+        let before = &self.draft[..cursor];
+        let trimmed = before.trim_end();
+        let start = trimmed
+            .char_indices()
+            .rev()
+            .find(|(_, character)| character.is_whitespace())
+            .map_or(0, |(index, character)| index + character.len_utf8());
+        start
+    }
+
+    fn word_end_after(&self, cursor: usize) -> usize {
+        let after = &self.draft[cursor..];
+        let mut end = cursor;
+        let mut seen_word = false;
+        for (index, character) in after.char_indices() {
+            if character.is_whitespace() {
+                if seen_word {
+                    break;
+                }
+            } else {
+                seen_word = true;
+                end = cursor + index + character.len_utf8();
+            }
+        }
+        end
+    }
+
+    fn set_draft_cursor_byte(&mut self, byte: usize) {
+        let byte = byte.min(self.draft.len());
+        self.draft_cursor = self.draft[..byte].graphemes(true).count();
+    }
+
+    /// Delete from the cursor back to the start of the previous word (`Ctrl+W`,
+    /// `Alt+Backspace`), the gesture a terminal user expects.
+    fn delete_word_before_cursor(&mut self) {
+        let cursor = self.cursor_byte();
+        if cursor == 0 {
+            return;
+        }
+        let start = self.word_start_before(cursor);
+        self.draft.drain(start..cursor);
+        self.set_draft_cursor_byte(start);
+    }
+
+    fn move_word(&mut self, forward: bool) {
+        let cursor = self.cursor_byte();
+        if forward {
+            let end = self.word_end_after(cursor);
+            self.set_draft_cursor_byte(end);
+        } else {
+            let start = self.word_start_before(cursor);
+            self.set_draft_cursor_byte(start);
+        }
+    }
+
+    fn clear_before_cursor(&mut self) {
+        let cursor = self.cursor_byte();
+        self.draft.drain(..cursor);
+        self.draft_cursor = 0;
+    }
+
+    fn kill_to_end(&mut self) {
+        let cursor = self.cursor_byte();
+        self.draft.truncate(cursor);
+    }
+
+    /// Apply a terminal-style editing gesture to the draft. Returns true when the
+    /// key was an edit, so callers can refresh derived state.
+    fn edit_draft(&mut self, key: KeyEvent) -> bool {
+        let control = key.modifiers.contains(KeyModifiers::CONTROL);
+        let alt = key.modifiers.contains(KeyModifiers::ALT);
+        match key.code {
+            KeyCode::Backspace if control || alt => self.delete_word_before_cursor(),
+            KeyCode::Backspace => self.delete_before_cursor(),
+            KeyCode::Delete => self.delete_at_cursor(),
+            KeyCode::Left if control || alt => self.move_word(false),
+            KeyCode::Right if control || alt => self.move_word(true),
+            KeyCode::Left => self.move_draft_cursor(-1),
+            KeyCode::Right => self.move_draft_cursor(1),
+            KeyCode::Home => self.draft_cursor = 0,
+            KeyCode::End => self.draft_cursor = self.draft.graphemes(true).count(),
+            KeyCode::Char('a') if control => self.draft_cursor = 0,
+            KeyCode::Char('e') if control => self.draft_cursor = self.draft.graphemes(true).count(),
+            KeyCode::Char('w') if control || alt => self.delete_word_before_cursor(),
+            KeyCode::Char('u') if control => self.clear_before_cursor(),
+            KeyCode::Char('k') if control => self.kill_to_end(),
+            KeyCode::Char(character) if !control && !alt => {
+                self.insert_draft(character);
+                self.update_command_menu();
+            }
+            _ => return false,
+        }
+        true
     }
 
     fn update_command_menu(&mut self) {
@@ -487,11 +645,14 @@ impl App {
         let words: Vec<_> = self.draft.split_whitespace().collect();
         self.command_menu = false;
         match words.as_slice() {
+            // `/help` opens the same popup the composer shows, rather than
+            // printing a wall of text as an error.
             ["/help"] => {
-                self.error =
-                    Some("Commands: /help, /theme [auto|dark|light], /settings, /nickname <name|clear>, /new, /filter, /compact, /cancel".into());
-                self.draft.clear();
-                self.draft_cursor = 0;
+                self.error = None;
+                self.draft = "/".to_owned();
+                self.draft_cursor = 1;
+                self.command_menu = true;
+                self.command_selection = 0;
             }
             ["/theme"] => {
                 self.toggle_theme();
@@ -611,8 +772,9 @@ impl App {
         }
     }
 
-    fn open_settings(&mut self) {
+    pub fn open_settings(&mut self) {
         self.leader_pending = false;
+        self.help_open = false;
         self.settings_open = true;
         self.settings_selection = 0;
         self.command_menu = false;
@@ -635,6 +797,18 @@ impl App {
         {
             self.send_feedback = None;
         }
+
+        // The shortcut sheet owns the keyboard while it is open.
+        if self.help_open {
+            if matches!(
+                key.code,
+                KeyCode::Esc | KeyCode::Char('?') | KeyCode::Char('q') | KeyCode::Enter
+            ) {
+                self.help_open = false;
+            }
+            return Action::None;
+        }
+
         if self.leader_pending {
             self.leader_pending = false;
             match key.code {
@@ -646,19 +820,24 @@ impl App {
                 KeyCode::Char('n') => self.begin_new_conversation(),
                 KeyCode::Char('f') => self.begin_filter(),
                 KeyCode::Char('t') => self.toggle_theme(),
+                KeyCode::Char('s') => self.open_settings(),
                 _ => {}
             }
             return Action::None;
         }
         if key.code == KeyCode::Char('b') && key.modifiers.contains(KeyModifiers::CONTROL) {
-            if !self.settings_open && self.filter_query().is_none() && !self.composing {
+            if !self.settings_open && self.filter_query().is_none() {
                 self.leader_pending = true;
             }
             return Action::None;
         }
+
         if self.settings_open {
             match key.code {
-                KeyCode::Esc => self.settings_open = false,
+                KeyCode::Esc => {
+                    self.settings_open = false;
+                    self.composing = true;
+                }
                 KeyCode::Up => self.settings_selection = self.settings_selection.saturating_sub(1),
                 KeyCode::Down => self.settings_selection = (self.settings_selection + 1).min(1),
                 KeyCode::Enter | KeyCode::Char(' ') => self.toggle_setting(),
@@ -667,6 +846,7 @@ impl App {
             }
             return Action::None;
         }
+
         if self.filter_query().is_some() {
             match key.code {
                 KeyCode::Esc => self.cancel_filter(),
@@ -677,59 +857,74 @@ impl App {
                 }
                 KeyCode::Up => self.select_step(-1),
                 KeyCode::Down => self.select_step(1),
-                KeyCode::Backspace => self.filter_backspace(),
-                KeyCode::Char(character) => self.filter_input(character),
-                _ => {}
+                _ => {
+                    if self.edit_filter(key) {
+                        self.reconcile_selection_with_visible();
+                    }
+                }
             }
             return Action::None;
         }
-        if self.composing {
-            if self.command_menu {
-                match key.code {
-                    KeyCode::Esc => self.command_menu = false,
-                    KeyCode::Up => {
-                        self.command_selection = self.command_selection.saturating_sub(1)
-                    }
-                    KeyCode::Down => {
-                        let last = self.command_suggestions().len().saturating_sub(1);
-                        self.command_selection = self.command_selection.saturating_add(1).min(last);
-                    }
-                    KeyCode::Tab => self.complete_command(),
-                    KeyCode::Enter => {
-                        let token = self.draft.split_whitespace().next().unwrap_or("");
-                        let exact = self
-                            .command_suggestions()
-                            .iter()
-                            .any(|(name, _)| *name == token);
-                        if exact || self.command_suggestions().is_empty() {
-                            self.execute_command();
-                        } else {
-                            self.complete_command();
-                        }
-                    }
-                    KeyCode::Backspace => {
-                        self.delete_before_cursor();
-                        self.update_command_menu();
-                    }
-                    KeyCode::Delete => {
-                        self.delete_at_cursor();
-                        self.update_command_menu();
-                    }
-                    KeyCode::Left => self.move_draft_cursor(-1),
-                    KeyCode::Right => self.move_draft_cursor(1),
-                    KeyCode::Home => self.draft_cursor = 0,
-                    KeyCode::End => self.draft_cursor = self.draft.graphemes(true).count(),
-                    KeyCode::Char(character) => {
-                        self.insert_draft(character);
-                        self.update_command_menu();
-                    }
-                    _ => {}
+
+        if self.command_menu {
+            match key.code {
+                KeyCode::Esc => self.command_menu = false,
+                KeyCode::Up => self.command_selection = self.command_selection.saturating_sub(1),
+                KeyCode::Down => {
+                    let last = self.command_suggestions().len().saturating_sub(1);
+                    self.command_selection = self.command_selection.saturating_add(1).min(last);
                 }
+                KeyCode::Tab => self.complete_command(),
+                KeyCode::Enter => {
+                    let token = self.draft.split_whitespace().next().unwrap_or("");
+                    let exact = self
+                        .command_suggestions()
+                        .iter()
+                        .any(|(name, _)| *name == token);
+                    if exact || self.command_suggestions().is_empty() {
+                        self.execute_command();
+                    } else {
+                        self.complete_command();
+                    }
+                }
+                _ => {
+                    self.edit_draft(key);
+                }
+            }
+            return Action::None;
+        }
+
+        // Keys that work no matter where the draft is. `?` and `,` only claim an
+        // empty composer so they can still be typed as prose.
+        match key.code {
+            KeyCode::Tab | KeyCode::BackTab => {
+                self.focus = match self.focus {
+                    Focus::Composer => Focus::Sidebar,
+                    Focus::Sidebar => Focus::Composer,
+                };
                 return Action::None;
             }
+            KeyCode::Char('?') if self.draft.is_empty() => {
+                self.help_open = true;
+                return Action::None;
+            }
+            KeyCode::Char(',') if self.draft.is_empty() => {
+                self.open_settings();
+                return Action::None;
+            }
+            _ => {}
+        }
+
+        if self.composing {
             match key.code {
                 KeyCode::Esc => {
                     self.cancel_composition();
+                    return Action::None;
+                }
+                // In sidebar focus, Enter opens the highlighted chat and hands the
+                // keyboard back to the composer.
+                KeyCode::Enter if self.focus == Focus::Sidebar => {
+                    self.focus = Focus::Composer;
                     return Action::None;
                 }
                 KeyCode::Enter => {
@@ -740,6 +935,9 @@ impl App {
                         .is_some_and(|token| token.starts_with('/'))
                     {
                         self.execute_command();
+                        return Action::None;
+                    }
+                    if self.draft.trim().is_empty() {
                         return Action::None;
                     }
                     let action = match self.submit_intent() {
@@ -762,34 +960,39 @@ impl App {
                             }
                         }
                     };
-                    // `submit_intent` owns the composer state: it closes the composer
-                    // when a message is sent, and deliberately keeps it open after the
-                    // recipient step so the body can be typed without pressing Enter
-                    // again, which is what the prompt then asks for.
                     return action;
                 }
-                KeyCode::Backspace => {
-                    self.delete_before_cursor();
-                    self.update_command_menu();
+                KeyCode::Up if self.focus == Focus::Sidebar => self.select_step(-1),
+                KeyCode::Down if self.focus == Focus::Sidebar => self.select_step(1),
+                // Scrolling belongs to the transcript, not the sidebar, which is the
+                // whole point of the focus split.
+                KeyCode::Up => self.scroll_back(1),
+                KeyCode::Down => self.scroll_forward(1),
+                KeyCode::PageUp => self.scroll_back(SCROLL_PAGE),
+                KeyCode::PageDown => self.scroll_forward(SCROLL_PAGE),
+                // Codex binds the transcript extremes to Ctrl+Home / Ctrl+End and
+                // leaves Home / End to the composer line.
+                KeyCode::Home if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    self.scroll_to_oldest()
                 }
-                KeyCode::Delete => self.delete_at_cursor(),
-                KeyCode::Left => self.move_draft_cursor(-1),
-                KeyCode::Right => self.move_draft_cursor(1),
-                KeyCode::Home => self.draft_cursor = 0,
-                KeyCode::End => self.draft_cursor = self.draft.graphemes(true).count(),
-                KeyCode::Char(character) => {
-                    self.insert_draft(character);
-                    self.update_command_menu();
+                KeyCode::End if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    self.scroll_to_newest()
                 }
-                _ => {}
+                _ => {
+                    // Typing always aims at the composer.
+                    if matches!(key.code, KeyCode::Char(_)) {
+                        self.focus = Focus::Composer;
+                    }
+                    self.edit_draft(key);
+                }
             }
             return Action::None;
         }
+
         match key.code {
             KeyCode::Char('q') => return Action::Quit,
             KeyCode::Down => self.select_step(1),
             KeyCode::Up => self.select_step(-1),
-            // Reading back through a thread, a screenful at a time.
             KeyCode::PageUp => self.scroll_back(SCROLL_PAGE),
             KeyCode::PageDown => self.scroll_forward(SCROLL_PAGE),
             KeyCode::Home => self.scroll_to_oldest(),
@@ -801,6 +1004,108 @@ impl App {
             _ => {}
         }
         Action::None
+    }
+
+    /// Resolve a mouse event against the last frame's hitboxes. The hitboxes come
+    /// from rendering, so a click can only land on something that was drawn.
+    pub fn handle_mouse(
+        &mut self,
+        kind: MouseEventKind,
+        column: u16,
+        row: u16,
+        hits: &HitMap,
+    ) -> Action {
+        // A wheel notch moves a few rows, the way a terminal usually scrolls.
+        const WHEEL_ROWS: usize = 3;
+        match kind {
+            MouseEventKind::ScrollUp => {
+                if matches!(hits.at(column, row), Some(Hit::SidebarChat(_))) {
+                    self.select_step(-1);
+                } else {
+                    self.scroll_back(WHEEL_ROWS);
+                }
+            }
+            MouseEventKind::ScrollDown => {
+                if matches!(hits.at(column, row), Some(Hit::SidebarChat(_))) {
+                    self.select_step(1);
+                } else {
+                    self.scroll_forward(WHEEL_ROWS);
+                }
+            }
+            MouseEventKind::Down(MouseButton::Left) => match hits.at(column, row) {
+                Some(Hit::SidebarChat(id)) => {
+                    self.select(Some(id));
+                    self.focus = Focus::Sidebar;
+                }
+                Some(Hit::Composer) => {
+                    self.focus = Focus::Composer;
+                    self.composing = true;
+                }
+                Some(Hit::MenuRow(index)) => self.activate_command(index),
+                Some(Hit::SettingsRow(index)) => {
+                    self.settings_selection = index;
+                    self.toggle_setting();
+                }
+                Some(Hit::HeaderSettings) => self.open_settings(),
+                Some(Hit::HeaderHelp) => {
+                    self.help_open = !self.help_open;
+                }
+                Some(Hit::CloseOverlay) => {
+                    self.help_open = false;
+                    self.command_menu = false;
+                }
+                _ => {}
+            },
+            _ => {}
+        }
+        Action::None
+    }
+
+    /// Run the command at a suggestion index, used by a click in the popup.
+    fn activate_command(&mut self, index: usize) {
+        let Some((name, _)) = self.command_suggestions().get(index).copied() else {
+            return;
+        };
+        self.draft = name.to_owned();
+        self.draft_cursor = self.draft.graphemes(true).count();
+        self.execute_command();
+    }
+
+    /// Apply a terminal editing gesture to the filter query, so `Ctrl+W` and the
+    /// rest behave the same there as in the composer.
+    fn edit_filter(&mut self, key: KeyEvent) -> bool {
+        let control = key.modifiers.contains(KeyModifiers::CONTROL);
+        let alt = key.modifiers.contains(KeyModifiers::ALT);
+        let Some(query) = self.filter.as_mut() else {
+            return false;
+        };
+        match key.code {
+            KeyCode::Backspace if control || alt => {
+                let trimmed = query.trim_end();
+                let start = trimmed
+                    .char_indices()
+                    .rev()
+                    .find(|(_, character)| character.is_whitespace())
+                    .map_or(0, |(index, character)| index + character.len_utf8());
+                query.truncate(start);
+            }
+            KeyCode::Backspace => {
+                query.pop();
+            }
+            KeyCode::Char('w') if control || alt => {
+                let trimmed = query.trim_end();
+                let start = trimmed
+                    .char_indices()
+                    .rev()
+                    .find(|(_, character)| character.is_whitespace())
+                    .map_or(0, |(index, character)| index + character.len_utf8());
+                query.truncate(start);
+            }
+            KeyCode::Char('u') if control => query.clear(),
+            KeyCode::Char(character) if !control && !alt => query.push(character),
+            _ => return false,
+        }
+        true
     }
 
     /// Keep the selection inside the filtered set as the query changes.
@@ -832,7 +1137,7 @@ impl App {
                 return nickname.clone();
             }
         }
-        chat_name(conversation).to_owned()
+        chat_name(conversation)
     }
 
     pub fn speaker_label_for(
@@ -961,17 +1266,70 @@ pub fn conversation_matches(conversation: &Conversation, query: &str) -> bool {
     })
 }
 
-pub fn chat_name(conversation: &Conversation) -> &str {
+/// The people on the far side of a conversation, in the order the engine listed
+/// them. `is_me` is excluded, so the result is who the chat is *with*.
+pub fn others(conversation: &Conversation) -> impl Iterator<Item = &Participant> {
     conversation
+        .participants
+        .iter()
+        .filter(|participant| !participant.is_me)
+}
+
+/// A person's label: their display name when the engine has one, otherwise the
+/// handle itself. The engine usually has no display name, and a bare handle is
+/// far more useful than the word "Conversation".
+fn participant_label(participant: &Participant) -> String {
+    participant
+        .display_name
+        .as_deref()
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+        .map(str::to_owned)
+        .unwrap_or_else(|| participant.handle.value().to_owned())
+}
+
+/// How many names an untitled group title lists before it summarises the rest.
+const GROUP_TITLE_NAMES: usize = 3;
+
+/// A conversation's name, independent of local nickname overrides.
+///
+/// A conversation title wins. A direct chat is named after the other person. An
+/// untitled group lists the other people, then counts the remainder, so the
+/// sidebar never shows several identical `Conversation` rows.
+pub fn chat_name(conversation: &Conversation) -> String {
+    if let Some(title) = conversation
         .title
         .as_deref()
-        .or_else(|| {
-            conversation
-                .participants
-                .first()
-                .and_then(|p| p.display_name.as_deref())
-        })
-        .unwrap_or("Conversation")
+        .map(str::trim)
+        .filter(|title| !title.is_empty())
+    {
+        return title.to_owned();
+    }
+    let names: Vec<String> = others(conversation).map(participant_label).collect();
+    match names.len() {
+        0 => "Conversation".to_owned(),
+        1 => names.into_iter().next().unwrap_or_default(),
+        count => {
+            let shown = GROUP_TITLE_NAMES.min(count);
+            let mut title = names[..shown].join(", ");
+            if count > shown {
+                title.push_str(&format!(" +{}", count - shown));
+            }
+            title
+        }
+    }
+}
+
+/// The quiet second line in the header: the recipient for a direct chat, the
+/// participant count for a group.
+pub fn conversation_subtitle(conversation: &Conversation) -> String {
+    if conversation.kind == ConversationKind::Direct {
+        return others(conversation)
+            .next()
+            .map(participant_label)
+            .unwrap_or_else(|| participant_count(conversation.participants.len()));
+    }
+    participant_count(conversation.participants.len())
 }
 
 pub fn participant_count(count: usize) -> String {
@@ -1277,8 +1635,12 @@ mod tests {
 
     #[test]
     fn helper_text_and_timestamp_formatting() {
+        // A direct chat with no title is named after the other person, not
+        // `Conversation`. The opaque handle value is all the engine gave us here.
         let chat = conversation("a", None);
-        assert_eq!(chat_name(&chat), "Conversation");
+        assert_eq!(chat_name(&chat), "a");
+        assert_eq!(conversation_subtitle(&chat), "a");
+        assert_eq!(participant_count(1), "1 person");
         assert_eq!(participant_count(1), "1 person");
         assert_eq!(participant_count(3), "3 people");
         assert_eq!(timestamp(0).len(), 5);
@@ -1288,6 +1650,53 @@ mod tests {
         }
         assert_eq!(timestamp(0), timestamp(0));
         assert_ne!(timestamp(0), timestamp(60_000));
+    }
+
+    #[test]
+    fn untitled_conversations_are_named_after_their_people() {
+        let mut direct = conversation("a", None);
+        direct.title = None;
+        direct.participants[0].display_name = Some("Maya Chen".into());
+        assert_eq!(chat_name(&direct), "Maya Chen");
+        assert_eq!(conversation_subtitle(&direct), "Maya Chen");
+
+        // A title always wins, even for a direct chat with a display name.
+        direct.title = Some("Weekend crew".into());
+        assert_eq!(chat_name(&direct), "Weekend crew");
+
+        // An untitled group lists its people and counts the remainder.
+        let mut group = conversation("g", None);
+        group.kind = ConversationKind::Group;
+        group.title = None;
+        group.participants = vec![
+            Participant {
+                handle: Handle::new(HandleKind::Opaque, "me").unwrap(),
+                display_name: None,
+                is_me: true,
+            },
+            Participant {
+                handle: Handle::new(HandleKind::Opaque, "one").unwrap(),
+                display_name: Some("One".into()),
+                is_me: false,
+            },
+            Participant {
+                handle: Handle::new(HandleKind::Opaque, "two").unwrap(),
+                display_name: None,
+                is_me: false,
+            },
+            Participant {
+                handle: Handle::new(HandleKind::Opaque, "three").unwrap(),
+                display_name: None,
+                is_me: false,
+            },
+            Participant {
+                handle: Handle::new(HandleKind::Opaque, "four").unwrap(),
+                display_name: None,
+                is_me: false,
+            },
+        ];
+        assert_eq!(chat_name(&group), "One, two, three +1");
+        assert_eq!(conversation_subtitle(&group), "5 people");
     }
 
     #[test]
@@ -1321,13 +1730,15 @@ mod tests {
         let _ = app.submit_intent();
         app.cancel_composition();
         assert_eq!(app.pending_address, None);
-        assert!(!app.composing && !app.new_conversation);
+        // The composer stays active after cancelling: it is always active now, so
+        // Esc clears the draft rather than taking typing away.
+        assert!(app.composing && !app.new_conversation);
 
         // An empty address aborts instead of starting a conversation.
         app.begin_new_conversation();
         app.draft = "   ".into();
         assert!(matches!(app.submit_intent(), CompositionIntent::None));
-        assert!(!app.composing);
+        assert!(app.composing);
         assert_eq!(app.pending_address, None);
     }
 
@@ -1730,5 +2141,86 @@ mod tests {
         app.set_conversations(vec![a.clone()]);
         app.upsert(a.id.clone(), message);
         assert_eq!(app.preview(&a.id), "[attachment] caption");
+    }
+
+    #[test]
+    fn word_and_line_editing_gestures_match_a_shell() {
+        let mut app = App::default();
+        for character in "hello brave world".chars() {
+            draft_key(&mut app, KeyCode::Char(character));
+        }
+        assert_eq!(app.draft, "hello brave world");
+
+        // Ctrl+W removes the trailing word up to the space before it.
+        assert!(app.edit_draft(KeyEvent::new(KeyCode::Char('w'), KeyModifiers::CONTROL)));
+        assert_eq!(app.draft, "hello brave ");
+
+        // Alt+Backspace does the same, skipping the trailing space first.
+        app.edit_draft(KeyEvent::new(
+            KeyCode::Backspace,
+            KeyModifiers::ALT,
+        ));
+        assert_eq!(app.draft, "hello ");
+
+        // Word movement then Ctrl+K kills the rest of the line.
+        app.draft = "alpha beta gamma".into();
+        app.draft_cursor = 0;
+        app.edit_draft(KeyEvent::new(KeyCode::Right, KeyModifiers::ALT));
+        assert_eq!(app.draft_cursor, 5, "Alt+Right moves a word forward");
+        app.edit_draft(KeyEvent::new(KeyCode::Char('k'), KeyModifiers::CONTROL));
+        assert_eq!(app.draft, "alpha");
+
+        // Ctrl+U clears everything before the cursor.
+        app.draft = "alpha beta".into();
+        app.draft_cursor = 5;
+        app.edit_draft(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL));
+        assert_eq!(app.draft, " beta");
+    }
+
+    #[test]
+    fn mouse_input_resolves_against_the_rendered_hitboxes() {
+        use ratatui::layout::Rect;
+        let mut app = App::default();
+        let first = conversation("First chat", Some(2));
+        let second = conversation("Second chat", Some(1));
+        app.set_conversations(vec![first.clone(), second.clone()]);
+        app.selected = Some(first.id.clone());
+
+        let mut hits = HitMap::default();
+        hits.sidebar = Rect::new(0, 0, 20, 10);
+        hits.sidebar_rows = vec![
+            (Rect::new(1, 1, 18, 1), first.id.clone()),
+            (Rect::new(1, 2, 18, 1), second.id.clone()),
+        ];
+        hits.transcript = Rect::new(21, 1, 60, 20);
+        hits.composer = Rect::new(21, 24, 60, 1);
+
+        // A click on the second row selects that chat and focuses the list.
+        app.handle_mouse(
+            MouseEventKind::Down(MouseButton::Left),
+            5,
+            2,
+            &hits,
+        );
+        assert_eq!(app.selected, Some(second.id.clone()));
+        assert_eq!(app.focus, Focus::Sidebar);
+
+        // The wheel over the transcript scrolls messages, not the selection.
+        app.handle_mouse(MouseEventKind::ScrollUp, 30, 5, &hits);
+        assert!(app.is_scrolled_back(), "wheel over the transcript scrolls it");
+        assert_eq!(app.selected, Some(second.id.clone()));
+
+        // The wheel over the chat list moves the selection instead.
+        app.handle_mouse(MouseEventKind::ScrollUp, 5, 2, &hits);
+        assert_eq!(app.selected, Some(first.id.clone()), "wheel moves selection");
+
+        // Clicking the composer hands focus back to it.
+        app.handle_mouse(
+            MouseEventKind::Down(MouseButton::Left),
+            30,
+            24,
+            &hits,
+        );
+        assert_eq!(app.focus, Focus::Composer);
     }
 }

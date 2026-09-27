@@ -45,7 +45,49 @@ KEY_SEQUENCES = {
     "delete": b"\x1b[3~",
     "ctrl-b": b"\x02",
     "ctrl-c": b"\x03",
+    "ctrl-w": b"\x17",
+    "ctrl-u": b"\x15",
+    "ctrl-k": b"\x0b",
+    "ctrl-a": b"\x01",
+    "ctrl-e": b"\x05",
+    "ctrl-n": b"\x0e",
+    "ctrl-p": b"\x10",
+    "ctrl-j": b"\n",
+    "ctrl-left": b"\x1b[1;5D",
+    "ctrl-right": b"\x1b[1;5C",
+    "alt-left": b"\x1b[1;3D",
+    "alt-right": b"\x1b[1;3C",
+    "alt-backspace": b"\x1b\x7f",
+    "shift-tab": b"\x1b[Z",
+    "f2": b"\x1bOQ",
 }
+
+
+def mouse_sequence(token: str) -> bytes | None:
+    """SGR mouse input for clicks and wheel events, as `name:x,y` (1-based)."""
+    if ":" not in token:
+        return None
+    name, _, coords = token.partition(":")
+    codes = {
+        "click": 0,
+        "wheelup": 64,
+        "wheeldown": 65,
+        "rightclick": 2,
+    }
+    if name not in codes:
+        return None
+    try:
+        x, y = (int(part) for part in coords.split(","))
+    except ValueError:
+        return None
+    press = codes[name]
+    # Wheel events are single press reports; buttons also report a release.
+    sequence = f"\x1b[<{press};{x};{y}M".encode()
+    if name == "click":
+        sequence += f"\x1b[<0;{x};{y}m".encode()
+    elif name == "rightclick":
+        sequence += f"\x1b[<2;{x};{y}m".encode()
+    return sequence
 
 PALETTE = {
     "black": "#45475a",
@@ -100,11 +142,14 @@ def parse_keys(value: str) -> list[bytes]:
     # that happen to match a key name. text: explicitly disambiguates token input.
     if len(tokens) == 1 and not tokens[0].lower().startswith("text:"):
         token = tokens[0]
-        if token.lower() not in KEY_SEQUENCES:
+        if token.lower() not in KEY_SEQUENCES and mouse_sequence(token) is None:
             return [char.encode() for char in token]
     result = []
     for token in tokens:
-        if token.lower().startswith("text:"):
+        mouse = mouse_sequence(token)
+        if mouse is not None:
+            result.append(mouse)
+        elif token.lower().startswith("text:"):
             result.extend(char.encode() for char in token[5:])
         elif token.lower() in KEY_SEQUENCES:
             result.append(KEY_SEQUENCES[token.lower()])

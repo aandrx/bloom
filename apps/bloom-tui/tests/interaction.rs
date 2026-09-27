@@ -90,8 +90,10 @@ fn app_with(titles: &[&str]) -> App {
 fn q_is_text_while_the_filter_is_open_and_quits_from_the_list() {
     let mut app = app_with(&["Quinn Callahan", "Jules Lee"]);
 
-    // In the plain list state `q` still quits.
-    assert_eq!(app.handle_key(key(KeyCode::Char('q'))), Action::Quit);
+    // q is text in the composer; Ctrl+C remains the quit path.
+    assert_eq!(app.handle_key(key(KeyCode::Char('q'))), Action::None);
+    assert_eq!(app.draft, "q");
+    assert_eq!(app.handle_key(ctrl(KeyCode::Char('c'))), Action::Quit);
 
     // With the filter open it must be an ordinary character, or names containing a
     // q are unsearchable and the app exits while the user is typing.
@@ -165,11 +167,15 @@ fn herdr_style_leader_chords_navigate_without_breaking_composition() {
     assert!(app.new_conversation);
     assert!(app.composing);
 
+    // Ctrl+B is a leader even with the composer focused, because the composer is
+    // always focused; the chord must not be swallowed as draft text.
     let mut composing = app_with(&["Jules Lee"]);
     composing.composing = true;
     composing.handle_key(ctrl(KeyCode::Char('b')));
-    assert!(!composing.leader_pending);
-    assert!(composing.draft.is_empty());
+    assert!(composing.leader_pending);
+    assert!(composing.draft.is_empty(), "Ctrl+B is not typed into the draft");
+    composing.handle_key(key(KeyCode::Char('s')));
+    assert!(composing.settings_open, "Ctrl+B s opens settings");
 }
 
 #[test]
@@ -203,7 +209,7 @@ fn slash_actions_open_new_chat_and_filter_or_toggle_the_sidebar() {
     }
     compact.handle_key(key(KeyCode::Enter));
     assert!(compact.compact_sidebar);
-    assert!(!compact.composing);
+    assert!(compact.composing);
 }
 
 #[test]
@@ -346,10 +352,12 @@ fn escape_dismisses_command_menu_without_losing_draft_and_slashes_in_prose_send_
     assert_eq!(app.draft, draft);
     assert_eq!(app.draft_cursor, cursor);
 
-    // Even after dismissing suggestions, Enter handles the command locally.
+    // `/help` opens the command popup without producing an error.
+    app.draft = "/help".into();
+    app.draft_cursor = 5;
     assert_eq!(app.handle_key(key(KeyCode::Enter)), Action::None);
-    assert!(app.error.as_deref().unwrap().contains("Commands:"));
-    assert!(app.draft.is_empty());
+    assert!(app.command_menu);
+    assert!(app.error.is_none());
 
     let mut prose = app_with(&["Jules Lee"]);
     prose.composing = true;
@@ -370,10 +378,21 @@ fn escape_dismisses_command_menu_without_losing_draft_and_slashes_in_prose_send_
 
 #[test]
 fn slash_in_list_mode_still_opens_the_conversation_filter() {
+    // `/` opens the command menu now; the filter has its own route. What matters
+    // for this guard is that once the filter owns the keyboard, letters are query
+    // text rather than bindings.
     let mut app = app_with(&["Jules Lee"]);
     assert_eq!(app.handle_key(key(KeyCode::Char('/'))), Action::None);
+    assert!(app.command_menu, "/ opens the command menu");
+    assert_eq!(app.filter_query(), None);
+
+    app.cancel_filter();
+    app.handle_key(ctrl(KeyCode::Char('b')));
+    app.handle_key(key(KeyCode::Char('f')));
     assert_eq!(app.filter_query(), Some(""));
     assert!(!app.composing);
+    assert_eq!(app.handle_key(key(KeyCode::Char('q'))), Action::None);
+    assert_eq!(app.filter_query(), Some("q"), "q is filter text");
 }
 
 #[test]
@@ -593,11 +612,19 @@ fn page_keys_move_the_reading_position_and_clamp_at_the_newest() {
         "a page forward moves one page back"
     );
 
-    app.handle_key(key(KeyCode::Home));
-    assert!(app.scroll > 0, "Home requests the oldest content");
+    app.handle_key(ctrl(KeyCode::Home));
+    assert!(app.scroll > 0, "Ctrl+Home requests the oldest content");
 
+    app.handle_key(ctrl(KeyCode::End));
+    assert!(!app.is_scrolled_back(), "Ctrl+End returns to the newest message");
+
+    // Home and End belong to the composer line now.
+    app.draft = "a draft".into();
+    app.draft_cursor = 3;
+    app.handle_key(key(KeyCode::Home));
+    assert_eq!(app.draft_cursor, 0, "Home moves the draft cursor");
     app.handle_key(key(KeyCode::End));
-    assert!(!app.is_scrolled_back(), "End returns to the newest message");
+    assert_eq!(app.draft_cursor, "a draft".chars().count());
 
     // A new message in the open thread pins the view back to the newest.
     app.handle_key(key(KeyCode::PageUp));
@@ -621,19 +648,24 @@ fn scrolling_does_not_disturb_the_composer_or_the_filter() {
     app.handle_key(key(KeyCode::PageUp));
     assert_eq!(app.scroll, 0);
 
-    // And while composing, the draft is what keys act on.
+    // While composing, page keys scroll the transcript and leave the draft alone:
+    // scroll-back is the default gesture in a chat.
     app.cancel_filter();
-    app.composing = true;
+    app.draft = "half written".into();
     app.handle_key(key(KeyCode::PageUp));
-    assert_eq!(app.scroll, 0);
-    assert_eq!(app.draft, "");
+    assert_eq!(app.scroll, 10, "PageUp scrolls the transcript while composing");
+    assert_eq!(app.draft, "half written", "scrolling must not touch the draft");
+    app.handle_key(key(KeyCode::Down));
+    assert_eq!(app.scroll, 9, "Down scrolls the transcript by one row");
 }
 
 #[test]
 fn the_recipient_step_keeps_the_composer_open_all_the_way_to_sending() {
-    // The whole two-step flow through the real key path, with no manual state
-    // pokes: n, recipient, Enter, body, Enter must send to the typed address.
+    // The whole two-step flow through the real key path: the leader chord starts a
+    // new chat, then recipient, Enter, body, Enter must send to the typed address.
+    // A bare `n` is text now that the composer is always focused.
     let mut app = app_with(&["Jules Lee"]);
+    app.handle_key(ctrl(KeyCode::Char('b')));
     app.handle_key(key(KeyCode::Char('n')));
     for character in "newfriend@example.invalid".chars() {
         app.handle_key(key(KeyCode::Char(character)));
@@ -661,20 +693,23 @@ fn opening_another_thread_returns_to_its_newest_message() {
     assert!(app.is_scrolled_back());
 
     // Moving to another thread must not inherit the previous reading position.
-    app.handle_key(key(KeyCode::Down));
+    // Chats move with the leader chord; Down scrolls the transcript now.
+    app.handle_key(ctrl(KeyCode::Char('b')));
+    app.handle_key(key(KeyCode::Char('l')));
     assert_ne!(app.selected, Some(first));
     assert!(
         !app.is_scrolled_back(),
         "a different thread must open at its newest message"
     );
 
-    // Home followed by a thread change is the worst case: it leaves the largest
-    // offset behind if the position is not reset.
-    app.handle_key(key(KeyCode::Home));
+    // Ctrl+Home followed by a thread change is the worst case: it leaves the
+    // largest offset behind if the position is not reset.
+    app.handle_key(ctrl(KeyCode::Home));
     assert!(app.is_scrolled_back());
-    app.handle_key(key(KeyCode::Up));
+    app.handle_key(ctrl(KeyCode::Char('b')));
+    app.handle_key(key(KeyCode::Char('h')));
     assert!(
         !app.is_scrolled_back(),
-        "Home in one thread must not carry over to the next"
+        "Ctrl+Home in one thread must not carry over to the next"
     );
 }
