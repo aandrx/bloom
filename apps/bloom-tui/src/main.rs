@@ -39,14 +39,13 @@ impl Drop for TerminalGuard {
     }
 }
 
+/// The same resolution the daemon uses, so an override (including one from .env)
+/// cannot put the UI on a different socket than the daemon.
 fn socket_path() -> PathBuf {
-    std::env::var_os("BLOOM_SOCKET")
+    std::env::var_os("BLOOM_SOCKET_PATH")
+        .or_else(|| std::env::var_os("BLOOM_SOCKET"))
         .map(PathBuf::from)
-        .unwrap_or_else(|| {
-            PathBuf::from("/run/user")
-                .join(unsafe { libc::geteuid() }.to_string())
-                .join("bloom/bloomd.sock")
-        })
+        .unwrap_or_else(bloom_ipc::default_socket_path)
 }
 
 #[tokio::main]

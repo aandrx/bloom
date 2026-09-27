@@ -185,6 +185,14 @@ fn empty_store_renders_a_usable_screen_rather_than_nothing() {
 }
 
 #[test]
+fn rendering_at_small_sizes_does_not_panic() {
+    let app = App::default();
+    for (width, height) in [(100, 30), (60, 20), (20, 5)] {
+        let _ = buffer(&app, width, height);
+    }
+}
+
+#[test]
 fn new_conversation_mode_asks_for_a_recipient() {
     let mut app = App::default();
     app.begin_new_conversation();
