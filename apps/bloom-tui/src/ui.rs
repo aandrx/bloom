@@ -85,8 +85,11 @@ pub fn render(frame: &mut Frame<'_>, app: &App) {
         Constraint::Min(1),
     ])
     .split(inner);
+    // The mockup letter-spaces this label. A terminal cannot set tracking, so the
+    // spaces are inserted explicitly, and the label stays muted rather than bold so
+    // it reads as a quiet section label.
     frame.render_widget(
-        Paragraph::new("CHATS").style(Style::default().fg(MUTED).add_modifier(Modifier::BOLD)),
+        Paragraph::new("C H A T S").style(Style::default().fg(MUTED)),
         Rect::new(body[0].x, body[0].y, body[0].width, 1),
     );
     let visible = app.visible_conversations();
@@ -214,17 +217,24 @@ pub fn render(frame: &mut Frame<'_>, app: &App) {
     if inner.width >= 60 {
         if let Some(status) = status_text(app) {
             let tone = status_tone(app);
-            let width = status.chars().count() as u16 + 1;
+            let label = format!(" {status} ");
+            let width = label.chars().count() as u16 + 2;
             frame.render_widget(
-                Paragraph::new(status)
-                    .alignment(Alignment::Right)
+                Paragraph::new(label)
+                    .alignment(Alignment::Center)
                     .style(Style::default().fg(match tone {
                         StatusTone::Healthy => MUTED,
                         StatusTone::Attention => YELLOW,
                         StatusTone::Failure => RED,
-                    })),
+                    }))
+                    .block(
+                        Block::default()
+                            .borders(Borders::LEFT | Borders::RIGHT)
+                            .border_type(BorderType::Rounded)
+                            .border_style(Style::default().fg(RULE)),
+                    ),
                 Rect::new(
-                    right[0].x + right[0].width.saturating_sub(width),
+                    right[0].x + right[0].width.saturating_sub(width + 1),
                     right[0].y,
                     width,
                     1,

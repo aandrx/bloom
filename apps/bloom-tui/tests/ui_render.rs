@@ -158,7 +158,7 @@ fn layout_matches_the_mockup_structure() {
     );
 
     for expected in [
-        "CHATS",                  // sidebar label
+        "C H A T S",              // sidebar label
         "Bloom /",                // header prefix
         "Weekend crew",           // selected conversation title
         "3 people",               // participant count wording
@@ -180,6 +180,14 @@ fn layout_matches_the_mockup_structure() {
     assert!(
         !hint_text.contains("Connected"),
         "connection state belongs in the header, found: {hint_text:?}"
+    );
+
+    // The header status is an outlined chip, so it has side borders on its row.
+    let badge_row =
+        (1..4).find(|y| (rule_x + 1..99).filter(|x| symbol(*x, *y) == "│").count() >= 2);
+    assert!(
+        badge_row.is_some(),
+        "the header status should be framed, like the mockup's badge"
     );
 
     // The transcript is capped rather than running edge to edge, which is the
@@ -219,7 +227,7 @@ fn empty_store_renders_a_usable_screen_rather_than_nothing() {
     let text = rendered(&app);
 
     assert!(
-        text.contains("CHATS"),
+        text.contains("C H A T S"),
         "sidebar still present when empty:\n{text}"
     );
     assert!(
