@@ -144,14 +144,46 @@ instead of a JSONL file.
 
 Phase 3, first write, user authorized:
 
-10. Send one outbound message and confirm delivery.
-11. Restart the sidecar and confirm inbound messages still arrive.
-12. Confirm renewal behavior after the scheduled re-registration.
+10. **PASSED.** `bin/send_test.dart` sent one iMessage from the restored state with
+    no registration and no login. `newMsg` built the message, `send` returned
+    accepted, and exactly one send confirmation arrived for that message id with no
+    error. The recipient independently confirmed receiving the message. Four inbound
+    iMessages also arrived during the send window, so both directions were exercised
+    in one run. State files written: `facetime.plist`, `hw_info.plist`,
+    `id_cache.plist`, `statuskit.plist`.
+11. Verified send path: `getHandles` supplies the sending addresses; the sender is
+    chosen to match the recipient's scheme; `ConversationData` carries the
+    participant handles, the local chat guid and the previous message guid;
+    `newMsg` returns a `MessageInst` whose `id` keys the send confirmation.
 
-Phase 3, integration:
+Remaining:
 
-7. Wire `bloomd` to supervise the sidecar and expose it through Bloom IPC.
-8. End-to-end test through the TUI with the OpenBubbles app not running.
+12. Restart and resume, to confirm state reloads and messaging continues.
+13. Reopen the OpenBubbles app and confirm the user's normal setup still works after
+    the sidecar has written state.
+14. Confirm renewal after the scheduled re-registration.
+
+## Confidence
+
+Verified so far, all with the Mac off and with the user's real registration:
+
+- A headless process can load the shipped engine and drive it without Flutter.
+- The existing state restores, and the engine connects to Apple and polls.
+- Inbound iMessages arrive and are captured with real content.
+- Outbound iMessage sends are accepted, confirmed, and independently observed as
+  delivered by the recipient.
+
+So the route works for send and receive. What remains before calling it intended
+behavior is restart/resume, coexistence with the app, and one observed renewal.
+
+## Integration work still to do
+
+15. Wire `bloomd` to supervise the sidecar and expose it through Bloom IPC.
+16. End-to-end test through the TUI with the OpenBubbles app not running.
+17. Read existing history from the app's ObjectBox store, or accept starting from
+    takeover and backfilling from Apple.
+18. Replace the spike's mirror-based encoder with explicit encoders and write into
+    Bloom's encrypted store instead of a JSONL file.
 
 ## Open decision
 
