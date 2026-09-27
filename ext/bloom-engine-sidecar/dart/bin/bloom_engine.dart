@@ -27,14 +27,13 @@ class SidecarConfig {
 
   final String stateDirectory;
   final String libraryPath;
+  bool get syncChats => false;
 }
 
 SidecarConfig? parseConfig(List<String> arguments) {
-  final state =
-      _option(arguments, '--state') ??
+  final state = _option(arguments, '--state') ??
       Platform.environment['BLOOM_ENGINE_STATE'];
-  final library =
-      _option(arguments, '--library') ??
+  final library = _option(arguments, '--library') ??
       Platform.environment['BLOOM_ENGINE_LIBRARY'];
   if (state == null || state.isEmpty) {
     stderr.writeln(
@@ -128,16 +127,16 @@ api.MessageInst buildMessage({
 }
 
 api.MessagePart textPart(String text) => api.MessagePart.text(
-  text,
-  api.TextFormat.flags(
-    api.TextFlags(
-      bold: false,
-      italic: false,
-      underline: false,
-      strikethrough: false,
-    ),
-  ),
-);
+      text,
+      api.TextFormat.flags(
+        api.TextFlags(
+          bold: false,
+          italic: false,
+          underline: false,
+          strikethrough: false,
+        ),
+      ),
+    );
 
 Future<void> main(List<String> arguments) async {
   final config = parseConfig(arguments);
@@ -177,20 +176,18 @@ Future<void> main(List<String> arguments) async {
     ),
   );
 
-  final commands = stdin
-      .transform(utf8.decoder)
-      .transform(const LineSplitter())
-      .listen(
-        (line) => _handleCommand(
-          line: line,
-          deskState: deskState,
-          sends: sends,
-          stop: () {
-            stopping = true;
-            api.cancelPoll(cancel: deskState.cancelPoll);
-          },
-        ),
-      );
+  final commands =
+      stdin.transform(utf8.decoder).transform(const LineSplitter()).listen(
+            (line) => _handleCommand(
+              line: line,
+              deskState: deskState,
+              sends: sends,
+              stop: () {
+                stopping = true;
+                api.cancelPoll(cancel: deskState.cancelPoll);
+              },
+            ),
+          );
 
   while (!stopping) {
     final api.PollResult result;

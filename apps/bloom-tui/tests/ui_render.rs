@@ -11,6 +11,13 @@ use bloom_domain::{
 use bloom_tui::{app::App, ui};
 use ratatui::{backend::TestBackend, Terminal};
 
+fn buffer(app: &App, width: u16, height: u16) -> ratatui::buffer::Buffer {
+    let backend = TestBackend::new(width, height);
+    let mut terminal = Terminal::new(backend).unwrap();
+    terminal.draw(|frame| ui::render(frame, app)).unwrap();
+    terminal.backend().buffer().clone()
+}
+
 fn transport() -> TransportId {
     TransportId::new("openbubbles").unwrap()
 }
@@ -108,6 +115,17 @@ fn layout_matches_the_mockup_structure() {
     app.session = "Active".into();
 
     let text = rendered(&app);
+    let buffer = buffer(&app, 100, 30);
+
+    let symbol = |x, y| buffer[(x, y)].symbol();
+    let rule_x = 24;
+    assert!((2..30).filter(|y| symbol(rule_x, *y) == "│").count() >= 23);
+    assert_eq!(symbol(25, 27), "─");
+    assert_eq!(symbol(25, 28), "›");
+    assert_eq!(symbol(25, 29), "C");
+    assert_eq!((0..100).filter(|x| symbol(*x, 1) == "─").count(), 100);
+    let all = rendered(&app);
+    assert_eq!(all.matches("›  Write a message...").count(), 1);
 
     for expected in [
         "CHATS",                  // sidebar label
@@ -153,7 +171,7 @@ fn empty_store_renders_a_usable_screen_rather_than_nothing() {
         "sidebar still present when empty:\n{text}"
     );
     assert!(
-        text.contains("Bloom /"),
+        text.contains("Bloom"),
         "header still present when empty:\n{text}"
     );
     assert!(

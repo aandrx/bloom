@@ -57,6 +57,13 @@ field; variants that are not modelled yet are emitted with
 `"complete": false` and an `unsupported` marker naming the variant and the reason,
 so content is never silently replaced by a `toString()` placeholder.
 
+## Formatting caveat
+
+Run `dart pub get` before checking formatting. The formatter selects its style from
+the package configuration, so without it `dart format` silently uses a different
+style and reports the tree as clean while CI, which resolves dependencies first,
+reports the same files as changed.
+
 ## Status
 
 Implemented and covered by offline tests: encoder, protocol, configuration guards.

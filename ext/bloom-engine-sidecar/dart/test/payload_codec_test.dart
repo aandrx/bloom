@@ -9,69 +9,71 @@ import 'package:bloom_engine_sidecar/upstream/api/api.dart' as api;
 import 'package:test/test.dart';
 
 api.MMCSFile _mmcs() => api.MMCSFile(
-  signature: Uint8List.fromList(<int>[1, 2, 3]),
-  object: 'object',
-  url: 'https://example.invalid/file',
-  key: Uint8List.fromList(<int>[4, 5, 6]),
-  size: 128,
-);
+      signature: Uint8List.fromList(<int>[1, 2, 3]),
+      object: 'object',
+      url: 'https://example.invalid/file',
+      key: Uint8List.fromList(<int>[4, 5, 6]),
+      size: 128,
+    );
 
 api.MessagePart textPart(String text) => api.MessagePart.text(
-  text,
-  api.TextFormat.flags(
-    api.TextFlags(
-      bold: false,
-      italic: false,
-      underline: false,
-      strikethrough: false,
-    ),
-  ),
-);
+      text,
+      api.TextFormat.flags(
+        api.TextFlags(
+          bold: false,
+          italic: false,
+          underline: false,
+          strikethrough: false,
+        ),
+      ),
+    );
 
 api.MessageInst fullInstance({
   String id = 'message-uuid',
   String sender = 'tel:+15550000001',
-}) => api.MessageInst(
-  id: id,
-  sender: sender,
-  conversation: api.ConversationData(
-    participants: <String>[sender, 'mailto:self@example.invalid'],
-    cvName: null,
-    senderGuid: 'iMessage;-;$sender',
-    afterGuid: null,
-  ),
-  message: api.Message.message(
-    api.NormalMessage(
-      parts: api.MessageParts(
-        field0: <api.IndexedMessagePart>[
-          api.IndexedMessagePart(part_: textPart('hello'), idx: 0),
-          api.IndexedMessagePart(
-            part_: api.MessagePart.attachment(
-              api.Attachment(
-                aType: api.AttachmentType.mmcs(_mmcs()),
-                part_: 1,
-                utiType: 'public.jpeg',
-                mime: 'image/jpeg',
-                name: 'photo.jpg',
-                iris: false,
-              ),
-            ),
-            idx: 1,
-          ),
-          api.IndexedMessagePart(
-            part_: const api.MessagePart.mention('@bob', 'tel:+15550000002'),
-            idx: 2,
-          ),
-        ],
+}) =>
+    api.MessageInst(
+      id: id,
+      sender: sender,
+      conversation: api.ConversationData(
+        participants: <String>[sender, 'mailto:self@example.invalid'],
+        cvName: null,
+        senderGuid: 'iMessage;-;$sender',
+        afterGuid: null,
       ),
-      service: const api.MessageType.iMessage(),
-      voice: false,
-    ),
-  ),
-  sentTimestamp: 1700000000000,
-  sendDelivered: true,
-  verificationFailed: false,
-);
+      message: api.Message.message(
+        api.NormalMessage(
+          parts: api.MessageParts(
+            field0: <api.IndexedMessagePart>[
+              api.IndexedMessagePart(part_: textPart('hello'), idx: 0),
+              api.IndexedMessagePart(
+                part_: api.MessagePart.attachment(
+                  api.Attachment(
+                    aType: api.AttachmentType.mmcs(_mmcs()),
+                    part_: 1,
+                    utiType: 'public.jpeg',
+                    mime: 'image/jpeg',
+                    name: 'photo.jpg',
+                    iris: false,
+                  ),
+                ),
+                idx: 1,
+              ),
+              api.IndexedMessagePart(
+                part_:
+                    const api.MessagePart.mention('@bob', 'tel:+15550000002'),
+                idx: 2,
+              ),
+            ],
+          ),
+          service: const api.MessageType.iMessage(),
+          voice: false,
+        ),
+      ),
+      sentTimestamp: 1700000000000,
+      sendDelivered: true,
+      verificationFailed: false,
+    );
 
 /// The contract every encoded payload must satisfy: it names its variant and either
 /// carries complete content or an explicit unsupported marker. Silent degradation
@@ -300,14 +302,14 @@ void main() {
 
   group('outbound message variants', () {
     api.MessageInst withMessage(api.Message message) => api.MessageInst(
-      id: 'uuid',
-      sender: 'mailto:me@example.invalid',
-      conversation: null,
-      message: message,
-      sentTimestamp: 5,
-      sendDelivered: false,
-      verificationFailed: false,
-    );
+          id: 'uuid',
+          sender: 'mailto:me@example.invalid',
+          conversation: null,
+          message: message,
+          sentTimestamp: 5,
+          sendDelivered: false,
+          verificationFailed: false,
+        );
 
     test('unsend and edit encode their fields', () {
       final unsend = encodePushMessage(

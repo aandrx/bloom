@@ -17,20 +17,21 @@ pub fn render(frame: &mut Frame<'_>, app: &App) {
     let areas = Layout::vertical([Constraint::Length(2), Constraint::Min(1)]).split(frame.area());
     let header = Layout::vertical([Constraint::Length(1), Constraint::Length(1)]).split(areas[0]);
     let selected = app.selected_conversation();
-    let title = selected.map(chat_name).unwrap_or("New conversation");
+    let title = selected.map(chat_name);
     let people = selected
         .map(|c| participant_count(c.participants.len()))
         .unwrap_or_default();
-    let mut heading = vec![
-        Span::styled("Bloom / ", Style::default().fg(TEXT)),
-        Span::styled(
+    let mut heading = vec![Span::styled("Bloom", Style::default().fg(TEXT))];
+    if let Some(title) = title {
+        heading.push(Span::raw(" / "));
+        heading.push(Span::styled(
             title,
             Style::default().fg(TEXT).add_modifier(Modifier::BOLD),
-        ),
-    ];
-    if !people.is_empty() {
-        heading.push(Span::raw("  "));
-        heading.push(Span::styled(people, Style::default().fg(MUTED)));
+        ));
+        if !people.is_empty() {
+            heading.push(Span::raw("  "));
+            heading.push(Span::styled(people, Style::default().fg(MUTED)));
+        }
     }
     frame.render_widget(Paragraph::new(Line::from(heading)), header[0]);
     frame.render_widget(
@@ -80,7 +81,9 @@ pub fn render(frame: &mut Frame<'_>, app: &App) {
         .collect::<Vec<_>>();
     frame.render_widget(List::new(entries).style(Style::default().bg(BG)), side[1]);
     frame.render_widget(
-        Paragraph::new("│").style(Style::default().fg(RULE)),
+        Block::default()
+            .borders(Borders::LEFT)
+            .border_style(Style::default().fg(RULE)),
         body[1],
     );
 
@@ -143,6 +146,15 @@ pub fn render(frame: &mut Frame<'_>, app: &App) {
         ComposerPrompt::Body(address) => format!("›  To {address} — write a message..."),
         _ => "›  Write a message...".to_owned(),
     };
+    let prompt = if app.new_conversation && app.pending_address.is_none() {
+        "›  To: recipient address...".to_owned()
+    } else if let Some(address) = &app.pending_address {
+        format!("›  To {address} — write a message... {}", app.draft)
+    } else if app.composing {
+        format!("›  {}", app.draft)
+    } else {
+        prompt
+    };
     frame.render_widget(
         Paragraph::new(prompt)
             .style(Style::default().fg(if app.draft.is_empty() { MUTED } else { TEXT }))
@@ -150,16 +162,9 @@ pub fn render(frame: &mut Frame<'_>, app: &App) {
                 Block::default()
                     .borders(Borders::TOP)
                     .border_style(Style::default().fg(RULE)),
-            )
-            .style(Style::default().fg(MUTED)),
+            ),
         right[1],
     );
-    if app.composing || app.new_conversation {
-        frame.render_widget(
-            Paragraph::new(format!("›  {}", app.draft)).style(Style::default().fg(CYAN)),
-            right[1],
-        );
-    }
     let error = app
         .error
         .as_deref()

@@ -151,21 +151,26 @@ String readyFrame({
   required String engineVersion,
   required bool canSend,
   required bool canReadHistory,
-}) => _frame(<String, Object?>{
-  'type': 'ready',
-  'engine_version': engineVersion,
-  'capabilities': <String, Object?>{'send': canSend, 'history': canReadHistory},
-});
+}) =>
+    _frame(<String, Object?>{
+      'type': 'ready',
+      'engine_version': engineVersion,
+      'capabilities': <String, Object?>{
+        'send': canSend,
+        'history': canReadHistory
+      },
+    });
 
 /// One decoded inbound push payload, in the order it was received.
 String inboundFrame({
   required int sequence,
   required Map<String, Object?> payload,
-}) => _frame(<String, Object?>{
-  'type': 'inbound_message',
-  'sequence': sequence,
-  'payload': payload,
-});
+}) =>
+    _frame(<String, Object?>{
+      'type': 'inbound_message',
+      'sequence': sequence,
+      'payload': payload,
+    });
 
 /// Result of a correlated send command.
 String sendConfirmFrame({
@@ -173,13 +178,14 @@ String sendConfirmFrame({
   required String messageId,
   required bool accepted,
   String? error,
-}) => _frame(<String, Object?>{
-  'type': 'send_confirmation',
-  'request_id': requestId,
-  'message_id': messageId,
-  'accepted': accepted,
-  if (error != null) 'error': error,
-});
+}) =>
+    _frame(<String, Object?>{
+      'type': 'send_confirmation',
+      'request_id': requestId,
+      'message_id': messageId,
+      'accepted': accepted,
+      if (error != null) 'error': error,
+    });
 
 /// Acknowledgement that the sidecar has begun shutting down.
 String shutdownAckFrame({required int requestId}) =>
@@ -190,21 +196,23 @@ String shutdownAckFrame({required int requestId}) =>
 String conversationFrame({
   required int sequence,
   required Map<String, Object?> conversation,
-}) => _frame(<String, Object?>{
-  'type': 'conversation',
-  'sequence': sequence,
-  'conversation': conversation,
-});
+}) =>
+    _frame(<String, Object?>{
+      'type': 'conversation',
+      'sequence': sequence,
+      'conversation': conversation,
+    });
 
 /// One historical message imported from the existing local history.
 String historyMessageFrame({
   required int sequence,
   required Map<String, Object?> message,
-}) => _frame(<String, Object?>{
-  'type': 'history_message',
-  'sequence': sequence,
-  'message': message,
-});
+}) =>
+    _frame(<String, Object?>{
+      'type': 'history_message',
+      'sequence': sequence,
+      'message': message,
+    });
 
 /// Marks the end of the startup import. `limited` is true when the import stopped
 /// early, so the daemon can log that coverage was partial rather than assume
@@ -213,12 +221,13 @@ String historyCompleteFrame({
   required int conversations,
   required int messages,
   required bool limited,
-}) => _frame(<String, Object?>{
-  'type': 'history_complete',
-  'conversations': conversations,
-  'messages': messages,
-  'limited': limited,
-});
+}) =>
+    _frame(<String, Object?>{
+      'type': 'history_complete',
+      'conversations': conversations,
+      'messages': messages,
+      'limited': limited,
+    });
 
 /// Engine session/registration state change.
 String sessionFrame({required String state, String? reason}) =>
@@ -233,9 +242,10 @@ String errorFrame({
   int? requestId,
   required String code,
   bool retryable = false,
-}) => _frame(<String, Object?>{
-  'type': 'error',
-  'code': code,
-  'retryable': retryable,
-  if (requestId != null) 'request_id': requestId,
-});
+}) =>
+    _frame(<String, Object?>{
+      'type': 'error',
+      'code': code,
+      'retryable': retryable,
+      if (requestId != null) 'request_id': requestId,
+    });
