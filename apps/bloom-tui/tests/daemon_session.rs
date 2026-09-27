@@ -39,6 +39,7 @@ fn conversation(value: &str, last: i64) -> Conversation {
         }],
         created_at: 1,
         last_message_at: Some(last),
+        aliases: Vec::new(),
         preview: None,
     }
 }

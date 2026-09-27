@@ -73,6 +73,27 @@ pub fn get_message(store: &EncryptedStore, id: &MessageId) -> Result<Option<Mess
         .transpose()
 }
 
+pub(crate) fn remap_message(
+    message: &Message,
+    conversation_id: &ConversationId,
+) -> Result<Message, StoreError> {
+    Message::new(
+        message.id().clone(),
+        conversation_id.clone(),
+        message.remote_id.clone(),
+        message.sender.clone(),
+        message.parts.clone(),
+        message.created_at,
+        message.sent_at,
+        message.delivery.clone(),
+        message.from_me,
+        message.edited_at,
+        message.reactions.clone(),
+        message.unsent_at,
+    )
+    .map_err(|_| StoreError::MessageConversationMismatch)
+}
+
 pub fn history(
     store: &EncryptedStore,
     conversation_id: &ConversationId,
@@ -81,22 +102,64 @@ pub fn history(
     if limit == 0 {
         return Ok(Vec::new());
     }
-    let key = stable_conversation_id(conversation_id)?;
-    let mut statement = store._connection.prepare("SELECT data FROM (SELECT id, data, created_at FROM messages WHERE conversation_id=?1 ORDER BY created_at DESC, id DESC LIMIT ?2) ORDER BY created_at ASC, id ASC")?;
-    let records = statement.query_map(params![key, limit], |row| row.get::<_, Vec<u8>>(0))?;
-    records
-        .map(|record| {
-            let data = record?;
-            serde_json::from_slice(&data).map_err(|_| StoreError::Schema)
-        })
-        .collect()
+    if let Some(canonical) = super::conversations::get_conversation(store, conversation_id)? {
+        return history_for_conversation(store, &canonical, limit);
+    }
+    history_for_identities(store, conversation_id, &[], limit)
+}
+
+pub(crate) fn history_for_conversation(
+    store: &EncryptedStore,
+    conversation: &bloom_domain::Conversation,
+    limit: u16,
+) -> Result<Vec<Message>, StoreError> {
+    history_for_identities(store, &conversation.id, &conversation.aliases, limit)
+}
+
+fn history_for_identities(
+    store: &EncryptedStore,
+    canonical_id: &ConversationId,
+    aliases: &[ConversationId],
+    limit: u16,
+) -> Result<Vec<Message>, StoreError> {
+    if limit == 0 {
+        return Ok(Vec::new());
+    }
+    let canonical_id = canonical_id.clone();
+    let mut identities = vec![canonical_id.clone()];
+    identities.extend(aliases.iter().cloned());
+    identities.sort_by(|left, right| left.value().cmp(right.value()));
+    identities.dedup();
+
+    let mut messages = Vec::new();
+    for identity in identities {
+        let key = stable_conversation_id(&identity)?;
+        let mut statement = store._connection.prepare("SELECT data FROM (SELECT id, data, created_at FROM messages WHERE conversation_id=?1 ORDER BY created_at DESC, id DESC LIMIT ?2) ORDER BY created_at ASC, id ASC")?;
+        let records = statement.query_map(params![key, limit], |row| row.get::<_, Vec<u8>>(0))?;
+        for record in records {
+            let message: Message =
+                serde_json::from_slice(&record?).map_err(|_| StoreError::Schema)?;
+            messages.push(remap_message(&message, &canonical_id)?);
+        }
+    }
+    messages.sort_by(|left, right| {
+        left.created_at
+            .cmp(&right.created_at)
+            .then_with(|| left.id().value().cmp(right.id().value()))
+    });
+    if messages.len() > limit as usize {
+        messages.drain(..messages.len() - limit as usize);
+    }
+    Ok(messages)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::store::KEY_BYTES;
-    use bloom_domain::{DeliveryState, Handle, HandleKind, MessagePart, TransportId};
+    use bloom_domain::{
+        Conversation, ConversationKind, DeliveryState, Handle, HandleKind, MessagePart, TransportId,
+    };
     use std::fs;
 
     fn fixture_message(
@@ -135,16 +198,23 @@ mod tests {
             fs::set_permissions(&private, fs::Permissions::from_mode(0o700)).unwrap();
         }
         let conversation = ConversationId::new(TransportId::new("alpha").unwrap(), "room").unwrap();
-        let store =
+        let mut store =
             EncryptedStore::open_with_key(private.join("messages.db"), &[9; KEY_BYTES]).unwrap();
-        let key = stable_conversation_id(&conversation).unwrap();
-        store
-            ._connection
-            .execute(
-                "INSERT INTO conversations(id, created_at, data) VALUES (?1, 0, x'00')",
-                params![key],
-            )
-            .unwrap();
+        super::super::conversations::upsert_conversation(
+            &mut store,
+            &Conversation {
+                id: conversation.clone(),
+                remote_id: "room".into(),
+                kind: ConversationKind::Direct,
+                title: None,
+                participants: Vec::new(),
+                created_at: 0,
+                last_message_at: None,
+                aliases: Vec::new(),
+                preview: None,
+            },
+        )
+        .unwrap();
         (temp, store, conversation)
     }
 
@@ -162,14 +232,21 @@ mod tests {
             DeliveryState::Sent,
         );
         let second_conversation = second.conversation_id().clone();
-        let second_key = stable_conversation_id(&second_conversation).unwrap();
-        store
-            ._connection
-            .execute(
-                "INSERT INTO conversations(id, created_at, data) VALUES (?1, 0, x'00')",
-                params![second_key],
-            )
-            .unwrap();
+        super::super::conversations::upsert_conversation(
+            &mut store,
+            &Conversation {
+                id: second_conversation.clone(),
+                remote_id: "elsewhere".into(),
+                kind: ConversationKind::Direct,
+                title: None,
+                participants: Vec::new(),
+                created_at: 0,
+                last_message_at: None,
+                aliases: Vec::new(),
+                preview: None,
+            },
+        )
+        .unwrap();
         assert_eq!(
             upsert_message(&mut store, &first).unwrap(),
             MessageUpsertOutcome::Inserted

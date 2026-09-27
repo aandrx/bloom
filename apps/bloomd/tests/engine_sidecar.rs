@@ -61,6 +61,140 @@ done
 }
 
 #[tokio::test]
+async fn exact_direct_identity_reconciles_split_histories_at_the_service_boundary() {
+    use bloom_domain::{
+        Conversation, ConversationId, ConversationKind, DeliveryState, Handle, HandleKind, Message,
+        MessageId, Participant, TransportId,
+    };
+    use bloom_transport::TransportEvent;
+
+    let dir = tempfile::tempdir().unwrap();
+    let private = dir.path().join("private");
+    fs::create_dir(&private).unwrap();
+    fs::set_permissions(&private, fs::Permissions::from_mode(0o700)).unwrap();
+    let store = EncryptedStore::open(private.join("store.db"), &TestSecrets).unwrap();
+    let store = Arc::new(Mutex::new(store));
+    let handle = Handle::new(HandleKind::Email, "person@example.test").unwrap();
+    let transport = TransportId::new("openbubbles").unwrap();
+    let local = Conversation {
+        id: ConversationId::new(transport.clone(), "iMessage;-;mailto:person@example.test")
+            .unwrap(),
+        remote_id: "iMessage;-;mailto:person@example.test".into(),
+        kind: ConversationKind::Direct,
+        title: None,
+        participants: vec![Participant {
+            handle: handle.clone(),
+            display_name: None,
+            is_me: false,
+        }],
+        created_at: 1,
+        last_message_at: Some(10),
+        aliases: Vec::new(),
+        preview: None,
+    };
+    let engine = Conversation {
+        id: ConversationId::new(transport.clone(), "iMessage;-;person@example.test").unwrap(),
+        remote_id: "iMessage;-;person@example.test".into(),
+        kind: ConversationKind::Direct,
+        title: None,
+        participants: local.participants.clone(),
+        created_at: 2,
+        last_message_at: Some(20),
+        aliases: Vec::new(),
+        preview: None,
+    };
+    let make_message = |conversation: &Conversation, id: &str, at: i64, text: &str| {
+        Message::new(
+            MessageId::new(transport.clone(), id).unwrap(),
+            conversation.id.clone(),
+            None,
+            handle.clone(),
+            vec![MessagePart::Text(text.into())],
+            at,
+            None,
+            DeliveryState::Delivered,
+            false,
+            None,
+            Vec::new(),
+            None,
+        )
+        .unwrap()
+    };
+    let outgoing_thread = make_message(&local, "outgoing", 10, "outgoing-only history");
+    let incoming_thread = make_message(&engine, "incoming", 20, "incoming-only history");
+    {
+        let mut guard = store.lock().unwrap();
+        store::ingest_inbound(&mut guard, &local, &outgoing_thread).unwrap();
+        store::ingest_inbound(&mut guard, &engine, &incoming_thread).unwrap();
+        assert_eq!(store::list_conversations(&guard).unwrap().len(), 2);
+    }
+
+    let daemon_engine = Arc::new(Engine::new(EngineConfig {
+        sync_chats: false,
+        dart_executable: PathBuf::from("unused"),
+        script: PathBuf::from("unused"),
+        state_dir: private.clone(),
+        library: PathBuf::from("unused"),
+    }));
+    let hub = SubscriptionHub::with_default_capacity();
+    let service = Service::new(store.clone(), daemon_engine, hub);
+    let live = make_message(&engine, "live", 30, "next message");
+    assert!(service
+        .persist(&TransportEvent::Message {
+            conversation: engine.clone(),
+            message: live,
+        })
+        .unwrap());
+
+    let conversations = service.list_conversations().await.unwrap();
+    assert_eq!(conversations.len(), 1);
+    assert_eq!(conversations[0].id, local.id);
+    assert_eq!(conversations[0].remote_id, "iMessage;-;person@example.test");
+    let history = service.history(local.id.clone(), 10).await.unwrap();
+    assert_eq!(history.len(), 3);
+    assert!(history
+        .iter()
+        .all(|message| message.conversation_id() == &local.id));
+    assert_eq!(
+        history[0].parts(),
+        &[MessagePart::Text("outgoing-only history".into())]
+    );
+    assert_eq!(
+        history[1].parts(),
+        &[MessagePart::Text("incoming-only history".into())]
+    );
+    assert_eq!(
+        history[2].parts(),
+        &[MessagePart::Text("next message".into())]
+    );
+
+    let unrelated_id = ConversationId::new(transport.clone(), "unrelated-thread").unwrap();
+    let mismatched = Message::new(
+        MessageId::new(transport.clone(), "mismatched-message").unwrap(),
+        unrelated_id,
+        None,
+        handle.clone(),
+        vec![MessagePart::Text("must not be ingested".into())],
+        40,
+        None,
+        DeliveryState::Delivered,
+        false,
+        None,
+        Vec::new(),
+        None,
+    )
+    .unwrap();
+    assert!(matches!(
+        service.persist(&TransportEvent::Message {
+            conversation: engine,
+            message: mismatched,
+        }),
+        Err(store::StoreError::MessageConversationMismatch)
+    ));
+    assert_eq!(service.history(local.id, 10).await.unwrap().len(), 3);
+}
+
+#[tokio::test]
 async fn daemon_persists_inbound_and_sends_outbound_through_the_sidecar() {
     let dir = tempfile::tempdir().unwrap();
     let private = dir.path().join("private");
@@ -183,18 +317,24 @@ async fn daemon_persists_inbound_and_sends_outbound_through_the_sidecar() {
     assert_eq!(history.len(), 2);
 }
 
-/// Like `fake_sidecar`, but reports readiness without pushing an inbound message,
-/// so outbound tests are not polluted by an inbound conversation.
-fn fake_sidecar_quiet(dir: &std::path::Path) -> PathBuf {
-    let path = dir.join("fake_engine_quiet.sh");
+/// Push an engine-GUID inbound message before confirming the first send. This
+/// recreates the identity race a user can hit when starting a fresh direct chat.
+fn fake_sidecar_identity_race(dir: &std::path::Path) -> PathBuf {
+    let path = dir.join("fake_engine_identity_race.sh");
     let script = r#"#!/bin/sh
 cat <<'FRAMES'
 {"version":1,"type":"ready","engine_version":"fake","handles":["mailto:me@example.invalid"],"capabilities":{"send":true,"history":false}}
 FRAMES
+sent=0
 while IFS= read -r line; do
   case "$line" in
     *'"type":"send"'*)
       id=$(printf '%s' "$line" | sed -n 's/.*"request_id":\([0-9]*\).*/\1/p')
+      if [ "$sent" -eq 0 ]; then
+        printf '%s\n' '{"version":1,"type":"inbound_message","sequence":1,"payload":{"variant":"iMessage","complete":true,"inst":{"id":"inbound-race","sender":"mailto:someone@example.com","conversation":{"participants":["mailto:someone@example.com","mailto:me@example.invalid"],"cv_name":null,"sender_guid":"iMessage;-;someone@example.com","after_guid":null},"message":{"type":"normal","complete":true,"value":{"parts":[{"idx":0,"part":{"type":"text","text":"echo"}}],"service":{"type":"iMessage","complete":true}}},"sent_timestamp_ms":1700000000000,"send_delivered":false,"verification_failed":false}}}'
+        sent=1
+        sleep 0.2
+      fi
       printf '{"version":1,"type":"send_confirmation","request_id":%s,"message_id":"outbound-%s","accepted":true}\n' "$id" "$id"
       ;;
     *'"type":"shutdown"'*)
@@ -215,7 +355,7 @@ async fn starting_a_conversation_creates_then_reuses_it_and_normalises_addresses
     let private = dir.path().join("private");
     fs::create_dir(&private).unwrap();
     fs::set_permissions(&private, fs::Permissions::from_mode(0o700)).unwrap();
-    let fake = fake_sidecar_quiet(dir.path());
+    let fake = fake_sidecar_identity_race(dir.path());
 
     let store = EncryptedStore::open(private.join("store.db"), &TestSecrets).unwrap();
     let store = Arc::new(Mutex::new(store));
@@ -255,6 +395,30 @@ async fn starting_a_conversation_creates_then_reuses_it_and_normalises_addresses
     let body = || OutgoingBody {
         parts: vec![MessagePart::Text("hello".to_owned())],
     };
+    let foreign = bloom_domain::Conversation {
+        id: bloom_domain::ConversationId::new(
+            bloom_domain::TransportId::new("other-transport").unwrap(),
+            "someone@example.com-thread",
+        )
+        .unwrap(),
+        remote_id: "foreign-route".into(),
+        kind: bloom_domain::ConversationKind::Direct,
+        title: None,
+        participants: vec![bloom_domain::Participant {
+            handle: bloom_domain::Handle::new(
+                bloom_domain::HandleKind::Email,
+                "someone@example.com",
+            )
+            .unwrap(),
+            display_name: None,
+            is_me: false,
+        }],
+        created_at: 1,
+        last_message_at: None,
+        aliases: Vec::new(),
+        preview: None,
+    };
+    store::upsert_conversation(&mut store.lock().unwrap(), &foreign).unwrap();
 
     // A bare email address starts a conversation.
     let first = service
@@ -269,15 +433,24 @@ async fn starting_a_conversation_creates_then_reuses_it_and_normalises_addresses
     };
     assert_eq!(
         conversations.len(),
-        1,
-        "exactly one conversation is created"
+        2,
+        "the other transport's thread stays separate"
     );
-    assert_eq!(conversations[0].participants.len(), 2);
+    let engine_thread = conversations
+        .iter()
+        .find(|conversation| conversation.id.transport().as_str() == "openbubbles")
+        .expect("the direct thread is stored on the engine transport");
+    assert_eq!(engine_thread.participants.len(), 2);
+    assert_eq!(engine_thread.remote_id, "iMessage;-;someone@example.com");
+    assert_eq!(engine_thread.aliases.len(), 1);
     assert!(
-        conversations[0].participants.iter().any(|p| p.is_me),
+        engine_thread
+            .participants
+            .iter()
+            .any(|participant| participant.is_me),
         "the local participant must be recorded so the UI can label our side"
     );
-    let conversation_id = conversations[0].id.clone();
+    let conversation_id = engine_thread.id.clone();
 
     // A duplicate message must not be created by re-sending the same address.
     let second = service
@@ -289,13 +462,13 @@ async fn starting_a_conversation_creates_then_reuses_it_and_normalises_addresses
         let guard = store.lock().unwrap();
         assert_eq!(
             store::list_conversations(&guard).unwrap().len(),
-            1,
-            "re-sending to the same address reuses the conversation"
+            2,
+            "re-sending to the same address reuses the engine conversation"
         );
         assert_eq!(
             store::history(&guard, &conversation_id, 50).unwrap().len(),
-            2,
-            "both outbound messages are stored"
+            3,
+            "the inbound race and both outbound messages are stored in one thread"
         );
     }
 
@@ -307,10 +480,15 @@ async fn starting_a_conversation_creates_then_reuses_it_and_normalises_addresses
     {
         let guard = store.lock().unwrap();
         let conversations = store::list_conversations(&guard).unwrap();
-        assert_eq!(conversations.len(), 2);
+        assert_eq!(conversations.len(), 3);
         let phone = conversations
             .iter()
-            .find(|c| c.id != conversation_id)
+            .find(|conversation| {
+                conversation
+                    .participants
+                    .iter()
+                    .any(|participant| participant.handle.value() == "+15550000009")
+            })
             .expect("the phone conversation exists");
         assert!(
             phone.participants.iter().any(|p| !p.is_me
@@ -354,6 +532,7 @@ async fn starting_a_conversation_creates_then_reuses_it_and_normalises_addresses
         ],
         created_at: 1,
         last_message_at: None,
+        aliases: Vec::new(),
         preview: None,
     };
     store::upsert_conversation(&mut store.lock().unwrap(), &group).unwrap();
@@ -658,6 +837,7 @@ async fn late_confirmation_after_send_timeout_is_not_reconciled() {
         ],
         created_at: 1,
         last_message_at: None,
+        aliases: Vec::new(),
         preview: None,
     };
     store::upsert_conversation(&mut store.lock().unwrap(), &conversation).unwrap();

@@ -49,6 +49,7 @@ fn conversation(title: &str, participants: usize) -> Conversation {
         participants: people,
         created_at: 1,
         last_message_at: Some(10),
+        aliases: Vec::new(),
         preview: None,
     }
 }

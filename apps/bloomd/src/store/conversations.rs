@@ -76,16 +76,31 @@ pub fn merge_conversation(
     }
 }
 
-pub fn list_conversations(store: &EncryptedStore) -> Result<Vec<Conversation>, StoreError> {
+pub(crate) fn list_all_conversations(
+    store: &EncryptedStore,
+) -> Result<Vec<Conversation>, StoreError> {
     let mut statement = store
         ._connection
-        .prepare("SELECT data FROM conversations ORDER BY last_message_at DESC, id ASC")?;
+        .prepare("SELECT data FROM conversations")?;
     let records = statement.query_map([], |row| row.get::<_, Vec<u8>>(0))?;
-    let mut conversations = Vec::new();
-    for record in records {
-        let data = record?;
-        conversations.push(serde_json::from_slice(&data).map_err(|_| StoreError::Schema)?);
-    }
+    records
+        .map(|record| serde_json::from_slice(&record?).map_err(|_| StoreError::Schema))
+        .collect()
+}
+
+pub fn list_conversations(store: &EncryptedStore) -> Result<Vec<Conversation>, StoreError> {
+    let mut conversations = list_all_conversations(store)?;
+    let aliases = conversations
+        .iter()
+        .flat_map(|conversation| conversation.aliases.iter().cloned())
+        .collect::<std::collections::HashSet<_>>();
+    conversations.retain(|conversation| !aliases.contains(&conversation.id));
+    conversations.sort_by_key(|conversation| {
+        (
+            std::cmp::Reverse(conversation.last_message_at),
+            stable_id(&conversation.id).unwrap_or_default(),
+        )
+    });
     Ok(conversations)
 }
 
@@ -102,8 +117,18 @@ pub fn get_conversation(
             |row| row.get(0),
         )
         .optional()?;
-    data.map(|data| serde_json::from_slice(&data).map_err(|_| StoreError::Schema))
-        .transpose()
+    let Some(data) = data else {
+        return Ok(None);
+    };
+    if let Some(canonical) = list_all_conversations(store)?
+        .into_iter()
+        .find(|conversation| conversation.aliases.contains(id))
+    {
+        return Ok(Some(canonical));
+    }
+    serde_json::from_slice(&data)
+        .map(Some)
+        .map_err(|_| StoreError::Schema)
 }
 
 #[cfg(test)]
@@ -126,6 +151,7 @@ mod tests {
             participants: vec![],
             created_at: 1,
             last_message_at,
+            aliases: Vec::new(),
             preview: None,
         }
     }

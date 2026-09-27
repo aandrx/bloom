@@ -122,6 +122,24 @@ impl ComposerLayout {
 }
 
 fn composer_content(app: &App, width: usize) -> (String, String, usize, bool, bool) {
+    if app.contacts_open {
+        if app.contacts_editing.is_some() {
+            return (
+                "›  nickname: ".to_owned(),
+                app.draft.clone(),
+                app.draft_cursor_byte(),
+                true,
+                app.draft.is_empty(),
+            );
+        }
+        return (
+            "›  ".to_owned(),
+            "Select a contact, then Enter to edit its nickname".to_owned(),
+            0,
+            false,
+            true,
+        );
+    }
     if app.renaming.is_some() {
         return (
             "›  rename: ".to_owned(),
@@ -337,6 +355,10 @@ fn footer_hints(width: usize, palette: Palette, app: &App) -> Line<'static> {
     const SETTINGS_FULL: [(&str, &str); 3] =
         [("↑↓", " select"), ("Enter", " change"), ("Esc", " close")];
     const SETTINGS_TIGHT: [(&str, &str); 1] = [("Esc", " close")];
+    const CONTACTS_FULL: [(&str, &str); 3] =
+        [("↑↓", " select"), ("Enter", " name"), ("Esc", " close")];
+    const CONTACTS_EDIT: [(&str, &str); 2] = [("Enter", " save"), ("Esc", " cancel")];
+    const CONTACTS_TIGHT: [(&str, &str); 1] = [("Esc", " close")];
     const RENAME_FULL: [(&str, &str); 2] = [("Enter", " save"), ("Esc", " cancel")];
     const RENAME_TIGHT: [(&str, &str); 1] = [("Esc", " cancel")];
 
@@ -347,6 +369,14 @@ fn footer_hints(width: usize, palette: Palette, app: &App) -> Line<'static> {
             &LEADER_COMPACT
         } else {
             &LEADER_COMPACT[..1]
+        }
+    } else if app.contacts_open {
+        if app.contacts_editing.is_some() {
+            &CONTACTS_EDIT
+        } else if width >= 32 {
+            &CONTACTS_FULL
+        } else {
+            &CONTACTS_TIGHT
         }
     } else if app.settings_open {
         if width >= 32 {
@@ -491,7 +521,7 @@ fn render_command_menu(
     }
     let suggestions = app.command_suggestions();
     let item_count = suggestions.len().max(1);
-    let visible = item_count.min(8).min(content.height as usize);
+    let visible = item_count.min(9).min(content.height as usize);
     let first = app
         .command_selection
         .saturating_sub(visible.saturating_sub(1))
@@ -694,6 +724,109 @@ fn render_settings(
     rows
 }
 
+/// Draw the standalone contacts view and expose the actual rows as mouse hitboxes.
+fn render_contacts(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    app: &App,
+    palette: Palette,
+) -> Vec<(Rect, usize)> {
+    if area.width == 0 || area.height == 0 {
+        return Vec::new();
+    }
+    let inset = 1u16.min(area.width);
+    let x = area.x + inset;
+    let width = area.width.saturating_sub(inset).max(1);
+    let handles = app.contact_handles();
+    if handles.is_empty() {
+        frame.render_widget(
+            Paragraph::new("No contacts yet. Contacts come from chats Bloom already knows.")
+                .style(Style::default().fg(palette.muted)),
+            Rect::new(x, area.y, width, area.height.min(2)),
+        );
+        return Vec::new();
+    }
+
+    frame.render_widget(
+        Paragraph::new(format!(
+            "{} known contacts · Enter to set a nickname",
+            handles.len()
+        ))
+        .style(Style::default().fg(palette.muted)),
+        Rect::new(x, area.y, width, 1),
+    );
+    if area.height < 2 {
+        return Vec::new();
+    }
+    let list_area = Rect::new(x, area.y + 1, width, area.height - 1);
+    let items = handles
+        .iter()
+        .map(|handle| {
+            let label = app.contact_label(handle);
+            let address = match handle.kind() {
+                bloom_domain::HandleKind::Email => format!("mailto:{}", handle.value()),
+                bloom_domain::HandleKind::Tel => format!("tel:{}", handle.value()),
+                bloom_domain::HandleKind::Opaque => handle.value().to_owned(),
+            };
+            let text = if !app
+                .nicknames
+                .contains_key(&crate::app::nickname_key(handle))
+            {
+                Line::from(Span::styled(
+                    display_truncate(&address, width as usize),
+                    Style::default().fg(palette.text),
+                ))
+            } else {
+                let label_width = unicode_width::UnicodeWidthStr::width(label.as_str());
+                let separator_width = 2;
+                let address_width = (width as usize).saturating_sub(label_width + separator_width);
+                Line::from(vec![
+                    Span::styled(
+                        truncate_display_graphemes(label.as_str(), label_width.min(width as usize)),
+                        Style::default()
+                            .fg(palette.text)
+                            .add_modifier(Modifier::BOLD),
+                    ),
+                    Span::styled("  ", Style::default().fg(palette.muted)),
+                    Span::styled(
+                        display_truncate(&address, address_width),
+                        Style::default().fg(palette.muted),
+                    ),
+                ])
+            };
+            ListItem::new(text)
+        })
+        .collect::<Vec<_>>();
+    let mut state = ListState::default();
+    state.select(Some(app.contacts_selection.min(handles.len() - 1)));
+    frame.render_stateful_widget(
+        List::new(items)
+            .style(Style::default().bg(palette.surface))
+            .highlight_style(
+                Style::default()
+                    .bg(palette.input_surface)
+                    .add_modifier(Modifier::BOLD),
+            )
+            .highlight_symbol("› "),
+        list_area,
+        &mut state,
+    );
+    let first = state.offset();
+    (first..(first + list_area.height as usize).min(handles.len()))
+        .map(|index| {
+            (
+                Rect::new(
+                    list_area.x,
+                    list_area.y + (index - first) as u16,
+                    list_area.width,
+                    1,
+                ),
+                index,
+            )
+        })
+        .collect()
+}
+
 /// Wrap text into display rows the way the transcript paragraph does, breaking at
 /// whitespace and splitting a word only when it cannot fit on a row by itself.
 /// The count is what the paragraph will actually occupy, so the tail can be
@@ -783,6 +916,7 @@ pub enum Hit {
     Transcript,
     MenuRow(usize),
     SettingsRow(usize),
+    ContactRow(usize),
     ContextMenuRow(usize),
     HeaderSettings,
     HeaderHelp,
@@ -799,6 +933,7 @@ pub struct HitMap {
     pub menu: Option<Rect>,
     pub menu_rows: Vec<(Rect, usize)>,
     pub settings_rows: Vec<(Rect, usize)>,
+    pub contacts_rows: Vec<(Rect, usize)>,
     /// The conversation context menu and its items.
     pub context_menu: Option<Rect>,
     pub context_menu_rows: Vec<(Rect, usize)>,
@@ -846,6 +981,9 @@ impl HitMap {
         }
         if let Some(index) = Self::row_at(&self.settings_rows, column, row) {
             return Some(Hit::SettingsRow(index));
+        }
+        if let Some(index) = Self::row_at(&self.contacts_rows, column, row) {
+            return Some(Hit::ContactRow(index));
         }
         if self
             .header_settings
@@ -999,6 +1137,8 @@ fn render_with_mode(frame: &mut Frame<'_>, app: &App, monochrome: bool) -> HitMa
         Paragraph::new(display_truncate(&label, label_width)).style(label_style),
         Rect::new(body[0].x, body[0].y, body[0].width, 1),
     );
+    // Match the transcript's header-to-content breathing room in the sidebar.
+    let sidebar_spacer = u16::from(body[0].height >= 6 && !app.settings_open && !app.help_open);
     // The rail carries one item per chat: a name line and, unless the sidebar is
     // compact, a preview of the newest message. The selection fills both lines.
     const SELECTION_MARKER_WIDTH: usize = 2;
@@ -1025,9 +1165,9 @@ fn render_with_mode(frame: &mut Frame<'_>, app: &App, monochrome: bool) -> HitMa
     list_state.select(selected_index);
     let list_area = Rect::new(
         body[0].x,
-        body[0].y + 1,
+        body[0].y + 1 + sidebar_spacer,
         body[0].width,
-        body[0].height.saturating_sub(1),
+        body[0].height.saturating_sub(1 + sidebar_spacer),
     );
     frame.render_stateful_widget(
         List::new(entries)
@@ -1112,7 +1252,14 @@ fn render_with_mode(frame: &mut Frame<'_>, app: &App, monochrome: bool) -> HitMa
     // The left of the header leads with the chat itself; the app name lives on the
     // right, next to the other quiet affordances.
     let mut heading = Vec::new();
-    if app.settings_open {
+    if app.contacts_open {
+        heading.push(Span::styled(
+            "Contacts",
+            Style::default()
+                .fg(palette.text)
+                .add_modifier(Modifier::BOLD),
+        ));
+    } else if app.settings_open {
         heading.push(Span::styled(
             "Settings",
             Style::default()
@@ -1461,7 +1608,9 @@ fn render_with_mode(frame: &mut Frame<'_>, app: &App, monochrome: bool) -> HitMa
         }
     }
     let scroll = max_scroll.saturating_sub(back).min(u16::MAX as usize) as u16;
-    if app.settings_open {
+    if app.contacts_open {
+        hits.contacts_rows = render_contacts(frame, content, app, palette);
+    } else if app.settings_open {
         hits.settings_rows = render_settings(frame, content, app, palette);
     } else if lines.is_empty() {
         let (title, key, description) = if app.filter_has_no_matches() {

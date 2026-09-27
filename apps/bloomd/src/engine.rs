@@ -732,6 +732,7 @@ pub fn map_inbound(
         participants,
         created_at: sent_at,
         last_message_at: Some(sent_at),
+        aliases: Vec::new(),
         preview: None,
     };
 
@@ -810,6 +811,7 @@ pub fn map_conversation(
             participants,
             created_at: 0,
             last_message_at: None,
+            aliases: Vec::new(),
             preview: None,
         },
     })

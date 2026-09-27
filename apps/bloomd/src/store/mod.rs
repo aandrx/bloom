@@ -1,13 +1,17 @@
 //! Encrypted-at-rest SQLite store.
 
 mod conversations;
+mod identity;
 mod ingest;
 mod messages;
 pub use conversations::{
     get_conversation, list_conversations, merge_conversation, upsert_conversation,
 };
+pub(crate) use identity::direct_conversation_matches;
+pub use identity::{reconcile_direct_conversation, reconcile_stored_direct_conversations};
 pub use ingest::{ingest_inbound, ingest_message, update_delivery};
 pub use messages::{get_message, history, upsert_message, MessageUpsertOutcome};
+pub(crate) use messages::{history_for_conversation, remap_message};
 
 use bloom_secrets::{SecretStore, SecretStoreError};
 use rusqlite::{Connection, OpenFlags};
@@ -63,6 +67,7 @@ pub enum StoreError {
     DecryptFailed,
     Schema,
     MessageConversationMismatch,
+    IdentityConflict,
     UnsupportedSchemaVersion,
     UnsupportedPlatform,
 }
@@ -84,6 +89,7 @@ impl fmt::Debug for StoreError {
             Self::DecryptFailed => "StoreError::DecryptFailed",
             Self::Schema => "StoreError::Schema",
             Self::MessageConversationMismatch => "StoreError::MessageConversationMismatch",
+            Self::IdentityConflict => "StoreError::IdentityConflict",
             Self::UnsupportedSchemaVersion => "StoreError::UnsupportedSchemaVersion",
             Self::UnsupportedPlatform => "StoreError::UnsupportedPlatform",
         })
@@ -110,6 +116,7 @@ impl fmt::Display for StoreError {
             Self::MessageConversationMismatch => {
                 f.write_str("message belongs to a different conversation")
             }
+            Self::IdentityConflict => f.write_str("conversation identity conflict"),
             Self::UnsupportedSchemaVersion => f.write_str("store schema version is unsupported"),
             Self::UnsupportedPlatform => f.write_str("encrypted store requires Unix permissions"),
         }

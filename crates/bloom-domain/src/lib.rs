@@ -158,6 +158,10 @@ pub struct Conversation {
     pub participants: Vec<Participant>,
     pub created_at: Timestamp,
     pub last_message_at: Option<Timestamp>,
+    /// Engine or legacy identities folded into this stable local conversation.
+    /// These aliases preserve references such as local titles and hidden state.
+    #[serde(default)]
+    pub aliases: Vec<ConversationId>,
     /// A short preview of the newest message, for the sidebar's second line. The
     /// daemon fills it from its store; the engine's own listing carries no message
     /// text, so it is absent until Bloom has seen a message for the conversation.
@@ -518,6 +522,25 @@ mod tests {
         )
         .is_err());
     }
+    #[test]
+    fn old_conversation_json_defaults_identity_aliases() {
+        let conversation = Conversation {
+            id: ConversationId::new(tr(), "chat").unwrap(),
+            remote_id: "engine-guid".into(),
+            kind: ConversationKind::Direct,
+            title: None,
+            participants: Vec::new(),
+            created_at: 1,
+            last_message_at: None,
+            aliases: Vec::new(),
+            preview: None,
+        };
+        let mut value = serde_json::to_value(conversation).unwrap();
+        value.as_object_mut().unwrap().remove("aliases");
+        let restored: Conversation = serde_json::from_value(value).unwrap();
+        assert!(restored.aliases.is_empty());
+    }
+
     #[test]
     fn ids_and_handles_validate_and_roundtrip() {
         let id = MessageId::new(tr(), "m-1").unwrap();

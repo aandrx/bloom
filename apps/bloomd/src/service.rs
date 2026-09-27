@@ -43,9 +43,21 @@ impl Service {
                 conversation,
                 message,
             } => {
-                let (outcome, _created) = {
+                let (outcome, _created, canonical, stored_message) = {
                     let mut store = self.store.lock().unwrap();
-                    store::ingest_inbound(&mut store, conversation, message)?
+                    let (canonical, linked) =
+                        store::reconcile_direct_conversation(&mut store, conversation)?;
+                    log_identity_links(linked);
+                    let message_conversation = message.conversation_id();
+                    if message_conversation != &canonical.id
+                        && !canonical.aliases.contains(message_conversation)
+                    {
+                        return Err(store::StoreError::MessageConversationMismatch);
+                    }
+                    let message = store::remap_message(message, &canonical.id)?;
+                    let (outcome, created) =
+                        store::ingest_inbound(&mut store, &canonical, &message)?;
+                    (outcome, created, canonical, message)
                 };
                 match outcome {
                     store::MessageUpsertOutcome::Unchanged => return Ok(false),
@@ -54,8 +66,8 @@ impl Service {
                 }
                 self.hub.publish(Event {
                     event: EventKind::Message {
-                        conversation_id: conversation.id.clone(),
-                        message: message.clone(),
+                        conversation_id: canonical.id,
+                        message: stored_message,
                     },
                 });
                 Ok(true)
@@ -65,14 +77,23 @@ impl Service {
                 message,
                 delivery,
             } => {
-                let updated = {
+                let (canonical_id, updated) = {
                     let mut store = self.store.lock().unwrap();
-                    store::update_delivery(&mut store, conversation, message, delivery.clone())?
+                    let canonical_id = store::get_conversation(&store, conversation)?
+                        .map(|row| row.id)
+                        .unwrap_or_else(|| conversation.clone());
+                    let updated = store::update_delivery(
+                        &mut store,
+                        conversation,
+                        message,
+                        delivery.clone(),
+                    )?;
+                    (canonical_id, updated)
                 };
                 if let Some(message) = updated {
                     self.hub.publish(Event {
                         event: EventKind::Delivery {
-                            conversation_id: conversation.clone(),
+                            conversation_id: canonical_id,
                             message_id: message.id().clone(),
                             state: delivery.clone(),
                         },
@@ -83,9 +104,8 @@ impl Service {
             }
             TransportEvent::Conversation { conversation } => {
                 let mut store = self.store.lock().unwrap();
-                // Merge, not overwrite: a listing carries no messages, so it must not
-                // reset the summary that ingestion maintains.
-                store::merge_conversation(&mut store, conversation)?;
+                let (_, linked) = store::reconcile_direct_conversation(&mut store, conversation)?;
+                log_identity_links(linked);
                 Ok(false)
             }
             TransportEvent::ConversationsChanged => {
@@ -149,14 +169,24 @@ fn preview_text(message: &Message) -> String {
 impl RequestHandler for Service {
     fn list_conversations(&self) -> HandlerFuture<'_, Vec<Conversation>> {
         Box::pin(async move {
-            let store = self.store.lock().unwrap();
+            let mut store = self.store.lock().unwrap();
+            let linked = match store::reconcile_stored_direct_conversations(&mut store) {
+                Ok(linked) => linked,
+                Err(error) => {
+                    eprintln!(
+                        "bloomd: direct identity reconciliation failed during listing: {error}"
+                    );
+                    return Err(ProtocolError::Internal);
+                }
+            };
+            log_identity_links(linked);
             let mut conversations =
                 store::list_conversations(&store).map_err(|_| ProtocolError::Internal)?;
             // The engine's listing carries no message text, so the preview comes
             // from Bloom's own store. A conversation Bloom has never seen a message
             // for keeps a null preview and the sidebar shows its name alone.
             for conversation in &mut conversations {
-                conversation.preview = store::history(&store, &conversation.id, 1)
+                conversation.preview = store::history_for_conversation(&store, conversation, 1)
                     .map_err(|_| ProtocolError::Internal)?
                     .last()
                     .map(preview_text);
@@ -184,25 +214,34 @@ impl RequestHandler for Service {
         Box::pin(async move {
             let text = outgoing_text(&body).map_err(|_| ProtocolError::Unsupported)?;
             let (handle, recipient) = normalize_address(&address)?;
-            let (conversation, existed) = {
-                let store = self.store.lock().unwrap();
+            let engine_transport = crate::engine::transport_id();
+            let conversation = {
+                let mut store = self.store.lock().unwrap();
+                let linked = match store::reconcile_stored_direct_conversations(&mut store) {
+                    Ok(linked) => linked,
+                    Err(error) => {
+                        eprintln!("bloomd: direct identity reconciliation failed before new chat: {error}");
+                        return Err(ProtocolError::Internal);
+                    }
+                };
+                log_identity_links(linked);
                 let found = store::list_conversations(&store)
                     .map_err(|_| ProtocolError::Internal)?
                     .into_iter()
-                    .filter(|c| c.kind == ConversationKind::Direct)
-                    .find(|c| {
-                        c.participants
-                            .iter()
-                            .any(|p| !p.is_me && p.handle == handle)
+                    .filter(|conversation| {
+                        conversation.kind == ConversationKind::Direct
+                            && conversation.id.transport() == &engine_transport
+                    })
+                    .find(|conversation| {
+                        crate::store::direct_conversation_matches(conversation, &handle)
                     });
                 match found {
-                    Some(conversation) => (conversation, true),
+                    Some(conversation) => conversation,
                     None => {
                         let remote_id = format!("iMessage;-;{}", recipient);
-                        let id =
-                            ConversationId::new(crate::engine::transport_id(), remote_id.clone())
-                                .map_err(|_| ProtocolError::InvalidRequest)?;
-                        let conversation = Conversation {
+                        let id = ConversationId::new(engine_transport.clone(), remote_id.clone())
+                            .map_err(|_| ProtocolError::InvalidRequest)?;
+                        Conversation {
                             id,
                             remote_id,
                             kind: ConversationKind::Direct,
@@ -224,9 +263,9 @@ impl RequestHandler for Service {
                             },
                             created_at: now_millis(),
                             last_message_at: None,
+                            aliases: Vec::new(),
                             preview: None,
-                        };
-                        (conversation, false)
+                        }
                     }
                 }
             };
@@ -235,41 +274,42 @@ impl RequestHandler for Service {
                 .send_text(&recipient, Some(&conversation.remote_id), &text)
                 .await
                 .map_err(map_transport_error)?;
-            let sender = conversation
-                .participants
-                .iter()
-                .find(|p| p.is_me)
-                .map(|p| p.handle.clone())
-                .unwrap_or_else(|| {
-                    Handle::new(HandleKind::Opaque, "me").expect("static handle is valid")
-                });
-            let message = Message::new(
-                message_id.clone(),
-                conversation.id.clone(),
-                None,
-                sender,
-                body.parts.clone(),
-                now_millis(),
-                None,
-                DeliveryState::Sent,
-                true,
-                None,
-                Vec::new(),
-                None,
-            )
-            .map_err(|_| ProtocolError::Internal)?;
-            {
+            let (canonical, message) = {
                 let mut store = self.store.lock().unwrap();
-                if !existed {
-                    store::upsert_conversation(&mut store, &conversation)
+                let (canonical, linked) =
+                    store::reconcile_direct_conversation(&mut store, &conversation)
                         .map_err(|_| ProtocolError::Internal)?;
-                }
-                store::ingest_inbound(&mut store, &conversation, &message)
+                log_identity_links(linked);
+                let sender = canonical
+                    .participants
+                    .iter()
+                    .find(|participant| participant.is_me)
+                    .map(|participant| participant.handle.clone())
+                    .unwrap_or_else(|| {
+                        Handle::new(HandleKind::Opaque, "me").expect("static handle is valid")
+                    });
+                let message = Message::new(
+                    message_id.clone(),
+                    canonical.id.clone(),
+                    None,
+                    sender,
+                    body.parts.clone(),
+                    now_millis(),
+                    None,
+                    DeliveryState::Sent,
+                    true,
+                    None,
+                    Vec::new(),
+                    None,
+                )
+                .map_err(|_| ProtocolError::Internal)?;
+                store::ingest_inbound(&mut store, &canonical, &message)
                     .map_err(|_| ProtocolError::Internal)?;
-            }
+                (canonical, message)
+            };
             self.hub.publish(Event {
                 event: EventKind::Message {
-                    conversation_id: conversation.id,
+                    conversation_id: canonical.id,
                     message,
                 },
             });
@@ -304,7 +344,7 @@ impl RequestHandler for Service {
             let created_at = now_millis();
             let message = Message::new(
                 message_id.clone(),
-                conversation_id.clone(),
+                conversation.id.clone(),
                 None,
                 sender,
                 body.parts.clone(),
@@ -325,12 +365,20 @@ impl RequestHandler for Service {
             }
             self.hub.publish(Event {
                 event: EventKind::Message {
-                    conversation_id,
+                    conversation_id: conversation.id,
                     message,
                 },
             });
             Ok(message_id)
         })
+    }
+}
+
+fn log_identity_links(linked: usize) {
+    if linked > 0 {
+        eprintln!(
+            "bloomd: direct identity reconciliation outcome=linked aliases_added={linked} match=exact_handle history=retained"
+        );
     }
 }
 

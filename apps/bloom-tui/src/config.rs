@@ -101,6 +101,14 @@ impl Config {
                 Some("Invalid local theme preference; using automatic theme.".into()),
             );
         }
+        let mut nickname_entries: Vec<_> = config.nicknames.drain().collect();
+        nickname_entries.sort_by(|left, right| left.0.cmp(&right.0));
+        for (key, nickname) in nickname_entries {
+            config
+                .nicknames
+                .entry(normalize_nickname_key(&key))
+                .or_insert(nickname);
+        }
         let original_count = config.nicknames.len();
         config
             .nicknames
@@ -177,6 +185,29 @@ impl Config {
     }
 }
 
+fn normalize_nickname_key(key: &str) -> String {
+    let Some(value) = key.strip_prefix("tel:") else {
+        return key.to_owned();
+    };
+    let valid = value.chars().any(|character| character.is_ascii_digit())
+        && value.chars().all(|character| {
+            character.is_ascii_digit()
+                || character == '+'
+                || character.is_whitespace()
+                || "().-".contains(character)
+        });
+    if !valid {
+        return key.to_owned();
+    }
+    format!(
+        "tel:{}",
+        value
+            .chars()
+            .filter(|character| !character.is_whitespace() && !"().-".contains(*character))
+            .collect::<String>()
+    )
+}
+
 pub fn valid_nickname(value: &str) -> bool {
     let value = value.trim();
     !value.is_empty() && value.chars().count() <= 80 && !value.chars().any(char::is_control)
@@ -222,6 +253,23 @@ mod tests {
         let (config, warning) = Config::load(&path);
         assert_eq!(config.theme, None);
         assert!(warning.unwrap().contains("theme"));
+    }
+
+    #[test]
+    fn formatted_phone_nickname_keys_migrate_to_stable_identity() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("settings.json");
+        fs::write(
+            &path,
+            r#"{"version":1,"nicknames":{"tel:+1 (555) 000-0009":"Maya"}}"#,
+        )
+        .unwrap();
+        let (config, warning) = Config::load(&path);
+        assert_eq!(warning, None);
+        assert_eq!(
+            config.nicknames.get("tel:+15550000009").map(String::as_str),
+            Some("Maya")
+        );
     }
 
     #[test]

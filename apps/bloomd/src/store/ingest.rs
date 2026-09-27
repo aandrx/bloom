@@ -18,6 +18,8 @@ fn upsert_message_row(
     conversation_key: &str,
     created_at: i64,
     data: &[u8],
+    aliases: &[String],
+    conversation: &ConversationId,
 ) -> Result<MessageUpsertOutcome, StoreError> {
     let previous: Option<(String, Vec<u8>)> = tx
         .query_row(
@@ -26,11 +28,27 @@ fn upsert_message_row(
             |r| Ok((r.get(0)?, r.get(1)?)),
         )
         .optional()?;
-    if previous
-        .as_ref()
-        .is_some_and(|(owner, _)| owner != conversation_key)
-    {
-        return Err(StoreError::MessageConversationMismatch);
+    if let Some((owner, old_data)) = previous.as_ref() {
+        if owner != conversation_key {
+            if !aliases.contains(owner) {
+                return Err(StoreError::MessageConversationMismatch);
+            }
+            let old_message: Message =
+                serde_json::from_slice(old_data).map_err(|_| StoreError::Schema)?;
+            let remapped = super::messages::remap_message(&old_message, conversation)?;
+            let new_message: Message =
+                serde_json::from_slice(data).map_err(|_| StoreError::Schema)?;
+            let outcome = if remapped == new_message {
+                MessageUpsertOutcome::Unchanged
+            } else {
+                MessageUpsertOutcome::Updated
+            };
+            tx.execute(
+                "UPDATE messages SET conversation_id=?2, created_at=?3, data=?4 WHERE id=?1",
+                params![message_key, conversation_key, created_at, data],
+            )?;
+            return Ok(outcome);
+        }
     }
     Ok(match previous {
         None => {
@@ -57,11 +75,18 @@ fn refresh_summary(
     conversation_key: &str,
     mut conversation: Conversation,
 ) -> Result<(), StoreError> {
-    let summary: Option<i64> = tx.query_row(
-        "SELECT MAX(created_at) FROM messages WHERE conversation_id=?1",
-        [conversation_key],
-        |r| r.get(0),
-    )?;
+    let mut summary = None;
+    let mut identities = vec![conversation.id.clone()];
+    identities.extend(conversation.aliases.iter().cloned());
+    for identity in identities {
+        let key = conversation_id(&identity)?;
+        let latest: Option<i64> = tx.query_row(
+            "SELECT MAX(created_at) FROM messages WHERE conversation_id=?1",
+            [key],
+            |r| r.get(0),
+        )?;
+        summary = summary.max(latest);
+    }
     conversation.last_message_at = summary;
     let encoded = serde_json::to_vec(&conversation).map_err(|_| StoreError::Schema)?;
     tx.execute(
@@ -76,26 +101,42 @@ pub fn ingest_message(
     message: &Message,
 ) -> Result<MessageUpsertOutcome, StoreError> {
     let message_id = message_id(message.id())?;
-    let conversation_id = conversation_id(message.conversation_id())?;
+    let conversation_key = conversation_id(message.conversation_id())?;
     let data = serde_json::to_vec(message).map_err(|_| StoreError::Schema)?;
     let tx = store._connection.transaction()?;
-    let outcome = upsert_message_row(
-        &tx,
-        &message_id,
-        &conversation_id,
-        message.created_at,
-        &data,
-    )?;
     let blob: Option<Vec<u8>> = tx
         .query_row(
             "SELECT data FROM conversations WHERE id=?1",
-            [&conversation_id],
+            [&conversation_key],
             |r| r.get(0),
         )
         .optional()?;
-    let conversation: Conversation =
-        serde_json::from_slice(&blob.ok_or(StoreError::Schema)?).map_err(|_| StoreError::Schema)?;
-    refresh_summary(&tx, &conversation_id, conversation)?;
+    let conversation = blob
+        .map(|blob| serde_json::from_slice::<Conversation>(&blob))
+        .transpose()
+        .map_err(|_| StoreError::Schema)?;
+    let aliases = conversation
+        .as_ref()
+        .map(|conversation| {
+            conversation
+                .aliases
+                .iter()
+                .map(conversation_id)
+                .collect::<Result<Vec<_>, _>>()
+        })
+        .transpose()?
+        .unwrap_or_default();
+    let outcome = upsert_message_row(
+        &tx,
+        &message_id,
+        &conversation_key,
+        message.created_at,
+        &data,
+        &aliases,
+        message.conversation_id(),
+    )?;
+    let conversation = conversation.ok_or(StoreError::Schema)?;
+    refresh_summary(&tx, &conversation_key, conversation)?;
     tx.commit()?;
     Ok(outcome)
 }
@@ -154,12 +195,19 @@ pub fn ingest_inbound(
             encoded
         ],
     )?;
+    let aliases = merged
+        .aliases
+        .iter()
+        .map(conversation_id)
+        .collect::<Result<Vec<_>, _>>()?;
     let outcome = upsert_message_row(
         &tx,
         &message_key,
         &conversation_key,
         message.created_at,
         &data,
+        &aliases,
+        &merged.id,
     )?;
     refresh_summary(&tx, &conversation_key, merged)?;
     tx.commit()?;
@@ -172,7 +220,20 @@ pub fn update_delivery(
     message: &MessageId,
     delivery: DeliveryState,
 ) -> Result<Option<Message>, StoreError> {
-    let conversation_key = conversation_id(conversation)?;
+    let canonical = super::conversations::get_conversation(store, conversation)?;
+    let canonical_id = canonical
+        .as_ref()
+        .map(|row| row.id.clone())
+        .unwrap_or_else(|| conversation.clone());
+    let mut accepted = vec![conversation_id(&canonical_id)?];
+    if let Some(row) = canonical.as_ref() {
+        accepted.extend(
+            row.aliases
+                .iter()
+                .map(conversation_id)
+                .collect::<Result<Vec<_>, _>>()?,
+        );
+    }
     let message_key = message_id(message)?;
     let tx = store._connection.transaction()?;
     let row: Option<(String, Vec<u8>)> = tx
@@ -186,12 +247,11 @@ pub fn update_delivery(
         tx.commit()?;
         return Ok(None);
     };
-    if owner != conversation_key {
+    if !accepted.contains(&owner) {
         return Err(StoreError::MessageConversationMismatch);
     }
     let mut value: Message = serde_json::from_slice(&data).map_err(|_| StoreError::Schema)?;
-    if message_id(value.id())? != message_key
-        || conversation_id(value.conversation_id())? != conversation_key
+    if message_id(value.id())? != message_key || conversation_id(value.conversation_id())? != owner
     {
         return Err(StoreError::Schema);
     }
@@ -202,7 +262,7 @@ pub fn update_delivery(
         params![message_key, encoded],
     )?;
     tx.commit()?;
-    Ok(Some(value))
+    super::messages::remap_message(&value, &canonical_id).map(Some)
 }
 
 #[cfg(test)]
@@ -232,6 +292,7 @@ mod tests {
             participants: vec![],
             created_at: 1,
             last_message_at: None,
+            aliases: Vec::new(),
             preview: None,
         };
         super::super::conversations::upsert_conversation(&mut store, &conversation).unwrap();

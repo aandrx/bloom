@@ -49,6 +49,7 @@ fn conversation(title: &str, participants: usize, last: i64) -> Conversation {
             .collect(),
         created_at: 1,
         last_message_at: Some(last),
+        aliases: Vec::new(),
         preview: None,
     }
 }
@@ -1471,6 +1472,117 @@ fn sidebar_entries_show_a_clipped_preview_and_highlight_both_rows() {
         "▎",
         "marker repeats on preview row"
     );
+}
+
+#[test]
+fn sidebar_header_spacer_preserves_row_hit_testing_across_modes() {
+    let selected = conversation("Weekend crew", 2, 40);
+    let mut app = App {
+        selected: Some(selected.id.clone()),
+        ..Default::default()
+    };
+    app.set_conversations(vec![selected.clone()]);
+
+    for (height, spacer, mode) in [
+        (30u16, true, "normal"),
+        (6, true, "short"),
+        (30, false, "settings"),
+        (30, false, "help"),
+    ] {
+        app.settings_open = mode == "settings";
+        app.help_open = mode == "help";
+        let grid = buffer(&app, 100, height);
+        let row = |y| {
+            row_text(&grid, y)
+                .split('│')
+                .next()
+                .unwrap_or_default()
+                .to_owned()
+        };
+        let chat_y = if spacer { 2 } else { 1 };
+        assert!(
+            row(chat_y).contains("Weekend crew"),
+            "mode={mode}: {grid:?}"
+        );
+        if spacer {
+            assert!(row(1).trim().is_empty(), "sidebar spacer in mode={mode}");
+        }
+
+        let backend = TestBackend::new(100, height);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let mut hits = ui::HitMap::default();
+        terminal
+            .draw(|frame| hits = ui::render(frame, &app))
+            .unwrap();
+        assert_eq!(
+            hits.at(2, chat_y),
+            Some(ui::Hit::SidebarChat(selected.id.clone())),
+            "chat hitbox follows shifted row in mode={mode}"
+        );
+        if spacer {
+            assert_ne!(
+                hits.at(2, 1),
+                Some(ui::Hit::SidebarChat(selected.id.clone())),
+                "spacer is not clickable as a chat"
+            );
+        }
+    }
+
+    app.settings_open = false;
+    app.help_open = false;
+    let tiny = buffer(&app, 100, 5);
+    assert_eq!(tiny.area.height, 5, "tiny fallback remains renderable");
+}
+
+#[test]
+fn contacts_view_shows_local_nicknames_and_renders_narrow_layouts() {
+    let mut contact = conversation("person@example.test", 1, 10);
+    contact.participants[0].is_me = false;
+    contact.participants[0].handle = Handle::new(HandleKind::Email, "person@example.test").unwrap();
+    let handle = contact.participants[0].handle.clone();
+    let mut app = App {
+        contacts_open: true,
+        ..Default::default()
+    };
+    app.set_conversations(vec![contact]);
+    app.nicknames
+        .insert(bloom_tui::app::nickname_key(&handle), "Maya".into());
+
+    for (width, height) in [(100u16, 30u16), (44, 12), (20, 5)] {
+        let grid = buffer(&app, width, height);
+        let text = (0..height)
+            .map(|y| row_text(&grid, y))
+            .collect::<Vec<_>>()
+            .join("\n");
+        if width >= 44 {
+            assert!(text.contains("Contacts"));
+            assert!(text.contains("Maya"), "size={width}x{height}:\n{text}");
+            assert!(
+                text.contains(if width >= 100 {
+                    "mailto:person@example.test"
+                } else {
+                    "mailto:"
+                }),
+                "size={width}x{height}:\n{text}"
+            );
+        }
+        assert_eq!(grid.area.width, width);
+        assert_eq!(grid.area.height, height);
+    }
+
+    let backend = TestBackend::new(100, 30);
+    let mut terminal = Terminal::new(backend).unwrap();
+    let mut hits = ui::HitMap::default();
+    terminal
+        .draw(|frame| hits = ui::render(frame, &app))
+        .unwrap();
+    let (area, index) = hits
+        .contacts_rows
+        .first()
+        .copied()
+        .expect("contact row hitbox");
+    assert_eq!(index, 0);
+    assert_eq!(hits.at(area.x, area.y), Some(ui::Hit::ContactRow(0)));
 }
 
 #[test]

@@ -75,6 +75,10 @@ pub struct App {
     pub compact_sidebar: bool,
     pub settings_open: bool,
     pub settings_selection: usize,
+    pub contacts_open: bool,
+    pub contacts_selection: usize,
+    pub contacts_editing: Option<String>,
+    pub contacts_return_focus: Focus,
     pub conversations: Vec<Conversation>,
     pub selected: Option<ConversationId>,
     pub messages: HashMap<ConversationId, Vec<Message>>,
@@ -166,6 +170,10 @@ impl Default for App {
             compact_sidebar: false,
             settings_open: false,
             settings_selection: 0,
+            contacts_open: false,
+            contacts_selection: 0,
+            contacts_editing: None,
+            contacts_return_focus: Focus::default(),
             conversations: Vec::new(),
             selected: None,
             messages: HashMap::new(),
@@ -231,8 +239,19 @@ impl App {
     }
 
     pub fn set_conversations(&mut self, mut conversations: Vec<Conversation>) {
+        if let Some(selected) = self.selected.as_ref() {
+            if let Some(canonical) = conversations
+                .iter()
+                .find(|conversation| conversation.aliases.contains(selected))
+            {
+                self.selected = Some(canonical.id.clone());
+            }
+        }
         conversations.sort_by_key(|c| std::cmp::Reverse(c.last_message_at));
         self.conversations = conversations;
+        self.contacts_selection = self
+            .contacts_selection
+            .min(self.contact_handles().len().saturating_sub(1));
         if !self
             .selected
             .as_ref()
@@ -281,6 +300,122 @@ impl App {
     }
 
     /// Start a new conversation: first the recipient address, then the message.
+    pub fn contact_handles(&self) -> Vec<Handle> {
+        let mut handles = HashMap::<String, Handle>::new();
+        for participant in self
+            .conversations
+            .iter()
+            .flat_map(|conversation| &conversation.participants)
+            .filter(|participant| !participant.is_me)
+        {
+            handles
+                .entry(nickname_key(&participant.handle))
+                .or_insert_with(|| participant.handle.clone());
+        }
+        let mut handles: Vec<_> = handles.into_values().collect();
+        handles.sort_by_key(|handle| {
+            (
+                self.contact_label(handle).to_lowercase(),
+                nickname_key(handle),
+            )
+        });
+        handles
+    }
+
+    pub fn contact_label(&self, handle: &Handle) -> String {
+        self.nicknames
+            .get(&nickname_key(handle))
+            .cloned()
+            .unwrap_or_else(|| handle.value().to_owned())
+    }
+
+    pub fn selected_contact_handle(&self) -> Option<Handle> {
+        self.contact_handles().get(self.contacts_selection).cloned()
+    }
+
+    pub fn begin_contacts(&mut self) {
+        self.contacts_return_focus = self.focus;
+        self.contacts_open = true;
+        self.settings_open = false;
+        self.help_open = false;
+        self.contacts_selection = 0;
+        self.contacts_editing = None;
+        self.command_menu = false;
+        self.composing = false;
+        self.draft.clear();
+        self.draft_cursor = 0;
+        self.error = None;
+    }
+
+    pub fn close_contacts(&mut self) {
+        self.contacts_open = false;
+        self.contacts_editing = None;
+        self.composing = true;
+        self.draft.clear();
+        self.draft_cursor = 0;
+        self.focus = self.contacts_return_focus;
+    }
+
+    fn contacts_step(&mut self, delta: isize) {
+        let count = self.contact_handles().len();
+        if count > 0 {
+            self.contacts_selection =
+                (self.contacts_selection as isize + delta).clamp(0, count as isize - 1) as usize;
+        } else {
+            self.contacts_selection = 0;
+        }
+    }
+
+    fn begin_contact_edit(&mut self) {
+        let Some(handle) = self.selected_contact_handle() else {
+            self.error = Some("No contacts are available yet.".into());
+            return;
+        };
+        let key = nickname_key(&handle);
+        self.draft = self.nicknames.get(&key).cloned().unwrap_or_default();
+        self.draft_cursor = self.draft.graphemes(true).count();
+        self.contacts_editing = Some(key);
+        self.composing = true;
+        self.error = None;
+    }
+
+    fn cancel_contact_edit(&mut self) {
+        self.contacts_editing = None;
+        self.composing = false;
+        self.draft.clear();
+        self.draft_cursor = 0;
+        self.error = None;
+    }
+
+    fn save_contact_edit(&mut self) {
+        let Some(key) = self.contacts_editing.clone() else {
+            return;
+        };
+        let nickname = self.draft.trim();
+        if nickname.is_empty() || nickname.eq_ignore_ascii_case("clear") {
+            self.nicknames.remove(&key);
+            self.notice = Some("Local nickname cleared.".into());
+        } else if !crate::config::valid_nickname(nickname) {
+            self.error = Some("Nickname must be 1 to 80 printable characters.".into());
+            return;
+        } else {
+            self.nicknames.insert(key.clone(), nickname.to_owned());
+            self.notice = Some("Local nickname saved.".into());
+        }
+        if let Some(index) = self
+            .contact_handles()
+            .iter()
+            .position(|handle| nickname_key(handle) == key)
+        {
+            self.contacts_selection = index;
+        }
+        self.contacts_editing = None;
+        self.composing = false;
+        self.draft.clear();
+        self.draft_cursor = 0;
+        self.error = None;
+    }
+
     pub fn begin_new_conversation(&mut self) {
         self.leader_pending = false;
         self.command_menu = false;
@@ -365,7 +500,7 @@ impl App {
         let listed = self
             .conversations
             .iter()
-            .filter(|conversation| !self.hidden.contains(&conversation_key(&conversation.id)));
+            .filter(|conversation| !self.conversation_is_hidden(conversation));
         match self.filter_query() {
             None => listed.collect(),
             Some(query) if query.trim().is_empty() => listed.collect(),
@@ -391,6 +526,12 @@ impl App {
             .into_iter()
             .map(|conversation| conversation.id.clone())
             .collect()
+    }
+
+    fn conversation_is_hidden(&self, conversation: &Conversation) -> bool {
+        std::iter::once(&conversation.id)
+            .chain(conversation.aliases.iter())
+            .any(|id| self.hidden.contains(&conversation_key(id)))
     }
 
     /// The filter query, or None when the filter is closed.
@@ -607,6 +748,7 @@ impl App {
             ("/theme", "Choose system, dark, or light theme"),
             ("/settings", "Open local display settings"),
             ("/nickname", "Name this direct chat locally"),
+            ("/contacts", "Browse known participants and nicknames"),
             ("/new", "Start a new direct chat"),
             ("/filter", "Filter your conversations"),
             ("/compact", "Toggle sidebar density"),
@@ -723,6 +865,9 @@ impl App {
                 self.error = None;
                 self.open_settings();
             }
+            ["/contacts"] => {
+                self.begin_contacts();
+            }
             ["/nickname", ..] => self.execute_nickname_command(),
             ["/new"] => {
                 self.error = None;
@@ -822,6 +967,8 @@ impl App {
     pub fn open_settings(&mut self) {
         self.leader_pending = false;
         self.help_open = false;
+        self.contacts_open = false;
+        self.contacts_editing = None;
         self.settings_open = true;
         self.settings_selection = 0;
         self.command_menu = false;
@@ -869,6 +1016,33 @@ impl App {
             return Action::None;
         }
 
+        if self.contacts_open {
+            if self.contacts_editing.is_some() {
+                match key.code {
+                    KeyCode::Esc => self.cancel_contact_edit(),
+                    KeyCode::Enter => self.save_contact_edit(),
+                    _ => {
+                        self.edit_draft(key);
+                    }
+                }
+            } else {
+                match key.code {
+                    KeyCode::Esc | KeyCode::Char('q') => self.close_contacts(),
+                    KeyCode::Up => self.contacts_step(-1),
+                    KeyCode::Down => self.contacts_step(1),
+                    KeyCode::PageUp => self.contacts_step(-10),
+                    KeyCode::PageDown => self.contacts_step(10),
+                    KeyCode::Home => self.contacts_selection = 0,
+                    KeyCode::End => {
+                        self.contacts_selection = self.contact_handles().len().saturating_sub(1)
+                    }
+                    KeyCode::Enter | KeyCode::Char('n') => self.begin_contact_edit(),
+                    _ => {}
+                }
+            }
+            return Action::None;
+        }
+
         // The shortcut sheet owns the keyboard while it is open.
         if self.help_open {
             if matches!(
@@ -897,7 +1071,7 @@ impl App {
             return Action::None;
         }
         if key.code == KeyCode::Char('b') && key.modifiers.contains(KeyModifiers::CONTROL) {
-            if !self.settings_open && self.filter_query().is_none() {
+            if !self.settings_open && !self.contacts_open && self.filter_query().is_none() {
                 self.leader_pending = true;
             }
             return Action::None;
@@ -1079,14 +1253,18 @@ impl App {
         const WHEEL_ROWS: usize = 3;
         match kind {
             MouseEventKind::ScrollUp => {
-                if matches!(hits.at(column, row), Some(Hit::SidebarChat(_))) {
+                if self.contacts_open {
+                    self.contacts_step(-(WHEEL_ROWS as isize));
+                } else if matches!(hits.at(column, row), Some(Hit::SidebarChat(_))) {
                     self.select_step(-1);
                 } else {
                     self.scroll_back(WHEEL_ROWS);
                 }
             }
             MouseEventKind::ScrollDown => {
-                if matches!(hits.at(column, row), Some(Hit::SidebarChat(_))) {
+                if self.contacts_open {
+                    self.contacts_step(WHEEL_ROWS as isize);
+                } else if matches!(hits.at(column, row), Some(Hit::SidebarChat(_))) {
                     self.select_step(1);
                 } else {
                     self.scroll_forward(WHEEL_ROWS);
@@ -1101,6 +1279,9 @@ impl App {
                 }
             }
             MouseEventKind::Down(MouseButton::Left) => match hits.at(column, row) {
+                Some(Hit::ContactRow(index)) if self.contacts_open => {
+                    self.contacts_selection = index;
+                }
                 Some(Hit::ContextMenuRow(index)) => {
                     if let Some(menu) = self.context_menu.as_mut() {
                         menu.selection = index;
@@ -1123,6 +1304,9 @@ impl App {
                 }
                 Some(Hit::HeaderSettings) => self.open_settings(),
                 Some(Hit::HeaderHelp) => {
+                    if self.contacts_open {
+                        self.close_contacts();
+                    }
                     self.help_open = !self.help_open;
                 }
                 Some(Hit::CloseOverlay) => {
@@ -1247,10 +1431,19 @@ impl App {
             return;
         };
         let name = self.draft.trim().to_owned();
+        let aliases = self
+            .conversations
+            .iter()
+            .find(|conversation| conversation.id == id)
+            .map(|conversation| conversation.aliases.clone())
+            .unwrap_or_default();
         self.draft.clear();
         self.draft_cursor = 0;
         if name.is_empty() {
             self.titles.remove(&conversation_key(&id));
+            for alias in aliases {
+                self.titles.remove(&conversation_key(&alias));
+            }
             self.notice = Some("Local title cleared.".into());
         } else if crate::config::valid_nickname(&name) {
             self.titles.insert(conversation_key(&id), name.clone());
@@ -1264,6 +1457,10 @@ impl App {
     /// everything at once, so this can never destroy data.
     pub fn close_conversation(&mut self, id: ConversationId) {
         self.hidden.insert(conversation_key(&id));
+        if let Some(conversation) = self.conversations.iter().find(|row| row.id == id) {
+            self.hidden
+                .extend(conversation.aliases.iter().map(conversation_key));
+        }
         let visible = self.visible_ids();
         if !visible
             .iter()
@@ -1276,7 +1473,24 @@ impl App {
     }
 
     pub fn unhide_all(&mut self) {
-        let restored = self.hidden.len();
+        let known_keys: HashSet<_> = self
+            .conversations
+            .iter()
+            .flat_map(|conversation| {
+                std::iter::once(conversation_key(&conversation.id))
+                    .chain(conversation.aliases.iter().map(conversation_key))
+            })
+            .collect();
+        let restored = self
+            .conversations
+            .iter()
+            .filter(|conversation| self.conversation_is_hidden(conversation))
+            .count()
+            + self
+                .hidden
+                .iter()
+                .filter(|key| !known_keys.contains(*key))
+                .count();
         self.hidden.clear();
         self.notice = Some(match restored {
             0 => "No hidden chats.".into(),
@@ -1325,7 +1539,10 @@ impl App {
 
     pub fn conversation_name(&self, conversation: &Conversation) -> String {
         // A local Rename wins over everything, including a participant nickname.
-        if let Some(title) = self.titles.get(&conversation_key(&conversation.id)) {
+        if let Some(title) = std::iter::once(&conversation.id)
+            .chain(conversation.aliases.iter())
+            .find_map(|id| self.titles.get(&conversation_key(id)))
+        {
             return title.clone();
         }
         if conversation.kind == ConversationKind::Direct {
@@ -1437,7 +1654,26 @@ pub fn nickname_key(handle: &Handle) -> String {
         HandleKind::Email => "email",
         HandleKind::Opaque => "opaque",
     };
-    format!("{kind}:{}", handle.value())
+    let value = if handle.kind() == &HandleKind::Tel {
+        let raw = handle.value();
+        let valid = raw.chars().any(|character| character.is_ascii_digit())
+            && raw.chars().all(|character| {
+                character.is_ascii_digit()
+                    || character == '+'
+                    || character.is_whitespace()
+                    || "().-".contains(character)
+            });
+        if valid {
+            raw.chars()
+                .filter(|character| !character.is_whitespace() && !"().-".contains(*character))
+                .collect()
+        } else {
+            raw.to_owned()
+        }
+    } else {
+        handle.value().to_owned()
+    };
+    format!("{kind}:{value}")
 }
 
 /// Does a conversation match a filter query?
@@ -1750,6 +1986,7 @@ mod tests {
             }],
             created_at: 1,
             last_message_at: last,
+            aliases: Vec::new(),
             preview: None,
         }
     }
@@ -2507,6 +2744,151 @@ mod tests {
             app.nicknames.values().next().map(String::as_str),
             Some("Maya")
         );
+    }
+
+    #[test]
+    fn contacts_are_unique_local_and_nickname_editing_returns_to_chat() {
+        let direct = conversation("person@example.test", Some(3));
+        let alice = direct.participants[0].handle.clone();
+        let mut group = conversation("group", Some(2));
+        group.kind = ConversationKind::Group;
+        group.participants = vec![
+            Participant {
+                handle: alice.clone(),
+                display_name: None,
+                is_me: false,
+            },
+            Participant {
+                handle: Handle::new(HandleKind::Email, "other@example.test").unwrap(),
+                display_name: None,
+                is_me: false,
+            },
+            Participant {
+                handle: Handle::new(HandleKind::Email, "me@example.test").unwrap(),
+                display_name: None,
+                is_me: true,
+            },
+        ];
+        let mut app = App::default();
+        app.set_conversations(vec![direct.clone(), group]);
+        app.selected = Some(direct.id.clone());
+        assert_eq!(app.contact_handles().len(), 2);
+
+        typed(&mut app, "/contacts");
+        draft_key(&mut app, KeyCode::Enter);
+        assert!(app.contacts_open);
+        assert_eq!(app.selected, Some(direct.id.clone()));
+        assert!(app.draft.is_empty());
+        assert_eq!(app.contact_label(&alice), "person@example.test");
+
+        let alice_index = app
+            .contact_handles()
+            .iter()
+            .position(|handle| handle == &alice)
+            .unwrap();
+        app.contacts_selection = alice_index;
+        draft_key(&mut app, KeyCode::Enter);
+        assert!(app.contacts_editing.is_some());
+        typed(&mut app, "Maya");
+        draft_key(&mut app, KeyCode::Enter);
+        assert_eq!(app.contact_label(&alice), "Maya");
+        assert_eq!(app.conversation_name(&direct), "Maya");
+        assert!(app.contacts_open);
+        assert!(app.draft.is_empty());
+
+        let alice_index = app
+            .contact_handles()
+            .iter()
+            .position(|handle| handle == &alice)
+            .unwrap();
+        app.contacts_selection = alice_index;
+        draft_key(&mut app, KeyCode::Enter);
+        app.draft = "clear".into();
+        app.draft_cursor = 5;
+        draft_key(&mut app, KeyCode::Enter);
+        assert_eq!(app.contact_label(&alice), "person@example.test");
+        assert!(!app.nicknames.contains_key(&nickname_key(&alice)));
+
+        draft_key(&mut app, KeyCode::Esc);
+        assert!(!app.contacts_open);
+        assert_eq!(app.focus, Focus::Composer);
+        assert!(app.composing);
+        assert_eq!(app.selected, Some(direct.id));
+    }
+
+    #[test]
+    fn contacts_navigation_scrolls_independently_and_clamps() {
+        let conversations = (0..15)
+            .map(|index| conversation(&format!("person{index:02}@example.test"), None))
+            .collect();
+        let mut app = App::default();
+        app.set_conversations(conversations);
+        app.begin_contacts();
+        draft_key(&mut app, KeyCode::Down);
+        assert_eq!(app.contacts_selection, 1);
+        draft_key(&mut app, KeyCode::PageDown);
+        assert_eq!(app.contacts_selection, 11);
+        draft_key(&mut app, KeyCode::PageDown);
+        assert_eq!(app.contacts_selection, 14);
+        draft_key(&mut app, KeyCode::PageUp);
+        assert_eq!(app.contacts_selection, 4);
+        draft_key(&mut app, KeyCode::Home);
+        assert_eq!(app.contacts_selection, 0);
+    }
+
+    #[test]
+    fn phone_nickname_keys_ignore_display_punctuation() {
+        let formatted = Handle::new(HandleKind::Tel, "+1 (555) 000-0009").unwrap();
+        let normalized = Handle::new(HandleKind::Tel, "+15550000009").unwrap();
+        assert_eq!(nickname_key(&formatted), nickname_key(&normalized));
+    }
+
+    #[test]
+    fn local_conversation_rename_beats_contact_nickname_and_engine_title() {
+        let mut direct = conversation("person@example.test", Some(1));
+        direct.title = Some("Work chat".into());
+        let handle = direct.participants[0].handle.clone();
+        let mut app = App::default();
+        app.nicknames.insert(nickname_key(&handle), "Maya".into());
+        assert_eq!(app.conversation_name(&direct), "Maya");
+        app.titles
+            .insert(conversation_key(&direct.id), "Pinned name".into());
+        assert_eq!(app.conversation_name(&direct), "Pinned name");
+    }
+
+    #[test]
+    fn merged_conversation_aliases_preserve_selection_names_and_hidden_state() {
+        let legacy = conversation("legacy-id", Some(2));
+        let mut canonical = conversation("stable-id", Some(1));
+        canonical.participants = legacy.participants.clone();
+        canonical.aliases = vec![legacy.id.clone()];
+        let legacy_key = conversation_key(&legacy.id);
+        let mut app = App {
+            selected: Some(legacy.id.clone()),
+            ..Default::default()
+        };
+        app.titles.insert(legacy_key.clone(), "Saved name".into());
+        app.hidden.insert(legacy_key);
+        app.set_conversations(vec![canonical.clone()]);
+
+        assert_eq!(app.selected, Some(canonical.id.clone()));
+        assert_eq!(app.conversation_name(&canonical), "Saved name");
+        assert!(app.visible_ids().is_empty());
+        app.unhide_all();
+        assert_eq!(app.notice.as_deref(), Some("Restored 1 hidden chat."));
+        assert_eq!(app.visible_ids(), vec![canonical.id.clone()]);
+        app.begin_rename(canonical.id.clone());
+        app.draft.clear();
+        app.draft_cursor = 0;
+        draft_key(&mut app, KeyCode::Enter);
+        assert!(!app.titles.contains_key(&conversation_key(&legacy.id)));
+        assert_eq!(app.conversation_name(&canonical), "legacy-id");
+        app.close_conversation(canonical.id.clone());
+        assert!(app.visible_ids().is_empty());
+        assert!(app.hidden.contains(&conversation_key(&canonical.id)));
+        assert!(app.hidden.contains(&conversation_key(&legacy.id)));
+        app.unhide_all();
+        assert_eq!(app.notice.as_deref(), Some("Restored 1 hidden chat."));
     }
 
     #[test]
