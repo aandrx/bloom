@@ -145,8 +145,10 @@ pub fn render(frame: &mut Frame<'_>, app: &App) {
     // count. The transcript keeps its own width cap, so the rail only takes room
     // that was empty in the conversation column.
     let desired = (inner.width as u32 * 21 + 50) / 100;
+    // The floor keeps the widest chat label the fixtures use (` Design systems`, with
+    // its selection marker) from being clipped when the proportional width rounds down.
     let sidebar_width = desired
-        .clamp(14, 28)
+        .clamp(16, 28)
         .min(inner.width.saturating_sub(3) as u32) as u16;
     let body = Layout::horizontal([
         Constraint::Length(sidebar_width),
@@ -154,14 +156,40 @@ pub fn render(frame: &mut Frame<'_>, app: &App) {
         Constraint::Min(1),
     ])
     .split(inner);
+    let visible = app.visible_conversations();
     // The mockup letter-spaces this label. A terminal cannot set tracking, so the
     // spaces are inserted explicitly, and the label stays muted rather than bold so
     // it reads as a quiet section label.
+    //
+    // An active filter replaces the label rather than drawing over it. Both used to
+    // render into this row, and the shorter filter text left the tail of the plain
+    // label behind, so `1 MATCH` appeared as `1 MATCH S`.
+    let (label, is_filter) = match app.filter_query() {
+        Some(query) if query.trim().is_empty() => ("FILTER".to_owned(), true),
+        Some(_) if app.filter_has_no_matches() => {
+            // Short enough to survive the narrow sidebar; the query itself is already
+            // visible in the composer prompt.
+            ("NO MATCHES".to_owned(), true)
+        }
+        Some(_) => match visible.len() {
+            1 => ("1 MATCH".to_owned(), true),
+            count => (format!("{count} MATCHES"), true),
+        },
+        None => ("C H A T S".to_owned(), false),
+    };
+    let label_style = if is_filter {
+        Style::default()
+            .fg(palette.cyan)
+            .add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(palette.muted)
+    };
+    let label_width =
+        (body[0].width as usize).min(unicode_width::UnicodeWidthStr::width(label.as_str()));
     frame.render_widget(
-        Paragraph::new("C H A T S").style(Style::default().fg(palette.muted)),
+        Paragraph::new(display_truncate(&label, label_width)).style(label_style),
         Rect::new(body[0].x, body[0].y, body[0].width, 1),
     );
-    let visible = app.visible_conversations();
     let entries = visible
         .iter()
         .map(|c| {
@@ -213,31 +241,6 @@ pub fn render(frame: &mut Frame<'_>, app: &App) {
         &mut list_state,
     );
 
-    // Filter feedback replaces the plain label so the state is never ambiguous.
-    if let Some(query) = app.filter_query() {
-        let label = if query.trim().is_empty() {
-            "FILTER".to_owned()
-        } else if app.filter_has_no_matches() {
-            // Short enough to survive the narrow sidebar; the query is already
-            // visible in the filter prompt.
-            "NO MATCHES".to_owned()
-        } else {
-            match visible.len() {
-                1 => "1 MATCH".to_owned(),
-                count => format!("{count} MATCHES"),
-            }
-        };
-        let width =
-            (body[0].width as usize).min(unicode_width::UnicodeWidthStr::width(label.as_str()));
-        frame.render_widget(
-            Paragraph::new(display_truncate(&label, width)).style(
-                Style::default()
-                    .fg(palette.cyan)
-                    .add_modifier(Modifier::BOLD),
-            ),
-            Rect::new(body[0].x, body[0].y, body[0].width, 1),
-        );
-    }
     frame.render_widget(
         Block::default()
             .borders(Borders::LEFT)
@@ -290,8 +293,10 @@ pub fn render(frame: &mut Frame<'_>, app: &App) {
         Paragraph::new(Line::from(heading)),
         Rect::new(right[0].x, right[0].y, right[0].width, 1),
     );
-    // Status is only surfaced when it needs attention; the theme control remains visible.
-    if inner.width >= 60 {
+    // Status is only surfaced when it needs attention; the theme control stays visible
+    // whenever the header has room for the identity plus the control, which it does
+    // from roughly 50 columns up.
+    if right[0].width >= 38 {
         let mut x = right[0].x + right[0].width;
         let theme_label = match app.theme {
             Theme::Dark => " Dark ",
@@ -486,9 +491,12 @@ pub fn render(frame: &mut Frame<'_>, app: &App) {
             ),
         Rect::new(composer.x, composer.y, composer.width, 2),
     );
-    // Shorten the hints rather than truncating them mid-word on a narrow terminal.
+    // Shorten the hints rather than truncating them mid-word on a narrow terminal,
+    // but keep the theme key: the control it toggles is the only other hint of it.
     let hints = if composer.width >= HINTS.chars().count() as u16 {
         HINTS
+    } else if composer.width >= 24 {
+        "↑↓ · / · t theme · Esc"
     } else {
         "↑↓ · / · Esc"
     };

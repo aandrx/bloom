@@ -679,3 +679,53 @@ fn the_theme_control_sits_one_column_inside_the_frame() {
         );
     }
 }
+
+#[test]
+fn a_single_match_heading_is_not_followed_by_leftovers() {
+    // The filter heading used to be drawn over the plain `C H A T S` label, and the
+    // shorter text left the end of the old label showing, so it read `1 MATCH S`.
+    let mut app = App::default();
+    app.set_conversations(vec![
+        conversation("Jules Lee", 2, 20),
+        conversation("Maya Chen", 2, 10),
+    ]);
+    app.begin_filter();
+    for character in "jules".chars() {
+        app.filter_input(character);
+    }
+
+    let text = rendered(&app);
+    let heading = text.lines().nth(1).expect("a label row");
+    assert!(
+        heading.contains("1 MATCH"),
+        "the singular heading must be shown:\n{text}"
+    );
+    assert!(
+        !heading.contains("MATCH S"),
+        "no tail of the plain label may survive:\n{text}"
+    );
+}
+
+#[test]
+fn the_theme_control_stays_visible_on_a_narrow_terminal() {
+    // At 60 columns there is room for the identity and the control; losing the control
+    // left no visible way to discover the theme.
+    let mut app = App::default();
+    app.set_conversations(vec![conversation("Weekend crew", 3, 40)]);
+    app.selected = app.conversations.first().map(|c| c.id.clone());
+    let grid = buffer(&app, 60, 20);
+    let row: String = (0..grid.area.width)
+        .map(|x| grid[(x, 1)].symbol())
+        .collect();
+    assert!(
+        row.contains("Dark"),
+        "the theme control must survive at 60 columns, got:\n{row}"
+    );
+    let footer: String = (0..grid.area.width)
+        .map(|x| grid[(x, 18)].symbol())
+        .collect();
+    assert!(
+        footer.contains("t theme"),
+        "the narrow hints must still name the theme key, got:\n{footer}"
+    );
+}
