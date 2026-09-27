@@ -56,6 +56,10 @@ const LIGHT: Palette = Palette {
     red: Color::Rgb(160, 30, 45),
 };
 
+/// Below this header width the identity and the theme chip stop fitting, so the
+/// chip is dropped. It has a name so the guard can mutate one value and prove the
+/// narrow layout still keeps the control.
+const THEME_MIN_WIDTH: u16 = 38;
 
 #[derive(Clone)]
 struct ComposerLayout {
