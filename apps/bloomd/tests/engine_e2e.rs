@@ -83,11 +83,31 @@ async fn daemon_end_to_end_with_the_real_engine() {
     assert!(wait_for_socket(&socket), "daemon never created its socket");
 
     let client = BloomClient::new(&socket);
-    let conversations = client
-        .list_conversations()
-        .await
-        .expect("daemon answers list_conversations");
+
+    // The engine's chat listing runs after the session becomes ready, so poll for
+    // a non-empty list rather than sampling once. `BLOOM_E2E_REQUIRE_CONVERSATIONS`
+    // makes a still-empty list a failure.
+    let listing_deadline = tokio::time::Instant::now() + Duration::from_secs(150);
+    let mut conversations = Vec::new();
+    while tokio::time::Instant::now() < listing_deadline {
+        conversations = client
+            .list_conversations()
+            .await
+            .expect("daemon answers list_conversations");
+        if !conversations.is_empty() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_secs(2)).await;
+    }
     println!("conversations visible: {}", conversations.len());
+    if conversations.is_empty() {
+        let required = std::env::var("BLOOM_E2E_REQUIRE_CONVERSATIONS").is_ok();
+        assert!(
+            !required,
+            "no conversations were listed; the engine chat sync produced nothing"
+        );
+        println!("note: listing is empty, which may mean iCloud chat sync is off");
+    }
 
     let mut stream = client.subscribe().await.expect("subscription accepted");
 

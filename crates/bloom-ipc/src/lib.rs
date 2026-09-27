@@ -103,6 +103,7 @@ pub struct Event {
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "event", rename_all = "snake_case")]
 pub enum EventKind {
+    ConversationsChanged,
     Message {
         conversation_id: ConversationId,
         message: Message,

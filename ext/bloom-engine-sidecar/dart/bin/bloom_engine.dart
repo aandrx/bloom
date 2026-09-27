@@ -9,6 +9,7 @@
 // sidecar refuses to start while the OpenBubbles app is running, because both
 // would write the same registration state.
 
+import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
 import 'dart:math';
@@ -18,16 +19,24 @@ import 'package:flutter_rust_bridge/flutter_rust_bridge_for_generated_io.dart';
 import '../lib/payload_codec.dart';
 import '../lib/protocol.dart';
 import '../lib/upstream/api/api.dart' as api;
+import '../lib/upstream/lib.dart' as upstream;
 import '../lib/upstream/frb_generated.dart';
 
 const String engineVersion = 'openbubbles-v1.15.0+205';
 
 class SidecarConfig {
-  SidecarConfig({required this.stateDirectory, required this.libraryPath});
+  SidecarConfig({
+    required this.stateDirectory,
+    required this.libraryPath,
+    required this.syncChats,
+  });
 
   final String stateDirectory;
   final String libraryPath;
-  bool get syncChats => false;
+
+  /// Listing the account's existing conversations is on by default: without it a
+  /// fresh store shows nothing at all.
+  final bool syncChats;
 }
 
 SidecarConfig? parseConfig(List<String> arguments) {
@@ -55,7 +64,11 @@ SidecarConfig? parseConfig(List<String> arguments) {
     stderr.writeln('error: engine library not found');
     return null;
   }
-  return SidecarConfig(stateDirectory: state, libraryPath: library);
+  return SidecarConfig(
+    stateDirectory: state,
+    libraryPath: library,
+    syncChats: !arguments.contains('--no-sync-chats'),
+  );
 }
 
 String? _option(List<String> arguments, String name) {
@@ -163,6 +176,10 @@ Future<void> main(List<String> arguments) async {
   }
   final (push, watcher) = restored;
   final (pollState, deskState) = api.dupDaemonDesk(state: push);
+  // Take the CloudKit client from the state dupDaemonDesk returned: it consumes the
+  // restored state, and handles read from the original are disposed with it. The
+  // app itself reads the client from its desktop state for the same reason.
+  final cloudMessagesClient = deskState.icloudServices?.cloudMessagesClient;
 
   final sends = <String, int>{}; // message id -> originating request id
   var sequence = 0;
@@ -172,9 +189,20 @@ Future<void> main(List<String> arguments) async {
     readyFrame(
       engineVersion: engineVersion,
       canSend: true,
-      canReadHistory: false,
+      canReadHistory: config.syncChats,
     ),
   );
+
+  if (config.syncChats) {
+    final client = cloudMessagesClient;
+    if (client == null) {
+      stderr.writeln('chat sync unavailable: no cloud messages client');
+      stdout.writeln(
+          historyCompleteFrame(conversations: 0, messages: 0, limited: true));
+    } else {
+      unawaited(_syncChats(client));
+    }
+  }
 
   final commands =
       stdin.transform(utf8.decoder).transform(const LineSplitter()).listen(
@@ -233,6 +261,85 @@ Future<void> main(List<String> arguments) async {
 
   await commands.cancel();
   stderr.writeln('sidecar stopped');
+}
+
+/// Build the conversation shape for a `conversation` frame from plain values, so
+/// the mapping can be tested without constructing engine objects.
+Map<String, Object?>? conversationFromChat({
+  required String guid,
+  required String chatIdentifier,
+  required String? displayName,
+  required List<String> participants,
+}) {
+  final resolved = guid.trim().isNotEmpty ? guid.trim() : chatIdentifier.trim();
+  if (resolved.isEmpty) return null;
+  final title = (displayName ?? '').trim();
+  return <String, Object?>{
+    'guid': resolved,
+    'title': title.isEmpty ? null : title,
+    'participants': participants
+        .map((uri) => uri.trim())
+        .where((uri) => uri.isNotEmpty)
+        .toList(),
+    'is_group': participants.length > 2,
+  };
+}
+
+/// Page through the account's existing conversations and emit them.
+///
+/// Runs off the receive path so live messaging is unaffected. Bounded, and marks
+/// the result limited rather than silently truncating.
+Future<void> _syncChats(
+  upstream.ArcCloudMessagesClientDefaultAnisetteProvider client,
+) async {
+  const maxPages = 200;
+  const maxRows = 20000;
+  Uint8List? token;
+  var pages = 0;
+  var rows = 0;
+  var limited = false;
+  final seen = <String>{};
+  try {
+    while (pages < maxPages && rows < maxRows) {
+      final (next, page, status) = await api.syncChats(
+        cloudMessagesClient: client,
+        continuationToken: token,
+      );
+      pages++;
+      if (page.isEmpty) break;
+      for (final chat in page.values) {
+        if (chat == null) continue;
+        final mapped = conversationFromChat(
+          guid: chat.guid,
+          chatIdentifier: chat.chatIdentifier,
+          displayName: chat.displayName,
+          participants: chat.participants.map((p) => p.uri).toList(),
+        );
+        if (mapped == null) continue;
+        if (!seen.add(mapped['guid']! as String)) continue;
+        if (rows >= maxRows) {
+          limited = true;
+          break;
+        }
+        rows++;
+        stdout.writeln(conversationFrame(sequence: rows, conversation: mapped));
+      }
+      if (limited) break;
+      if (status != 1 || next.isEmpty) break;
+      token = next;
+    }
+    if (pages >= maxPages || rows >= maxRows) limited = true;
+  } catch (error) {
+    stderr.writeln(
+      'chat sync failed: ${error.runtimeType}: ${error.toString().split('\n').first}',
+    );
+    limited = true;
+  }
+  stderr.writeln(
+      'chat sync complete: pages=$pages conversations=$rows limited=$limited');
+  stdout.writeln(
+    historyCompleteFrame(conversations: rows, messages: 0, limited: limited),
+  );
 }
 
 Future<void> _handleCommand({

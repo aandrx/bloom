@@ -69,6 +69,12 @@ pub async fn snapshot(
     })
 }
 
+/// Read only the conversation list, for a refresh that must not disturb the thread
+/// the user is reading.
+pub async fn conversations(client: &BloomClient) -> Result<Vec<Conversation>, ClientError> {
+    client.list_conversations().await
+}
+
 /// Run one connected session: snapshot, subscribe, forward events, and follow the
 /// visible conversation when the user selects a different one.
 ///

@@ -77,7 +77,8 @@ async fn serve_inner<H: RequestHandler>(
         if first && matches!(&request.request, RequestKind::Subscribe) {
             if let Some(hub) = hub {
                 let receiver = hub.subscribe();
-                serve_subscriber(connection, request.request_id, receiver).await;
+                let initial = hub.latest_session();
+                serve_subscriber(connection, request.request_id, receiver, initial).await;
                 return;
             }
         }

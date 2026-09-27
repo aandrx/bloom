@@ -293,6 +293,7 @@ async fn read_frames(
 ) {
     let mut lines = BufReader::new(stdout).lines();
     let mut my_handles: Vec<String> = Vec::new();
+    let mut skipped_conversations = 0usize;
     let mut skipped: HashMap<SkipReason, u64> = HashMap::new();
     while let Ok(Some(line)) = lines.next_line().await {
         if line.len() > MAX_FRAME_BYTES {
@@ -383,7 +384,37 @@ async fn read_frames(
                 eprintln!("engine reported error: {code}");
             }
             Some("shutdown_ack") => {}
-            Some("conversation") | Some("history_complete") => {}
+            Some("history_complete") => {
+                let conversations = frame
+                    .get("conversations")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(0);
+                let limited = frame
+                    .get("limited")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false);
+                eprintln!(
+                    "engine listing complete: conversations={conversations} limited={limited} skipped={skipped_conversations}"
+                );
+                // One refresh for the whole listing sync, not one per conversation.
+                if outgoing
+                    .send(TransportEvent::ConversationsChanged)
+                    .await
+                    .is_err()
+                {
+                    return;
+                }
+            }
+            Some("conversation") => {
+                match map_conversation(frame.get("conversation"), &my_handles, &id) {
+                    Some(event) => {
+                        if outgoing.send(event).await.is_err() {
+                            return;
+                        }
+                    }
+                    None => skipped_conversations += 1,
+                }
+            }
             _ => eprintln!("engine sent an unknown frame type"),
         }
     }
@@ -622,6 +653,59 @@ pub fn map_inbound(
     })
 }
 
+/// Map a `conversation` frame into a domain conversation. Returns None when the
+/// frame is unusable, so one malformed entry cannot end the whole listing.
+pub fn map_conversation(
+    value: Option<&Value>,
+    my_handles: &[String],
+    id: &TransportId,
+) -> Option<TransportEvent> {
+    let value = value?;
+    let guid = value.get("guid")?.as_str()?.trim();
+    if guid.is_empty() {
+        return None;
+    }
+    let title = value
+        .get("title")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|title| !title.is_empty())
+        .map(str::to_owned);
+    let mut participants = Vec::new();
+    if let Some(raw) = value.get("participants").and_then(Value::as_array) {
+        for entry in raw {
+            let Some(text) = entry.as_str() else { continue };
+            let Some(handle) = handle_from(text) else {
+                continue;
+            };
+            participants.push(Participant {
+                handle,
+                display_name: None,
+                is_me: my_handles.iter().any(|mine| mine == text),
+            });
+        }
+    }
+    let is_group = value
+        .get("is_group")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    Some(TransportEvent::Conversation {
+        conversation: Conversation {
+            id: ConversationId::new(id.clone(), guid).ok()?,
+            remote_id: guid.to_owned(),
+            kind: if is_group {
+                ConversationKind::Group
+            } else {
+                ConversationKind::Direct
+            },
+            title,
+            participants,
+            created_at: 0,
+            last_message_at: None,
+        },
+    })
+}
+
 /// Extract the text to send from an outgoing body. Only plain text is supported.
 pub fn outgoing_text(body: &OutgoingBody) -> TransportResult<String> {
     text_of(&body.parts).ok_or(TransportError::Unsupported)
@@ -772,6 +856,60 @@ mod tests {
         else {
             panic!("expected a message event");
         };
+    }
+
+    #[test]
+    fn maps_a_conversation_frame_including_our_own_participant() {
+        let value = json!({
+            "guid": "iMessage;-;group",
+            "title": "Weekend crew",
+            "participants": [
+                "mailto:a@example.invalid",
+                "mailto:me@example.invalid",
+                "tel:+15550000001"
+            ],
+            "is_group": true
+        });
+        let event = map_conversation(
+            Some(&value),
+            &["mailto:me@example.invalid".to_owned()],
+            &transport(),
+        )
+        .expect("conversation maps");
+        let TransportEvent::Conversation { conversation } = event else {
+            panic!("expected a conversation event");
+        };
+        assert_eq!(conversation.id.value(), "iMessage;-;group");
+        assert_eq!(conversation.title.as_deref(), Some("Weekend crew"));
+        assert_eq!(conversation.kind, ConversationKind::Group);
+        assert_eq!(conversation.participants.len(), 3);
+        assert_eq!(
+            conversation
+                .participants
+                .iter()
+                .filter(|participant| participant.is_me)
+                .count(),
+            1
+        );
+        assert!(conversation.last_message_at.is_none());
+    }
+
+    #[test]
+    fn unusable_conversation_frames_are_skipped_not_fatal() {
+        let no_guid = json!({"guid": "  ", "participants": []});
+        assert!(map_conversation(Some(&no_guid), &[], &transport()).is_none());
+        assert!(map_conversation(None, &[], &transport()).is_none());
+
+        // A conversation with no usable participants still lists, so the user can
+        // still select it.
+        let empty = json!({"guid": "g", "title": null, "participants": [], "is_group": false});
+        let event = map_conversation(Some(&empty), &[], &transport()).expect("maps");
+        let TransportEvent::Conversation { conversation } = event else {
+            panic!("expected a conversation event");
+        };
+        assert!(conversation.participants.is_empty());
+        assert!(conversation.title.is_none());
+        assert_eq!(conversation.kind, ConversationKind::Direct);
     }
 
     #[test]

@@ -1,7 +1,7 @@
 //! UI state for the Bloom TUI. Rendering lives in `ui.rs`.
 
 use crate::daemon::Snapshot;
-use bloom_domain::{Conversation, ConversationId, Message};
+use bloom_domain::{Conversation, ConversationId, HandleKind, Message};
 use bloom_ipc::EventKind;
 use std::collections::HashMap;
 
@@ -13,6 +13,9 @@ pub struct App {
     pub connection: String,
     pub session: String,
     pub draft: String,
+    /// Set when the daemon reports a conversation listing change; the caller then
+    /// re-reads the conversation list without disturbing the open thread.
+    pub resync_conversations: bool,
     pub composing: bool,
     /// Recipient address captured before the first message of a new conversation.
     pub pending_address: Option<String>,
@@ -163,6 +166,7 @@ impl App {
                     m.delivery = state;
                 }
             }
+            EventKind::ConversationsChanged => self.resync_conversations = true,
             EventKind::Session { state } => self.session = format!("{state:?}"),
         }
     }
@@ -236,6 +240,45 @@ pub enum CompositionIntent {
         body: String,
     },
     SendMessage(String),
+}
+
+/// A compact label for a message's sender.
+///
+/// The mockup shows short names. Most engine participants have no display name, so
+/// fall back to the local part of an email handle, capitalised, rather than printing
+/// a full address on every message.
+pub fn speaker_label(message: &Message, conversation: Option<&Conversation>) -> String {
+    if message.from_me {
+        return "You".to_owned();
+    }
+    if let Some(conversation) = conversation {
+        if let Some(named) = conversation
+            .participants
+            .iter()
+            .find(|participant| participant.handle == message.sender)
+            .and_then(|participant| participant.display_name.as_deref())
+            .map(str::trim)
+            .filter(|name| !name.is_empty())
+        {
+            return named.to_owned();
+        }
+    }
+    match message.sender.kind() {
+        HandleKind::Email => match message.sender.value().split_once('@') {
+            Some((local, _)) if !local.is_empty() => capitalise(local),
+            _ => message.sender.value().to_owned(),
+        },
+        HandleKind::Tel => message.sender.value().to_owned(),
+        HandleKind::Opaque => message.sender.value().to_owned(),
+    }
+}
+
+fn capitalise(value: &str) -> String {
+    let mut characters = value.chars();
+    match characters.next() {
+        Some(first) => first.to_uppercase().collect::<String>() + characters.as_str(),
+        None => String::new(),
+    }
 }
 
 pub fn message_text(message: &Message) -> String {
@@ -460,6 +503,79 @@ mod tests {
             state: bloom_domain::SessionState::Disconnected,
         });
         assert!(app.selected_conversation().is_none());
+    }
+
+    #[test]
+    fn speaker_labels_prefer_names_then_short_forms() {
+        let conversation = conversation("weekend", Some(1));
+        let named = Message::new(
+            MessageId::new(TransportId::new("openbubbles").unwrap(), "m1").unwrap(),
+            conversation.id.clone(),
+            None,
+            Handle::new(HandleKind::Email, "maya@example.invalid").unwrap(),
+            vec![bloom_domain::MessagePart::Text("hi".to_owned())],
+            1,
+            None,
+            DeliveryState::Delivered,
+            false,
+            None,
+            Vec::new(),
+            None,
+        )
+        .unwrap();
+        // No display name on the conversation: the local part is used, capitalised.
+        assert_eq!(speaker_label(&named, Some(&conversation)), "Maya");
+
+        let mut with_name = conversation.clone();
+        with_name.participants[0].handle =
+            Handle::new(HandleKind::Email, "maya@example.invalid").unwrap();
+        with_name.participants[0].display_name = Some("Maya Chen".to_owned());
+        assert_eq!(speaker_label(&named, Some(&with_name)), "Maya Chen");
+
+        // Our own messages are always "You".
+        let mine = Message::new(
+            MessageId::new(TransportId::new("openbubbles").unwrap(), "m2").unwrap(),
+            conversation.id.clone(),
+            None,
+            Handle::new(HandleKind::Email, "me@example.invalid").unwrap(),
+            vec![bloom_domain::MessagePart::Text("mine".to_owned())],
+            2,
+            None,
+            DeliveryState::Sent,
+            true,
+            None,
+            Vec::new(),
+            None,
+        )
+        .unwrap();
+        assert_eq!(speaker_label(&mine, Some(&conversation)), "You");
+
+        // Phone numbers are shown as-is, and odd handles fall back to their value.
+        let phone = Message::new(
+            MessageId::new(TransportId::new("openbubbles").unwrap(), "m3").unwrap(),
+            conversation.id.clone(),
+            None,
+            Handle::new(HandleKind::Tel, "+15550000001").unwrap(),
+            vec![bloom_domain::MessagePart::Text("call".to_owned())],
+            3,
+            None,
+            DeliveryState::Delivered,
+            false,
+            None,
+            Vec::new(),
+            None,
+        )
+        .unwrap();
+        assert_eq!(speaker_label(&phone, Some(&conversation)), "+15550000001");
+        assert_eq!(speaker_label(&named, None), "Maya");
+    }
+
+    #[test]
+    fn a_listing_change_asks_for_a_conversation_resync() {
+        let mut app = App::default();
+        assert!(!app.resync_conversations);
+        app.apply_event(EventKind::ConversationsChanged);
+        assert!(app.resync_conversations, "the caller must refresh the list");
     }
 
     #[test]

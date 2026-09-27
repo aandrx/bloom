@@ -323,3 +323,123 @@ async fn starting_a_conversation_creates_then_reuses_it_and_normalises_addresses
     assert!(!report.drain_incomplete);
     persistence.abort();
 }
+
+/// A sidecar that reports readiness and then lists conversations, ending with a
+/// completion frame, which is the shape the engine's chat sync produces.
+fn fake_sidecar_listing(dir: &std::path::Path) -> PathBuf {
+    let path = dir.join("fake_engine_listing.sh");
+    let script = r#"#!/bin/sh
+cat <<'FRAMES'
+{"version":1,"type":"ready","engine_version":"fake","handles":["mailto:me@example.invalid"],"capabilities":{"send":true,"history":true}}
+{"version":1,"type":"conversation","sequence":1,"conversation":{"guid":"iMessage;-;a@example.invalid","title":"First","participants":["mailto:a@example.invalid","mailto:me@example.invalid"],"is_group":false}}
+{"version":1,"type":"conversation","sequence":2,"conversation":{"guid":"iMessage;-;b@example.invalid","title":null,"participants":["mailto:b@example.invalid","mailto:me@example.invalid"],"is_group":false}}
+{"version":1,"type":"conversation","sequence":3,"conversation":{"guid":"iMessage;-;a@example.invalid","title":"First","participants":["mailto:a@example.invalid","mailto:me@example.invalid"],"is_group":false}}
+{"version":1,"type":"conversation","sequence":4,"conversation":{"guid":"   ","participants":[]}}
+{"version":1,"type":"history_complete","conversations":3,"messages":0,"limited":false}
+FRAMES
+while IFS= read -r line; do
+  case "$line" in
+    *'"type":"shutdown"'*) printf '{"version":1,"type":"shutdown_ack","request_id":1}\n'; exit 0 ;;
+  esac
+done
+"#;
+    fs::write(&path, script).unwrap();
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o700)).unwrap();
+    path
+}
+
+#[tokio::test]
+async fn listing_frames_upsert_conversations_and_publish_one_refresh() {
+    let dir = tempfile::tempdir().unwrap();
+    let private = dir.path().join("private");
+    fs::create_dir(&private).unwrap();
+    fs::set_permissions(&private, fs::Permissions::from_mode(0o700)).unwrap();
+    let fake = fake_sidecar_listing(dir.path());
+
+    let store = EncryptedStore::open(private.join("store.db"), &TestSecrets).unwrap();
+    let store = Arc::new(Mutex::new(store));
+    let hub = SubscriptionHub::with_default_capacity();
+    let mut subscriber = hub.subscribe();
+
+    let engine = Arc::new(Engine::new(EngineConfig {
+        dart_executable: fake,
+        script: PathBuf::from("ignored"),
+        state_dir: private.clone(),
+        library: PathBuf::from("ignored"),
+    }));
+
+    let (sink, mut events) = mpsc::channel(64);
+    let mut supervisor = Supervisor::new(engine.clone(), sink);
+    let service = Arc::new(Service::new(store.clone(), engine.clone(), hub.clone()));
+    let persistence = {
+        let service = service.clone();
+        tokio::spawn(async move {
+            while let Some(event) = events.recv().await {
+                let _ = service.persist(&event);
+            }
+        })
+    };
+    supervisor.start().await.expect("engine starts");
+
+    // The first published event is the session becoming active.
+    let mut refreshes = 0usize;
+    let mut saw_conversations_changed = false;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    while tokio::time::Instant::now() < deadline && !saw_conversations_changed {
+        match tokio::time::timeout(Duration::from_secs(2), subscriber.recv()).await {
+            Ok(Ok(event)) => {
+                if matches!(event.event, EventKind::ConversationsChanged) {
+                    refreshes += 1;
+                    saw_conversations_changed = true;
+                }
+            }
+            Ok(Err(_)) => break,
+            Err(_) => {}
+        }
+    }
+    assert!(
+        saw_conversations_changed,
+        "finishing a listing must tell clients to refresh"
+    );
+
+    let conversations = {
+        let guard = store.lock().unwrap();
+        store::list_conversations(&guard).expect("store readable")
+    };
+    assert_eq!(
+        conversations.len(),
+        2,
+        "a repeated guid must not create a duplicate, and an unusable frame is skipped"
+    );
+    assert!(conversations
+        .iter()
+        .any(|conversation| conversation.title.as_deref() == Some("First")));
+    assert!(conversations
+        .iter()
+        .any(|conversation| conversation.title.is_none()));
+    for conversation in &conversations {
+        assert!(
+            conversation.participants.iter().any(|p| p.is_me),
+            "our own participant must be marked"
+        );
+    }
+
+    // No further refresh should arrive for the same listing.
+    let extra = tokio::time::timeout(Duration::from_millis(400), subscriber.recv()).await;
+    assert!(
+        extra.is_err()
+            || !matches!(
+                extra.unwrap().map(|e| e.event),
+                Ok(EventKind::ConversationsChanged)
+            ),
+        "a listing must publish exactly one refresh"
+    );
+    assert_eq!(refreshes, 1);
+
+    let report = supervisor
+        .shutdown(Duration::from_secs(5))
+        .await
+        .expect("shutdown completes");
+    assert!(!report.drain_incomplete);
+    persistence.abort();
+}

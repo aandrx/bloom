@@ -68,6 +68,11 @@ impl fmt::Debug for SessionReason {
 #[derive(Clone)]
 pub enum TransportEvent {
     ConversationsChanged,
+    /// One conversation discovered by the transport, for example from a chat
+    /// listing sync. Carries no messages.
+    Conversation {
+        conversation: Conversation,
+    },
     Message {
         conversation: Conversation,
         message: Message,
@@ -90,6 +95,7 @@ impl fmt::Debug for TransportEvent {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(match self {
             Self::ConversationsChanged => "TransportEvent::ConversationsChanged",
+            Self::Conversation { .. } => "TransportEvent::Conversation([REDACTED])",
             Self::Message { .. } => "TransportEvent::Message([REDACTED])",
             Self::MessageUpdated { .. } => "TransportEvent::MessageUpdated([REDACTED])",
             Self::DeliveryChanged { .. } => "TransportEvent::DeliveryChanged([REDACTED])",

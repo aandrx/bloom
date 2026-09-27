@@ -71,6 +71,8 @@ async fn main() -> Result<()> {
     let (snapshot_tx, mut snapshot_rx) = mpsc::unbounded_channel::<Snapshot>();
     let (status_tx, mut status_rx) = mpsc::unbounded_channel::<ConnectionState>();
     let (send_tx, mut send_rx) = mpsc::unbounded_channel::<Result<(), String>>();
+    let (conversation_tx, mut conversation_rx) =
+        mpsc::unbounded_channel::<Vec<bloom_domain::Conversation>>();
     let (visible_tx, visible_rx) = watch::channel::<Option<bloom_domain::ConversationId>>(None);
 
     {
@@ -126,10 +128,23 @@ async fn main() -> Result<()> {
                 last_visible = app.selected.clone();
                 let _ = visible_tx.send(last_visible.clone());
             }
+            Some(conversations) = conversation_rx.recv() => app.set_conversations(conversations),
             Some(state) = status_rx.recv() => {
                 app.connection = state.label().to_owned();
             }
-            Some(event) = event_rx.recv() => app.apply_event(event),
+            Some(event) = event_rx.recv() => {
+                app.apply_event(event);
+                if app.resync_conversations {
+                    app.resync_conversations = false;
+                    let client = client.clone();
+                    let tx = conversation_tx.clone();
+                    tokio::spawn(async move {
+                        if let Ok(conversations) = daemon::conversations(&client).await {
+                            let _ = tx.send(conversations);
+                        }
+                    });
+                }
+            }
             Some(result) = send_rx.recv() => {
                 if let Err(error) = result {
                     app.error = Some(error);

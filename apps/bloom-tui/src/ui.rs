@@ -1,8 +1,11 @@
-use crate::app::{chat_name, message_text, participant_count, timestamp, App, ComposerPrompt};
+use crate::app::{
+    chat_name, message_text, participant_count, speaker_label, timestamp, App, ComposerPrompt,
+};
 use bloom_domain::DeliveryState;
 use ratatui::{prelude::*, widgets::*};
 
 const BG: Color = Color::Rgb(30, 30, 46);
+const SURFACE: Color = Color::Rgb(24, 24, 37);
 const RULE: Color = Color::Rgb(69, 71, 90);
 const TEXT: Color = Color::Rgb(205, 214, 244);
 const MUTED: Color = Color::Rgb(166, 173, 200);
@@ -10,59 +13,54 @@ const CYAN: Color = Color::Rgb(137, 220, 235);
 const GREEN: Color = Color::Rgb(166, 227, 161);
 
 pub fn render(frame: &mut Frame<'_>, app: &App) {
+    let area = frame.area();
     frame.render_widget(
-        Block::default().style(Style::default().bg(BG).fg(TEXT)),
-        frame.area(),
+        Block::default()
+            .style(Style::default().bg(SURFACE).fg(TEXT))
+            .borders(Borders::ALL)
+            .border_type(BorderType::Rounded)
+            .border_style(Style::default().fg(RULE)),
+        area,
     );
-    let areas = Layout::vertical([Constraint::Length(2), Constraint::Min(1)]).split(frame.area());
-    let header = Layout::vertical([Constraint::Length(1), Constraint::Length(1)]).split(areas[0]);
-    let selected = app.selected_conversation();
-    let title = selected.map(chat_name);
-    let people = selected
-        .map(|c| participant_count(c.participants.len()))
-        .unwrap_or_default();
-    let mut heading = vec![Span::styled("Bloom", Style::default().fg(TEXT))];
-    if let Some(title) = title {
-        heading.push(Span::raw(" / "));
-        heading.push(Span::styled(
-            title,
-            Style::default().fg(TEXT).add_modifier(Modifier::BOLD),
-        ));
-        if !people.is_empty() {
-            heading.push(Span::raw("  "));
-            heading.push(Span::styled(people, Style::default().fg(MUTED)));
-        }
+    let inner = area.inner(Margin {
+        horizontal: 1,
+        vertical: 1,
+    });
+    // A terminal can be arbitrarily small. Below the size where the layout is
+    // meaningful, show a compact fallback instead of asking ratatui for regions
+    // outside the buffer, which panics.
+    if inner.width < 20 || inner.height < 5 {
+        frame.render_widget(
+            Paragraph::new(format!("Bloom  {}", app.connection))
+                .style(Style::default().fg(TEXT).bg(SURFACE)),
+            inner,
+        );
+        return;
     }
-    frame.render_widget(Paragraph::new(Line::from(heading)), header[0]);
-    frame.render_widget(
-        Paragraph::new("─".repeat(frame.area().width as usize)).style(Style::default().fg(RULE)),
-        header[1],
-    );
 
+    // Keep the sidebar inside the available width and leave room for the divider
+    // and at least one column of transcript.
+    let sidebar_width = 24.min(inner.width.saturating_sub(2));
     let body = Layout::horizontal([
-        Constraint::Length(24),
+        Constraint::Length(sidebar_width),
         Constraint::Length(1),
         Constraint::Min(1),
     ])
-    .split(areas[1]);
-    let side = Layout::vertical([Constraint::Length(2), Constraint::Min(1)]).split(body[0]);
+    .split(inner);
     frame.render_widget(
         Paragraph::new("CHATS").style(Style::default().fg(MUTED).add_modifier(Modifier::BOLD)),
-        side[0],
+        Rect::new(body[0].x, body[0].y, body[0].width, 1),
     );
     let entries = app
         .conversations
         .iter()
         .map(|c| {
             let selected = Some(&c.id) == app.selected.as_ref();
-            let name = chat_name(c);
-            let count = participant_count(c.participants.len());
-            let marker = if selected { "▎" } else { " " };
             ListItem::new(vec![
                 Line::from(vec![
-                    Span::styled(marker, Style::default().fg(CYAN)),
+                    Span::styled(if selected { "▎" } else { " " }, Style::default().fg(CYAN)),
                     Span::styled(
-                        name,
+                        chat_name(c),
                         Style::default()
                             .fg(if selected { CYAN } else { TEXT })
                             .add_modifier(if selected {
@@ -74,36 +72,71 @@ pub fn render(frame: &mut Frame<'_>, app: &App) {
                 ]),
                 Line::from(vec![
                     Span::raw("  "),
-                    Span::styled(count, Style::default().fg(MUTED)),
+                    Span::styled(
+                        participant_count(c.participants.len()),
+                        Style::default().fg(MUTED),
+                    ),
                 ]),
             ])
         })
         .collect::<Vec<_>>();
-    frame.render_widget(List::new(entries).style(Style::default().bg(BG)), side[1]);
+    frame.render_widget(
+        List::new(entries).style(Style::default().bg(BG)),
+        Rect::new(
+            body[0].x,
+            body[0].y + 1,
+            body[0].width,
+            body[0].height.saturating_sub(1),
+        ),
+    );
     frame.render_widget(
         Block::default()
             .borders(Borders::LEFT)
             .border_style(Style::default().fg(RULE)),
         body[1],
     );
-
+    // Shrink the header and composer blocks on short terminals so their heights can
+    // never exceed the area they are given.
+    let (header_height, composer_height) = if inner.height >= 10 {
+        (2u16, 3u16)
+    } else {
+        (1u16, 1u16)
+    };
     let right = Layout::vertical([
+        Constraint::Length(header_height),
         Constraint::Min(1),
-        Constraint::Length(2),
-        Constraint::Length(1),
+        Constraint::Length(composer_height),
     ])
     .split(body[2]);
-    let mut transcript = Vec::new();
+    let selected = app.selected_conversation();
+    let mut heading = vec![Span::styled("Bloom", Style::default().fg(TEXT))];
+    if let Some(c) = selected {
+        heading.extend([
+            Span::raw(" / "),
+            Span::styled(
+                chat_name(c),
+                Style::default().fg(TEXT).add_modifier(Modifier::BOLD),
+            ),
+            Span::raw("  "),
+            Span::styled(
+                participant_count(c.participants.len()),
+                Style::default().fg(MUTED),
+            ),
+        ]);
+    }
+    frame.render_widget(
+        Paragraph::new(Line::from(heading)),
+        Rect::new(right[0].x, right[0].y, right[0].width, 1),
+    );
+    frame.render_widget(
+        Paragraph::new("─".repeat(right[0].width as usize)).style(Style::default().fg(RULE)),
+        Rect::new(right[0].x, right[0].y + 1, right[0].width, 1),
+    );
+    let mut lines = Vec::new();
     if let Some(messages) = app.selected.as_ref().and_then(|id| app.messages.get(id)) {
         for message in messages {
-            // `from_me` is the authoritative signal; comparing the sender against a
-            // placeholder string mislabels our own messages.
-            let speaker = if message.from_me {
-                "You"
-            } else {
-                message.sender.value()
-            };
-            transcript.push(Line::from(vec![
+            let speaker = speaker_label(message, app.selected_conversation());
+            lines.push(Line::from(vec![
                 Span::styled(
                     speaker,
                     Style::default().fg(TEXT).add_modifier(Modifier::BOLD),
@@ -123,23 +156,27 @@ pub fn render(frame: &mut Frame<'_>, app: &App) {
                     DeliveryState::Read => "read",
                     DeliveryState::Failed => "failed",
                 };
-                content.push(Span::raw("  "));
-                content.push(Span::styled(
-                    state,
-                    Style::default().fg(if state == "delivered" || state == "read" {
-                        GREEN
-                    } else {
-                        MUTED
-                    }),
-                ));
+                content.extend([
+                    Span::raw("  "),
+                    Span::styled(
+                        state,
+                        Style::default().fg(if state == "delivered" || state == "read" {
+                            GREEN
+                        } else {
+                            MUTED
+                        }),
+                    ),
+                ]);
             }
-            transcript.push(Line::from(content));
-            transcript.push(Line::raw(""));
+            lines.push(Line::from(content));
+            lines.push(Line::raw(""));
         }
     }
     frame.render_widget(
-        Paragraph::new(transcript).wrap(Wrap { trim: false }),
-        right[0],
+        Paragraph::new(lines)
+            .wrap(Wrap { trim: false })
+            .style(Style::default().bg(SURFACE)),
+        right[1],
     );
     let prompt = match app.composer_prompt() {
         ComposerPrompt::Recipient => "›  To: recipient address...".to_owned(),
@@ -163,21 +200,14 @@ pub fn render(frame: &mut Frame<'_>, app: &App) {
                     .borders(Borders::TOP)
                     .border_style(Style::default().fg(RULE)),
             ),
-        right[1],
+        Rect::new(right[2].x, right[2].y, right[2].width, 2),
     );
-    let error = app
-        .error
-        .as_deref()
-        .map(|e| format!("  {e}"))
-        .unwrap_or_default();
     frame.render_widget(
-        Paragraph::new(Line::from(vec![
-            Span::styled(
-                format!("{}  ·  ↑↓ chats · Enter open · Esc close", app.connection),
-                Style::default().fg(MUTED),
-            ),
-            Span::styled(error, Style::default().fg(GREEN)),
-        ])),
-        right[2],
+        Paragraph::new(format!(
+            "{}  ·  ↑↓ chats · Enter open · Esc close",
+            app.connection
+        ))
+        .style(Style::default().fg(MUTED)),
+        Rect::new(right[2].x, right[2].y + 2, right[2].width, 1),
     );
 }

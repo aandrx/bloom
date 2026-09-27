@@ -212,6 +212,30 @@ sidecar with an explicit field-by-field encoder, a versioned stdio protocol, con
 guards, and 29 offline tests, and it was verified live against the real engine
 (ready frame, inbound frames, clean shutdown).
 
+## Conversation listing from the engine
+
+A fresh Bloom store is empty, so the sidecar also lists the account's existing
+conversations from the engine's iCloud/CloudKit chat sync (`syncChats`), on by
+default and disabled with `--no-sync-chats`. It runs after the `ready` frame and off
+the receive path, paginates with a bounded page and row limit, deduplicates by guid,
+and ends with `history_complete`, which the daemon turns into a single
+`ConversationsChanged` event so clients refresh once rather than once per row.
+
+Verified against the real account: 4 pages, 568 conversations synced,
+`limited=false`, no frames skipped, and all 568 served back over the socket. Each
+listing takes tens of seconds, so the UI is usable immediately and fills in when the
+listing finishes. Thread history itself is not imported yet.
+
+Two implementation traps worth remembering, both found by running it:
+
+- `dupDaemonDesk` consumes the restored state, so handles read from the original are
+  disposed with it. The CloudKit client must be taken from the state it returns,
+  which is what the app does; otherwise every sync call throws
+  `DroppableDisposedException`.
+- A client that subscribes after startup would otherwise never learn the engine's
+  session state, because the event was published before it existed. The hub now
+  retains the last session event and replays it on subscription.
+
 ## Running it locally
 
 ```sh

@@ -118,14 +118,44 @@ fn layout_matches_the_mockup_structure() {
     let buffer = buffer(&app, 100, 30);
 
     let symbol = |x, y| buffer[(x, y)].symbol();
-    let rule_x = 24;
-    assert!((2..30).filter(|y| symbol(rule_x, *y) == "│").count() >= 23);
-    assert_eq!(symbol(25, 27), "─");
-    assert_eq!(symbol(25, 28), "›");
-    assert_eq!(symbol(25, 29), "C");
-    assert_eq!((0..100).filter(|x| symbol(*x, 1) == "─").count(), 100);
+
+    // Derive positions instead of hardcoding them, so a layout change cannot make
+    // these assertions quietly meaningless.
+    let rule_x = (2..99)
+        .find(|x| symbol(*x, 10) == "│")
+        .expect("the sidebar divider must be drawn");
+    assert!(
+        (2..29).filter(|y| symbol(rule_x, *y) == "│").count() >= 20,
+        "the divider must span the body"
+    );
+
+    // The header rule belongs to the conversation column only.
+    let header_rule_row = (1..8)
+        .find(|y| (rule_x + 1..99).filter(|x| symbol(*x, *y) == "─").count() > 40)
+        .expect("the conversation header must have its own rule");
+    assert!(
+        (1..rule_x).all(|x| symbol(x, header_rule_row) != "─"),
+        "the header rule must not run over the sidebar"
+    );
+
+    // The outer frame is drawn on all four edges.
+    assert!((0..100).filter(|x| symbol(*x, 0) == "─").count() > 80);
+    assert!((0..100).filter(|x| symbol(*x, 29) == "─").count() > 80);
+    assert!((1..29).filter(|y| symbol(0, *y) == "│").count() >= 25);
+    assert!((1..29).filter(|y| symbol(99, *y) == "│").count() >= 25);
+
+    // Exactly one composer line, and the hints sit directly beneath it.
     let all = rendered(&app);
     assert_eq!(all.matches("›  Write a message...").count(), 1);
+    let prompt_row = (1..29)
+        .find(|y| (0..100).any(|x| symbol(x, *y) == "›"))
+        .expect("the composer prompt must be drawn");
+    let hints_row = prompt_row + 1;
+    let hints: String = (0..100).map(|x| symbol(x, hints_row)).collect();
+    assert!(
+        hints.contains("chats"),
+        "the key hints must sit directly under the composer, found: {hints:?}"
+    );
 
     for expected in [
         "CHATS",                  // sidebar label

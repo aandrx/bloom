@@ -81,7 +81,18 @@ impl Service {
                 }
                 Ok(false)
             }
-            TransportEvent::ConversationsChanged => Ok(false),
+            TransportEvent::Conversation { conversation } => {
+                let mut store = self.store.lock().unwrap();
+                store::upsert_conversation(&mut store, conversation)?;
+                Ok(false)
+            }
+            TransportEvent::ConversationsChanged => {
+                // One refresh for a whole listing sync, after the rows are committed.
+                self.hub.publish(Event {
+                    event: EventKind::ConversationsChanged,
+                });
+                Ok(true)
+            }
             TransportEvent::Session { state, .. } => {
                 self.hub.publish(Event {
                     event: EventKind::Session {

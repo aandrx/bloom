@@ -1,5 +1,8 @@
 //! Bounded event fanout for dedicated subscription sockets.
-use std::time::Duration;
+use std::{
+    sync::{Arc, Mutex},
+    time::Duration,
+};
 
 use bloom_ipc::{Event, Response, ResponseKind};
 use tokio::{io::AsyncWrite, sync::broadcast, time::timeout};
@@ -13,13 +16,20 @@ const DEFAULT_CAPACITY: usize = 128;
 #[derive(Clone)]
 pub struct SubscriptionHub {
     sender: broadcast::Sender<Event>,
+    /// The most recent session state, replayed to clients that subscribe later.
+    /// Without it a client that connects after startup never learns the engine's
+    /// state, because the event was published before it existed.
+    latest_session: Arc<Mutex<Option<Event>>>,
 }
 
 impl SubscriptionHub {
     pub fn new(capacity: usize) -> Self {
         assert!(capacity > 0, "subscription capacity must be nonzero");
         let (sender, _) = broadcast::channel(capacity);
-        Self { sender }
+        Self {
+            sender,
+            latest_session: Arc::new(Mutex::new(None)),
+        }
     }
 
     pub fn with_default_capacity() -> Self {
@@ -33,7 +43,15 @@ impl SubscriptionHub {
 
     /// Publish a persisted event. No receivers is normal and is not a persistence error.
     pub fn publish(&self, event: Event) {
+        if matches!(event.event, bloom_ipc::EventKind::Session { .. }) {
+            *self.latest_session.lock().unwrap() = Some(event.clone());
+        }
         let _ = self.sender.send(event);
+    }
+
+    /// The last session state published, for replay on subscription.
+    pub fn latest_session(&self) -> Option<Event> {
+        self.latest_session.lock().unwrap().clone()
     }
 }
 
@@ -51,6 +69,7 @@ pub async fn serve_subscriber(
     mut connection: AuthenticatedStream,
     request_id: u64,
     mut receiver: broadcast::Receiver<Event>,
+    initial: Option<Event>,
 ) {
     let response = Response {
         request_id,
@@ -64,6 +83,15 @@ pub async fn serve_subscriber(
     .map_or(true, |result| result.is_err())
     {
         return;
+    }
+
+    if let Some(event) = initial {
+        if write_event_bounded(connection.stream_mut(), &event, SUBSCRIPTION_WRITE_TIMEOUT)
+            .await
+            .is_err()
+        {
+            return;
+        }
     }
 
     loop {
@@ -146,7 +174,7 @@ mod tests {
         let hub = SubscriptionHub::new(4);
         let receiver = hub.subscribe();
         hub.publish(event());
-        let task = tokio::spawn(serve_subscriber(server, 77, receiver));
+        let task = tokio::spawn(serve_subscriber(server, 77, receiver, None));
         let ack = read_response(&mut client).await.unwrap();
         assert_eq!(ack.request_id, 77);
         assert!(matches!(ack.response, ResponseKind::Subscribed));
@@ -164,7 +192,7 @@ mod tests {
         let (_dir, mut server, mut client) = pair().await;
         subscribe_request(&mut server, &mut client).await;
         let hub = SubscriptionHub::new(4);
-        let task = tokio::spawn(serve_subscriber(server, 77, hub.subscribe()));
+        let task = tokio::spawn(serve_subscriber(server, 77, hub.subscribe(), None));
         assert!(matches!(
             read_response(&mut client).await.unwrap().response,
             ResponseKind::Subscribed
@@ -185,7 +213,7 @@ mod tests {
         for _ in 0..3 {
             hub.publish(event());
         }
-        let task = tokio::spawn(serve_subscriber(server, 77, receiver));
+        let task = tokio::spawn(serve_subscriber(server, 77, receiver, None));
         assert!(matches!(
             read_response(&mut client).await.unwrap().response,
             ResponseKind::Subscribed
@@ -206,5 +234,43 @@ mod tests {
                 .await
                 .is_err()
         );
+    }
+
+    #[tokio::test]
+    async fn a_late_subscriber_is_told_the_current_session_state() {
+        let (_dir, mut server, mut client) = pair().await;
+        subscribe_request(&mut server, &mut client).await;
+        let hub = SubscriptionHub::new(4);
+
+        // Published before anyone is listening, as happens at startup.
+        hub.publish(Event {
+            event: EventKind::Session {
+                state: bloom_domain::SessionState::Active,
+            },
+        });
+        assert!(hub.latest_session().is_some());
+
+        let task = tokio::spawn(serve_subscriber(
+            server,
+            77,
+            hub.subscribe(),
+            hub.latest_session(),
+        ));
+        assert!(matches!(
+            read_response(&mut client).await.unwrap().response,
+            ResponseKind::Subscribed
+        ));
+        let replayed = read_event(&mut client).await.unwrap();
+        assert!(matches!(
+            replayed.event,
+            EventKind::Session {
+                state: bloom_domain::SessionState::Active
+            }
+        ));
+        drop(client);
+        timeout(Duration::from_secs(1), task)
+            .await
+            .unwrap()
+            .unwrap();
     }
 }
