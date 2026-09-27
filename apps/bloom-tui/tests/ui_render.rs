@@ -85,9 +85,11 @@ fn rendered(app: &App) -> String {
 fn layout_matches_the_mockup_structure() {
     let selected = conversation("Weekend crew", 3, 40);
     let other = conversation("Jules Lee", 2, 20);
-    let mut app = App::default();
+    let mut app = App {
+        selected: Some(selected.id.clone()),
+        ..Default::default()
+    };
     app.set_conversations(vec![selected.clone(), other]);
-    app.selected = Some(selected.id.clone());
     app.upsert(
         selected.id.clone(),
         message(
@@ -139,8 +141,10 @@ fn layout_matches_the_mockup_structure() {
 
 #[test]
 fn empty_store_renders_a_usable_screen_rather_than_nothing() {
-    let mut app = App::default();
-    app.connection = "Connecting".into();
+    let app = App {
+        connection: "Connecting".into(),
+        ..Default::default()
+    };
 
     let text = rendered(&app);
 

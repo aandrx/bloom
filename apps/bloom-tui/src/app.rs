@@ -346,9 +346,11 @@ mod tests {
 
     #[test]
     fn normal_messages_still_submit_as_a_single_step() {
-        let mut app = App::default();
-        app.composing = true;
-        app.draft = "hello".into();
+        let mut app = App {
+            composing: true,
+            draft: "hello".into(),
+            ..Default::default()
+        };
         match app.submit_intent() {
             CompositionIntent::SendMessage(body) => assert_eq!(body, "hello"),
             _ => panic!("expected a send intent"),
