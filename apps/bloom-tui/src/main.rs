@@ -145,11 +145,10 @@ async fn main() -> Result<()> {
                     });
                 }
             }
-            Some(result) = send_rx.recv() => {
-                if let Err(error) = result {
-                    app.error = Some(error);
-                }
-            }
+            Some(result) = send_rx.recv() => match result {
+                Ok(()) => app.error = None,
+                Err(error) => app.error = Some(error),
+            },
             Some(key) = key_rx.recv() => {
                 let quit = key.code == KeyCode::Char('q') && !app.composing
                     || key.code == KeyCode::Char('c')

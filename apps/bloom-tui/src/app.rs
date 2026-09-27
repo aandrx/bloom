@@ -219,6 +219,15 @@ impl App {
                 conversation_id,
                 message,
             } => {
+                // A message for a conversation we do not know about means our list is
+                // stale: ask for a refresh rather than caching it invisibly.
+                if !self
+                    .conversations
+                    .iter()
+                    .any(|conversation| conversation.id == conversation_id)
+                {
+                    self.resync_conversations = true;
+                }
                 self.upsert(conversation_id.clone(), message);
                 if let Some(c) = self
                     .conversations
@@ -860,6 +869,33 @@ mod tests {
         app.connection = "Connected".into();
         app.session = "  ".into();
         assert_eq!(status_text(&app), None);
+    }
+
+    #[test]
+    fn a_message_for_an_unknown_conversation_asks_for_a_refresh() {
+        // Sending the first message of a new conversation produces exactly this: the
+        // daemon creates the conversation, but our sidebar has never seen it.
+        let mut app = App::default();
+        let known = conversation("Known", Some(10));
+        app.set_conversations(vec![known.clone()]);
+        app.apply_event(EventKind::Message {
+            conversation_id: known.id.clone(),
+            message: message(&known, "m1", 20, "known thread"),
+        });
+        assert!(
+            !app.resync_conversations,
+            "a known conversation must not force a refresh"
+        );
+
+        let unknown = conversation("Brand new", Some(30));
+        app.apply_event(EventKind::Message {
+            conversation_id: unknown.id.clone(),
+            message: message(&unknown, "m2", 40, "first message"),
+        });
+        assert!(
+            app.resync_conversations,
+            "an unknown conversation must trigger a refresh so it becomes visible"
+        );
     }
 
     #[test]

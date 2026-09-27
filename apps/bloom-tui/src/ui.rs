@@ -346,8 +346,14 @@ pub fn render(frame: &mut Frame<'_>, app: &App) {
     } else {
         "↑↓ · / · Esc"
     };
+    // A failure has to be visible and must say what went wrong; a silent send
+    // failure is worse than an ugly line. It takes the hint row while it lasts.
+    let (footer, footer_style) = match app.error.as_deref() {
+        Some(message) => (message.to_owned(), Style::default().fg(RED)),
+        None => (hints.to_owned(), Style::default().fg(MUTED)),
+    };
     frame.render_widget(
-        Paragraph::new(hints).style(Style::default().fg(MUTED)),
+        Paragraph::new(footer).style(footer_style),
         Rect::new(composer.x, composer.y + 2, composer.width, 1),
     );
 }

@@ -3,7 +3,9 @@
 mod conversations;
 mod ingest;
 mod messages;
-pub use conversations::{get_conversation, list_conversations, upsert_conversation};
+pub use conversations::{
+    get_conversation, list_conversations, merge_conversation, upsert_conversation,
+};
 pub use ingest::{ingest_inbound, ingest_message, update_delivery};
 pub use messages::{get_message, history, upsert_message, MessageUpsertOutcome};
 

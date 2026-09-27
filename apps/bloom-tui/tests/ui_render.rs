@@ -426,3 +426,18 @@ fn speaker_names_and_timestamps_align_into_columns() {
         "timestamps must share a column, found {time_columns:?} in {header_rows:?}"
     );
 }
+
+#[test]
+fn a_send_failure_is_visible_rather_than_silent() {
+    let mut app = App::default();
+    app.set_conversations(vec![conversation("Weekend crew", 2, 10)]);
+    app.connection = "Connected".into();
+    app.session = "Active".into();
+    app.error = Some("send failed: transport unavailable".to_owned());
+
+    let text = rendered(&app);
+    assert!(
+        text.contains("send failed"),
+        "an error must be shown somewhere visible:\n{text}"
+    );
+}

@@ -83,7 +83,9 @@ impl Service {
             }
             TransportEvent::Conversation { conversation } => {
                 let mut store = self.store.lock().unwrap();
-                store::upsert_conversation(&mut store, conversation)?;
+                // Merge, not overwrite: a listing carries no messages, so it must not
+                // reset the summary that ingestion maintains.
+                store::merge_conversation(&mut store, conversation)?;
                 Ok(false)
             }
             TransportEvent::ConversationsChanged => {
