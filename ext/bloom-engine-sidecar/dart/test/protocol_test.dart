@@ -91,6 +91,7 @@ void main() {
           payload: <String, Object?>{'variant': 'iMessage', 'complete': true},
         ),
         sendConfirmFrame(requestId: 1, messageId: 'm', accepted: true),
+        shutdownAckFrame(requestId: 2),
         sessionFrame(state: 'active'),
         errorFrame(code: ProtocolCodes.sendFailed, retryable: true),
       ]) {
@@ -123,6 +124,13 @@ void main() {
       expect(frame['request_id'], 42);
       expect(frame['accepted'], isFalse);
       expect(frame['error'], 'not delivered');
+    });
+
+    test('shutdown is acknowledged distinctly from a send', () {
+      final frame = decodeFrame(shutdownAckFrame(requestId: 9));
+      expect(frame['type'], 'shutdown_ack');
+      expect(frame['request_id'], 9);
+      expect(frame.containsKey('message_id'), isFalse);
     });
 
     test('error frames omit absent request ids rather than sending null', () {

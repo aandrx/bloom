@@ -241,11 +241,7 @@ Future<void> _handleCommand({
 
   switch (command) {
     case ShutdownCommand():
-      stdout.writeln(sendConfirmFrame(
-        requestId: command.requestId,
-        messageId: '',
-        accepted: true,
-      ));
+      stdout.writeln(shutdownAckFrame(requestId: command.requestId));
       stop();
     case SendCommand():
       try {

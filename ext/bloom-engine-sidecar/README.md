@@ -45,6 +45,7 @@ Sidecar to daemon:
 - `ready` - emitted once after restore, with `engine_version` and `capabilities`
 - `inbound_message` - `sequence` plus the encoded engine payload
 - `send_confirmation` - `request_id`, `message_id`, `accepted`, optional `error`
+- `shutdown_ack` - `request_id`
 - `session_state` - `state` plus an optional `reason`
 - `error` - bounded `code`, `retryable`, optional `request_id`
 
@@ -59,5 +60,9 @@ Implemented and covered by offline tests: encoder, protocol, configuration guard
 Not yet implemented: daemon integration, writing into Bloom's encrypted store, and
 reading pre-existing OpenBubbles history (which lives in the app's Dart ObjectBox
 database, not in the engine).
+
+The engine re-delivers queued pushes across runs. A live 25 second run produced 37
+inbound frames but only 32 distinct message ids, so consumers must deduplicate by
+message id. Bloom's store already upserts by message id and reports `Unchanged`.
 
 Tests never load the engine and never touch account state.

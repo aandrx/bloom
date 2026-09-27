@@ -157,6 +157,12 @@ String sendConfirmFrame({
       if (error != null) 'error': error,
     });
 
+/// Acknowledgement that the sidecar has begun shutting down.
+String shutdownAckFrame({required int requestId}) => _frame(<String, Object?>{
+      'type': 'shutdown_ack',
+      'request_id': requestId,
+    });
+
 /// Engine session/registration state change.
 String sessionFrame({required String state, String? reason}) =>
     _frame(<String, Object?>{
