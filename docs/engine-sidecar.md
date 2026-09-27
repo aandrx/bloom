@@ -48,6 +48,24 @@ Not available: no documented or shipped local IPC, REST, CLI, plugin, or
 server/host mode for an external program. The documented extension API is
 Android/AIDL-specific and does not expose conversation history or general send.
 
+## Design consequences from the source mapping
+
+Mapping the public tag's restore path established three facts that shape the plan:
+
+- Chats and message history live in the app's Dart-side ObjectBox database, not in
+  the Rust engine. The chat list comes from `Chat.getChats` and threads load local
+  messages first. A sidecar that drives only the Rust library can restore push and
+  Apple service state and consume incoming messages, but cannot read existing
+  history through those APIs. Reading it requires the app's ObjectBox model and the
+  bundled `libobjectbox.so`, or backfilling from Apple.
+- The aggregate restore is not read-only. It rewrites `hw_info.plist` and
+  `id.plist`, opens the push connection, and constructs CloudKit with a hard
+  expectation that can panic on invalid state. It is the same sequence the app runs
+  at every launch.
+- `bluebubbles.lck` is a Dart-side app-instance marker, not a Rust state lock. The
+  engine does not enforce exclusive access, so one owner at a time is a rule we
+  impose, not one the engine guarantees.
+
 ## Approach
 
 1. A small Dart program (`bloom-engine`) loads the installed engine library with
@@ -92,16 +110,25 @@ Phase 1, no account state, no credentials: **PASSED.**
 3. Verified engine artifact: `librust_lib_bluebubbles.so`, 33,912,920 bytes,
    SHA-256 `67d91b7024ed94bcd0b2cb3b1bb295cc518065c43afd329b4fe71b8dfbcac7a3`.
 
-Phase 2, restored state, read-only, user authorized:
+Phase 2a, restored state, read-only, user authorized: **PASSED.**
 
-3. Restore the existing state, connect, and list conversations and history without
-   registering or sending anything. Nothing changes at Apple in this step.
+3. The harness at `~/.cache/bloom-engine-spike/bin/state_probe.dart` read the
+   user's existing state through `readHardware` and `restoreUsers` only, and
+   reported presence, variant types and a user count. No identifiers, handles or
+   key material are printed.
+4. Verified inert: a size and mtime snapshot of every file in the state directory
+   was identical before and after the probe, with 25 files unchanged.
+
+Phase 2b, live engine restore and bounded receive window, user authorized:
+
+5. Restore the engine, poll for a bounded window, and durably append anything
+   received so no message is silently consumed and lost. No sends.
 
 Phase 3, first write, user authorized:
 
-4. Send one outbound message and confirm delivery.
-5. Restart the sidecar and confirm inbound messages still arrive.
-6. Confirm renewal behavior after the scheduled re-registration.
+6. Send one outbound message and confirm delivery.
+7. Restart the sidecar and confirm inbound messages still arrive.
+8. Confirm renewal behavior after the scheduled re-registration.
 
 Phase 3, integration:
 
