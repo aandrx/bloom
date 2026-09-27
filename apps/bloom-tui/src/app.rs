@@ -333,11 +333,11 @@ pub fn timestamp(created_at: i64) -> String {
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs() as i64;
-    let local = unsafe { libc::localtime_r(&seconds, &mut std::mem::zeroed()) };
+    let mut tm = unsafe { std::mem::zeroed() };
+    let local = unsafe { libc::localtime_r(&seconds, &mut tm) };
     if local.is_null() {
         return "--:--".into();
     }
-    let tm = unsafe { *local };
     format!("{:02}:{:02}", tm.tm_hour, tm.tm_min)
 }
 
@@ -495,6 +495,11 @@ mod tests {
         assert_eq!(participant_count(3), "3 people");
         assert_eq!(timestamp(0).len(), 5);
         assert!(timestamp(0).contains(':'));
+        for value in [0, i64::MAX, -1] {
+            assert_eq!(timestamp(value).len(), 5);
+        }
+        assert_eq!(timestamp(0), timestamp(0));
+        assert_ne!(timestamp(0), timestamp(60_000));
     }
 
     #[test]

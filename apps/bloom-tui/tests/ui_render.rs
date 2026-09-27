@@ -375,7 +375,7 @@ fn speaker_names_and_timestamps_align_into_columns() {
     app.set_conversations(vec![only.clone()]);
     app.selected = Some(only.id.clone());
     // A short name and a long one: the timestamps must still line up.
-    for (index, sender) in ["a@example.invalid", "bartholomew@example.invalid"]
+    for (index, sender) in ["anna@example.invalid", "bartholomew@example.invalid"]
         .into_iter()
         .enumerate()
     {
@@ -403,23 +403,20 @@ fn speaker_names_and_timestamps_align_into_columns() {
 
     let text = rendered(&app);
     let rows: Vec<&str> = text.lines().collect();
-    // Both message headers must place their timestamp at the same column.
-    let header_rows: Vec<&str> = rows
+    // Locate headers by their derived speaker labels, independent of local clock settings.
+    let expected = bloom_tui::app::timestamp(1_700_000_000_000);
+    let header_rows: Vec<&str> = ["Anna", "Bartholomew"]
         .iter()
-        .copied()
-        .filter(|row| row.contains("17:") || row.contains("18:"))
+        .map(|speaker| {
+            rows.iter()
+                .copied()
+                .find(|row| row.contains(speaker) && row.contains(&expected))
+                .unwrap_or_else(|| panic!("missing header for {speaker} with {expected}: {text}"))
+        })
         .collect();
-    assert!(
-        header_rows.len() >= 2,
-        "expected two message headers, found {header_rows:?}"
-    );
     let time_columns: Vec<usize> = header_rows
         .iter()
-        .map(|row| {
-            row.find(":1")
-                .map(|position| position.saturating_sub(2))
-                .unwrap_or(usize::MAX)
-        })
+        .map(|row| row.find(&expected).unwrap())
         .collect();
     assert!(
         time_columns.windows(2).all(|pair| pair[0] == pair[1]),
