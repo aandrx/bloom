@@ -190,3 +190,23 @@ after each verified milestone; optional bridge tasks do not block local core.
 | Concurrent agents exhaust RAM or the cargo lock | all waves | cap build-running agents at 3 |
 | `chat.db` unreadable on current macOS | B6, B7 | relay is optional; verify before B6 deepens |
 | Interface change after fan-out | all of Wave B | section 2 rule 2; re-freeze explicitly |
+
+## 12. Later work, intentionally not scheduled
+
+### Windowed surface (GPUI)
+
+The shipped client is the terminal UI, and it stays the client until the terminal
+surface reaches parity with Codex, which is itself a ratatui TUI. A windowed
+surface is the eventual target because `design/mockup/index.html` is a desktop app
+and a character grid cannot express sub-cell motion, proportional type or inline
+attachments.
+
+Recommendation: a native window with our own rendering (GPUI), not a native window
+wrapping an embedded terminal. Only the render and input layers change; the
+domain, IPC, daemon, engine sidecar and store are reused unchanged, because the
+UI is already just another client of the daemon's Unix socket.
+
+The full reasoning, the two shapes considered, the migration risks and what would
+be measured before the port is called done are in
+[`gpui-surface.md`](gpui-surface.md). No work on it starts until the terminal
+surface is finished.
