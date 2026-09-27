@@ -30,6 +30,7 @@ fn tail_that_fits(lines: Vec<Line<'_>>, width: u16, height: u16) -> Vec<Line<'_>
         return Vec::new();
     }
     let width = width.max(1) as usize;
+    let height = height as usize;
     let mut used = 0usize;
     let mut start = lines.len();
     for (index, line) in lines.iter().enumerate().rev() {
@@ -38,16 +39,89 @@ fn tail_that_fits(lines: Vec<Line<'_>>, width: u16, height: u16) -> Vec<Line<'_>
             .iter()
             .map(|span| span.content.as_ref())
             .collect();
-        let rows = unicode_width::UnicodeWidthStr::width(text.as_str())
-            .div_ceil(width)
-            .max(1);
-        if used + rows > height as usize {
+        let rows = wrap_text(&text, width).len().max(1);
+        if used + rows > height {
+            // Nothing but blank spacers fits above this line, which means the newest
+            // message is taller than the whole view. Rendering it whole would clip it
+            // from the top and show the start of a long message, or nothing at all
+            // when only the spacers after it fit, so show its final rows instead.
+            if lines[index + 1..]
+                .iter()
+                .all(|line| line.spans.iter().all(|span| span.content.trim().is_empty()))
+            {
+                let mut wrapped = wrap_text(&text, width);
+                let tail = wrapped.split_off(wrapped.len().saturating_sub(height));
+                if !tail.is_empty() {
+                    return tail.into_iter().map(Line::raw).collect();
+                }
+            }
             break;
         }
         used += rows;
         start = index;
     }
     lines.into_iter().skip(start).collect()
+}
+
+/// Wrap text into display rows the way the transcript paragraph does, breaking at
+/// whitespace and splitting a word only when it cannot fit on a row by itself.
+/// The count is what the paragraph will actually occupy, so the tail can be
+/// chosen without clipping the oldest visible line.
+fn wrap_text(text: &str, width: usize) -> Vec<String> {
+    let width = width.max(1);
+    let mut rows: Vec<String> = Vec::new();
+    let mut row = String::new();
+    let mut used = 0usize;
+    for word in text
+        .split_inclusive(char::is_whitespace)
+        .filter(|word| !word.is_empty())
+    {
+        let word_width = unicode_width::UnicodeWidthStr::width(word);
+        if used > 0 && used + word_width > width {
+            rows.push(std::mem::take(&mut row));
+            used = 0;
+        }
+        if word_width > width {
+            for character in word.chars() {
+                let character_width =
+                    unicode_width::UnicodeWidthChar::width(character).unwrap_or(0);
+                if used + character_width > width {
+                    rows.push(std::mem::take(&mut row));
+                    used = 0;
+                }
+                row.push(character);
+                used += character_width;
+            }
+            continue;
+        }
+        row.push_str(word);
+        used += word_width;
+    }
+    if !row.is_empty() || rows.is_empty() {
+        rows.push(row);
+    }
+    rows
+}
+
+fn display_truncate(value: &str, width: usize) -> String {
+    let mut result = String::new();
+    let mut used = 0;
+    for character in value.chars() {
+        let char_width = unicode_width::UnicodeWidthChar::width(character).unwrap_or(0);
+        if used + char_width > width {
+            break;
+        }
+        result.push(character);
+        used += char_width;
+    }
+    result
+}
+
+fn display_pad(value: &str, width: usize) -> String {
+    let mut result = display_truncate(value, width);
+    let used = unicode_width::UnicodeWidthStr::width(result.as_str());
+    result.push_str(&" ".repeat(width.saturating_sub(used)));
+    result
 }
 
 pub fn render(frame: &mut Frame<'_>, app: &App) {
@@ -155,9 +229,10 @@ pub fn render(frame: &mut Frame<'_>, app: &App) {
                 count => format!("{count} MATCHES"),
             }
         };
-        let width = (body[0].width as usize).min(label.chars().count());
+        let width =
+            (body[0].width as usize).min(unicode_width::UnicodeWidthStr::width(label.as_str()));
         frame.render_widget(
-            Paragraph::new(label.chars().take(width).collect::<String>())
+            Paragraph::new(display_truncate(&label, width))
                 .style(Style::default().fg(CYAN).add_modifier(Modifier::BOLD)),
             Rect::new(body[0].x, body[0].y, body[0].width, 1),
         );
@@ -255,9 +330,8 @@ pub fn render(frame: &mut Frame<'_>, app: &App) {
         let speaker_column = messages
             .iter()
             .map(|message| {
-                speaker_label(message, app.selected_conversation())
-                    .chars()
-                    .count()
+                let label = speaker_label(message, app.selected_conversation());
+                unicode_width::UnicodeWidthStr::width(label.as_str())
             })
             .max()
             .unwrap_or(0)
@@ -265,7 +339,7 @@ pub fn render(frame: &mut Frame<'_>, app: &App) {
 
         for message in messages {
             let speaker = speaker_label(message, app.selected_conversation());
-            let padded = format!("{speaker:<speaker_column$}");
+            let padded = display_pad(&speaker, speaker_column);
             lines.push(Line::from(vec![
                 Span::styled(
                     padded,

@@ -74,10 +74,7 @@ fn message(conversation: &Conversation, id: &str, at: i64, text: &str, mine: boo
 }
 
 fn rendered(app: &App) -> String {
-    let backend = TestBackend::new(100, 24);
-    let mut terminal = Terminal::new(backend).unwrap();
-    terminal.draw(|frame| ui::render(frame, app)).unwrap();
-    let buffer = terminal.backend().buffer().clone();
+    let buffer = buffer(app, 100, 24);
     let mut text = String::new();
     for y in 0..buffer.area.height {
         for x in 0..buffer.area.width {
@@ -86,6 +83,30 @@ fn rendered(app: &App) -> String {
         text.push('\n');
     }
     text
+}
+
+/// One buffer row rebuilt from its cells. Wide characters occupy a cell each, so
+/// this is a display view of the row rather than a byte view of what was drawn.
+fn row_text(buffer: &ratatui::buffer::Buffer, y: u16) -> String {
+    (0..buffer.area.width)
+        .map(|x| buffer[(x, y)].symbol())
+        .collect()
+}
+
+/// The display column where `needle` starts on row `y`, matched cell by cell.
+fn column_of(buffer: &ratatui::buffer::Buffer, y: u16, needle: &str) -> Option<u16> {
+    let span = needle.chars().count() as u16;
+    (0..buffer.area.width).find(|x| {
+        let mut candidate = String::new();
+        for offset in 0..span {
+            let index = x + offset;
+            if index >= buffer.area.width {
+                return false;
+            }
+            candidate.push_str(buffer[(index, y)].symbol());
+        }
+        candidate == needle
+    })
 }
 
 #[test]
@@ -298,6 +319,26 @@ fn a_selection_deep_in_a_long_list_is_scrolled_into_view() {
 }
 
 #[test]
+fn an_overheight_message_still_renders_its_tail() {
+    let mut app = App::default();
+    let only = conversation("Long message", 2, 1);
+    app.set_conversations(vec![only.clone()]);
+    app.selected = Some(only.id.clone());
+    app.upsert(
+        only.id.clone(),
+        message(
+            &only,
+            "huge",
+            1_700_000_000_000,
+            &"visible tail ".repeat(500),
+            false,
+        ),
+    );
+    let text = rendered(&app);
+    assert!(text.contains("visible"), "message vanished:\n{text}");
+}
+
+#[test]
 fn a_long_thread_shows_its_newest_messages() {
     let mut app = App::default();
     let only = conversation("Long thread", 2, 1);
@@ -374,10 +415,13 @@ fn speaker_names_and_timestamps_align_into_columns() {
     let only = conversation("Aligned", 2, 10);
     app.set_conversations(vec![only.clone()]);
     app.selected = Some(only.id.clone());
-    // A short name and a long one: the timestamps must still line up.
-    for (index, sender) in ["anna@example.invalid", "bartholomew@example.invalid"]
-        .into_iter()
-        .enumerate()
+    // Wide and over-cap names must still align timestamps without splitting characters.
+    for (index, sender) in [
+        "界界界界界界界界界界",
+        "averyveryverylongname@example.invalid",
+    ]
+    .into_iter()
+    .enumerate()
     {
         let message = Message::new(
             MessageId::new(
@@ -401,26 +445,28 @@ fn speaker_names_and_timestamps_align_into_columns() {
         app.upsert(only.id.clone(), message);
     }
 
-    let text = rendered(&app);
-    let rows: Vec<&str> = text.lines().collect();
-    // Locate headers by their derived speaker labels, independent of local clock settings.
+    let grid = buffer(&app, 100, 24);
     let expected = bloom_tui::app::timestamp(1_700_000_000_000);
-    let header_rows: Vec<&str> = ["Anna", "Bartholomew"]
+    // Compare DISPLAY columns, not byte offsets: a wide character occupies two
+    // cells, so `str::find` on a flattened row reports a misleading index.
+    let columns: Vec<u16> = ["界", "Averyveryver"]
         .iter()
-        .map(|speaker| {
-            rows.iter()
-                .copied()
-                .find(|row| row.contains(speaker) && row.contains(&expected))
-                .unwrap_or_else(|| panic!("missing header for {speaker} with {expected}: {text}"))
+        .map(|label| {
+            (0..grid.area.height)
+                .find_map(|y| {
+                    let text = row_text(&grid, y);
+                    if text.contains(label) && text.contains(&expected) {
+                        column_of(&grid, y, &expected)
+                    } else {
+                        None
+                    }
+                })
+                .unwrap_or_else(|| panic!("no header for {label} in:\n{}", rendered(&app)))
         })
         .collect();
-    let time_columns: Vec<usize> = header_rows
-        .iter()
-        .map(|row| row.find(&expected).unwrap())
-        .collect();
     assert!(
-        time_columns.windows(2).all(|pair| pair[0] == pair[1]),
-        "timestamps must share a column, found {time_columns:?} in {header_rows:?}"
+        columns.windows(2).all(|pair| pair[0] == pair[1]),
+        "timestamps must share a display column, found {columns:?}"
     );
 }
 
