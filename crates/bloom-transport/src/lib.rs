@@ -69,11 +69,11 @@ impl fmt::Debug for SessionReason {
 pub enum TransportEvent {
     ConversationsChanged,
     Message {
-        conversation: ConversationId,
+        conversation: Conversation,
         message: Message,
     },
     MessageUpdated {
-        conversation: ConversationId,
+        conversation: Conversation,
         message: Message,
     },
     DeliveryChanged {

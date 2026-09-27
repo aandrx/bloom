@@ -11,6 +11,66 @@ fn message_id(id: &MessageId) -> Result<String, StoreError> {
     serde_json::to_string(id).map_err(|_| StoreError::Schema)
 }
 
+/// Insert or update one message row inside an existing transaction.
+fn upsert_message_row(
+    tx: &rusqlite::Transaction<'_>,
+    message_key: &str,
+    conversation_key: &str,
+    created_at: i64,
+    data: &[u8],
+) -> Result<MessageUpsertOutcome, StoreError> {
+    let previous: Option<(String, Vec<u8>)> = tx
+        .query_row(
+            "SELECT conversation_id, data FROM messages WHERE id=?1",
+            [message_key],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .optional()?;
+    if previous
+        .as_ref()
+        .is_some_and(|(owner, _)| owner != conversation_key)
+    {
+        return Err(StoreError::MessageConversationMismatch);
+    }
+    Ok(match previous {
+        None => {
+            tx.execute(
+                "INSERT INTO messages(id, conversation_id, created_at, data) VALUES (?1, ?2, ?3, ?4)",
+                params![message_key, conversation_key, created_at, data],
+            )?;
+            MessageUpsertOutcome::Inserted
+        }
+        Some((_, old)) if old == data => MessageUpsertOutcome::Unchanged,
+        Some(_) => {
+            tx.execute(
+                "UPDATE messages SET created_at=?2, data=?3 WHERE id=?1",
+                params![message_key, created_at, data],
+            )?;
+            MessageUpsertOutcome::Updated
+        }
+    })
+}
+
+/// Recompute the conversation summary from its messages and persist it.
+fn refresh_summary(
+    tx: &rusqlite::Transaction<'_>,
+    conversation_key: &str,
+    mut conversation: Conversation,
+) -> Result<(), StoreError> {
+    let summary: Option<i64> = tx.query_row(
+        "SELECT MAX(created_at) FROM messages WHERE conversation_id=?1",
+        [conversation_key],
+        |r| r.get(0),
+    )?;
+    conversation.last_message_at = summary;
+    let encoded = serde_json::to_vec(&conversation).map_err(|_| StoreError::Schema)?;
+    tx.execute(
+        "UPDATE conversations SET last_message_at=?2, data=?3 WHERE id=?1",
+        params![conversation_key, summary, encoded],
+    )?;
+    Ok(())
+}
+
 pub fn ingest_message(
     store: &mut EncryptedStore,
     message: &Message,
@@ -19,56 +79,91 @@ pub fn ingest_message(
     let conversation_id = conversation_id(message.conversation_id())?;
     let data = serde_json::to_vec(message).map_err(|_| StoreError::Schema)?;
     let tx = store._connection.transaction()?;
-    let previous: Option<(String, Vec<u8>)> = tx
-        .query_row(
-            "SELECT conversation_id, data FROM messages WHERE id=?1",
-            [&message_id],
-            |r| Ok((r.get(0)?, r.get(1)?)),
-        )
-        .optional()?;
-    if previous
-        .as_ref()
-        .is_some_and(|(c, _)| c != &conversation_id)
-    {
-        return Err(StoreError::MessageConversationMismatch);
-    }
-    let outcome = match previous {
-        None => {
-            tx.execute("INSERT INTO messages(id, conversation_id, created_at, data) VALUES (?1, ?2, ?3, ?4)", params![message_id, conversation_id, message.created_at, data])?;
-            MessageUpsertOutcome::Inserted
-        }
-        Some((_, old)) if old == data => MessageUpsertOutcome::Unchanged,
-        Some(_) => {
-            tx.execute(
-                "UPDATE messages SET created_at=?2, data=?3 WHERE id=?1",
-                params![message_id, message.created_at, data],
-            )?;
-            MessageUpsertOutcome::Updated
-        }
-    };
-    let summary: Option<i64> = tx.query_row(
-        "SELECT MAX(created_at) FROM messages WHERE conversation_id=?1",
-        [&conversation_id],
-        |r| r.get(0),
+    let outcome = upsert_message_row(
+        &tx,
+        &message_id,
+        &conversation_id,
+        message.created_at,
+        &data,
     )?;
-    let blob: Vec<u8> = tx
+    let blob: Option<Vec<u8>> = tx
         .query_row(
             "SELECT data FROM conversations WHERE id=?1",
             [&conversation_id],
             |r| r.get(0),
         )
-        .optional()?
-        .ok_or(StoreError::Schema)?;
-    let mut conversation: Conversation =
-        serde_json::from_slice(&blob).map_err(|_| StoreError::Schema)?;
-    conversation.last_message_at = summary;
-    let encoded = serde_json::to_vec(&conversation).map_err(|_| StoreError::Schema)?;
-    tx.execute(
-        "UPDATE conversations SET last_message_at=?2, data=?3 WHERE id=?1",
-        params![conversation_id, summary, encoded],
-    )?;
+        .optional()?;
+    let conversation: Conversation =
+        serde_json::from_slice(&blob.ok_or(StoreError::Schema)?).map_err(|_| StoreError::Schema)?;
+    refresh_summary(&tx, &conversation_id, conversation)?;
     tx.commit()?;
     Ok(outcome)
+}
+
+/// Create or update the conversation and ingest its message in ONE transaction.
+///
+/// The engine re-delivers queued pushes, so this must be idempotent: an unchanged
+/// message reports `Unchanged` and must not create a duplicate row or a second
+/// conversation. Returns whether the conversation row was created.
+pub fn ingest_inbound(
+    store: &mut EncryptedStore,
+    conversation: &Conversation,
+    message: &Message,
+) -> Result<(MessageUpsertOutcome, bool), StoreError> {
+    if conversation.id != *message.conversation_id() {
+        return Err(StoreError::MessageConversationMismatch);
+    }
+    let conversation_key = conversation_id(&conversation.id)?;
+    let message_key = message_id(message.id())?;
+    let data = serde_json::to_vec(message).map_err(|_| StoreError::Schema)?;
+    let tx = store._connection.transaction()?;
+
+    let existing_blob: Option<Vec<u8>> = tx
+        .query_row(
+            "SELECT data FROM conversations WHERE id=?1",
+            [&conversation_key],
+            |r| r.get(0),
+        )
+        .optional()?;
+    let created = existing_blob.is_none();
+    let merged = match existing_blob {
+        None => conversation.clone(),
+        Some(blob) => {
+            let existing: Conversation =
+                serde_json::from_slice(&blob).map_err(|_| StoreError::Schema)?;
+            Conversation {
+                created_at: existing.created_at.min(conversation.created_at),
+                title: conversation.title.clone().or(existing.title),
+                participants: if conversation.participants.is_empty() {
+                    existing.participants
+                } else {
+                    conversation.participants.clone()
+                },
+                ..conversation.clone()
+            }
+        }
+    };
+    let encoded = serde_json::to_vec(&merged).map_err(|_| StoreError::Schema)?;
+    tx.execute(
+        "INSERT INTO conversations(id, created_at, last_message_at, data) VALUES (?1, ?2, ?3, ?4)
+         ON CONFLICT(id) DO UPDATE SET created_at=excluded.created_at, last_message_at=excluded.last_message_at, data=excluded.data",
+        params![
+            &conversation_key,
+            merged.created_at,
+            merged.last_message_at,
+            encoded
+        ],
+    )?;
+    let outcome = upsert_message_row(
+        &tx,
+        &message_key,
+        &conversation_key,
+        message.created_at,
+        &data,
+    )?;
+    refresh_summary(&tx, &conversation_key, merged)?;
+    tx.commit()?;
+    Ok((outcome, created))
 }
 
 pub fn update_delivery(

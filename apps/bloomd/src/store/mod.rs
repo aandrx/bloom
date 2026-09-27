@@ -4,7 +4,7 @@ mod conversations;
 mod ingest;
 mod messages;
 pub use conversations::{get_conversation, list_conversations, upsert_conversation};
-pub use ingest::{ingest_message, update_delivery};
+pub use ingest::{ingest_inbound, ingest_message, update_delivery};
 pub use messages::{get_message, history, upsert_message, MessageUpsertOutcome};
 
 use bloom_secrets::{SecretStore, SecretStoreError};
@@ -18,6 +18,33 @@ use zeroize::Zeroize;
 
 const KEY_BYTES: usize = 32;
 const STORE_KEY_NAME: &str = "bloomd.sqlite.v1";
+
+/// Fill a buffer from the OS CSPRNG. Used only to provision a new store key.
+fn generate_key() -> Result<[u8; KEY_BYTES], StoreError> {
+    let mut key = [0u8; KEY_BYTES];
+    #[cfg(unix)]
+    {
+        let mut filled = 0usize;
+        while filled < key.len() {
+            let written = unsafe {
+                libc::getrandom(key[filled..].as_mut_ptr().cast(), key.len() - filled, 0)
+            };
+            if written < 0 {
+                let error = std::io::Error::last_os_error();
+                if error.kind() == std::io::ErrorKind::Interrupted {
+                    continue;
+                }
+                return Err(StoreError::KeySetup);
+            }
+            filled += written as usize;
+        }
+        Ok(key)
+    }
+    #[cfg(not(unix))]
+    {
+        Err(StoreError::UnsupportedPlatform)
+    }
+}
 
 pub enum StoreError {
     Io(std::io::Error),
@@ -93,12 +120,77 @@ impl From<rusqlite::Error> for StoreError {
     }
 }
 
+#[cfg(test)]
+pub(crate) mod tests_support {
+    use bloom_secrets::{SecretStore, SecretStoreError};
+    use std::sync::Mutex;
+
+    /// In-memory secret store so tests never touch the real keychain.
+    #[derive(Default)]
+    pub struct MemorySecrets(Mutex<Vec<(String, Vec<u8>)>>);
+
+    impl MemorySecrets {
+        pub fn is_empty(&self) -> bool {
+            self.0.lock().unwrap().is_empty()
+        }
+
+        pub fn len(&self) -> usize {
+            self.0.lock().unwrap().len()
+        }
+    }
+
+    impl SecretStore for MemorySecrets {
+        fn get(&self, key: &str) -> Result<Option<Vec<u8>>, SecretStoreError> {
+            Ok(self
+                .0
+                .lock()
+                .unwrap()
+                .iter()
+                .find(|(name, _)| name == key)
+                .map(|(_, value)| value.clone()))
+        }
+
+        fn set(&self, key: &str, value: &[u8]) -> Result<(), SecretStoreError> {
+            let mut guard = self.0.lock().unwrap();
+            guard.retain(|(name, _)| name != key);
+            guard.push((key.to_owned(), value.to_vec()));
+            Ok(())
+        }
+    }
+}
+
 pub struct EncryptedStore {
     _connection: Connection,
     path: PathBuf,
 }
 
 impl EncryptedStore {
+    /// Open the store, provisioning a keychain-backed key on first use.
+    ///
+    /// The key never leaves the OS keychain and there is no plaintext fallback: if
+    /// the keychain refuses the write, startup fails rather than using a weaker key.
+    pub fn open_or_create(
+        path: impl AsRef<Path>,
+        secrets: &dyn SecretStore,
+    ) -> Result<Self, StoreError> {
+        match secrets.get(STORE_KEY_NAME).map_err(StoreError::Secret)? {
+            Some(mut key) => {
+                let result = Self::open_with_key(path, &key);
+                key.zeroize();
+                result
+            }
+            None => {
+                let mut key = generate_key()?;
+                let stored = secrets
+                    .set(STORE_KEY_NAME, &key)
+                    .map_err(|_| StoreError::KeySetup);
+                let result = stored.and_then(|()| Self::open_with_key(path, &key));
+                key.zeroize();
+                result
+            }
+        }
+    }
+
     pub fn open(path: impl AsRef<Path>, secrets: &dyn SecretStore) -> Result<Self, StoreError> {
         let mut key = secrets
             .get(STORE_KEY_NAME)
@@ -381,6 +473,35 @@ mod tests {
                 Err(StoreError::UnsafePath)
             ));
         }
+    }
+
+    #[test]
+    fn open_or_create_provisions_a_key_once_and_reuses_it() {
+        use crate::store::tests_support::MemorySecrets;
+
+        let owner = tempfile::tempdir().unwrap();
+        let private = owner.path().join("private");
+        fs::create_dir(&private).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&private, fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        let path = private.join("store.db");
+        let secrets = MemorySecrets::default();
+
+        assert!(secrets.is_empty(), "no key exists before first open");
+        let store = EncryptedStore::open_or_create(&path, &secrets).unwrap();
+        assert_eq!(secrets.len(), 1, "first open provisions exactly one key");
+        drop(store);
+
+        // Reopening reuses the same key, so existing data stays readable.
+        EncryptedStore::open_or_create(&path, &secrets).unwrap();
+        assert_eq!(
+            secrets.len(),
+            1,
+            "reopening must not provision a second key"
+        );
     }
 
     #[test]

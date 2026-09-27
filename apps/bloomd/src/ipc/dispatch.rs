@@ -13,7 +13,7 @@ use super::{
 pub const REQUEST_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
 pub const RESPONSE_WRITE_TIMEOUT: Duration = Duration::from_secs(30);
 
-type HandlerFuture<'a, T> = Pin<Box<dyn Future<Output = Result<T, ProtocolError>> + Send + 'a>>;
+pub type HandlerFuture<'a, T> = Pin<Box<dyn Future<Output = Result<T, ProtocolError>> + Send + 'a>>;
 
 pub trait RequestHandler: Send + Sync {
     fn list_conversations(&self) -> HandlerFuture<'_, Vec<Conversation>>;

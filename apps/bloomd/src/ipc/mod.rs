@@ -4,7 +4,9 @@ mod dispatch;
 mod listener;
 mod subscription;
 
-pub use dispatch::{serve, serve_with_subscriptions, RequestHandler, REQUEST_IDLE_TIMEOUT};
+pub use dispatch::{
+    serve, serve_with_subscriptions, HandlerFuture, RequestHandler, REQUEST_IDLE_TIMEOUT,
+};
 
 pub use subscription::{serve_subscriber, SubscriptionHub, SUBSCRIPTION_WRITE_TIMEOUT};
 
