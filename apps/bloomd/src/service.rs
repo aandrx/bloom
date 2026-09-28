@@ -130,19 +130,22 @@ impl Service {
         &self,
         conversation_id: &ConversationId,
         body: &OutgoingBody,
-    ) -> Result<(String, String, Conversation), ProtocolError> {
+    ) -> Result<(String, Vec<String>, Conversation), ProtocolError> {
         let text = outgoing_text(body).map_err(|_| ProtocolError::Unsupported)?;
         let store = self.store.lock().unwrap();
         let conversation = store::get_conversation(&store, conversation_id)
             .map_err(|_| ProtocolError::Internal)?
             .ok_or(ProtocolError::NotFound)?;
-        let recipient = conversation
+        let recipients: Vec<String> = conversation
             .participants
             .iter()
-            .find(|participant| !participant.is_me)
+            .filter(|participant| !participant.is_me)
             .map(|participant| rust_handle(&participant.handle))
-            .ok_or(ProtocolError::NotFound)?;
-        Ok((text, recipient, conversation))
+            .collect();
+        if recipients.is_empty() {
+            return Err(ProtocolError::NotFound);
+        }
+        Ok((text, recipients, conversation))
     }
 }
 
@@ -269,9 +272,10 @@ impl RequestHandler for Service {
                     }
                 }
             };
+            let recipients = vec![recipient];
             let message_id = self
                 .engine
-                .send_text(&recipient, Some(&conversation.remote_id), &text)
+                .send_text(&recipients, Some(&conversation.remote_id), &text)
                 .await
                 .map_err(map_transport_error)?;
             let (canonical, message) = {
@@ -323,12 +327,12 @@ impl RequestHandler for Service {
         body: OutgoingBody,
     ) -> HandlerFuture<'_, MessageId> {
         Box::pin(async move {
-            let (text, recipient, conversation) =
+            let (text, recipients, conversation) =
                 self.send_blocking_prepare(&conversation_id, &body)?;
 
             let message_id = self
                 .engine
-                .send_text(&recipient, Some(&conversation.remote_id), &text)
+                .send_text(&recipients, Some(&conversation.remote_id), &text)
                 .await
                 .map_err(map_transport_error)?;
 

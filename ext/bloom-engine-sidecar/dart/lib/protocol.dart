@@ -41,13 +41,13 @@ sealed class Command {
 final class SendCommand extends Command {
   const SendCommand({
     required this.requestId,
-    required this.recipient,
+    required this.recipients,
     required this.text,
     this.chatGuid,
   });
 
   final int requestId;
-  final String recipient;
+  final List<String> recipients;
   final String text;
 
   /// When present, the message is threaded into this existing conversation.
@@ -58,6 +58,36 @@ final class ShutdownCommand extends Command {
   const ShutdownCommand({required this.requestId});
 
   final int requestId;
+}
+
+/// Recover only the correlation ID from a rejected send frame.
+///
+/// This lets an older daemon receive a negative send confirmation when paired
+/// with a newer sidecar, rather than waiting for its request timeout.
+int? rejectedSendRequestId(String line) {
+  try {
+    final decoded = jsonDecode(line);
+    if (decoded is Map<String, dynamic> &&
+        decoded['type'] == 'send' &&
+        decoded['request_id'] is int) {
+      return decoded['request_id'] as int;
+    }
+  } catch (_) {
+    // Invalid JSON has no trustworthy request ID.
+  }
+  return null;
+}
+
+/// Create a bounded, correlated reply when rejecting a command frame.
+String rejectedCommandFrame(String line, String code) {
+  final requestId = rejectedSendRequestId(line);
+  if (requestId == null) return errorFrame(code: code);
+  return sendConfirmFrame(
+    requestId: requestId,
+    messageId: '',
+    accepted: false,
+    error: code,
+  );
 }
 
 /// Parse one stdin line. Throws ProtocolException on any malformed input.
@@ -94,23 +124,30 @@ Command decodeCommand(String line) {
   switch (type) {
     case 'send':
       final requestId = decoded['request_id'];
-      final recipient = decoded['recipient'];
+      final recipients = decoded['recipients'];
       final text = decoded['text'];
-      if (requestId is! int || recipient is! String || text is! String) {
+      if (requestId is! int ||
+          recipients is! List ||
+          text is! String ||
+          recipients.any(
+            (value) => value is! String || value.trim().isEmpty,
+          )) {
         throw ProtocolException(
           ProtocolCodes.invalidFrame,
-          'send requires integer request_id, string recipient and string text',
+          'send requires integer request_id, string recipients array and string text',
         );
       }
-      if (recipient.isEmpty) {
+      final normalizedRecipients = recipients.cast<String>();
+      if (normalizedRecipients.isEmpty ||
+          normalizedRecipients.any((value) => value.isEmpty)) {
         throw ProtocolException(
           ProtocolCodes.invalidFrame,
-          'recipient must not be empty',
+          'recipients must not be empty',
         );
       }
       return SendCommand(
         requestId: requestId,
-        recipient: recipient,
+        recipients: List<String>.unmodifiable(normalizedRecipients),
         text: text,
         chatGuid: _optionalChatGuid(decoded),
       );
@@ -159,7 +196,8 @@ String readyFrame({
       'handles': handles,
       'capabilities': <String, Object?>{
         'send': canSend,
-        'history': canReadHistory
+        'history': canReadHistory,
+        'recipient_lists': true,
       },
     });
 

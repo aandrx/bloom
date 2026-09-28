@@ -37,12 +37,13 @@ stderr. Frames larger than 1 MiB are rejected before parsing.
 
 Daemon to sidecar:
 
-- `{"version":1,"type":"send","request_id":N,"recipient":"...","text":"..."}`
+- `{"version":1,"type":"send","request_id":N,"recipients":["..."],"text":"..."}`
+- A single-recipient send also includes the legacy `recipient` scalar for direct-send compatibility. Group sends are only issued when the sidecar advertises `capabilities.recipient_lists: true` in `ready`; an older sidecar therefore cannot silently downgrade a group to one target. A newer sidecar rejects scalar-only requests from an older daemon with a correlated negative send confirmation; update the daemon and sidecar together to enable group sends.
 - `{"version":1,"type":"shutdown","request_id":N}`
 
 Sidecar to daemon:
 
-- `ready` - emitted once after restore, with `engine_version` and `capabilities`
+- `ready` - emitted once after restore, with `engine_version` and `capabilities`; `recipient_lists: true` advertises multi-recipient send support
 - `inbound_message` - `sequence` plus the encoded engine payload
 - `send_confirmation` - `request_id`, `message_id`, `accepted`, optional `error`
 - `shutdown_ack` - `request_id`

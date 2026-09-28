@@ -109,6 +109,8 @@ pub struct Engine {
     started: AtomicBool,
     /// Addresses the account can send from, learned from the sidecar's ready frame.
     my_handles: Arc<Mutex<Vec<String>>>,
+    /// Whether the sidecar advertises multi-recipient send frames.
+    recipient_lists_supported: Arc<AtomicBool>,
 }
 
 impl Engine {
@@ -127,6 +129,7 @@ impl Engine {
             next_request: AtomicU64::new(1),
             started: AtomicBool::new(false),
             my_handles: Arc::new(Mutex::new(Vec::new())),
+            recipient_lists_supported: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -148,12 +151,22 @@ impl Engine {
     /// engine needs a recipient address and the existing chat guid.
     pub async fn send_text(
         &self,
-        recipient: &str,
+        recipients: &[String],
         chat_guid: Option<&str>,
         text: &str,
     ) -> TransportResult<MessageId> {
+        if recipients.is_empty()
+            || recipients
+                .iter()
+                .any(|recipient| recipient.trim().is_empty())
+        {
+            return Err(TransportError::Protocol);
+        }
         if !self.started.load(Ordering::SeqCst) {
             return Err(TransportError::TransportUnavailable);
+        }
+        if recipients.len() > 1 && !self.recipient_lists_supported.load(Ordering::SeqCst) {
+            return Err(TransportError::Unsupported);
         }
         let request_id = self.next_request.fetch_add(1, Ordering::Relaxed);
         let (sender, receiver) = oneshot::channel();
@@ -167,9 +180,14 @@ impl Engine {
             "version": 1,
             "type": "send",
             "request_id": request_id,
-            "recipient": recipient,
+            "recipients": recipients,
             "text": text,
         });
+        // Older sidecars only understand a scalar recipient. Preserve direct sends
+        // while multi-recipient sends require an explicit ready-frame capability.
+        if let [recipient] = recipients {
+            frame["recipient"] = Value::String(recipient.clone());
+        }
         if let Some(guid) = chat_guid {
             frame["chat_guid"] = Value::String(guid.to_owned());
         }
@@ -209,7 +227,8 @@ impl Transport for Engine {
         self.id.clone()
     }
 
-    /// Conservative: only plain text direct messages are supported end to end.
+    /// Generic transport sends remain unsupported because they lack recipient resolution.
+    /// The daemon's store-backed send path separately supports plain-text groups.
     fn capabilities(&self) -> Capabilities {
         Capabilities {
             reactions: false,
@@ -249,7 +268,10 @@ impl Transport for Engine {
         // Hand the only sender to the reader task. If the engine held one, the
         // supervisor's forwarder could never observe the channel closing and
         // shutdown would always report an incomplete drain.
+        self.recipient_lists_supported
+            .store(false, Ordering::SeqCst);
         let my_handles = self.my_handles.clone();
+        let recipient_lists_supported = self.recipient_lists_supported.clone();
         let outgoing = self
             .outgoing
             .lock()
@@ -259,7 +281,15 @@ impl Transport for Engine {
         let pending = self.pending.clone();
         let id = self.id.clone();
         tokio::spawn(async move {
-            read_frames(stdout, outgoing, pending, id, my_handles).await;
+            read_frames(
+                stdout,
+                outgoing,
+                pending,
+                id,
+                my_handles,
+                recipient_lists_supported,
+            )
+            .await;
         });
         Ok(())
     }
@@ -283,6 +313,8 @@ impl Transport for Engine {
             }
         }
         self.started.store(false, Ordering::SeqCst);
+        self.recipient_lists_supported
+            .store(false, Ordering::SeqCst);
         Ok(())
     }
 
@@ -375,6 +407,7 @@ async fn read_frames(
     pending: Arc<Pending>,
     id: TransportId,
     my_handles_store: Arc<Mutex<Vec<String>>>,
+    recipient_lists_supported: Arc<AtomicBool>,
 ) {
     let mut reader = BufReader::new(stdout);
     let mut my_handles: Vec<String> = Vec::new();
@@ -420,6 +453,13 @@ async fn read_frames(
                         .collect();
                     *my_handles_store.lock().unwrap() = my_handles.clone();
                 }
+                let supports_recipient_lists = frame
+                    .get("capabilities")
+                    .and_then(Value::as_object)
+                    .and_then(|capabilities| capabilities.get("recipient_lists"))
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false);
+                recipient_lists_supported.store(supports_recipient_lists, Ordering::SeqCst);
                 if outgoing
                     .send(TransportEvent::Session {
                         state: SessionState::Active,
@@ -831,6 +871,31 @@ mod tests {
         transport_id()
     }
 
+    #[tokio::test]
+    async fn multi_recipient_send_requires_sidecar_capability() {
+        let engine = Engine::new(EngineConfig {
+            dart_executable: PathBuf::new(),
+            script: PathBuf::new(),
+            state_dir: PathBuf::new(),
+            library: PathBuf::new(),
+            sync_chats: false,
+        });
+        engine.started.store(true, Ordering::SeqCst);
+
+        let result = engine
+            .send_text(
+                &[
+                    "mailto:one@example.invalid".to_owned(),
+                    "tel:+15550000002".to_owned(),
+                ],
+                Some("iMessage;-;group"),
+                "group message",
+            )
+            .await;
+        assert!(matches!(result, Err(TransportError::Unsupported)));
+        assert!(engine.pending.waiters.lock().unwrap().is_empty());
+    }
+
     fn payload(sender: &str, text: &str) -> Value {
         json!({
             "variant": "iMessage",
@@ -955,9 +1020,11 @@ mod tests {
             "tel:+15550000002",
             "mailto:me@example.invalid"
         ]);
+        value["inst"]["conversation"]["cv_name"] = json!("Two people");
+        value["inst"]["conversation"]["sender_guid"] = json!("iMessage;-;group");
         let TransportEvent::Message {
-            conversation: _conversation,
-            ..
+            conversation,
+            message,
         } = map_inbound(
             &value,
             &["mailto:me@example.invalid".to_owned()],
@@ -967,6 +1034,36 @@ mod tests {
         else {
             panic!("expected a message event");
         };
+        assert_eq!(conversation.id.value(), "iMessage;-;group");
+        assert_eq!(conversation.remote_id, "iMessage;-;group");
+        assert_eq!(conversation.kind, ConversationKind::Group);
+        assert_eq!(conversation.title.as_deref(), Some("Two people"));
+        assert_eq!(conversation.participants.len(), 3);
+        assert_eq!(
+            conversation
+                .participants
+                .iter()
+                .filter(|participant| participant.is_me)
+                .count(),
+            1
+        );
+        assert!(conversation
+            .participants
+            .iter()
+            .any(|participant| participant.handle.value() == "+15550000001" && !participant.is_me));
+        assert!(conversation
+            .participants
+            .iter()
+            .any(|participant| participant.handle.value() == "+15550000002" && !participant.is_me));
+        assert!(conversation
+            .participants
+            .iter()
+            .any(
+                |participant| participant.handle.value() == "me@example.invalid"
+                    && participant.is_me
+            ));
+        assert_eq!(message.conversation_id(), &conversation.id);
+        assert_eq!(message.parts(), &[MessagePart::Text("hi".to_owned())]);
     }
 
     #[test]

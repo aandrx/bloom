@@ -16,14 +16,14 @@ void main() {
           'version': protocolVersion,
           'type': 'send',
           'request_id': 7,
-          'recipient': 'someone@example.com',
+          'recipients': ['someone@example.com'],
           'text': 'hello',
         }),
       );
       expect(command, isA<SendCommand>());
       final send = command as SendCommand;
       expect(send.requestId, 7);
-      expect(send.recipient, 'someone@example.com');
+      expect(send.recipients, ['someone@example.com']);
       expect(send.text, 'hello');
     });
 
@@ -33,7 +33,7 @@ void main() {
           'version': protocolVersion,
           'type': 'send',
           'request_id': 8,
-          'recipient': 'someone@example.com',
+          'recipients': ['someone@example.com'],
           'text': 'hi',
           'chat_guid': 'iMessage;-;someone@example.com',
         }),
@@ -49,7 +49,7 @@ void main() {
             'version': protocolVersion,
             'type': 'send',
             'request_id': 8,
-            'recipient': 'someone@example.com',
+            'recipients': ['someone@example.com'],
             'text': 'hi',
             'chat_guid': 5,
           }),
@@ -75,6 +75,39 @@ void main() {
       expect(command, isA<ShutdownCommand>());
     });
 
+    test('rejects a scalar-only legacy send with a correlated response', () {
+      final frame = decodeFrame(
+        rejectedCommandFrame(
+          jsonEncode(<String, Object?>{
+            'version': protocolVersion,
+            'type': 'send',
+            'request_id': 12,
+            'recipient': 'one@example.invalid',
+            'text': 'hello',
+          }),
+          ProtocolCodes.invalidFrame,
+        ),
+      );
+      expect(frame['type'], 'send_confirmation');
+      expect(frame['request_id'], 12);
+      expect(frame['accepted'], isFalse);
+      expect(frame['message_id'], '');
+      expect(frame['error'], ProtocolCodes.invalidFrame);
+
+      final unrelated = decodeFrame(
+        rejectedCommandFrame(
+          jsonEncode(<String, Object?>{
+            'version': protocolVersion,
+            'type': 'shutdown',
+            'request_id': 12,
+          }),
+          ProtocolCodes.invalidFrame,
+        ),
+      );
+      expect(unrelated['type'], 'error');
+      expect(rejectedSendRequestId('not json'), isNull);
+    });
+
     test('rejects malformed frames with bounded codes', () {
       final cases = <String, String>{
         'not json at all': ProtocolCodes.invalidFrame,
@@ -91,14 +124,28 @@ void main() {
           'version': protocolVersion,
           'type': 'send',
           'request_id': 'seven',
-          'recipient': 'a',
+          'recipients': ['a'],
           'text': 'b',
         }): ProtocolCodes.invalidFrame,
         jsonEncode(<String, Object?>{
           'version': protocolVersion,
           'type': 'send',
           'request_id': 1,
-          'recipient': '',
+          'recipients': [],
+          'text': 'b',
+        }): ProtocolCodes.invalidFrame,
+        jsonEncode(<String, Object?>{
+          'version': protocolVersion,
+          'type': 'send',
+          'request_id': 1,
+          'recipients': [''],
+          'text': 'b',
+        }): ProtocolCodes.invalidFrame,
+        jsonEncode(<String, Object?>{
+          'version': protocolVersion,
+          'type': 'send',
+          'request_id': 1,
+          'recipients': [3],
           'text': 'b',
         }): ProtocolCodes.invalidFrame,
       };
@@ -161,6 +208,7 @@ void main() {
       expect(frame['capabilities'], <String, Object?>{
         'send': true,
         'history': false,
+        'recipient_lists': true,
       });
     });
 

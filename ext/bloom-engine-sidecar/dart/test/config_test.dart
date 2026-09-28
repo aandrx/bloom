@@ -60,18 +60,20 @@ void main() {
     test('matches the recipient scheme when possible', () {
       final handles = <String>['tel:+15550000001', 'mailto:me@example.invalid'];
       expect(
-        sidecar.chooseSender(handles, 'someone@example.com'),
+        sidecar.chooseSender(handles, ['someone@example.com']),
         'mailto:me@example.invalid',
       );
-      expect(sidecar.chooseSender(handles, '+15550000009'), 'tel:+15550000001');
+      expect(
+          sidecar.chooseSender(handles, ['+15550000009']), 'tel:+15550000001');
     });
 
     test('falls back to the first handle and reports no handles', () {
       expect(
-        sidecar.chooseSender(<String>['mailto:only@example.invalid'], '+1555'),
+        sidecar
+            .chooseSender(<String>['mailto:only@example.invalid'], ['+1555']),
         'mailto:only@example.invalid',
       );
-      expect(sidecar.chooseSender(<String>[], 'x@example.com'), isNull);
+      expect(sidecar.chooseSender(<String>[], ['x@example.com']), isNull);
     });
   });
 

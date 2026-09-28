@@ -41,23 +41,73 @@ void main() {
   });
 
   group('chooseSender', () {
-    test('prefers a handle whose scheme matches the recipient', () {
+    test('prefers a handle whose scheme matches a recipient', () {
       final handles = <String>['tel:+15550000000', 'mailto:me@example.invalid'];
       expect(
-        sidecar.chooseSender(handles, 'mailto:person@example.invalid'),
+        sidecar.chooseSender(handles, ['mailto:person@example.invalid']),
         'mailto:me@example.invalid',
       );
-      expect(sidecar.chooseSender(handles, 'tel:+15551111111'),
-          'tel:+15550000000');
+      expect(
+        sidecar.chooseSender(handles, ['tel:+15551111111']),
+        'tel:+15550000000',
+      );
+    });
+
+    test('supports a mixed email and telephone group', () {
+      final handles = <String>['tel:+15550000000', 'mailto:me@example.invalid'];
+      expect(
+        sidecar.chooseSender(
+          handles,
+          ['mailto:person@example.invalid', 'tel:+15551111111'],
+        ),
+        'tel:+15550000000',
+      );
     });
 
     test('falls back to the first account handle', () {
-      expect(sidecar.chooseSender(<String>['tel:+15550000000'], 'mailto:a@b.c'),
-          'tel:+15550000000');
+      expect(
+        sidecar.chooseSender(<String>['tel:+15550000000'], ['mailto:a@b.c']),
+        'tel:+15550000000',
+      );
     });
 
-    test('has no sender without handles', () {
-      expect(sidecar.chooseSender(<String>[], 'mailto:a@b.c'), isNull);
+    test('has no sender without handles or recipients', () {
+      expect(sidecar.chooseSender(<String>[], ['mailto:a@b.c']), isNull);
+      expect(sidecar.chooseSender(['tel:+15550000000'], []), isNull);
+    });
+  });
+
+  group('engine conversation data', () {
+    test('keeps every target, deduplicates sender, and preserves group guid',
+        () {
+      const sender = 'mailto:me@example.invalid';
+      const guid = 'iMessage;-;group-chat-guid';
+      final conversation = sidecar.engineConversationData(
+        recipients: [
+          'mailto:one@example.invalid',
+          'tel:+15550000002',
+          'one@example.invalid',
+          'me@example.invalid',
+        ],
+        sender: sender,
+        chatGuid: guid,
+      );
+      expect(conversation.participants, [
+        'mailto:one@example.invalid',
+        'tel:+15550000002',
+        sender,
+      ]);
+      expect(conversation.senderGuid, guid);
+    });
+
+    test('rejects a recipient set with no remote target', () {
+      expect(
+        () => sidecar.engineConversationData(
+          recipients: ['me@example.invalid'],
+          sender: 'mailto:me@example.invalid',
+        ),
+        throwsArgumentError,
+      );
     });
   });
 }

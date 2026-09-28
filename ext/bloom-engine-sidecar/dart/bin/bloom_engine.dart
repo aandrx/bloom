@@ -109,12 +109,52 @@ String engineHandle(String value) {
   return value.contains('@') ? 'mailto:$value' : 'tel:$value';
 }
 
-/// Pick a sending address whose scheme matches the recipient's.
-String? chooseSender(List<String> handles, String recipient) {
-  if (handles.isEmpty) return null;
-  final scheme = recipient.contains('@') ? 'mailto' : 'tel';
+/// Build the engine's ordered target list, followed by the account sender.
+List<String> engineConversationParticipants({
+  required List<String> recipients,
+  required String sender,
+}) {
+  if (recipients.isEmpty ||
+      recipients.any((recipient) => recipient.trim().isEmpty) ||
+      sender.trim().isEmpty) {
+    throw ArgumentError('recipients and sender must be non-empty');
+  }
+
+  final engineSender = engineHandle(sender);
+  final targets = <String>{};
+  for (final recipient in recipients) {
+    final target = engineHandle(recipient);
+    if (target != engineSender) targets.add(target);
+  }
+  if (targets.isEmpty) {
+    throw ArgumentError('at least one recipient must differ from the sender');
+  }
+  return <String>[...targets, engineSender];
+}
+
+/// Create the exact conversation passed to `api.newMsg`, preserving group IDs.
+api.ConversationData engineConversationData({
+  required List<String> recipients,
+  required String sender,
+  String? chatGuid,
+}) =>
+    api.ConversationData(
+      participants: engineConversationParticipants(
+        recipients: recipients,
+        sender: sender,
+      ),
+      cvName: null,
+      senderGuid: chatGuid ?? _uuid4(),
+      afterGuid: null,
+    );
+
+/// Pick a sending address whose scheme matches any recipient's.
+String? chooseSender(List<String> handles, List<String> recipients) {
+  if (handles.isEmpty || recipients.isEmpty) return null;
+  final schemes =
+      recipients.map((value) => engineHandle(value).split(':').first).toSet();
   for (final handle in handles) {
-    if (handle.startsWith('$scheme:')) return handle;
+    if (schemes.contains(handle.split(':').first)) return handle;
   }
   return handles.first;
 }
@@ -126,20 +166,19 @@ String? chooseSender(List<String> handles, String recipient) {
 /// `target` null and the engine then rejects the send with
 /// "No valid IDS targets for message".
 Future<api.MessageInst> buildMessage({
-  required String recipient,
+  required List<String> recipients,
   required String sender,
   required String text,
   String? chatGuid,
 }) {
-  final target = engineHandle(recipient);
+  final engineSender = engineHandle(sender);
   return api.newMsg(
-    conversation: api.ConversationData(
-      participants: <String>[target, sender],
-      cvName: null,
-      senderGuid: chatGuid ?? _uuid4(),
-      afterGuid: null,
+    conversation: engineConversationData(
+      recipients: recipients,
+      sender: engineSender,
+      chatGuid: chatGuid,
     ),
-    sender: sender,
+    sender: engineSender,
     message: api.Message.message(
       api.NormalMessage(
         parts: api.MessageParts(
@@ -382,7 +421,7 @@ Future<void> _handleCommand({
     command = decodeCommand(line);
   } on ProtocolException catch (error) {
     stderr.writeln('rejected command: ${error.code}');
-    stdout.writeln(errorFrame(code: error.code));
+    stdout.writeln(rejectedCommandFrame(line, error.code));
     return;
   }
 
@@ -394,7 +433,7 @@ Future<void> _handleCommand({
       String? messageId;
       try {
         final handles = await api.getHandles(state: deskState.client);
-        final sender = chooseSender(handles, command.recipient);
+        final sender = chooseSender(handles, command.recipients);
         if (sender == null) {
           stdout.writeln(
             errorFrame(
@@ -405,7 +444,7 @@ Future<void> _handleCommand({
           return;
         }
         final inst = await buildMessage(
-          recipient: command.recipient,
+          recipients: command.recipients,
           sender: sender,
           text: command.text,
           chatGuid: command.chatGuid,

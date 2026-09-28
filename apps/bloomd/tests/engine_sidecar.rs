@@ -39,12 +39,14 @@ fn fake_sidecar(dir: &std::path::Path) -> PathBuf {
     let script = r#"#!/bin/sh
 # Ignores its arguments; speaks the sidecar protocol on stdio.
 cat <<'FRAMES'
-{"version":1,"type":"ready","engine_version":"fake","handles":["mailto:me@example.invalid"],"capabilities":{"send":true,"history":false}}
+{"version":1,"type":"ready","engine_version":"fake","handles":["mailto:me@example.invalid"],"capabilities":{"send":true,"history":false,"recipient_lists":true}}
 {"version":1,"type":"inbound_message","sequence":1,"payload":{"variant":"iMessage","complete":true,"inst":{"id":"inbound-1","sender":"tel:+15550000001","conversation":{"participants":["tel:+15550000001","mailto:me@example.invalid"],"cv_name":null,"sender_guid":"iMessage;-;+15550000001","after_guid":null},"message":{"type":"normal","complete":true,"value":{"parts":[{"idx":0,"part":{"type":"text","text":"first"}}],"service":{"type":"iMessage","complete":true}}},"sent_timestamp_ms":1700000000000,"send_delivered":false,"verification_failed":false}}}
+{"version":1,"type":"inbound_message","sequence":2,"payload":{"variant":"iMessage","complete":true,"inst":{"id":"group-inbound-1","sender":"mailto:one@example.invalid","conversation":{"participants":["mailto:one@example.invalid","tel:+15550000002","mailto:me@example.invalid"],"cv_name":"Two people","sender_guid":"iMessage;-;group-with-two-people","after_guid":null},"message":{"type":"normal","complete":true,"value":{"parts":[{"idx":0,"part":{"type":"text","text":"group first"}}],"service":{"type":"iMessage","complete":true}}},"sent_timestamp_ms":1700000000001,"send_delivered":false,"verification_failed":false}}}
 FRAMES
 while IFS= read -r line; do
   case "$line" in
     *'"type":"send"'*)
+      printf '%s\n' "$line" >> "$0.send-log"
       id=$(printf '%s' "$line" | sed -n 's/.*"request_id":\([0-9]*\).*/\1/p')
       printf '{"version":1,"type":"send_confirmation","request_id":%s,"message_id":"outbound-%s","accepted":true}\n' "$id" "$id"
       ;;
@@ -201,6 +203,7 @@ async fn daemon_persists_inbound_and_sends_outbound_through_the_sidecar() {
     fs::create_dir(&private).unwrap();
     fs::set_permissions(&private, fs::Permissions::from_mode(0o700)).unwrap();
     let fake = fake_sidecar(dir.path());
+    let send_log = std::path::PathBuf::from(format!("{}.send-log", fake.display()));
 
     let store = EncryptedStore::open(private.join("store.db"), &TestSecrets).unwrap();
     let store = Arc::new(Mutex::new(store));
@@ -282,6 +285,142 @@ async fn daemon_persists_inbound_and_sends_outbound_through_the_sidecar() {
         assert!(stored.from_me);
         assert_eq!(stored.parts(), &[MessagePart::Text("reply".to_owned())]);
     }
+
+    // Receive the group via the real sidecar path before sending through it.
+    let (group_id, group_message) = tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            let event = subscriber.recv().await.expect("channel open");
+            if let EventKind::Message {
+                conversation_id,
+                message,
+            } = event.event
+            {
+                if conversation_id.value() == "iMessage;-;group-with-two-people" {
+                    return (conversation_id, message);
+                }
+            }
+        }
+    })
+    .await
+    .expect("an inbound group message event arrives");
+    assert_eq!(group_id.value(), "iMessage;-;group-with-two-people");
+    assert_eq!(
+        group_message.parts(),
+        &[MessagePart::Text("group first".to_owned())]
+    );
+
+    // A group send must carry every remote participant, not just the first one.
+    let group = bloom_domain::Conversation {
+        id: bloom_domain::ConversationId::new(
+            conversation_id.transport().clone(),
+            "iMessage;-;group-with-two-people",
+        )
+        .unwrap(),
+        remote_id: "iMessage;-;group-with-two-people".into(),
+        kind: bloom_domain::ConversationKind::Group,
+        title: Some("Two people".into()),
+        participants: vec![
+            bloom_domain::Participant {
+                handle: bloom_domain::Handle::new(
+                    bloom_domain::HandleKind::Email,
+                    "one@example.invalid",
+                )
+                .unwrap(),
+                display_name: None,
+                is_me: false,
+            },
+            bloom_domain::Participant {
+                handle: bloom_domain::Handle::new(bloom_domain::HandleKind::Tel, "+15550000002")
+                    .unwrap(),
+                display_name: None,
+                is_me: false,
+            },
+            bloom_domain::Participant {
+                handle: bloom_domain::Handle::new(
+                    bloom_domain::HandleKind::Email,
+                    "me@example.invalid",
+                )
+                .unwrap(),
+                display_name: None,
+                is_me: true,
+            },
+        ],
+        created_at: 1,
+        last_message_at: None,
+        aliases: Vec::new(),
+        preview: None,
+    };
+    assert_eq!(group.id, group_id);
+    {
+        let guard = store.lock().unwrap();
+        let received = store::get_conversation(&guard, &group_id)
+            .expect("store readable")
+            .expect("inbound group conversation persisted");
+        assert_eq!(received.kind, bloom_domain::ConversationKind::Group);
+        assert_eq!(received.remote_id, group_id.value());
+        assert_eq!(received.participants.len(), 3);
+        assert!(received
+            .participants
+            .iter()
+            .any(|p| p.handle.value() == "one@example.invalid" && !p.is_me));
+        assert!(received
+            .participants
+            .iter()
+            .any(|p| p.handle.value() == "+15550000002" && !p.is_me));
+        assert!(received
+            .participants
+            .iter()
+            .any(|p| p.handle.value() == "me@example.invalid" && p.is_me));
+        let history = store::history(&guard, &group_id, 10).expect("history readable");
+        assert_eq!(history.len(), 1);
+        assert_eq!(
+            history[0].parts(),
+            &[MessagePart::Text("group first".to_owned())]
+        );
+        assert_eq!(history[0].conversation_id(), &group_id);
+    }
+    assert_eq!(
+        service
+            .send(
+                group.id.clone(),
+                OutgoingBody {
+                    parts: vec![MessagePart::Text("group hello".into())],
+                },
+            )
+            .await
+            .expect("group send succeeds")
+            .value(),
+        "outbound-2"
+    );
+    let frames = fs::read_to_string(send_log)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        frames[0]["recipients"],
+        serde_json::json!(["tel:+15550000001"])
+    );
+    assert_eq!(frames[0]["recipient"], "tel:+15550000001");
+    assert_eq!(frames[0]["chat_guid"], "iMessage;-;+15550000001");
+    assert_eq!(
+        frames[1]["recipients"],
+        serde_json::json!(["mailto:one@example.invalid", "tel:+15550000002"])
+    );
+    assert_eq!(frames[1]["chat_guid"], "iMessage;-;group-with-two-people");
+    assert!(frames[1].get("recipient").is_none());
+    let group_history = store::history(&store.lock().unwrap(), &group.id, 10).unwrap();
+    assert_eq!(group_history.len(), 2);
+    assert_eq!(
+        group_history[0].parts(),
+        &[MessagePart::Text("group first".to_owned())]
+    );
+    assert_eq!(
+        group_history[1].parts(),
+        &[MessagePart::Text("group hello".into())]
+    );
+    assert_eq!(group_history[0].conversation_id(), &group.id);
+    assert_eq!(group_history[1].conversation_id(), &group.id);
 
     // The listing carries a preview of the newest stored message for the sidebar.
     let listed = service
@@ -1001,12 +1140,12 @@ async fn the_daemon_sends_engine_form_recipients_exactly_once_prefixed() {
     assert_eq!(sends.len(), 2, "both sends reached the sidecar: {frames}");
     for frame in sends {
         assert!(
-            frame.contains("\"recipient\":\"mailto:person@example.test\""),
-            "recipient must be engine form with one prefix: {frame}"
+            frame.contains("\"recipients\":[\"mailto:person@example.test\"]"),
+            "recipients must be engine form with one prefix: {frame}"
         );
         assert!(
             !frame.contains("mailto:mailto:"),
-            "recipient must not be double prefixed: {frame}"
+            "recipients must not be double prefixed: {frame}"
         );
     }
 }
