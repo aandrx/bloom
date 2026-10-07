@@ -1,17 +1,22 @@
 # Bloom
 
-Bloom is a keyboard-first messaging concept pairing a calm desktop conversation view with a terminal-oriented transcript.
+Bloom is an experimental keyboard-first terminal messenger using an existing OpenBubbles registration. Text messaging and local stored history are implemented; remote history import, Bloom-owned sign-in, and rich messaging are not.
 
 ## Design reference
 
 The offline, illustrative prototype is at [`design/mockup/index.html`](design/mockup/index.html); preview PNGs are in [`design/previews/`](design/previews/). It is a static reference, not a live service.
 
-For keyboard controls, screen details, and troubleshooting, see the [terminal client guide](docs/tui.md). For what is built, what is verified and what is blocked, see the [status page](docs/status.md).
+**New maintainer or fresh agent:** read [AGENTS.md](AGENTS.md), then the [handoff](docs/handoff.md). The [documentation map](docs/README.md) distinguishes current guides from historical research/plans.
+
+For keyboard controls and troubleshooting, see the [terminal client guide](docs/tui.md). For implemented/partial/missing features and verification boundaries, see [status](docs/status.md). The [system design](docs/system-design.md), [active roadmap](docs/implementation-plan.md), and [latest review](docs/iteration-review.md) explain architecture, next decisions and accepted work.
 
 ## Staged direction
 
-1. Build an auth-first foundation, establishing secure identity and session flows before messaging functionality.
-2. Develop the TUI-first experience around keyboard-led navigation and conversation workflows.
+1. Make the TUI's text-messaging loop safe, observable, and predictable.
+2. Validate engine recovery and historical ingestion before broadening features.
+3. Keep independent registration and desktop mockups separate from working-product claims.
+
+See the [current review and iteration plan](docs/iteration-review.md) for scope and verification.
 
 ## Running it
 
@@ -25,17 +30,54 @@ The launcher finds `dart` on `PATH` or under `~/.cache/dart-sdk/dart-sdk/bin`.
 - **The OpenBubbles Flatpak**, which supplies the engine library and the existing
 engine state.
 
+Resolve the sidecar dependencies once with
+`(cd ext/bloom-engine-sidecar/dart && dart pub get)`.
+
+From a checkout, `./scripts/bloom` invokes Cargo's incremental build,
+starts `bloomd` unless one is already answering on the socket, opens the TUI, and
+stops the daemon it started on exit. Daemon diagnostics go to
+`~/.local/share/bloom/bloomd.log`. Paths are discovered automatically; put
+overrides in a trusted `.env` file at the repository root (`BLOOM_ENGINE_STATE`,
+`BLOOM_ENGINE_LIBRARY`, `BLOOM_ENGINE_SCRIPT`, `BLOOM_DART_EXECUTABLE`,
+`BLOOM_SOCKET_PATH`). Only paths belong there, never secrets: the file is sourced
+as shell.
+
+### Installing the `bloom` command
+
+From the repository root, install the commands and prepare their runtime:
+
 ```sh
-./scripts/bloom
+(cd ext/bloom-engine-sidecar/dart && dart pub get)
+export BLOOM_ENGINE_SCRIPT="$PWD/ext/bloom-engine-sidecar/dart/bin/bloom_engine.dart"
+cargo install --path apps/bloomd
+cargo install --path apps/bloom-tui   # installs both `bloom` and `bloom-tui`
+bloom
 ```
 
-That rebuilds both binaries if their sources changed, starts `bloomd` unless one
-is already answering on the socket, opens the TUI, and stops the daemon it
-started on exit. Daemon diagnostics go to `~/.local/share/bloom/bloomd.log`.
-Paths are discovered automatically; put overrides in a `.env` file next to the
-script (`BLOOM_ENGINE_STATE`, `BLOOM_ENGINE_LIBRARY`, `BLOOM_ENGINE_SCRIPT`,
-`BLOOM_DART_EXECUTABLE`, `BLOOM_SOCKET_PATH`). Only paths belong there, never
-secrets: the file is sourced as shell.
+The second command also installs the `bloom` launcher, which starts `bloomd` when
+nothing is listening on the socket, opens the TUI, and stops only the daemon it
+started. A daemon that is already running is reused and left alone. If another
+TUI reuses this daemon, quitting its owning launcher also disconnects that TUI.
+
+**This is not a standalone distribution yet.** Cargo does not install the Dart
+sidecar, its packages, Dart itself, or the OpenBubbles engine/registration. Keep
+the checkout (including the sidecar's resolved packages), and persist the absolute
+`BLOOM_ENGINE_SCRIPT` setting in your shell configuration. The installed launcher
+does not source the repository's `.env`; export any needed path overrides. Do not
+copy just `bloom_engine.dart`: it imports sibling libraries and generated bindings.
+Linux with the OpenBubbles Flatpak is the documented setup; Windows is not supported.
+
+`cargo install` writes binaries to `$CARGO_HOME/bin` (normally `~/.cargo/bin`). Rustup normally puts that
+directory on `PATH` already, so `bloom` is runnable by name; if the shell reports
+`bloom: command not found`, add it once:
+
+```sh
+export PATH="$HOME/.cargo/bin:$PATH"
+```
+
+Put that line in `~/.bashrc`/`~/.zshrc` to make it permanent. With a custom
+`CARGO_HOME`, use that directory's `bin` instead. Installing to a custom prefix
+(`cargo install --root <dir> ...`) means adding `<dir>/bin` to `PATH` yourself.
 
 **Only one process may own the engine state at a time.** The sidecar loads your
 real registration, so stop the OpenBubbles app before starting Bloom, and check

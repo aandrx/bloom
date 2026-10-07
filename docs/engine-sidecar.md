@@ -1,6 +1,6 @@
 # OpenBubbles engine sidecar
 
-Status: researched, not implemented. Awaiting one decision (see the end).
+**Status: implemented local-engine integration plus historical research/live-run evidence.** The current route reuses the existing OpenBubbles registration. Read [current status](status.md), [handoff](handoff.md), and the [sidecar package guide](../ext/bloom-engine-sidecar/README.md) for present behavior. Recorded live runs below were separately authorized at that time; they are not permission to rerun them and do not validate the latest checkout or renewal.
 
 ## Purpose
 
@@ -15,9 +15,7 @@ would not hold its own Apple registration in this route.
 
 ## Verified evidence
 
-All checks were read-only and used only installed program files. No account state,
-messages, credentials or app data were read, and no Apple authentication was
-attempted.
+The initial program-file research in this section was read-only. Later sections explicitly record separately authorized state probes and live operations; do not apply this section's no-account-access boundary to the entire document.
 
 - Installed app: `app.openbubbles.OpenBubbles` v1.15.0.0, Flathub commit
   `108d51b6972853d7cd61cf1a7063383b4b229f465a1ea6227f76563bff226e7e`.
@@ -72,8 +70,7 @@ Mapping the public tag's restore path established three facts that shape the pla
    matching generated bridge and owns all engine state. `bloomd` claims its IPC
    socket before starting this child, preventing a second daemon from opening the
    same live registration state before discovering the singleton conflict.
-2. It speaks Bloom's existing versioned Unix-socket IPC, so `bloomd`, the TUI and
-   any future GPUI client stay unchanged in shape.
+2. The child speaks version-1 newline-delimited JSON over stdio to `bloomd`. The daemon separately exposes authenticated, length-framed Unix-socket IPC to UI clients; these are two different protocols.
 3. Hardware bootstrap uses the offline `OABS` payload from Mac Hardware Info. The
    hosted `MB` code path and Beeper relay are not used.
 4. Anisette is generated locally. No hosted dependency is introduced.
@@ -196,8 +193,7 @@ Verified so far, all with the Mac off and with the user's real registration:
 - Outbound iMessage sends are accepted, confirmed, and independently observed as
   delivered by the recipient.
 
-So the route works for send and receive. What remains before calling it intended
-behavior is restart/resume, coexistence with the app, and one observed renewal.
+Those historical runs demonstrate that the route could send/receive and restart in that recorded setup. Restart/resume and subsequent app use were recorded above; scheduled renewal and current-checkout live validation remain outstanding. Coexistence never means simultaneous ownership of the same registration.
 
 ## Integration work still to do
 
@@ -244,8 +240,8 @@ behavior is restart/resume, coexistence with the app, and one observed renewal.
     store writes during daemon operation.
 
 The sidecar half of item 18 is done: `ext/bloom-engine-sidecar` holds the packaged
-sidecar with an explicit field-by-field encoder, a versioned stdio protocol, config
-guards, and 34 offline tests, and it was verified live against the real engine
+sidecar with an explicit field-by-field encoder, a versioned stdio protocol and config
+guards. The latest iteration ran 56 offline Dart tests; earlier it was verified live against the real engine
 (ready frame, inbound frames, clean shutdown). The ready frame carries protocol
 version, engine version, send/history capability flags, and the account's handles.
 Handle lookup is best effort: failure is logged, startup continues with an empty
@@ -257,10 +253,9 @@ A fresh Bloom store is empty, so the sidecar also lists the account's existing
 conversations from the engine's iCloud/CloudKit chat sync (`syncChats`), on by
 default and disabled with `--no-sync-chats`. It runs after the `ready` frame and off
 the receive path, paginates with a bounded page and row limit, deduplicates by guid,
-and ends with `history_complete`, which the daemon turns into a single
-`ConversationsChanged` event so clients refresh once rather than once per row.
+and now ends with a correlated `sync_result` (complete/limited/failed), with a daemon persistence barrier before reporting completion. The daemon publishes a conversation refresh. Legacy `history_complete` frame definitions are not evidence of message import.
 
-Verified against the real account: 4 pages, 568 conversations synced,
+Historical authorized account run: 4 pages, 568 conversations synced,
 `limited=false`, no frames skipped, and all 568 served back over the socket. Each
 listing takes tens of seconds, so the UI is usable immediately and fills in when the
 listing finishes. Thread history itself is not imported yet.
@@ -287,8 +282,7 @@ bloomd          # opens the encrypted store, claims the socket, spawns the engin
 bloom-tui       # reads BLOOM_SOCKET_PATH (or BLOOM_SOCKET)
 ```
 
-The store starts empty, so the UI shows conversations only for messages received
-while Bloom is running until history import exists.
+A fresh store can list existing conversation metadata. Its transcripts contain only messages Bloom has stored; older app history is not imported. Run `dart pub get` in the sidecar package first. For the installed `bloom` command and runtime dependency caveats, use [the setup guide](../README.md#running-it). Do not run these real-engine commands without fresh explicit authorization.
 
 ## Verified end to end through the daemon
 
@@ -299,15 +293,15 @@ inbound message received, persisted, and served back through `history` before it
 fanned out. The store key is provisioned into the OS keychain on first run and there
 is no plaintext fallback.
 
-## Open decision
+## State ownership decision
 
-Which state directory the engine uses:
+The current route reuses existing app state. A separate registration is not implemented or authorized by this document.
 
-- **Reuse the existing app state (recommended).** No new Apple sign-in, no new
+- **Reuse the existing app state (implemented route).** No new Apple sign-in, no new
   registration, no new keys; the engine restores the session and registration the
   app already holds. The sidecar must not run concurrently with the app, and the
   engine will read and update that private state directory while it owns it.
-- Fresh dedicated state. No contact with existing app data, but the engine must
+- Fresh dedicated state (unimplemented alternative requiring its own design/authorization). No contact with existing app data, but the engine must
   sign in to Apple again and re-register the same hardware identity, which
   supersedes the current keys for that Apple ID. Only appropriate with a throwaway
   Apple ID, or a hardware code that differs from the one in use.

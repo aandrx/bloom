@@ -1,68 +1,15 @@
+%% Current architecture. See ../system-design.md and ../handoff.md.
 flowchart TB
-    subgraph PROVEN["Already proven on this machine - today"]
-        direction LR
-        P1["OpenBubbles client<br/>send + receive confirmed"]
-        P2["OpenBubbles MacOSConfig<br/>IDS registration confirmed"]
-        P3["OpenBubbles with Mac asleep<br/>send + receive working"]
-    end
-
-    subgraph ONCE["Mac hardware capture - renewal independence not yet proven"]
-        MAC["Hardware payload<br/>local base64, no server"]
-        VALID{{"Local IDS validation generator<br/>public source is a stub - unresolved"}}
-    end
-
-    subgraph SURF["Surfaces - MIT - to build"]
-        direction LR
-        TUI["bloom-tui<br/>ratatui"]
-        GPUI["bloom-gpui<br/>later"]
-    end
-
-    subgraph DAEMON["bloomd - headless daemon - MIT - to build"]
-        IPC["IPC server<br/>unix socket, owner only"]
-        SESS["session state machine<br/>activate / register / renew"]
-        STORE["conversation store<br/>dedupe / history / fanout"]
-        SUP["transport supervisor<br/>capabilities / retry"]
-    end
-
-    TRAIT{{"Transport trait<br/>conversations / history / send / event queue"}}
-
-    DIRECT["bloom-transport-direct<br/>rustpush adapter<br/>SSPL-1.0, never distributed"]
-    RELAY["bloom-transport<br/>RelayTransport - MIT"]
-    BRIDGE["bloom-mac-bridge<br/>fallback only"]
-
-    APPLE["Apple services<br/>IDS identity / APNs / activation"]
-    DB[("SQLite<br/>encrypted at rest")]
-    KC[("OS keychain<br/>store key / identity keys")]
-
-    P1 -.->|"what we replace"| TUI
-
-    MAC --> VALID
-    VALID --> SESS
-    TUI --> IPC
-    GPUI --> IPC
-    IPC --> SESS
-    IPC --> STORE
-    SESS --> SUP
-    SUP --> TRAIT
-    TRAIT -->|"primary - Mac-free if Gate 0 passes"| DIRECT
-    TRAIT -.->|"fallback - Mac awake"| RELAY
-    DIRECT --> APPLE
-    DIRECT --> KC
-    RELAY --> BRIDGE
-    BRIDGE --> APPLE
-    STORE --> DB
-    SESS --> KC
-
-    classDef proven fill:#2ea04333,stroke:#2ea043,stroke-width:2px,color:#c9d1d9
-    classDef build fill:#1f6feb22,stroke:#1f6feb,stroke-width:1.5px,color:#c9d1d9
-    classDef sspl fill:#f8514922,stroke:#f85149,stroke-width:2px,color:#c9d1d9
-    classDef seam fill:#d2992222,stroke:#d29922,stroke-width:2px,color:#c9d1d9
-    classDef data fill:#8957e522,stroke:#8957e5,stroke-width:1.5px,color:#c9d1d9
-    classDef apple fill:#2ea04322,stroke:#2ea043,stroke-width:1.5px,color:#c9d1d9
-
-    class P1,P2,P3 proven
-    class MAC,TUI,GPUI,IPC,SESS,STORE,SUP,RELAY,BRIDGE build
-    class DIRECT sspl
-    class TRAIT,VALID seam
-    class DB,KC data
-    class APPLE apple
+    LAUNCH["Installed bloom launcher"] --> TUI["bloom-tui: terminal interaction"]
+    LAUNCH --> DAEMON["bloomd: owned daemon or reused listener"]
+    TUI <-->|"Authenticated bounded Unix-socket IPC"| DAEMON
+    DAEMON --> STORE[("Encrypted SQLite: conversations and messages")]
+    KEY["OS keychain: database key"] --> STORE
+    DAEMON <-->|"Version-1 JSON lines over stdio"| DART["Headless Dart sidecar: explicit codec and coordination"]
+    DART --> ENGINE["External installed OpenBubbles engine library"]
+    STATE[("Existing registration: exclusive owner")] --> ENGINE
+    ENGINE <-->|"Existing engine transport"| APPLE["Apple services"]
+    GPUI["GPUI: deferred, not implemented"] -.->|"Future IPC client"| DAEMON
+    IDS["Independent registration: Gate 0 blocked"]
+    HISTORY["Remote message import: not implemented"]
+    RESTART["Automatic engine restart: not implemented"]

@@ -3,7 +3,7 @@
 **Status: not started, and deliberately so.** The shipped client is the terminal UI in
 `apps/bloom-tui`. This note records the decision and the recommendations for a future
 windowed surface so the reasoning is not lost, and so nobody starts that work by accident
-mid-polish.
+mid-polish. The active work order is in [implementation-plan.md](implementation-plan.md); this is a future-surface bookmark, not a scheduled implementation.
 
 ## Why a windowed surface is the eventual target
 
@@ -34,14 +34,12 @@ already lives in.
 
 ## What is reused, unchanged
 
-The decision is cheap because the architecture already separates the surface from
-everything else. A GUI client is **another client of the same daemon**:
+The process boundary keeps a new surface independent of the engine/store implementation. A GUI client is **another client of the same daemon**:
 
-- `bloom-domain`, `bloom-ipc`, `bloomd`, the engine sidecar and the encrypted store are
-  unchanged. The daemon listens on a Unix socket and speaks versioned IPC, so the UI is a
+- Reuse the domain, IPC, daemon, sidecar and encrypted-store boundaries. GUI-specific requirements may still require reviewed protocol/domain additions rather than assuming these remain unchanged. The daemon listens on a Unix socket and speaks versioned IPC, so the UI is a
   peer, not a component.
 - Only the render layer and the input layer are replaced: `apps/bloom-tui/src/{ui.rs,main.rs}`
-  and their tests. `app.rs` (state) and `daemon.rs` (client) carry over almost as-is.
+  and their tests. Reuse concepts from `app.rs`/`daemon.rs`, but extract shared state/client logic deliberately; ratatui-specific focus, geometry and command modes are not a drop-in GUI architecture.
 
 ## Recommendations for that work
 
@@ -69,7 +67,5 @@ the design loop keeps working after the port.
 
 ## Related
 
-- `docs/system-design.md` sections 5 to 9 describe the domain, transport, IPC and store
-  that a GUI client would reuse.
-- `docs/implementation-plan.md` sections 4 and 5 hold the crate layout and the
-  verification gates this surface would have to satisfy.
+- `docs/system-design.md` describes the current domain, engine process boundary, IPC and encrypted store a GUI client would reuse.
+- `docs/implementation-plan.md` holds current priorities and universal release gates; obsolete wave ownership tables are no longer active.

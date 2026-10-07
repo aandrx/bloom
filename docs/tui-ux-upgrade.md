@@ -1,12 +1,11 @@
 # TUI UX upgrade: Codex-level interaction
 
-Status: in progress. Target: **8/10** on the Codex-feel critique, where the score
-weighs interaction (UX) at least as heavily as visuals.
+**Status: historical reference and earlier UX plan, not an active work queue.** The listed baseline defects were addressed in later iterations. Read [current user guide](tui.md), [accepted review](iteration-review.md), and [active roadmap](implementation-plan.md). A subjective presentation score does not establish product completeness.
 
 ## Reference
 
 Codex v0.157.1 was captured directly under a PTY (`enter`, then `/`, then `?`).
-What the reference actually does, which Bloom does not:
+The recorded reference's patterns at that time (several are now implemented in Bloom):
 
 - **No outer border.** The whole window is flush to the edges. Only the header
   block has a rounded frame; content starts at column 0.
@@ -19,11 +18,11 @@ What the reference actually does, which Bloom does not:
   dialog and it is not capped to a narrow column.
 - **Scrolling belongs to the transcript.** `pgup`/`pgdn` scroll history; the
   composer keeps focus.
-- **`?` opens a keyboard-shortcut sheet**, `tab` sends, `ctrl+j` is a newline.
+- The reference's shortcuts are not Bloom's contract. Bloom uses `?` for help, Enter to send, Tab to change focus and Ctrl+J for newline; see the current user guide.
 
 Captures: `/tmp/codex-ref-main`, `/tmp/codex-ref-slash`, `/tmp/codex-ref-help`.
 
-## Reported problems
+## Historical reported problems
 
 1. Direct chats render as `Conversation` instead of the recipient.
 2. Transcript bubbles, composer and footer stop short of the pane's right edge.
@@ -44,8 +43,7 @@ Captures: `/tmp/codex-ref-main`, `/tmp/codex-ref-slash`, `/tmp/codex-ref-help`.
 - **Layout.** Drop the outer border and the `MAX_CONTENT_WIDTH` cap. Content
   fills the pane; a single subtle sidebar rule separates the rail.
 - **Focus model.** `Focus::Composer` (default) and `Focus::Sidebar`. `Tab`
-  toggles. Up/Down and the wheel scroll the transcript in composer focus, and
-  move the selection in sidebar focus. `Enter` in sidebar focus opens the chat
+  toggles. In current Bloom, Up/Down first move through wrapped composer lines and scroll at edges; the wheel scrolls its target region. Sidebar focus moves chat selection. `Enter` in sidebar focus opens the chat
   and returns focus to the composer.
 - **Editing.** `Ctrl+W`, `Alt+Backspace`, `Ctrl+U`, `Ctrl+K`, `Ctrl+A`, `Ctrl+E`,
   `Ctrl+Left/Right` and `Alt+Left/Right`. Paste arrives through bracketed paste.
@@ -62,7 +60,7 @@ Captures: `/tmp/codex-ref-main`, `/tmp/codex-ref-slash`, `/tmp/codex-ref-help`.
   `HitMap`; input resolves pointer events against it so hitboxes cannot drift
   from what was drawn.
 
-## Phases
+## Historical phases (do not redispatch)
 
 0. Extend `scripts/tui-shot.py` to drive mouse, wheel, modified keys and key
    releases, so every fix is verifiable end to end.
@@ -77,5 +75,4 @@ Captures: `/tmp/codex-ref-main`, `/tmp/codex-ref-slash`, `/tmp/codex-ref-help`.
 ## Verification
 
 Every phase updates the unit and integration tests and the PTY screenshot set.
-New invariants get guard entries in `scripts/check-guards.manifest`. Each
-iteration is captured and reviewed independently against the Codex reference.
+New invariants get guard entries in `scripts/check-guards.manifest`. Current evidence and review limitations are in `iteration-review.md`; temporary historical reference captures may no longer exist.

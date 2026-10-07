@@ -16,11 +16,15 @@ engine's Flutter Rust Bridge content hash: if the installed engine changes, the
 bindings must be regenerated from the matching tag with
 `dart/tool/refresh_bindings.sh <path-to-tag-checkout>`.
 
-## Running
+## Running (requires explicit authorization for real account state)
 
-```
+From `ext/bloom-engine-sidecar/dart`, resolve packages with `dart pub get`, then:
+
+```sh
 dart run bin/bloom_engine.dart --state <state-dir> --library <engine-library>
 ```
+
+The normal application launches this child through `bloomd`; see the [setup guide](../../README.md#running-it) and [fresh-agent handoff](../../docs/handoff.md). Cargo does not install Dart, this sidecar tree/package dependencies, the engine library, or a registration.
 
 `--state`/`BLOOM_ENGINE_STATE` and `--library`/`BLOOM_ENGINE_LIBRARY` are both
 required; there are no defaults and no personal paths are compiled in.
@@ -39,6 +43,7 @@ Daemon to sidecar:
 
 - `{"version":1,"type":"send","request_id":N,"recipients":["..."],"text":"..."}`
 - A single-recipient send also includes the legacy `recipient` scalar for direct-send compatibility. Group sends are only issued when the sidecar advertises `capabilities.recipient_lists: true` in `ready`; an older sidecar therefore cannot silently downgrade a group to one target. A newer sidecar rejects scalar-only requests from an older daemon with a correlated negative send confirmation; update the daemon and sidecar together to enable group sends.
+- `{"version":1,"type":"sync_conversations","request_id":N}` for conversation metadata, not historical messages
 - `{"version":1,"type":"shutdown","request_id":N}`
 
 Sidecar to daemon:
@@ -47,13 +52,13 @@ Sidecar to daemon:
 - `inbound_message` - `sequence` plus the encoded engine payload
 - `send_confirmation` - `request_id`, `message_id`, `accepted`, optional `error`
 - `shutdown_ack` - `request_id`
-- `conversation` - one imported conversation (`sequence`, `conversation`)
-- `history_message` - one imported historical message (`sequence`, `message`)
-- `history_complete` - `conversations`, `messages`, `limited`
+- `conversation` - one listed conversation's metadata (`sequence`, `conversation`)
+- `sync_result` - correlated metadata result (`request_id`, `status`: complete/limited/failed, `conversations`)
+- `history_message` and `history_complete` - legacy/future protocol definitions; not emitted as a working remote-message import
 - `session_state` - `state` plus an optional `reason`
 - `error` - bounded `code`, `retryable`, optional `request_id`
 
-Errors never carry raw exception text. Payload encoding is explicit, field by
+Protocol error frames never carry raw exception text. Sidecar/engine stderr is a separate diagnostic boundary and may contain external exception details; review it before sharing. Payload encoding is explicit, field by
 field; variants that are not modelled yet are emitted with
 `"complete": false` and an `unsupported` marker naming the variant and the reason,
 so content is never silently replaced by a `toString()` placeholder.
@@ -75,11 +80,11 @@ reports the same files as changed.
 
 ## Status
 
-Implemented and covered by offline tests: encoder, protocol, configuration guards.
-The startup history import frames are defined but not yet produced.
-Not yet implemented: daemon integration, writing into Bloom's encrypted store, and
-reading pre-existing OpenBubbles history (which lives in the app's Dart ObjectBox
-database, not in the engine).
+Implemented: explicit payload codec, versioned commands/results, configuration guards, send coordination, single-flight metadata listing, daemon integration, and daemon-side encrypted persistence before fanout. Latest iteration: 56 offline Dart tests plus fake-sidecar daemon coverage. The child handles EOF/shutdown; malformed output causes daemon-side stream failure and cleanup.
+
+Not implemented: remote/pre-existing message history import and automatic engine-generation restart. Existing app history depends on app-side storage/services; a safe headless read-only import source is not established. `history` capability is false. Listing existing conversations is not importing their messages. Group text is conditional on recipient-list support; no group-management or rich-message workflows.
+
+For current evidence and limits, see [status](../../docs/status.md). Historical live runs below do not validate current-checkout send/receive or renewal.
 
 The engine re-delivers queued pushes across runs. A live 25 second run produced 37
 inbound frames but only 32 distinct message ids, so consumers must deduplicate by

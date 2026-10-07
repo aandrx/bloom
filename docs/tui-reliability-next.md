@@ -1,4 +1,6 @@
-# TUI reliability and interaction follow-up
+# Historical TUI reliability and interaction follow-up
+
+**Status: historical investigation and design constraints, superseded as an active task list.** Use [handoff](handoff.md), [completed iteration](iteration-review.md), and [active roadmap](implementation-plan.md). Reported defects and old checkpoints below describe earlier states, not current outstanding bugs.
 
 ## Baseline and evidence
 
@@ -62,10 +64,9 @@ For each implementation stage:
 
 Scoring must use the user's 6.5 baseline, not declare improvement solely because tests pass. Judge delivery-state honesty, layout consistency, discoverability, keyboard behavior, and contact readability separately. Message loss, accidental resend, misleading send success, or unsafe merging blocks acceptance regardless of visual score.
 
-## Investigation in progress
+## Historical investigation roles
 
-- Researcher: send outcomes, identities, refresh capabilities, safe consolidation, and protocol-level reproduction.
-- Plan agent: UI implementation sites, contact-name model, layout/navigation reproductions, and bounded implementation sequence.
+Those research/planning tasks finished; no agent is still running from this document. Fresh sessions use the current roadmap and inspect Git before assigning new work.
 
 ## Research findings and decisions
 
@@ -103,11 +104,8 @@ Scoring must use the user's 6.5 baseline, not declare improvement solely because
 - The TUI writes private, bounded diagnostics to `tui.log` (no message text,
   recipient identifiers, raw frames, or arbitrary error text) and shows an
   outcome-aware reason instead of a generic "Send failed".
-- Dart CI formatting fix and the Rust guards are verified locally; push and a
-  GitHub rerun are still pending.
-- Still not implemented: durable encrypted send intent with restart-safe
-  reconciliation, an explicit "unknown outcome" send status for the 30-second
-  timeout, duplicate-direct consolidation, the settings overlay, and contacts.
+- Subsequent iterations added settings/contacts overlays, exact direct identity reconciliation, typed uncertain-send recovery, recipient-owned drafts/modal suspension, explicit metadata sync tracking, launcher process tests and broader CI gates. See the iteration review for verified results; Git status, not this historical note, determines push state.
+- Still not implemented: durable encrypted send intents with restart-safe reconciliation, automatic engine recovery and remote historical import. TUI uncertainty labeling is implemented; authoritative recovery of late remote acceptance across restart is not.
 
 Research and synthetic reproduction do not establish the cause of any particular
 live-account incident. The send coordinator removes a confirmed false-failure

@@ -1,5 +1,7 @@
 # Bloom Matrix local proof
 
+**Status: excluded legacy research proof, not Bloom's product transport or next iteration.** Start with [the current handoff](../../docs/handoff.md); do not run this separate Docker stack as the normal Bloom setup.
+
 A provisional local end-to-end encryption proof using the official Rust `matrix-sdk` 0.19.1 and Synapse. It verifies encrypted event delivery and local crypto-store persistence, not key backup or recovery and not production security. Use synthetic accounts only.
 
 Requires Docker Compose, Rust, and curl. From this directory, run the complete isolated proof with `./run-proof.sh`. It creates a fresh ignored `data/`, starts Synapse, provisions synthetic accounts, runs the Rust proof, and always stops Synapse and removes only this spike's `data/` on exit. For manual setup, use `./setup.sh`, then `cargo run`, and finally `./cleanup.sh`.

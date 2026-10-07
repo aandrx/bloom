@@ -1,36 +1,35 @@
+%% Current ordering; remote delivery and renewal require separate evidence.
 sequenceDiagram
     autonumber
     actor U as User
-    participant TUI as bloom-tui
-    participant D as bloomd
-    participant X as Transport
-    participant A as Apple services
-
-    Note over TUI,A: Outbound send
-
-    U->>TUI: type message and press Enter
-    TUI->>D: Send conversation body generation
-    D->>D: persist as Queued
-    D-->>TUI: MessageAccepted id
-    D->>X: send conversation body
-    X->>A: encrypted iMessage
-    A-->>X: delivery receipt
-    X-->>D: DeliveryChanged Delivered
-    D-->>TUI: event delivery updated
-    TUI->>U: transcript shows Delivered
-
-    Note over TUI,A: Inbound receive
-
-    A->>X: APS push
-    X->>X: decrypt and handle
-    X-->>D: Message received
-    D->>D: dedupe then persist
-    D-->>TUI: event Message
-    TUI->>U: render in transcript
-
-    Note over TUI,A: Session loss
-
-    X-->>D: Session RenewalDue
-    D->>D: enter Renewing state
-    D-->>TUI: event Session degraded
-    TUI->>U: show non-blocking warning
+    participant T as bloom-tui
+    participant D as bloomd service
+    participant E as External engine via Dart
+    participant S as Encrypted store
+    Note over T,E: Text send, acceptance is not delivery
+    U->>T: Compose and press Enter
+    T->>D: Send or StartConversation request
+    D->>D: Validate identity, recipients and text
+    D->>E: Correlated text send
+    E-->>D: Accepted message ID or error/uncertain timeout
+    alt Accepted
+        D->>S: Persist outgoing message as Sent
+        D-->>T: Publish message event and return accepted ID
+        T->>T: Correlate attempt/message ID, never guess target
+    else Rejected or uncertain
+        D-->>T: Protocol result
+        T->>U: Preserve draft, uncertain outcome needs manual check
+    end
+    Note over D,E: A persistence failure after acceptance does not undo the remote send
+    Note over T,E: Inbound message
+    E-->>D: Decoded message event
+    D->>S: Idempotent ingest and commit
+    D-->>T: Publish after persistence
+    T->>U: Render stored message
+    Note over T,E: Metadata sync is not remote message import
+    T->>D: SyncConversations request
+    D->>E: Correlated metadata listing
+    E-->>D: Conversation rows then complete/limited/failed
+    D->>S: Await persistence barrier
+    D-->>T: Refresh event and sync receipt
+    Note over T,E: Engine failure reports degraded/disconnected, no automatic generation restart

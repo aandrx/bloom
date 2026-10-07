@@ -1,214 +1,63 @@
-# Bloom - Implementation Plan (subagent-optimized)
+# Implementation roadmap
 
-Companion to `docs/system-design.md`. This document exists so that independent
-subagents can work in parallel without colliding. Read section 2 before touching
-anything.
+**Status: active next-work plan, not completed features.** Replaces the obsolete foundation/direct-transport wave list. Read [handoff](handoff.md), [current design](system-design.md), [status](status.md) and [completed iteration](iteration-review.md) first.
 
-Current project status: [docs/status.md](status.md).
+## Completed foundation
 
-## 1. Measured constraints
+Rust daemon/domain/IPC/secret-store boundary, encrypted persistence, external Dart engine integration, local conversation/message storage, TUI text sends and safe new-chat correlation, known-participant contacts/local preferences, exact direct identity reconciliation, literal multiline paste, recipient-bound session drafts/modal suspension, metadata sync request tracking, neutral responsive UI and installed launcher lifecycle have synthetic regression coverage. Cargo installs commands but not the complete runtime. Current live engine, historical import and renewal remain separate unverified gates.
 
-These are facts about this machine, not preferences.
+## Work order and acceptance
 
-| Constraint | Measurement | Consequence |
-|---|---|---|
-| Cores | 16 | Good for one build at a time |
-| Free RAM | ~8 GB of 27 GB | **Do not run many concurrent `cargo test`** |
-| Cargo target dir | single shared, 17 GB | Concurrent builds **block on the lock** |
-| `/tmp` | tmpfs, 8 GB free | Never put a target dir in `/tmp` |
-| Disk | ~105 GB free | Room for the workspace, not for 10 target dirs |
-| `sccache` / `nextest` | not installed | No shared compilation cache |
+### 1. Generation-scoped engine recovery
 
-**Rule:** parallelize authoring, serialize verification. Ten agents each running
-`cargo test` will thrash memory and queue on the lock. Cap concurrent
-*build-running* agents at 3; authoring-only agents can run 8 or more.
+Problem: TUI reconnects to IPC but a dead engine child is not automatically replaced.
 
-A dedicated target dir per agent is explicitly rejected: a full dep tree is
-several GB, so a handful would exhaust the disk and defeat the shared cache.
+Design before implementation: exclusive registration ownership, generation IDs, fresh event channels, stale-event rejection, bounded backoff, stop/cancellation during restart, and failure presentation. Reap the old child before a new owner starts. Uncertain sends are never automatically replayed.
 
-## 2. Anti-collision rules
+Likely ownership: daemon `engine.rs`, `supervisor.rs`, `session.rs` and service/lifecycle tests. Freeze cross-file contracts before delegation.
 
-1. **One writer per file.** The ownership table in section 4 is binding. If a task
-   needs a file it does not own, it must request a change through the orchestrator.
-2. **Interfaces freeze before fan-out.** Wave A defines every cross-crate type.
-   After that, no interface changes without a coordinating task.
-3. **No agent edits root `Cargo.toml`** except task A1.
-4. **No agent commits or pushes.** The orchestrator runs the full workspace gate
-   and commits per wave.
-5. **Each task carries its own tests.** A task is not done until its own crate's
-   tests and clippy pass.
-6. **Feature-gate, do not delete.** `bloom-core` stays until Phase 2 completes.
+Acceptance: fake-sidecar E2E covers crash, malformed output, delayed old-generation events, repeated failure/backoff, shutdown during backoff, queued persistence, single owner and no duplicate send. Authorized live receive/restart is a separate user-approved release gate.
 
-## 3. Crate layout and license boundary
+### 2. Verified historical ingestion
 
-```
-crates/bloom-domain        MIT        pure types, no I/O
-crates/bloom-secrets       MIT        SecretStore + OsKeyring (extracted from bloom-core)
-crates/bloom-ipc           MIT        wire protocol, framing, auth, client + server types
-crates/bloom-transport     MIT        Transport trait, conformance kit, FakeTransport, RelayTransport
-apps/bloomd                MIT        daemon: ipc, session, supervisor, store
-apps/bloom-tui             MIT        existing UI, rebound onto bloom-ipc
-apps/bloom-gpui            MIT        later
-ext/bloom-transport-direct SSPL-1.0   rustpush adapter - NEVER distributed
-ext/bloom-mac-bridge       MIT        macOS-side fallback bridge
-spike/matrix               excluded   existing Matrix proof
-spike/matrix-core          excluded   bloom-core, moved in Phase 2
-~/.cache/bloom-direct-spike excluded   Phase 0 scratch harness, not shipped
-```
+Do not start by calling generated methods and labeling results history. First verify pinned-engine source semantics for archive availability, pagination/token lifetime, identity, edits/unsend/tombstones and resume/cancellation. ObjectBox app history is not automatically available through the headless engine. Keep unsupported cases explicit.
 
-`ext/bloom-transport-direct` lives in its **own cargo workspace** so it can never
-enter a distributed artifact by accident. `bloomd` depends on it by path behind a
-non-default `direct` feature. A CI check asserts the default build has no
-`rustpush` in its dependency graph.
+If a lawful safe source is established: idempotent page ingestion, live/history deduplication, encrypted checkpoints committed only after durable page acknowledgment, transactional rollback and cancellation/resume. No plaintext archive exports or guessed body/time deduplication.
 
-## 4. Wave A - foundation (serial critical path)
+Acceptance: synthetic pages cover duplicates, out-of-order live overlap, tombstones, partial persistence, invalid cursor, interruption and restart. Authorized live archive comparison must prove completeness before claiming historical sync. If semantics remain unavailable, document the block rather than fabricate import.
 
-Blocks all parallel work. Interfaces defined here are frozen.
+### 3. Daily reading/composition loop
 
-| ID | Scope | Owns | Depends | Verify |
-|---|---|---|---|---|
-| A1 | Workspace scaffolding: crate dirs, stub `lib.rs` with module declarations, manifest per crate, license fields, `direct` feature, CI license check, rustfmt config | root `Cargo.toml`, every new `Cargo.toml`, stub `lib.rs` files | - | `cargo check --workspace` |
-| A2 | `bloom-domain`: all types, serde, invariants, unit tests | `crates/bloom-domain/**` | A1 | `cargo test -p bloom-domain` |
-| A3 | `bloom-ipc` protocol: frame format, version byte, request/response/event enums, socket path, peer-cred handshake, round-trip + version-negotiation tests | `crates/bloom-ipc/**` | A2 | `cargo test -p bloom-ipc` |
-| A4 | `Transport` trait, `Capabilities`, `TransportEvent`, typed error taxonomy | `crates/bloom-transport/src/lib.rs`, `trait.rs`, `error.rs` | A2 | `cargo test -p bloom-transport` |
+- Cursor-based local pagination beyond 200 stored messages, with stable viewport and bounded memory.
+- Local message search and explicit unread/jump-to-latest affordances without stealing a deliberate reading position.
+- A deliberate narrow-screen chat drawer rather than shrinking identities indefinitely.
+- Undo and, only after privacy/retention review, encrypted durable drafts.
+- Consider typed interaction modes to reduce independent flag combinations, but only behind regression coverage for modal transitions, recipient changes, aliases, filters and asynchronous results.
 
-A2 is the true bottleneck; give it the strongest agent. A3 and A4 run in parallel
-after it.
+Acceptance: actual PTY tests for long local histories, new arrivals while reading back, search navigation, drawer/focus/mouse paths, unicode cursor behavior and cancel/recovery ownership. Preserve exact body whitespace and uncertain-send policy.
 
-## 5. Wave B - parallel authoring (target 8 concurrent)
+### 4. Standalone runtime packaging and onboarding
 
-Only 2 or 3 of these run cargo at once; the rest are authoring-dominant.
+Current install requires retained sidecar checkout, resolved Dart packages, Dart and an existing compatible engine/registration. Design portable discovery/version diagnostics and reproducible runtime staging. Do not bundle the external engine or imply Cargo alone installs it. Check licensing/ABI requirements before distribution.
 
-| ID | Scope | Owns | Depends | Verify |
-|---|---|---|---|---|
-| B1 | Extract `SecretStore` + `OsKeyring` from bloom-core; fail-closed tests | `crates/bloom-secrets/**` | A2 | `cargo test -p bloom-secrets` |
-| B2 | Store: SQLite schema, migrations, encrypted-at-rest, CRUD for conversations/messages/parts/reactions | `apps/bloomd/src/store/**` | A2 | `cargo test -p bloomd store::` |
-| B3 | IPC server: listener, socket perms, uid check, dispatch skeleton | `apps/bloomd/src/ipc/**` | A3 | `cargo test -p bloomd ipc::` |
-| B4 | IPC client used by the TUI | `crates/bloom-ipc/src/client.rs` | A3 | `cargo test -p bloom-ipc client::` |
-| B5 | Conformance test kit + `FakeTransport` | `crates/bloom-transport/src/testing.rs`, `conformance.rs` | A4 | `cargo test -p bloom-transport` |
-| B6 | Mac bridge: chat.db tail, AppleScript send, narrow authenticated server | `ext/bloom-mac-bridge/**` | A4 spec | compiles; Mac test deferred |
-| B7 | `RelayTransport` speaking the bridge protocol | `crates/bloom-transport/src/relay.rs` | A4, B5 | conformance kit passes |
-| B8 | TUI event adapter: IPC events to existing `App`, against a fake client | `apps/bloom-tui/src/port.rs` (new file only) | A3, A4 | `cargo test -p bloom-tui port::` |
-| B9 | **Phase 0 spike**: isolated offline decoder, then a locally sourced validation-data provider, headless IDS registration, APS, send, receive | `~/.cache/bloom-direct-spike/**` | - | live send + receive and renewal with Mac off; currently blocked by public OpenAbsinthe stub |
+Acceptance: install into an isolated prefix, hide the source checkout, run from unrelated directories with synthetic engine/registration fixtures, test missing dependencies/version mismatch and safe failure. Verify executable/file permissions, reused-daemon lifecycle and terminal restoration. Bloom-owned sign-in is not part of this packaging step.
 
-B9 is the highest-risk item. The direct adapter depends on it; the local daemon,
-store, IPC, fake transport, and TUI can progress independently while Gate 0 is blocked.
+### 5. Rich messaging and future GUI
 
-### Local integration slices while Gate 0 is blocked
+Attachments, replies/reactions, edits/unsend, typing/read receipts and group management require transport mapping, persistence, IPC and interaction together. Capability declarations are not enough. GPUI remains deferred; [bookmark](gpui-surface.md) records exploration without scheduling it. Independent registration stays blocked by [Gate 0](ids-validation-gate.md).
 
-Freeze shared manifests and module exports with the orchestrator before parallel
-writes. Each row owns distinct implementation files; limit simultaneous cargo
-builds to three using the shared target directory.
+## Universal release gates
 
-| ID | Scope | Owns | Depends | Gate |
-|---|---|---|---|---|
-| L1 | Persist message, delivery, and conversation summary in one transaction | `apps/bloomd/src/store/ingest.rs`, minimal `store/mod.rs` export | B2 | duplicate and rollback tests |
-| L2 | Single-consumer transport lifecycle and supervisor with FakeTransport | `apps/bloomd/src/session.rs`, `supervisor.rs` | B5 | stop/backpressure tests |
-| L3 | Subscription socket with post-persistence event fanout; disconnect slow clients | `apps/bloomd/src/ipc/subscription.rs`, minimal `ipc/mod.rs` export | B3 | event/lag tests |
-| L4 | Route Subscribe from the authenticated dispatcher to L3 | `apps/bloomd/src/ipc/dispatch.rs` | L3 | real socket test |
-| L5 | Subscribe first, then snapshot visible state; reconnect and resnapshot on disconnect | `crates/bloom-ipc/src/client.rs` | L4 | missed-event recovery test |
-| L6 | RequestHandler backed by encrypted store and supervisor; persist before fanout | `apps/bloomd/src/service.rs` | L1-L5 | integration tests |
-| L7 | Runnable daemon, private runtime directory, fail-closed keychain, shutdown | `apps/bloomd/src/main.rs`, `config.rs`, daemon manifest and lib export | L6 | start/stop socket test |
-| L8 | Map domain and IPC events into TUI state against a fake client | new `apps/bloom-tui/src/port.rs` | B4 | adapter tests |
-| L9 | Replace Matrix TUI wiring with Bloom IPC; remove Matrix only after PTY pass | existing TUI source and manifest | L5, L7, L8 | PTY test |
-| L10 | Full local test: fake transport through daemon, encrypted store, IPC and TUI | `apps/bloomd/tests/local_e2e.rs` | L7, L9 | restart/resync test |
+- Workspace all-target tests, timezone TUI tests, strict Clippy, formatting and source guard pass.
+- Owned Dart format/analyze/test gates pass after `dart pub get`; generated bridge is not manually edited.
+- Synthetic fixture, actual TUI PTY input/messaging and actual launcher suites pass against rebuilt binaries.
+- Normal daemon dependency graph contains no `rustpush`; engine library is not vendored; staged files contain no credentials or personal content.
+- User-facing bugs reproduced before fixes; regressions fail for the original defect and pass afterward. Inspect actual UI output and mouse hitboxes, not just snapshots or test counts.
+- Current-account operations require explicit authorization. Synthetic results cannot pass live delivery/history/renewal gates.
+- Update docs/handoff with behavior, limits and evidence. Do not declare complete on partial agent output or stop with known test failures.
 
-L1, L2, L3, and L8 can begin together once their interfaces are settled. L4
-follows L3; L6 follows L1 through L5. The store is authoritative: after a
-subscription reconnect the client resnapshots conversations and the visible
-thread before applying buffered events. No unproven durable event cursor is
-assumed.
+## Delegation and Git policy
 
-## 6. Wave C - direct transport (Gate 0 blocked) and later wiring
+One writer per file, named bounded tasks, parent-owned decisions and visual critique. Serialize build-heavy verification against the shared target directory; do not create multiple full target trees or rely on historical machine RAM/disk numbers. Read-only researchers return source evidence; implementers get exact scope and acceptance; reviewers inspect actual changes. Agent success messages are not verification.
 
-| ID | Scope | Owns | Depends | Verify |
-|---|---|---|---|---|
-| C1 | Direct: activation payload ingest, Apple ID auth, IDS register, keystore persistence | `ext/bloom-transport-direct/src/activation.rs`, `keystore.rs` | B9, A4 | registers against Apple |
-| C2 | Direct: pure mapping between rustpush messages and domain types | `ext/bloom-transport-direct/src/map.rs` | A2 | offline unit tests |
-| C3 | Direct: APS connect and receive loop to `TransportEvent` | `ext/bloom-transport-direct/src/aps.rs` | C1 | live receive, Mac off |
-| C4 | Direct: outbound build, send, delivery-state tracking | `ext/bloom-transport-direct/src/send.rs` | C1 | live send, Mac off |
-| C5 | Daemon: session state machine, renewal, transport supervisor | `apps/bloomd/src/session.rs`, `supervisor.rs` | A4, B5 | tests against FakeTransport |
-| C6 | Daemon: main, config, logging, shutdown wiring | `apps/bloomd/src/main.rs`, `config.rs` | B2, B3, C5 | daemon starts, socket works |
-| C7 | TUI rebind: replace bloom-core usage with the IPC client | `apps/bloom-tui/src/main.rs`, `auth.rs` | B4, B8 | PTY test against FakeTransport |
-
-C5, C6, and C7 are covered by L2, L7, and L9 above; do not dispatch them twice.
-C1-C4 remain blocked by Gate 0. C2 is offline-testable but remains in the
-SSPL-separated adapter and should not be integrated until that boundary is set.
-
-## 7. Wave D - integration and retirement
-
-| ID | Scope | Depends | Verify |
-|---|---|---|---|
-| D1 | End-to-end PTY test through bloomd with FakeTransport | C6, C7 | PTY transcript asserts |
-| D2 | Live iMessage acceptance: send + receive, Mac powered off | C3, C4, C6 | two-way, exact-once |
-| D3 | Retire Matrix: move bloom-core to `spike/matrix-core`, update workspace | C7, D1 | workspace builds |
-| D4 | Reviewer pass on security paths: socket auth, secret handling, no-secret logging | C6, D1 | findings resolved |
-| D5 | Docs: reconcile system-design with shipped reality | D2 | review |
-
-## 8. Gates
-
-- **Gate 0:** See [validation evidence](ids-validation-gate.md). Find a lawful, locally runnable IDS validation-data implementation;
-  then Phase 0 spike must register, send, receive, and renew with the Mac off.
-  Public `OpenAbsinthe-Stub` has `todo!()` in this path. The author's legacy
-  [pypush mechanism](https://jjtech.dev/reverse-engineering/imessage-explained/)
-  emulates an obfuscated Mach-O binary, but a runnable, properly licensed local
-  implementation and renewal behavior are not confirmed. Do not start C1-C4
-  or claim a Mac-free runtime until this is resolved and tested. Local slices
-  L1-L10 do not require Gate 0; C1-C4 do.
-- **Gate 1:** `cargo fmt --all -- --check`, `cargo clippy --workspace --all-targets
-  -- -D warnings`, `cargo test --workspace` all pass on the default feature set.
-- **Gate 2:** the default build's dependency graph contains no `rustpush`.
-- **Gate 3:** no secrets in logs, verified by test.
-- **Gate 4:** live two-way iMessage with the Mac off.
-
-## 9. Review policy
-
-Reviewers are expensive and slow. Use them per wave, not per task:
-
-- After Wave A: one reviewer on the frozen interfaces (highest leverage; a bad
-  interface poisons every parallel task).
-- After Wave B: one reviewer for license boundary and socket auth, one for store.
-- After Wave C: one reviewer for the direct transport, one for daemon wiring.
-- Wave D4 always runs.
-
-Tasks B9, C1, and C3 are correctness- and security-critical: review those
-individually regardless.
-
-## 10. Commit policy
-
-One commit per independently verified foundation or integration milestone after
-the full workspace gate passes. Task-level commits are rejected: they create
-churn and break bisectability. Matrix retirement (D3) is its own commit. Push
-after each verified milestone; optional bridge tasks do not block local core.
-
-## 11. Risks that can invalidate this plan
-
-| Risk | Affects | Mitigation |
-|---|---|---|
-| Public OpenAbsinthe stub cannot generate IDS validation data | B9, C1-C4, D2 | Find and test a lawful local implementation before Gate 0; never substitute a hosted service silently |
-| Apple rejects the tracked legacy FairPlay cert at runtime | C1-C4, D2 | Exercise actual activation in Gate 0; a successful library build is insufficient |
-| Apple throttles or blocks the account | D2 | throwaway Apple ID; relay fallback |
-| rustpush upstream drifts (last commit Apr 2026) | C1-C4 | pin to a commit; vendor the patch |
-| Concurrent agents exhaust RAM or the cargo lock | all waves | cap build-running agents at 3 |
-| `chat.db` unreadable on current macOS | B6, B7 | relay is optional; verify before B6 deepens |
-| Interface change after fan-out | all of Wave B | section 2 rule 2; re-freeze explicitly |
-
-## 12. Later work, intentionally not scheduled
-
-### Windowed surface (GPUI)
-
-The shipped client is the terminal UI, and it stays the client until the terminal
-surface reaches parity with Codex, which is itself a ratatui TUI. A windowed
-surface is the eventual target because `design/mockup/index.html` is a desktop app
-and a character grid cannot express sub-cell motion, proportional type or inline
-attachments.
-
-Recommendation: a native window with our own rendering (GPUI), not a native window
-wrapping an embedded terminal. Only the render and input layers change; the
-domain, IPC, daemon, engine sidecar and store are reused unchanged, because the
-UI is already just another client of the daemon's Unix socket.
-
-The full reasoning, the two shapes considered, the migration risks and what would
-be measured before the port is called done are in
-[`gpui-surface.md`](gpui-surface.md). No work on it starts until the terminal
-surface is finished.
+Before committing, inspect status and diff, exclude secrets/account data/artifacts, run gates, and stage only intended source/docs/test changes. Commit coherent verified milestones without an agent co-author. Push normally to the configured remote when authorized; do not generate SSH keys or force-push. A fresh session checks actual branch status rather than trusting a recorded “pending push” note.

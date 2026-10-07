@@ -1,8 +1,7 @@
 # Direct iMessage validation gate
 
 **State: blocked.** A successful offline build is not proof of independent iMessage
-registration. Bloom has not used real Apple credentials or completed a live send,
-receive, or renewal. The OpenBubbles Flatpak working while the Mac sleeps proves
+registration. Bloom's independent transport has not completed its own registration, live send/receive or renewal. Separately authorized historical runs using an existing OpenBubbles registration do not satisfy this gate. The OpenBubbles Flatpak working while the Mac sleeps proves
 that app's behavior, not Bloom's independent transport.
 
 ## Verified boundary
@@ -37,8 +36,7 @@ that app's behavior, not Bloom's independent transport.
    independent registration, two-way send/receive, restart, and scheduled
    renewal with the Mac off. Verify the results and redacted logs.
 
-Until all three pass, Bloom's local daemon and TUI may progress against the fake
-transport, but direct iMessage must remain disabled and marked unverified.
+Until all three pass, the daemon/TUI may progress against synthetic fixtures and the implemented existing-engine route, but independent direct registration remains blocked and unverified. Live account operations always require fresh authorization.
 
 A separate, narrower route exists for users who accept the installed local
 OpenBubbles app as the engine and want only a different interface. That is not a

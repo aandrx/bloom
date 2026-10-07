@@ -1,26 +1,31 @@
+%% Current single-use Session lifecycle and mapped engine labels, not a sign-in/renewal implementation.
 stateDiagram-v2
-    [*] --> Unregistered
-    Unregistered --> Activating: import Mac hardware info
-    Activating --> Registered: IDS registration accepted
-    Activating --> ActivationFailed: cert rejected or throttled
-    Registered --> Active: APS connected
-    Active --> RenewalDue: renewal window reached
-    RenewalDue --> Renewing
-    Renewing --> Active: renewed
-    Renewing --> Throttled: Apple throttles
-    Renewing --> Blocked: account blocked
-    Throttled --> RenewalDue: backoff elapsed
-    Active --> TransportUnavailable: protocol change breaks client
-    TransportUnavailable --> Active: client updated
-    ActivationFailed --> [*]: fall back to RelayTransport
-    Blocked --> [*]: account unrecoverable
-
-    note right of Active
-        Normal operation.
-        Send and receive both work.
+    state "Daemon Session lifecycle" as Lifecycle {
+        [*] --> New
+        New --> Running: transport start succeeds
+        New --> Stopped: start fails and cleanup runs
+        Running --> Stopped: explicit stop cancels calls and stops transport
+        Stopped --> [*]
+    }
+    note right of Running
+        Child failure reports disconnected.
+        No automatic new generation or send replay.
+        Restart design must construct a fresh Session.
     end note
-
-    note right of TransportUnavailable
-        RelayTransport remains usable,
-        so history stays readable.
+    state "Mapped engine-reported labels" as Reported {
+        Unregistered
+        Activating
+        Registered
+        Active
+        RenewalDue
+        Renewing
+        Throttled
+        Blocked
+        Failed
+        Disconnected
+    }
+    note right of Reported
+        Labels map engine events, not enforced transitions.
+        Unknown labels map to Disconnected.
+        They do not prove Bloom-owned activation or renewal.
     end note
