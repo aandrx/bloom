@@ -9,10 +9,11 @@ use bloom_domain::{
     MessageId, MessagePart, Participant, TransportId,
 };
 use bloom_tui::{
-    app::{App, SendFeedback, SendPhase, Theme},
+    app::{App, Focus, SendFeedback, SendPhase, Theme},
     daemon::ConnectionState,
     ui,
 };
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEventKind};
 use ratatui::{
     backend::{Backend, TestBackend},
     Terminal,
@@ -146,6 +147,7 @@ fn layout_matches_the_mockup_structure() {
         message(&selected, "m2", 1_700_000_060_000, "Yes, 8:40 works.", true),
     );
     app.connection = "Connected".into();
+    app.connection_state = ConnectionState::Connected;
     app.session = "Active".into();
 
     let text = rendered(&app);
@@ -190,7 +192,7 @@ fn layout_matches_the_mockup_structure() {
         "bare composer has no surrounding box: {bottom_rule:?}"
     );
     let hints_row = (prompt_row + 1..30)
-        .find(|y| (0..100).any(|x| symbol(x, *y) == "↑"))
+        .find(|y| row_text(&buffer, *y).contains("Enter send"))
         .expect("footer hint row");
     let hints: String = (0..100).map(|x| symbol(x, hints_row)).collect();
     assert!(
@@ -207,16 +209,15 @@ fn layout_matches_the_mockup_structure() {
         "Yes, 8:40 works.",       // our own message
         "delivered",              // delivery marker
         "Write a message",        // composer placeholder
-        "↑↓ scroll",              // footer hints
+        "Ctrl+J newline",         // reliable multiline shortcut
         "Tab chats",              // sidebar focus shortcut
-        "Dark",                   // current theme in the header
     ] {
         assert!(text.contains(expected), "missing {expected:?} in:\n{text}");
     }
 
     // The hint line matches the mockup and no longer carries connection state.
     let hints_row = (0..30)
-        .find(|y| (0..100).any(|x| symbol(x, *y) == "↑"))
+        .find(|y| row_text(&buffer, *y).contains("Enter send"))
         .expect("the hint line must be drawn");
     let hint_text: String = (0..100).map(|x| symbol(x, hints_row)).collect();
     assert!(
@@ -226,10 +227,9 @@ fn layout_matches_the_mockup_structure() {
 
     // The header status is an outlined chip, so it has side borders on its row.
     let header = row_text(&buffer, 0);
-    let theme_at = header.find(" Dark ").expect("framed theme chip");
-    let controls = &header[theme_at + " Dark ".len()..];
+    let controls = &header;
     assert!(controls.contains('⚙') && controls.contains('?'));
-    assert!(header.contains("● ⠋ Active"));
+    assert!(header.contains("● Active"));
 
     // Pane content extends to its right edge rather than stopping at a fixed cap.
 
@@ -251,7 +251,8 @@ fn layout_matches_the_mockup_structure() {
 #[test]
 fn empty_store_renders_a_usable_screen_rather_than_nothing() {
     let app = App {
-        connection: "Connecting".into(),
+        connection: "Connected".into(),
+        connection_state: ConnectionState::Connected,
         ..Default::default()
     };
 
@@ -270,7 +271,7 @@ fn empty_store_renders_a_usable_screen_rather_than_nothing() {
         "composer still present when empty:\n{text}"
     );
     assert!(
-        text.contains("n start"),
+        text.contains("/new start"),
         "empty-store action is visible:\n{text}"
     );
     assert!(
@@ -380,9 +381,50 @@ fn leader_hint_explains_herdr_style_navigation() {
         ..Default::default()
     };
     let screen = rendered(&app);
-    assert!(screen.contains("h/l chats"), "leader keys:\n{screen}");
+    assert!(screen.contains("n next"), "leader keys:\n{screen}");
+    assert!(screen.contains("Ctrl+P previous"), "leader keys:\n{screen}");
     assert!(screen.contains("j/k scroll"), "leader keys:\n{screen}");
     assert!(screen.contains("Esc cancel"), "leader keys:\n{screen}");
+}
+
+#[test]
+fn shortcut_sheet_documents_new_navigation_and_clear_before_quit() {
+    let app = App {
+        help_open: true,
+        ..Default::default()
+    };
+    let screen = rendered(&app);
+    for hint in [
+        "/new",
+        "/sync",
+        "Ctrl+B n/p",
+        "Ctrl+P",
+        "Ctrl+C",
+        "cursor, chats, or scroll",
+        "toggle composer / chat list",
+    ] {
+        assert!(
+            screen.contains(hint),
+            "shortcut {hint:?} is missing:\n{screen}"
+        );
+    }
+    assert!(
+        screen.contains("clear input; quit when empty"),
+        "clear-before-quit behavior is explicit:\n{screen}"
+    );
+}
+
+#[test]
+fn sync_feedback_is_visible_in_the_composer_footer() {
+    let mut app = App::default();
+    app.finish_sync(Ok((bloom_ipc::ConversationSyncStatus::Complete, 42)));
+    assert!(rendered(&app).contains("Sync complete: 42 conversations listed."));
+
+    app.finish_sync(Ok((bloom_ipc::ConversationSyncStatus::Limited, 12)));
+    assert!(rendered(&app).contains("older chats may be missing."));
+
+    app.finish_sync(Err("Conversation-list sync failed.".into()));
+    assert!(rendered(&app).contains("Conversation-list sync failed."));
 }
 
 #[test]
@@ -404,29 +446,138 @@ fn send_feedback_is_visible_but_delivery_claims_stay_event_driven() {
         ..Default::default()
     };
     let screen = rendered(&accepted);
-    assert!(screen.contains("Message sent."));
+    assert!(screen.contains("New-chat message sent."));
     assert!(!screen.contains("delivered"));
+
+    let chat = conversation("Alice", 2, 1);
+    let scoped = App {
+        selected: Some(chat.id.clone()),
+        send_feedback: Some(SendFeedback {
+            conversation: Some(chat.id),
+            phase: SendPhase::Sent,
+        }),
+        ..Default::default()
+    };
+    assert!(rendered(&scoped).contains("Message sent."));
 }
 
 #[test]
-fn session_status_remains_visible_when_the_theme_control_is_hidden() {
+fn new_message_has_its_own_identity_and_never_shows_the_previous_transcript() {
+    for (width, height) in [(100, 30), (66, 18), (44, 12)] {
+        let old = conversation("Previous private chat", 2, 1);
+        let mut app = App {
+            new_conversation: true,
+            pending_address: Some("carol@example.invalid".into()),
+            ..Default::default()
+        };
+        app.set_conversations(vec![old.clone()]);
+        app.messages.insert(
+            old.id.clone(),
+            vec![message(
+                &old,
+                "old",
+                1,
+                "UNRELATED PRIVATE TRANSCRIPT",
+                false,
+            )],
+        );
+        let screen = buffer(&app, width, height);
+        let header = row_text(&screen, 0);
+        assert!(header.contains("New message"), "{width}: {header}");
+        assert!(
+            row_text(&screen, 1).contains("carol@example.invalid"),
+            "Recipient identity must not be clipped into an ambiguous composer prefix"
+        );
+        let text = (0..height)
+            .map(|y| row_text(&screen, y))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(!text.contains("UNRELATED PRIVATE TRANSCRIPT"));
+    }
+}
+
+#[test]
+fn empty_history_explains_the_local_store_and_never_claims_a_first_message() {
+    let chat = conversation("Existing remote chat", 2, 1);
+    let mut app = App {
+        connection_state: ConnectionState::Connected,
+        ..Default::default()
+    };
+    app.set_conversations(vec![chat]);
+    let screen = rendered(&app);
+    assert!(screen.contains("No stored messages"));
+    assert!(screen.contains("Older history is not imported"));
+    assert!(!screen.contains("first message"));
+}
+
+#[test]
+fn empty_offline_view_prioritizes_connection_recovery() {
+    let app = App {
+        connection_state: ConnectionState::Disconnected,
+        connection: "Disconnected, retrying".into(),
+        ..Default::default()
+    };
+    let screen = rendered(&app);
+    assert!(screen.contains("Daemon unavailable"));
+    assert!(screen.contains("Reconnecting"));
+    assert!(!screen.contains("start a conversation"));
+}
+
+#[test]
+fn syncing_catch_up_shows_a_spinner_and_word_in_the_header() {
     let selected = conversation("Weekend crew", 3, 40);
+    for (width, height) in [(100u16, 30u16), (60, 18)] {
+        let mut app = App {
+            selected: Some(selected.id.clone()),
+            connection: "Connected".into(),
+            connection_state: ConnectionState::Connected,
+            session: "Active".into(),
+            syncing: true,
+            ..Default::default()
+        };
+        app.set_conversations(vec![selected.clone()]);
+        let grid = buffer(&app, width, height);
+        let header = format!("{}\n{}", row_text(&grid, 0), row_text(&grid, 1));
+        assert!(header.contains("Syncing"), "{width}: {header:?}");
+        assert!(
+            !header.contains("Active"),
+            "catch-up replaces the idle session label: {header:?}"
+        );
+        // The braille spinner proves the header is animating, not a static dot.
+        assert!(
+            header
+                .chars()
+                .any(|c| ('\u{2800}'..'\u{2900}').contains(&c)),
+            "a spinner must accompany Syncing: {header:?}"
+        );
+    }
+}
+
+#[test]
+fn long_disconnected_header_keeps_identity_and_status_at_narrow_widths() {
+    let selected = conversation("Long recipient name with 👨‍👩‍👧‍👦 Unicode and address", 3, 40);
     let mut app = App {
         selected: Some(selected.id.clone()),
-        connection: "Connected".into(),
-        connection_state: ConnectionState::Connected,
-        session: "Active".into(),
+        connection: "Disconnected, retrying after network failure".into(),
+        connection_state: ConnectionState::Disconnected,
         ..Default::default()
     };
     app.set_conversations(vec![selected]);
-    let grid = buffer(&app, 40, 12);
-    let header = row_text(&grid, 0);
-    assert!(header.contains("● Active"), "status is visible: {header:?}");
-    assert!(header.contains("Weekend"), "title is retained: {header:?}");
-    assert!(
-        !header.contains("Dark"),
-        "theme control yields space: {header:?}"
-    );
+    for width in [44, 60, 66] {
+        let grid = buffer(&app, width, 18);
+        let rows = (0..grid.area.height)
+            .map(|y| row_text(&grid, y))
+            .collect::<Vec<_>>();
+        assert!(
+            rows[0].contains("Long recipient name"),
+            "identity at {width}: {:?}",
+            rows[0]
+        );
+        assert!(
+            rows.iter().take(2).any(|row| row.contains("Offline")),
+            "failure status at {width}: {rows:?}"
+        );
+    }
 }
 
 #[test]
@@ -459,7 +610,7 @@ fn short_narrow_view_keeps_the_start_of_the_latest_message_visible() {
 }
 
 #[test]
-fn sidebar_people_counts_share_the_name_row_and_align_right() {
+fn sidebar_identity_does_not_disguise_participant_counts_as_unread_badges() {
     let mut app = App::default();
     app.set_conversations(vec![
         conversation("Weekend crew", 3, 40),
@@ -481,42 +632,975 @@ fn sidebar_people_counts_share_the_name_row_and_align_right() {
     let weekend = sidebar_row("Weekend crew");
     let jules = sidebar_row("Jules Lee");
     assert!(weekend.contains("Weekend crew"));
-    assert!(weekend.trim_end().ends_with('3'));
-    assert!(jules.trim_end().ends_with('2'));
-    assert_eq!(
-        weekend[..weekend.rfind('3').unwrap()].chars().count(),
-        jules[..jules.rfind('2').unwrap()].chars().count(),
-        "counter columns differ: {weekend:?} vs {jules:?}"
-    );
+    assert!(weekend.trim_end().ends_with("Weekend crew"));
+    assert!(jules.trim_end().ends_with("Jules Lee"));
 }
 
 #[test]
 fn settings_panel_shows_selected_local_preferences() {
     let app = App {
         settings_open: true,
+        settings_category: 1,
         settings_selection: 1,
         compact_sidebar: true,
+        wrap_composer: false,
         ..Default::default()
     };
     let screen = rendered(&app);
-    assert!(screen.contains("│Settings"), "settings header:\n{screen}");
+    assert!(
+        screen.lines().any(|line| line.contains("│  Settings")),
+        "the picker owns the Settings title:\n{screen}"
+    );
+    assert!(
+        !screen
+            .lines()
+            .next()
+            .unwrap_or_default()
+            .contains("Settings"),
+        "the app header does not duplicate the picker title:\n{screen}"
+    );
+    assert!(screen.contains("Layout"), "layout tab:\n{screen}");
+    assert!(
+        screen.contains("Sidebar density"),
+        "sidebar setting:\n{screen}"
+    );
+    assert!(screen.contains("Compact"), "compact value:\n{screen}");
+    assert!(screen.contains("Wrap composer"), "wrap setting:\n{screen}");
+    assert!(screen.contains("Off"), "wrap value:\n{screen}");
+    assert!(
+        screen.contains("stored locally"),
+        "settings note:\n{screen}"
+    );
+    assert!(screen.contains("Esc close"), "settings help:\n{screen}");
+}
+
+#[test]
+fn settings_picker_uses_measured_geometry_at_100x30() {
+    let selected = conversation("Weekend crew", 2, 10);
+    let mut app = App {
+        settings_open: true,
+        ..Default::default()
+    };
+    app.set_conversations(vec![selected.clone()]);
+    app.selected = Some(selected.id.clone());
+    let backend = TestBackend::new(100, 30);
+    let mut terminal = Terminal::new(backend).unwrap();
+    let mut hits = ui::HitMap::default();
+    terminal
+        .draw(|frame| hits = ui::render(frame, &app))
+        .unwrap();
+
+    let popup = hits.popup.expect("settings panel");
+    assert_eq!(
+        popup.height, 8,
+        "panel measures title, tabs, option, copy and padding"
+    );
+    assert_eq!(
+        popup.y + popup.height,
+        hits.composer.y - 1,
+        "panel meets composer band"
+    );
+    assert!(
+        popup.height < 13,
+        "one-option picker must not keep a tall fixed slab"
+    );
+    let (row, index) = hits.settings_rows[0];
+    assert_eq!(index, 0);
+    assert_eq!(row.x, popup.x, "selection hitbox fills the picker width");
+    assert_eq!(row.width, popup.width);
+    assert_eq!(hits.at(row.x, row.y), Some(ui::Hit::SettingsRow(0)));
+
+    let grid = terminal.backend().buffer();
+    let selected_bg = grid.cell((row.x, row.y)).unwrap().bg;
+    assert_eq!(
+        grid.cell((row.x + 2, row.y)).unwrap().symbol(),
+        "›",
+        "option text has the shared two-cell inset"
+    );
+    let tab = hits.settings_tabs[0].0;
+    assert_ne!(
+        grid.cell((tab.x + 1, tab.y)).unwrap().bg,
+        selected_bg,
+        "category tab is neutral while the option owns the accent"
+    );
+    let text = rendered(&app);
+    let header = text.lines().next().unwrap_or_default();
+    assert!(
+        header.contains("Weekend crew"),
+        "settings preserves chat context:\n{text}"
+    );
+    assert!(
+        !header.contains("│Settings"),
+        "header does not duplicate panel title:\n{text}"
+    );
+    assert!(
+        text.contains("Cycles Automatic"),
+        "description remains visible:\n{text}"
+    );
+    assert!(
+        text.contains("stored locally"),
+        "local note remains visible:\n{text}"
+    );
+
+    let footer_y = (0..grid.area.height)
+        .find(|&y| row_text(grid, y).contains("Esc close"))
+        .expect("footer row");
+    let composer_bg = grid.cell((hits.composer.x, hits.composer.y)).unwrap().bg;
+    assert_ne!(grid.cell((0, footer_y)).unwrap().bg, composer_bg);
+    assert!(
+        footer_y >= hits.composer.y,
+        "footer remains below the composer band"
+    );
+}
+
+#[test]
+fn settings_picker_preserves_controls_at_66x18() {
+    let app = App {
+        settings_open: true,
+        settings_category: 1,
+        ..Default::default()
+    };
+    let backend = TestBackend::new(66, 18);
+    let mut terminal = Terminal::new(backend).unwrap();
+    let mut hits = ui::HitMap::default();
+    terminal
+        .draw(|frame| hits = ui::render(frame, &app))
+        .unwrap();
+
+    let popup = hits.popup.expect("settings panel");
+    assert!(
+        popup.height < 13,
+        "responsive panel is bounded by its content/viewport"
+    );
+    assert_eq!(
+        hits.settings_rows.len(),
+        2,
+        "both layout controls remain selectable"
+    );
+    assert!(popup.x + popup.width <= 66 && popup.y + popup.height <= 18);
+    let text = rendered(&app);
+    assert!(
+        text.contains("Sidebar density"),
+        "first control remains visible:\n{text}"
+    );
+    assert!(
+        text.contains("Wrap composer"),
+        "second control remains visible:\n{text}"
+    );
+    for (index, (row, selected)) in hits.settings_rows.iter().enumerate() {
+        assert_eq!(*selected, index);
+        assert_eq!(row.x, popup.x);
+        assert_eq!(row.width, popup.width);
+        assert!(row.y >= popup.y && row.y < popup.y + popup.height);
+        assert_eq!(hits.at(row.x, row.y), Some(ui::Hit::SettingsRow(index)));
+    }
+    assert_eq!(hits.settings_tabs.len(), 2);
+    assert!(hits
+        .settings_tabs
+        .iter()
+        .all(|(tab, _)| { tab.x >= popup.x && tab.x + tab.width <= popup.x + popup.width }));
+}
+
+#[test]
+fn settings_tabs_switch_by_mouse_and_keep_rows_consistent() {
+    let mut app = App {
+        settings_open: true,
+        ..Default::default()
+    };
+    let backend = TestBackend::new(100, 30);
+    let mut terminal = Terminal::new(backend).unwrap();
+    let mut hits = ui::HitMap::default();
+    terminal
+        .draw(|frame| hits = ui::render(frame, &app))
+        .unwrap();
+    let layout_tab = hits
+        .settings_tabs
+        .iter()
+        .find(|(_, index)| *index == 1)
+        .map(|(area, _)| *area)
+        .expect("Layout tab hitbox");
+    assert_eq!(
+        hits.at(layout_tab.x, layout_tab.y),
+        Some(ui::Hit::SettingsTab(1))
+    );
+    app.handle_mouse(
+        MouseEventKind::Down(MouseButton::Left),
+        layout_tab.x,
+        layout_tab.y,
+        &hits,
+    );
+    assert_eq!(app.settings_category, 1);
+    let screen = rendered(&app);
+    assert!(
+        screen.contains("Sidebar density"),
+        "layout options:\n{screen}"
+    );
+    assert!(
+        screen.contains("Wrap composer"),
+        "layout options:\n{screen}"
+    );
+}
+
+#[test]
+fn appearance_category_shows_cycleable_theme() {
+    let app = App {
+        settings_open: true,
+        settings_category: 0,
+        ..Default::default()
+    };
+    let screen = rendered(&app);
+    assert!(screen.contains("Appearance"), "appearance tab:\n{screen}");
     assert!(
         screen.contains("Automatic (Dark)"),
         "theme value:\n{screen}"
     );
-    assert!(screen.contains("Sidebar"), "sidebar setting:\n{screen}");
-    assert!(screen.contains("Compact"), "compact value:\n{screen}");
     assert!(
-        screen.contains("choices are stored locally"),
-        "settings composer:\n{screen}"
+        !screen.contains("Sidebar density"),
+        "layout options stay separate:\n{screen}"
     );
-    assert!(screen.contains("Esc close"), "settings help:\n{screen}");
+}
+
+#[test]
+fn popup_surfaces_match_outgoing_chat_line_background() {
+    let selected = conversation("Weekend crew", 3, 40);
+    let mut app = App {
+        settings_open: true,
+        settings_category: 1,
+        selected: Some(selected.id.clone()),
+        ..Default::default()
+    };
+    app.set_conversations(vec![selected.clone()]);
+    app.upsert(
+        selected.id.clone(),
+        message(
+            &selected,
+            "surface-match",
+            1_700_000_000_000,
+            "popup chat surface sample",
+            true,
+        ),
+    );
+    let backend = TestBackend::new(100, 30);
+    let mut terminal = Terminal::new(backend).unwrap();
+    let mut hits = ui::HitMap::default();
+    terminal
+        .draw(|frame| hits = ui::render(frame, &app))
+        .unwrap();
+    let grid = terminal.backend().buffer();
+    let (chat_row, chat_text) = (0..grid.area.height)
+        .map(|row| (row, row_text(grid, row)))
+        .find(|(_, text)| text.contains("popup chat surface sample"))
+        .expect("outgoing chat line");
+    let chat_column = chat_text.find("popup chat surface sample").unwrap() as u16;
+    let chat_bg = grid.cell((chat_column, chat_row)).unwrap().bg;
+    let popup_row = hits
+        .settings_rows
+        .iter()
+        .find(|(_, index)| *index == 1)
+        .map(|(area, _)| *area)
+        .expect("unselected popup row");
+    assert_eq!(grid.cell((popup_row.x, popup_row.y)).unwrap().bg, chat_bg);
+
+    let mut command_app = App {
+        composing: true,
+        ..Default::default()
+    };
+    command_app.set_conversations(vec![selected]);
+    command_app.draft = "/".into();
+    command_app.command_menu = true;
+    let backend = TestBackend::new(100, 30);
+    let mut terminal = Terminal::new(backend).unwrap();
+    let mut command_hits = ui::HitMap::default();
+    terminal
+        .draw(|frame| command_hits = ui::render(frame, &command_app))
+        .unwrap();
+    let grid = terminal.backend().buffer();
+    let menu_row = command_hits
+        .menu_rows
+        .iter()
+        .find(|(_, index)| *index != command_app.command_selection)
+        .map(|(area, _)| *area)
+        .expect("unselected command row");
+    assert_eq!(grid.cell((menu_row.x, menu_row.y)).unwrap().bg, chat_bg);
+    let command_panel = command_hits.menu.expect("command panel hitbox");
+    let bridge_y = command_panel.y + command_panel.height;
+    assert!(bridge_y < grid.area.height, "popup bridge remains visible");
+    assert_eq!(
+        grid.cell((command_panel.x, bridge_y)).unwrap().bg,
+        chat_bg,
+        "the row touching the composer must share the outgoing-message surface"
+    );
+}
+
+#[test]
+fn settings_contacts_and_theme_panels_overlay_the_transcript() {
+    let selected = conversation("Weekend crew", 3, 40);
+    let make_app = |settings_open, contacts_open, theme_panel_open| {
+        let mut app = App {
+            settings_open,
+            contacts_open,
+            theme_panel_open,
+            selected: Some(selected.id.clone()),
+            ..Default::default()
+        };
+        app.set_conversations(vec![selected.clone()]);
+        app.upsert(
+            selected.id.clone(),
+            message(
+                &selected,
+                "overlay-proof",
+                1_700_000_000_000,
+                "transcript remains visible behind the popup",
+                false,
+            ),
+        );
+        app
+    };
+
+    for (panel, title) in [
+        (make_app(true, false, false), "Settings"),
+        (make_app(false, true, false), "Contacts"),
+        (make_app(false, false, true), "Theme"),
+    ] {
+        let text = rendered(&panel);
+        assert!(text.contains(title), "missing {title} panel:\n{text}");
+        assert!(
+            text.contains("transcript remains visible"),
+            "{title} replaced the transcript:\n{text}"
+        );
+    }
+
+    let panel = make_app(false, false, true);
+    let backend = TestBackend::new(100, 30);
+    let mut terminal = Terminal::new(backend).unwrap();
+    let mut hits = ui::HitMap::default();
+    terminal
+        .draw(|frame| hits = ui::render(frame, &panel))
+        .unwrap();
+    let (row, index) = hits.theme_rows.first().copied().expect("theme row hitbox");
+    assert_eq!(index, 0);
+    assert_eq!(hits.at(row.x, row.y), Some(ui::Hit::ThemeRow(0)));
+
+    let tiny = buffer(&panel, 20, 5);
+    assert_eq!((tiny.area.width, tiny.area.height), (20, 5));
+}
+
+#[test]
+fn a_tall_picker_clears_orphan_transcript_text_not_just_its_background() {
+    let selected = conversation("Weekend crew", 3, 40);
+    let mut app = App::default();
+    app.set_conversations(vec![selected.clone()]);
+    app.upsert(
+        selected.id.clone(),
+        message(
+            &selected,
+            "last",
+            1_700_000_000_000,
+            "Orphan transcript fragment",
+            false,
+        ),
+    );
+    app.open_settings();
+    app.settings_category = 1;
+    let mut terminal = Terminal::new(TestBackend::new(66, 18)).unwrap();
+    let mut hits = ui::HitMap::default();
+    terminal
+        .draw(|frame| hits = ui::render(frame, &app))
+        .unwrap();
+    let popup = hits.popup.unwrap();
+    let excerpt_rows = popup.y.saturating_sub(hits.transcript.y);
+    assert!(
+        excerpt_rows > 0 && excerpt_rows < 3,
+        "fixture reproduces a short excerpt"
+    );
+    for y in hits.transcript.y..popup.y {
+        let row = &row_text(terminal.backend().buffer(), y);
+        assert!(
+            row.split('│').nth(1).unwrap_or(row).trim().is_empty(),
+            "orphan text must be cleared: {row:?}"
+        );
+    }
+}
+
+#[test]
+fn theme_picker_is_measured_and_responsive() {
+    let app = App {
+        theme_panel_open: true,
+        theme_panel_selection: 1,
+        ..Default::default()
+    };
+    for (width, height) in [(100u16, 30u16), (66, 18), (44, 12)] {
+        let backend = TestBackend::new(width, height);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let mut hits = ui::HitMap::default();
+        terminal
+            .draw(|frame| hits = ui::render(frame, &app))
+            .unwrap();
+        let popup = hits.popup.expect("Theme panel");
+        assert!(popup.x + popup.width <= width && popup.y + popup.height <= height);
+        assert_eq!(hits.theme_rows.len(), 3, "all options at {width}x{height}");
+        let grid = terminal.backend().buffer();
+        let title_y = (popup.y..popup.y + popup.height)
+            .find(|&y| row_text(grid, y).contains("Theme"))
+            .expect("Theme title");
+        assert_eq!(column_of(grid, title_y, "Theme"), Some(popup.x + 2));
+        let (selected, index) = hits.theme_rows[1];
+        assert_eq!(index, 1);
+        assert_eq!(selected.x, popup.x);
+        assert_eq!(selected.width, popup.width);
+        assert_eq!(hits.at(selected.x, selected.y), Some(ui::Hit::ThemeRow(1)));
+        assert_eq!(
+            grid.cell((selected.x, selected.y)).unwrap().bg,
+            grid.cell((selected.x + 1, selected.y)).unwrap().bg
+        );
+        assert_eq!(
+            grid.cell((selected.x + 2, selected.y)).unwrap().symbol(),
+            "›"
+        );
+        for (row, option) in hits.theme_rows.iter().zip(["Automatic", "Dark", "Light"]) {
+            assert_eq!(column_of(grid, row.0.y, option), Some(popup.x + 4));
+            assert!(row.0.y >= popup.y && row.0.y < popup.y + popup.height);
+        }
+        assert_eq!(popup.y + popup.height, hits.composer.y - 1);
+        let footer_y = (0..height)
+            .find(|&y| row_text(grid, y).contains("Esc close"))
+            .expect("Theme footer");
+        assert!(footer_y > hits.composer.y);
+        assert!(selected.y + selected.height < hits.composer.y);
+    }
+}
+
+#[test]
+fn bottom_popups_use_one_inset_and_keep_controls_in_the_footer() {
+    let app = App {
+        settings_open: true,
+        ..Default::default()
+    };
+    let text = rendered(&app);
+    assert!(
+        text.contains("Esc close"),
+        "controls remain in the footer:\n{text}"
+    );
+    assert!(
+        !text.contains("Esc close · ↑↓ move · Enter select"),
+        "the title row contains no repeated controls:\n{text}"
+    );
+    assert!(
+        !text.contains("Settings · Tab chats · ↑↓ choose · Enter change"),
+        "the composer line contains no repeated controls:\n{text}"
+    );
+
+    let backend = TestBackend::new(100, 30);
+    let mut terminal = Terminal::new(backend).unwrap();
+    let mut hits = ui::HitMap::default();
+    terminal
+        .draw(|frame| hits = ui::render(frame, &app))
+        .unwrap();
+    let popup = hits.popup.expect("settings popup");
+    assert!(popup.height >= 6);
+    assert_eq!(hits.settings_tabs.len(), 2);
+    let layout_tab = hits
+        .settings_tabs
+        .iter()
+        .find(|(_, index)| *index == 1)
+        .map(|(area, _)| *area)
+        .expect("Layout tab hitbox");
+    assert_eq!(
+        hits.at(layout_tab.x, layout_tab.y),
+        Some(ui::Hit::SettingsTab(1))
+    );
+    let first_option = hits.settings_rows.first().expect("first settings option").0;
+    assert_eq!(first_option.y, popup.y + 4, "room follows the tabs");
+    let grid = terminal.backend().buffer();
+    let top_padding = (popup.x..popup.x + popup.width)
+        .map(|x| grid.cell((x, popup.y)).unwrap().symbol())
+        .collect::<String>();
+    assert!(
+        top_padding.trim().is_empty(),
+        "top padding is blank: {top_padding:?}"
+    );
+    assert!(
+        row_text(grid, popup.y + 2).contains("Appearance"),
+        "tabs follow the title"
+    );
+    let tab_gap = (popup.x..popup.x + popup.width)
+        .map(|x| grid.cell((x, popup.y + 3)).unwrap().symbol())
+        .collect::<String>();
+    assert!(
+        tab_gap.trim().is_empty(),
+        "one row separates tabs and options: {tab_gap:?}"
+    );
+
+    let backend = TestBackend::new(100, 12);
+    let mut terminal = Terminal::new(backend).unwrap();
+    let mut compact_hits = ui::HitMap::default();
+    terminal
+        .draw(|frame| compact_hits = ui::render(frame, &app))
+        .unwrap();
+    let compact_popup = compact_hits.popup.expect("compact settings popup");
+    assert!(compact_popup.height < 6);
+    let first_option = compact_hits
+        .settings_rows
+        .first()
+        .expect("compact settings option")
+        .0;
+    assert_eq!(
+        first_option.y,
+        compact_popup.y + 3,
+        "compact layout retains the title and category before its option"
+    );
+}
+
+#[test]
+fn popup_spacing_bridge_focus_and_help_use_the_whole_layout() {
+    let mut app = App {
+        settings_open: true,
+        ..Default::default()
+    };
+    let backend = TestBackend::new(100, 30);
+    let mut terminal = Terminal::new(backend).unwrap();
+    let mut hits = ui::HitMap::default();
+    terminal
+        .draw(|frame| hits = ui::render(frame, &app))
+        .unwrap();
+    let popup = hits.popup.unwrap();
+    let option = hits.settings_rows[0].0;
+    assert!(
+        option.y >= popup.y + 4,
+        "options need vertical breathing room"
+    );
+    let grid = terminal.backend().buffer();
+    assert_eq!(grid.cell((option.x, option.y - 1)).unwrap().symbol(), " ");
+
+    app.settings_open = false;
+    app.contacts_open = true;
+    terminal
+        .draw(|frame| hits = ui::render(frame, &app))
+        .unwrap();
+    let popup = hits.popup.unwrap();
+    let grid = terminal.backend().buffer();
+    let surface = grid.cell((popup.x, popup.y + popup.height - 1)).unwrap().bg;
+    for y in popup.y + popup.height..hits.composer.y {
+        assert_eq!(
+            grid.cell((popup.x, y)).unwrap().bg,
+            surface,
+            "contacts popup must join composer shading at row {y}"
+        );
+    }
+    assert_eq!(
+        hits.contacts_rows.len(),
+        0,
+        "empty contacts have no selectable rows"
+    );
+    assert!(
+        rendered(&app).contains("No contacts yet"),
+        "empty-state hint remains visible"
+    );
+
+    app.contacts_open = false;
+    app.focus = Focus::Sidebar;
+    terminal
+        .draw(|frame| hits = ui::render(frame, &app))
+        .unwrap();
+    let sidebar_bg = terminal
+        .backend()
+        .buffer()
+        .cell((hits.composer.x, hits.composer.y))
+        .unwrap()
+        .bg;
+    app.focus = Focus::Composer;
+    terminal
+        .draw(|frame| hits = ui::render(frame, &app))
+        .unwrap();
+    assert_eq!(
+        sidebar_bg,
+        terminal
+            .backend()
+            .buffer()
+            .cell((hits.composer.x, hits.composer.y))
+            .unwrap()
+            .bg
+    );
+
+    app.help_open = true;
+    terminal
+        .draw(|frame| hits = ui::render(frame, &app))
+        .unwrap();
+    let help = hits.help.unwrap();
+    assert!(
+        (i32::from(help.x) * 2 + i32::from(help.width) - 100).abs() <= 1,
+        "help popup must center against the full 100-column TUI: {help:?}"
+    );
+    let short = buffer(&app, 60, 12);
+    assert!(
+        (0..short.area.height).any(|y| row_text(&short, y).contains("↑↓ scroll")),
+        "short-terminal help must show how to reach hidden shortcuts"
+    );
+    app.handle_key(KeyEvent::new(KeyCode::End, KeyModifiers::NONE));
+    let scrolled = buffer(&app, 60, 12);
+    assert!(
+        (0..scrolled.area.height).any(|y| row_text(&scrolled, y).contains("Ctrl+C")),
+        "hidden shortcuts become available by scrolling"
+    );
+
+    for (width, height, expected) in [
+        (19, 24, "wheel"),
+        (80, 4, "Keyboard shortcuts"),
+        (80, 3, "Ctrl+C"),
+    ] {
+        let tiny_app = App {
+            help_open: true,
+            help_scroll: if height == 3 {
+                bloom_tui::app::HELP_ROW_COUNT - 1
+            } else {
+                0
+            },
+            ..Default::default()
+        };
+        let backend = TestBackend::new(width, height);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let mut tiny_hits = ui::HitMap::default();
+        terminal
+            .draw(|frame| tiny_hits = ui::render(frame, &tiny_app))
+            .unwrap();
+        assert!(
+            tiny_hits.help.is_some(),
+            "help remains visible at {width}x{height}"
+        );
+        let grid = terminal.backend().buffer();
+        assert!(
+            (0..height).any(|y| row_text(grid, y).contains(expected)),
+            "help contains {expected:?} at {width}x{height}"
+        );
+    }
+}
+
+#[test]
+fn help_modal_dismisses_outside_click_without_activating_underlying_chat() {
+    let selected = conversation("Selected", 2, 10);
+    let other = conversation("Other", 2, 20);
+    let mut app = App {
+        help_open: true,
+        selected: Some(selected.id.clone()),
+        ..Default::default()
+    };
+    app.set_conversations(vec![selected.clone(), other.clone()]);
+    let backend = TestBackend::new(100, 30);
+    let mut terminal = Terminal::new(backend).unwrap();
+    let mut hits = ui::HitMap::default();
+    terminal
+        .draw(|frame| hits = ui::render(frame, &app))
+        .unwrap();
+    let outside = hits
+        .sidebar_rows
+        .iter()
+        .find(|(_, id)| id == &other.id)
+        .map(|(area, _)| *area)
+        .expect("underlying other chat row");
+    let help = hits.help.expect("help overlay");
+    assert!(outside.x < help.x, "test click is outside the help panel");
+    assert_eq!(hits.at(outside.x, outside.y), Some(ui::Hit::CloseOverlay));
+
+    app.handle_mouse(
+        MouseEventKind::Down(MouseButton::Left),
+        outside.x,
+        outside.y,
+        &hits,
+    );
+    assert!(!app.help_open, "outside click dismisses the help modal");
+    assert_eq!(
+        app.selected.as_ref(),
+        Some(&selected.id),
+        "outside click must not leak through and select the covered chat"
+    );
+}
+
+#[test]
+fn clicking_composer_below_slash_menu_restores_draft_editing() {
+    let mut app = App {
+        command_menu: true,
+        draft: "/".into(),
+        draft_cursor: 1,
+        focus: Focus::Sidebar,
+        ..Default::default()
+    };
+    let backend = TestBackend::new(100, 30);
+    let mut terminal = Terminal::new(backend).unwrap();
+    let mut hits = ui::HitMap::default();
+    terminal
+        .draw(|frame| hits = ui::render(frame, &app))
+        .unwrap();
+    let composer = hits.composer;
+    app.handle_mouse(
+        MouseEventKind::Down(MouseButton::Left),
+        composer.x + 4,
+        composer.y,
+        &hits,
+    );
+    assert_eq!(app.focus, Focus::Composer);
+    assert_eq!(app.draft, "/");
+    app.handle_key(KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE));
+    assert!(app.draft.is_empty());
+    assert!(!app.command_menu);
+}
+
+#[test]
+fn new_and_filter_popups_show_real_options_and_hitboxes() {
+    let direct = conversation("Jules Lee", 2, 20);
+    let mut group = conversation("Weekend crew", 3, 30);
+    group.kind = ConversationKind::Group;
+
+    let mut new_app = App {
+        new_conversation: true,
+        ..Default::default()
+    };
+    new_app.set_conversations(vec![direct.clone(), group.clone()]);
+    let new_screen = rendered(&new_app);
+    assert!(new_screen.contains("New conversation"), "{new_screen}");
+    assert!(new_screen.contains("Recent"), "{new_screen}");
+    assert!(new_screen.contains("All"), "{new_screen}");
+    assert!(new_screen.contains("Jules"), "{new_screen}");
+
+    let mut filter_app = App {
+        filter: Some(String::new()),
+        filter_category: 1,
+        selected: Some(direct.id.clone()),
+        ..Default::default()
+    };
+    filter_app.set_conversations(vec![direct.clone(), group]);
+    let filter_screen = rendered(&filter_app);
+    assert!(
+        filter_screen.contains("Filter conversations"),
+        "{filter_screen}"
+    );
+    assert!(filter_screen.contains("All"), "{filter_screen}");
+    assert!(filter_screen.contains("Direct"), "{filter_screen}");
+    assert!(filter_screen.contains("Groups"), "{filter_screen}");
+    assert!(filter_screen.contains("Jules Lee"), "{filter_screen}");
+    assert!(!filter_screen.contains("Weekend crew"), "{filter_screen}");
+
+    let backend = TestBackend::new(100, 30);
+    let mut terminal = Terminal::new(backend).unwrap();
+    let mut hits = ui::HitMap::default();
+    terminal
+        .draw(|frame| hits = ui::render(frame, &new_app))
+        .unwrap();
+    let (row, index) = hits
+        .new_contact_rows
+        .first()
+        .copied()
+        .expect("new-contact recommendation hitbox");
+    assert_eq!(index, 0);
+    assert_eq!(hits.at(row.x, row.y), Some(ui::Hit::NewContactRow(0)));
+    let (tab, tab_index) = hits
+        .new_contact_tabs
+        .first()
+        .copied()
+        .expect("recommendation tab hitbox");
+    assert_eq!(tab_index, 0);
+    assert_eq!(hits.at(tab.x, tab.y), Some(ui::Hit::NewContactTab(0)));
+
+    let backend = TestBackend::new(100, 30);
+    let mut terminal = Terminal::new(backend).unwrap();
+    terminal
+        .draw(|frame| hits = ui::render(frame, &filter_app))
+        .unwrap();
+    let popup = hits.popup.expect("shared Filter picker surface");
+    let (tab, tab_index) = hits
+        .filter_tabs
+        .get(1)
+        .copied()
+        .expect("filter category hitbox");
+    assert_eq!(tab_index, 1);
+    assert_eq!(
+        hits.filter_tabs[0].0.x,
+        popup.x + 2,
+        "Filter tabs share the two-cell inset"
+    );
+    assert_eq!(hits.at(tab.x, tab.y), Some(ui::Hit::FilterTab(1)));
+    let (row, index) = hits
+        .filter_rows
+        .first()
+        .copied()
+        .expect("filtered row hitbox");
+    assert_eq!(index, 0);
+    assert_eq!(row.x, popup.x);
+    assert_eq!(row.width, popup.width);
+    assert_eq!(hits.at(row.x, row.y), Some(ui::Hit::FilterRow(index)));
+    assert_eq!(
+        terminal
+            .backend()
+            .buffer()
+            .cell((row.x + 2, row.y))
+            .unwrap()
+            .symbol(),
+        "›"
+    );
+    assert_eq!(popup.y + popup.height, hits.composer.y - 1);
+    assert_eq!(filter_screen.matches("Filter conversations").count(), 1);
+
+    let count_row = row.y - 1;
+    assert_eq!(
+        terminal
+            .backend()
+            .buffer()
+            .cell((popup.x + 2, count_row))
+            .unwrap()
+            .symbol(),
+        "1",
+        "count text begins at the shared two-cell inset"
+    );
+}
+
+#[test]
+fn filter_picker_keeps_rows_and_tabs_visible_at_narrow_sizes() {
+    let direct = conversation("Jules Lee", 2, 20);
+    let mut group = conversation("Weekend crew", 3, 30);
+    group.kind = ConversationKind::Group;
+    let selected_id = direct.id.clone();
+    let mut app = App {
+        filter: Some(String::new()),
+        selected: Some(selected_id.clone()),
+        ..Default::default()
+    };
+    app.set_conversations(vec![direct, group]);
+    let selected_index = app
+        .visible_conversations()
+        .iter()
+        .position(|conversation| conversation.id == selected_id)
+        .expect("selected direct chat remains visible");
+
+    for (width, height) in [(66u16, 18u16), (44, 12)] {
+        let backend = TestBackend::new(width, height);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let mut hits = ui::HitMap::default();
+        terminal
+            .draw(|frame| hits = ui::render(frame, &app))
+            .unwrap();
+        let popup = hits.popup.expect("Filter picker remains visible");
+        assert!(popup.x + popup.width <= width && popup.y + popup.height <= height);
+        assert_eq!(hits.filter_tabs.len(), 3);
+        assert_eq!(hits.filter_tabs[0].0.x, popup.x + 2);
+        let (row, _) = hits
+            .filter_rows
+            .iter()
+            .copied()
+            .find(|(_, index)| *index == selected_index)
+            .expect("selected filter row remains in view");
+        assert_eq!(row.x, popup.x);
+        assert_eq!(row.width, popup.width);
+        assert_eq!(
+            hits.at(row.x, row.y),
+            Some(ui::Hit::FilterRow(selected_index))
+        );
+        assert!(row.y < popup.y + popup.height);
+        assert!(hits.composer.y > popup.y);
+        let grid = terminal.backend().buffer();
+        let screen = (0..height)
+            .map(|y| row_text(grid, y))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            screen.contains("Filter conversations"),
+            "{width}x{height}:\n{screen}"
+        );
+        assert!(screen.contains("Jules Lee"), "{width}x{height}:\n{screen}");
+        if width == 66 {
+            assert!(screen.contains("Enter open"), "{width}x{height}:\n{screen}");
+            assert!(screen.contains("Esc cancel"), "{width}x{height}:\n{screen}");
+        } else {
+            assert!(screen.contains("↵ open"), "{width}x{height}:\n{screen}");
+            assert!(screen.contains("Esc"), "{width}x{height}:\n{screen}");
+        }
+    }
+}
+
+#[test]
+fn filter_long_names_preserve_the_conversation_kind_at_narrow_width() {
+    let long = conversation(
+        "A very long conversation name that must be truncated",
+        2,
+        20,
+    );
+    let mut app = App {
+        filter: Some(String::new()),
+        ..Default::default()
+    };
+    app.set_conversations(vec![long]);
+    let backend = TestBackend::new(44, 12);
+    let mut terminal = Terminal::new(backend).unwrap();
+    let mut hits = ui::HitMap::default();
+    terminal
+        .draw(|frame| hits = ui::render(frame, &app))
+        .unwrap();
+    let grid = terminal.backend().buffer();
+    let row = hits.filter_rows[0].0;
+    let text = row_text(grid, row.y);
+    assert!(
+        text.contains("Direct"),
+        "kind suffix remains visible: {text:?}"
+    );
+    assert!(
+        text.contains("A very long conver"),
+        "long label is clipped: {text:?}"
+    );
+}
+
+#[test]
+fn filter_empty_state_keeps_the_shared_content_inset() {
+    let app = App {
+        filter: Some("unmatched".into()),
+        ..Default::default()
+    };
+    let backend = TestBackend::new(100, 30);
+    let mut terminal = Terminal::new(backend).unwrap();
+    let mut hits = ui::HitMap::default();
+    terminal
+        .draw(|frame| hits = ui::render(frame, &app))
+        .unwrap();
+    let popup = hits.popup.expect("Filter picker surface");
+    assert!(hits.filter_rows.is_empty());
+    let buffer = terminal.backend().buffer();
+    let row = (popup.y..popup.y + popup.height)
+        .find(|row| column_of(buffer, *row, "No matching conversations").is_some())
+        .expect("empty-state hint is visible");
+    assert_eq!(
+        column_of(buffer, row, "No matching conversations"),
+        Some(popup.x + 2),
+        "popup={popup:?}\n{}",
+        rendered(&app)
+    );
+}
+
+#[test]
+fn emoji_suggestions_render_selectable_shortcodes() {
+    let app = App {
+        composing: true,
+        draft: ":smil".into(),
+        draft_cursor: ":smil".chars().count(),
+        ..Default::default()
+    };
+    let screen = rendered(&app);
+    assert!(screen.contains("Emoji suggestions"), "{screen}");
+    assert!(screen.contains(":smile:"), "{screen}");
+    assert!(screen.contains("😄"), "{screen}");
+
+    let backend = TestBackend::new(100, 30);
+    let mut terminal = Terminal::new(backend).unwrap();
+    let mut hits = ui::HitMap::default();
+    terminal
+        .draw(|frame| hits = ui::render(frame, &app))
+        .unwrap();
+    let (row, index) = hits.emoji_rows.first().copied().expect("emoji row hitbox");
+    assert_eq!(index, 0);
+    assert_eq!(hits.at(row.x, row.y), Some(ui::Hit::EmojiRow(0)));
 }
 
 #[test]
 fn settings_remain_actionable_on_a_short_terminal() {
     let app = App {
         settings_open: true,
+        settings_category: 1,
         ..Default::default()
     };
     let compact = buffer(&app, 40, 8);
@@ -524,10 +1608,10 @@ fn settings_remain_actionable_on_a_short_terminal() {
         .map(|row| row_text(&compact, row))
         .collect::<Vec<_>>()
         .join("\n");
-    assert!(screen.contains("Automatic"), "compact settings:\n{screen}");
+    assert!(screen.contains("Sidebar"), "compact settings:\n{screen}");
     assert!(
-        screen.contains("Sidebar"),
-        "compact settings retain both setting rows:\n{screen}"
+        screen.contains("Wrap composer"),
+        "compact settings retain both layout rows:\n{screen}"
     );
     assert!(screen.contains("Esc close"), "compact controls:\n{screen}");
     assert!(screen.contains("Settings"), "settings header:\n{screen}");
@@ -535,11 +1619,17 @@ fn settings_remain_actionable_on_a_short_terminal() {
 
 #[test]
 fn footer_hints_follow_the_active_mode() {
-    let normal = rendered(&App::default());
-    assert!(normal.contains("n start"), "empty-store action:\n{normal}");
+    let normal = rendered(&App {
+        connection_state: ConnectionState::Connected,
+        ..Default::default()
+    });
+    assert!(
+        normal.contains("/new start"),
+        "empty-store action:\n{normal}"
+    );
     assert!(normal.contains("? help"), "normal quit action:\n{normal}");
     assert!(
-        normal.contains("↑↓ scroll · Tab chats · Enter send · / commands · ? help"),
+        normal.contains("Enter send · Ctrl+J newline · Tab chats · / commands · ? help"),
         "new composer hints:\n{normal}"
     );
     assert!(
@@ -564,12 +1654,41 @@ fn footer_hints_follow_the_active_mode() {
         "command hint:\n{composing_text}"
     );
     assert!(
-        composing_text.contains("↑↓ scroll"),
-        "scroll hint:\n{composing_text}"
+        composing_text.contains("Ctrl+J newline"),
+        "multiline hint:\n{composing_text}"
     );
     assert!(
         !composing_text.contains("Enter open"),
         "stale nav hint:\n{composing_text}"
+    );
+
+    let wrapped = App {
+        composing: true,
+        draft: "x".repeat(100),
+        draft_cursor: 100,
+        ..Default::default()
+    };
+    let wrapped_text = rendered(&wrapped);
+    assert!(
+        wrapped_text.contains("↑↓ cursor"),
+        "wrapped cursor hint:\n{wrapped_text}"
+    );
+    let sidebar_focus = App {
+        focus: Focus::Sidebar,
+        ..wrapped
+    };
+    let sidebar_text = rendered(&sidebar_focus);
+    assert!(
+        sidebar_text.contains("↑↓ chats"),
+        "sidebar focus hint:\n{sidebar_text}"
+    );
+    assert!(
+        sidebar_text.contains("Tab composer"),
+        "sidebar return hint:\n{sidebar_text}"
+    );
+    assert!(
+        sidebar_text.contains("Ctrl+P previous"),
+        "previous-chat shortcut:\n{sidebar_text}"
     );
 
     let mut recipient = App::default();
@@ -608,9 +1727,10 @@ fn footer_hints_follow_the_active_mode() {
         !filter_text.contains("/ filter"),
         "stale filter hint:\n{filter_text}"
     );
-    assert!(
-        filter_text.contains("No matching conversations"),
-        "filter empty state:\n{filter_text}"
+    assert_eq!(
+        filter_text.matches("No matching conversations").count(),
+        1,
+        "overlay owns the empty-state copy:\n{filter_text}"
     );
 }
 
@@ -629,12 +1749,12 @@ fn short_terminal_keeps_compact_footer_hints() {
         "compact prompt:\n{compact_text}"
     );
     assert!(
-        compact_text.contains("↑↓ scroll"),
-        "compact navigation hint:\n{compact_text}"
+        compact_text.contains("↵ send"),
+        "compact send hint:\n{compact_text}"
     );
     assert!(
-        compact_text.contains("/ cmds"),
-        "compact command hint:\n{compact_text}"
+        compact_text.contains("? help"),
+        "compact help hint:\n{compact_text}"
     );
     let compact_prompt = (0..compact.area.height)
         .find(|y| (0..compact.area.width).any(|x| compact[(x, *y)].symbol() == "›"))
@@ -644,7 +1764,7 @@ fn short_terminal_keeps_compact_footer_hints() {
         "composer is bare:\n{compact_text}"
     );
     assert!(
-        row_text(&compact, compact_prompt + 2).contains("↑↓ scroll"),
+        row_text(&compact, compact_prompt + 2).contains("↵ send"),
         "compact footer remains below the boundary:\n{compact_text}"
     );
     let sidebar_divider = (1..compact.area.width - 1)
@@ -667,12 +1787,12 @@ fn short_terminal_keeps_compact_footer_hints() {
         .collect::<Vec<_>>()
         .join("\n");
     assert!(
-        compose_text.contains("Enter send") || compose_text.contains("↑↓ scroll"),
+        compose_text.contains("↵ send"),
         "compact composer hints:\n{compose_text}"
     );
     assert!(
-        compose_text.contains("↑↓ scroll"),
-        "small composer navigation:\n{compose_text}"
+        compose_text.contains("↵ send") && compose_text.contains("? help"),
+        "small composer discovery:\n{compose_text}"
     );
 
     let mut filtering = App::default();
@@ -684,8 +1804,8 @@ fn short_terminal_keeps_compact_footer_hints() {
         .collect::<Vec<_>>()
         .join("\n");
     assert!(
-        filter_text.contains("↑↓ select"),
-        "small filter hint:\n{filter_text}"
+        filter_text.contains("↑↓") && filter_text.contains("↵"),
+        "small filter selection and open hints:\n{filter_text}"
     );
     assert!(
         filter_text.contains("Esc"),
@@ -698,7 +1818,7 @@ fn short_terminal_keeps_compact_footer_hints() {
         .collect::<Vec<_>>()
         .join("\n");
     assert!(
-        narrow_text.contains("↑↓ scroll"),
+        narrow_text.contains("↵ send") || narrow_text.contains("Enter send"),
         "narrow footer:\n{narrow_text}"
     );
 }
@@ -721,7 +1841,7 @@ fn long_header_title_does_not_overlap_status_or_theme() {
     let grid = buffer(&app, 100, 30);
     let header = row_text(&grid, 0);
     let title = column_of(&grid, 0, "A conversation").expect("chat title visible");
-    let status = column_of(&grid, 0, "⠋ Disconnected").expect("status visible");
+    let status = column_of(&grid, 0, "⠋ Offline").expect("status visible");
     let theme = column_of(&grid, 0, "Dark").expect("theme chip remains visible");
     assert!(title < status, "title/status overlap in {header:?}");
     assert!(
@@ -740,14 +1860,13 @@ fn long_header_title_does_not_overlap_status_or_theme() {
 
     let narrow = buffer(&app, 60, 10);
     let narrow_header = row_text(&narrow, 0);
-    let narrow_theme = column_of(&narrow, 0, "Dark").expect("narrow theme chip");
     assert!(
-        narrow_header.contains("●") && narrow_header.contains("?"),
-        "status and help remain visible: {narrow_header:?}"
+        narrow_header.contains("A conversation title"),
+        "identity: {narrow_header:?}"
     );
     assert!(
-        narrow_theme > 0,
-        "theme chip remains visible: {narrow_header:?}"
+        narrow_header.contains("Offline"),
+        "short layout keeps status beside identity: {narrow_header:?}"
     );
 }
 
@@ -799,7 +1918,7 @@ fn composer_and_own_messages_use_codex_style_surfaces() {
     let input_column = column_of(&grid, input_row, "›").unwrap();
     assert_eq!(
         grid[(input_column, input_row)].bg,
-        ratatui::style::Color::Rgb(49, 50, 68)
+        ratatui::style::Color::Rgb(38, 38, 38)
     );
 
     let message_row = (0..grid.area.height)
@@ -808,11 +1927,11 @@ fn composer_and_own_messages_use_codex_style_surfaces() {
     let message_column = column_of(&grid, message_row, "A user message").unwrap();
     assert_eq!(
         grid[(message_column, message_row)].bg,
-        ratatui::style::Color::Rgb(49, 50, 68)
+        ratatui::style::Color::Rgb(38, 38, 38)
     );
     assert_eq!(
         grid[(grid.area.width - 5, message_row)].bg,
-        ratatui::style::Color::Rgb(49, 50, 68)
+        ratatui::style::Color::Rgb(38, 38, 38)
     );
 }
 
@@ -872,10 +1991,9 @@ fn composer_cursor_tracks_wide_graphemes_and_long_drafts() {
     app.draft_cursor = app.draft.chars().count();
     let backend = TestBackend::new(40, 8);
     let mut terminal = Terminal::new(backend).unwrap();
+    let mut hits = ui::HitMap::default();
     terminal
-        .draw(|frame| {
-            ui::render(frame, &app);
-        })
+        .draw(|frame| hits = ui::render(frame, &app))
         .unwrap();
     let grid = terminal.backend().buffer().clone();
     let screen = (0..grid.area.height)
@@ -883,11 +2001,164 @@ fn composer_cursor_tracks_wide_graphemes_and_long_drafts() {
         .collect::<Vec<_>>()
         .join("\n");
     assert!(
-        screen.contains("pqrstuvwxyz"),
-        "draft tail is visible:\n{screen}"
+        screen.contains("abcdefghijklmnopqrstuv") && screen.contains("wxyz"),
+        "the draft wraps without dropping its tail:\n{screen}"
+    );
+    assert!(
+        hits.composer.height >= 2,
+        "wrapped draft has multiple input rows"
     );
     let cursor = terminal.backend_mut().get_cursor_position().unwrap();
     assert!(cursor.x < grid.area.width && cursor.y < grid.area.height);
+}
+
+#[test]
+fn wrapped_draft_shows_both_overflow_indicators_and_mouse_cursor_target() {
+    let draft = "abcdefghijklmnopqrstuvwxyz".repeat(40);
+    let mut app = App {
+        composing: true,
+        draft,
+        draft_cursor: 500,
+        focus: Focus::Sidebar,
+        ..Default::default()
+    };
+    let backend = TestBackend::new(100, 18);
+    let mut terminal = Terminal::new(backend).unwrap();
+    let mut hits = ui::HitMap::default();
+    terminal
+        .draw(|frame| hits = ui::render(frame, &app))
+        .unwrap();
+    assert_eq!(hits.composer.height, 5);
+    let grid = terminal.backend().buffer();
+    let composer_lines = (hits.composer.y..hits.composer.y + hits.composer.height)
+        .map(|y| {
+            (hits.composer.x..hits.composer.x + hits.composer.width)
+                .map(|x| grid.cell((x, y)).unwrap().symbol())
+                .collect::<String>()
+        })
+        .collect::<Vec<_>>();
+    assert!(
+        composer_lines[0].contains("↑ "),
+        "top overflow: {composer_lines:?}"
+    );
+    assert!(
+        composer_lines[4].contains("↓ "),
+        "bottom overflow: {composer_lines:?}"
+    );
+    let cursor = terminal.backend_mut().get_cursor_position().unwrap();
+    assert!(cursor.y >= hits.composer.y && cursor.y < hits.composer.y + hits.composer.height);
+
+    let (x, y, index) = hits
+        .composer_positions
+        .iter()
+        .copied()
+        .find(|(_, _, index)| *index == 500)
+        .expect("visible grapheme boundary under the cursor");
+    assert_eq!(hits.at(x, y), Some(ui::Hit::Composer));
+    app.handle_mouse(MouseEventKind::Down(MouseButton::Left), x, y, &hits);
+    assert_eq!(app.focus, Focus::Composer);
+    assert_eq!(app.draft_cursor, index);
+}
+
+#[test]
+fn short_terminal_keeps_multiline_cursor_and_overflow_cues() {
+    let app = App {
+        composing: true,
+        draft: "abcdefghijklmnopqrstuvwxyz".repeat(40),
+        draft_cursor: 500,
+        ..Default::default()
+    };
+    let backend = TestBackend::new(100, 6);
+    let mut terminal = Terminal::new(backend).unwrap();
+    let mut hits = ui::HitMap::default();
+    terminal
+        .draw(|frame| hits = ui::render(frame, &app))
+        .unwrap();
+    assert!(hits.composer.height >= 3);
+    let grid = terminal.backend().buffer();
+    let first = row_text(grid, hits.composer.y);
+    let last = row_text(grid, hits.composer.y + hits.composer.height - 1);
+    let screen_width = grid.area.width;
+    assert!(first.contains("↑ "), "top overflow: {first:?}");
+    assert!(last.contains("↓ "), "bottom overflow: {last:?}");
+    let cursor = terminal.backend_mut().get_cursor_position().unwrap();
+    assert!(cursor.y >= hits.composer.y && cursor.y < hits.composer.y + hits.composer.height);
+    assert!(cursor.x < screen_width);
+}
+
+#[test]
+fn composer_width_helper_matches_the_rendered_input_width() {
+    for (width, compact_sidebar) in [(40, false), (64, false), (100, false), (100, true)] {
+        let app = App {
+            compact_sidebar,
+            ..Default::default()
+        };
+        let backend = TestBackend::new(width, 20);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let mut hits = ui::HitMap::default();
+        terminal
+            .draw(|frame| hits = ui::render(frame, &app))
+            .unwrap();
+        assert_eq!(
+            usize::from(hits.composer.width),
+            ui::composer_columns(width, compact_sidebar),
+            "width {width} with compact_sidebar={compact_sidebar}"
+        );
+    }
+}
+
+#[test]
+fn wrapped_composer_keeps_wide_emoji_clusters_intact() {
+    let family = "👨‍👩‍👧‍👦";
+    let draft = format!("{}{}{}", "a".repeat(20), family, "b".repeat(20));
+    let app = App {
+        composing: true,
+        draft,
+        draft_cursor: 41,
+        ..Default::default()
+    };
+    let backend = TestBackend::new(40, 10);
+    let mut terminal = Terminal::new(backend).unwrap();
+    let mut hits = ui::HitMap::default();
+    terminal
+        .draw(|frame| hits = ui::render(frame, &app))
+        .unwrap();
+    assert!(hits.composer.height >= 2);
+    let grid = terminal.backend().buffer();
+    assert!(
+        (hits.composer.y..hits.composer.y + hits.composer.height).any(|y| {
+            (hits.composer.x..hits.composer.x + hits.composer.width)
+                .any(|x| grid.cell((x, y)).unwrap().symbol() == family)
+        }),
+        "wide family emoji remains a single grapheme cell"
+    );
+}
+
+#[test]
+fn disabling_composer_wrap_restores_horizontal_scrolling() {
+    let draft = "abcdefghijklmnopqrstuvwxyz";
+    let app = App {
+        composing: true,
+        draft: draft.into(),
+        draft_cursor: draft.chars().count(),
+        wrap_composer: false,
+        ..Default::default()
+    };
+    let backend = TestBackend::new(40, 10);
+    let mut terminal = Terminal::new(backend).unwrap();
+    let mut hits = ui::HitMap::default();
+    terminal
+        .draw(|frame| hits = ui::render(frame, &app))
+        .unwrap();
+    assert_eq!(hits.composer.height, 1);
+    let grid = terminal.backend().buffer();
+    let input = (hits.composer.x..hits.composer.x + hits.composer.width)
+        .map(|x| grid.cell((x, hits.composer.y)).unwrap().symbol())
+        .collect::<String>();
+    assert!(
+        input.contains("uvwxyz"),
+        "horizontal tail is visible: {input:?}"
+    );
 }
 
 #[test]
@@ -1398,7 +2669,7 @@ fn a_single_match_heading_is_not_followed_by_leftovers() {
 }
 
 #[test]
-fn the_theme_control_stays_visible_on_a_narrow_terminal() {
+fn narrow_header_prioritizes_identity_over_optional_theme() {
     // On narrow terminals the theme chip is hidden while usable hints remain.
     let mut app = App::default();
     app.set_conversations(vec![conversation("Weekend crew", 3, 40)]);
@@ -1408,17 +2679,60 @@ fn the_theme_control_stays_visible_on_a_narrow_terminal() {
         .map(|x| grid[(x, 0)].symbol())
         .collect();
     assert!(
-        row.contains("Dark"),
-        "theme chip and trailing controls at 60 columns:\n{row}"
+        row.contains("Weekend crew") && !row.contains("Dark"),
+        "identity takes precedence at 60 columns:\n{row}"
     );
     let footer: String = (0..grid.area.height)
         .map(|y| row_text(&grid, y))
         .collect::<Vec<_>>()
         .join("\n");
     assert!(
-        footer.contains("↑↓ scroll"),
-        "the narrow hints must still name the theme key, got:\n{footer}"
+        footer.contains("↵ send") && footer.contains("? help"),
+        "the narrow hints retain submission and discovery, got:\n{footer}"
     );
+}
+
+#[test]
+fn selected_sidebar_chat_stays_highlighted_in_both_focus_states() {
+    let selected = conversation("Weekend crew", 3, 40);
+    let other = conversation("Jules Lee", 2, 30);
+    for focus in [Focus::Composer, Focus::Sidebar] {
+        let mut app = App {
+            selected: Some(selected.id.clone()),
+            focus,
+            ..Default::default()
+        };
+        app.set_conversations(vec![selected.clone(), other.clone()]);
+        let backend = TestBackend::new(100, 30);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let mut hits = ui::HitMap::default();
+        terminal
+            .draw(|frame| hits = ui::render(frame, &app))
+            .unwrap();
+        let selected_row = hits
+            .sidebar_rows
+            .iter()
+            .find(|(_, id)| id == &selected.id)
+            .map(|(area, _)| *area)
+            .expect("selected chat row");
+        let other_row = hits
+            .sidebar_rows
+            .iter()
+            .find(|(_, id)| id == &other.id)
+            .map(|(area, _)| *area)
+            .expect("unselected chat row");
+        let grid = terminal.backend().buffer();
+        for offset in 0..selected_row.height {
+            assert_ne!(
+                grid.cell((selected_row.x, selected_row.y + offset))
+                    .unwrap()
+                    .bg,
+                grid.cell((other_row.x, other_row.y + offset)).unwrap().bg,
+                "selected row remains highlighted with focus {focus:?}"
+            );
+        }
+        assert!(row_text(grid, selected_row.y).contains("▎"));
+    }
 }
 
 #[test]
@@ -1486,11 +2800,15 @@ fn sidebar_header_spacer_preserves_row_hit_testing_across_modes() {
     for (height, spacer, mode) in [
         (30u16, true, "normal"),
         (6, true, "short"),
-        (30, false, "settings"),
-        (30, false, "help"),
+        (30, true, "settings"),
+        (30, true, "contacts"),
+        (30, true, "help"),
+        (30, true, "filter"),
     ] {
         app.settings_open = mode == "settings";
+        app.contacts_open = mode == "contacts";
         app.help_open = mode == "help";
+        app.filter = (mode == "filter").then(String::new);
         let grid = buffer(&app, 100, height);
         let row = |y| {
             row_text(&grid, y)
@@ -1514,9 +2832,14 @@ fn sidebar_header_spacer_preserves_row_hit_testing_across_modes() {
         terminal
             .draw(|frame| hits = ui::render(frame, &app))
             .unwrap();
+        let expected_hit = if mode == "help" {
+            Some(ui::Hit::CloseOverlay)
+        } else {
+            Some(ui::Hit::SidebarChat(selected.id.clone()))
+        };
         assert_eq!(
             hits.at(2, chat_y),
-            Some(ui::Hit::SidebarChat(selected.id.clone())),
+            expected_hit,
             "chat hitbox follows shifted row in mode={mode}"
         );
         if spacer {
@@ -1548,7 +2871,7 @@ fn contacts_view_shows_local_nicknames_and_renders_narrow_layouts() {
     app.nicknames
         .insert(bloom_tui::app::nickname_key(&handle), "Maya".into());
 
-    for (width, height) in [(100u16, 30u16), (44, 12), (20, 5)] {
+    for (width, height) in [(100u16, 30u16), (66, 18), (44, 12), (20, 5)] {
         let grid = buffer(&app, width, height);
         let text = (0..height)
             .map(|y| row_text(&grid, y))
@@ -1556,6 +2879,10 @@ fn contacts_view_shows_local_nicknames_and_renders_narrow_layouts() {
             .join("\n");
         if width >= 44 {
             assert!(text.contains("Contacts"));
+            assert!(
+                text.contains("Search by number or nickname"),
+                "size={width}x{height}:\n{text}"
+            );
             assert!(text.contains("Maya"), "size={width}x{height}:\n{text}");
             assert!(
                 text.contains(if width >= 100 {
@@ -1576,13 +2903,101 @@ fn contacts_view_shows_local_nicknames_and_renders_narrow_layouts() {
     terminal
         .draw(|frame| hits = ui::render(frame, &app))
         .unwrap();
+    let popup = hits.popup.expect("Contacts picker surface");
     let (area, index) = hits
         .contacts_rows
         .first()
         .copied()
         .expect("contact row hitbox");
     assert_eq!(index, 0);
+    assert_eq!(area.x, popup.x, "selected background fills the panel width");
+    assert_eq!(area.width, popup.width);
     assert_eq!(hits.at(area.x, area.y), Some(ui::Hit::ContactRow(0)));
+    let grid = terminal.backend().buffer();
+    assert_eq!(grid.cell((area.x + 2, area.y)).unwrap().symbol(), "›");
+    let tab_line = row_text(grid, hits.contacts_tabs[0].0.y);
+    assert_eq!(
+        tab_line.matches("All").count(),
+        1,
+        "tabs render once: {tab_line:?}"
+    );
+    assert_eq!(
+        hits.contacts_tabs[0].0.x,
+        popup.x + 2,
+        "tabs share Settings inset"
+    );
+    assert_eq!(popup.y + popup.height, hits.composer.y - 1);
+    let (tab, tab_index) = hits
+        .contacts_tabs
+        .get(1)
+        .copied()
+        .expect("nickname tab hitbox");
+    assert_eq!(tab_index, 1);
+    assert_eq!(hits.at(tab.x, tab.y), Some(ui::Hit::ContactTab(1)));
+}
+
+#[test]
+fn contacts_search_renders_query_no_results_and_narrow_layouts() {
+    let mut app = App {
+        contacts_open: true,
+        contacts_query: "no-such-contact".into(),
+        ..Default::default()
+    };
+    app.set_conversations(vec![conversation("Known contact", 2, 1)]);
+
+    let text = rendered(&app);
+    assert!(
+        text.contains("Search: no-such-contact"),
+        "search field:\n{text}"
+    );
+    assert!(text.contains("0 matches"), "match count:\n{text}");
+    assert!(text.contains("No contacts match"), "empty state:\n{text}");
+
+    for (width, height) in [(44u16, 12u16), (20, 5)] {
+        let grid = buffer(&app, width, height);
+        assert_eq!((grid.area.width, grid.area.height), (width, height));
+    }
+}
+
+#[test]
+fn consecutive_contacts_keep_last_selection_visible_and_clickable() {
+    let conversations = (0..20)
+        .map(|index| {
+            let mut chat = conversation(&format!("person{index}@example.test"), 1, index);
+            chat.participants[0].is_me = false;
+            chat.participants[0].handle =
+                Handle::new(HandleKind::Email, format!("person{index}@example.test")).unwrap();
+            chat
+        })
+        .collect();
+    let mut app = App {
+        contacts_open: true,
+        ..Default::default()
+    };
+    app.set_conversations(conversations);
+    app.contacts_selection = 19;
+    let backend = TestBackend::new(100, 30);
+    let mut terminal = Terminal::new(backend).unwrap();
+    let mut hits = ui::HitMap::default();
+    terminal
+        .draw(|frame| hits = ui::render(frame, &app))
+        .unwrap();
+    let (row, _) = hits
+        .contacts_rows
+        .iter()
+        .find(|(_, index)| *index == 19)
+        .expect("last contact scrolls into view");
+    assert_eq!(row.height, 1, "contact rows have no blank gap");
+    assert_eq!(hits.at(row.x, row.y), Some(ui::Hit::ContactRow(19)));
+    assert!(
+        hits.contacts_rows
+            .windows(2)
+            .all(|pair| { pair[1].0.y == pair[0].0.y + 1 && pair[1].1 == pair[0].1 + 1 }),
+        "visible contacts are consecutive: {:?}",
+        hits.contacts_rows
+    );
+    assert!(row_text(terminal.backend().buffer(), row.y)
+        .contains(app.visible_contact_handles()[19].value()));
 }
 
 #[test]
@@ -1724,7 +3139,7 @@ fn the_header_leads_with_the_chat_and_ends_with_bloom() {
     let header = row_text(&grid, 0);
     let pane = header.split('│').nth(1).expect("pane header");
     assert!(
-        pane.starts_with("Weekend crew"),
+        pane.trim_start().starts_with("Weekend crew"),
         "chat name leads: {pane:?}"
     );
     assert!(

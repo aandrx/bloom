@@ -4,8 +4,15 @@ use bloom_domain::{
     Capabilities, Conversation, ConversationId, DeliveryState, Message, MessageId, MessagePart,
     OutgoingBody, SessionState, TransportId,
 };
-use std::{error::Error, fmt};
-use tokio::sync::mpsc;
+use std::{
+    error::Error,
+    fmt,
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    },
+};
+use tokio::sync::{mpsc, Notify};
 
 pub mod conformance;
 pub mod testing;
@@ -64,6 +71,33 @@ impl fmt::Debug for SessionReason {
     }
 }
 
+/// A sync completion acknowledgement shared between the engine and persistence consumer.
+/// The consumer marks failed rows before acknowledging; the engine then reports failure instead
+/// of a successful sync result.
+#[derive(Default)]
+pub struct SyncCompletion {
+    persistence_failed: AtomicBool,
+    acknowledged: Notify,
+}
+
+impl SyncCompletion {
+    pub fn mark_persistence_failed(&self) {
+        self.persistence_failed.store(true, Ordering::Release);
+    }
+
+    pub fn persistence_failed(&self) -> bool {
+        self.persistence_failed.load(Ordering::Acquire)
+    }
+
+    pub fn acknowledge(&self) {
+        self.acknowledged.notify_one();
+    }
+
+    pub async fn wait(&self) {
+        self.acknowledged.notified().await;
+    }
+}
+
 /// Transport events. Debug output intentionally includes only variant names.
 #[derive(Clone)]
 pub enum TransportEvent {
@@ -73,9 +107,15 @@ pub enum TransportEvent {
     Conversation {
         conversation: Conversation,
     },
+    /// Ordered sync-completion marker. The persistence consumer acknowledges only after
+    /// preceding conversation events have been committed and any refresh published.
+    ConversationSyncComplete {
+        completion: Arc<SyncCompletion>,
+    },
     Message {
         conversation: Conversation,
         message: Message,
+        push_sequence: Option<u64>,
     },
     MessageUpdated {
         conversation: Conversation,
@@ -96,6 +136,7 @@ impl fmt::Debug for TransportEvent {
         f.write_str(match self {
             Self::ConversationsChanged => "TransportEvent::ConversationsChanged",
             Self::Conversation { .. } => "TransportEvent::Conversation([REDACTED])",
+            Self::ConversationSyncComplete { .. } => "TransportEvent::ConversationSyncComplete",
             Self::Message { .. } => "TransportEvent::Message([REDACTED])",
             Self::MessageUpdated { .. } => "TransportEvent::MessageUpdated([REDACTED])",
             Self::DeliveryChanged { .. } => "TransportEvent::DeliveryChanged([REDACTED])",

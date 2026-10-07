@@ -54,6 +54,11 @@ final class SendCommand extends Command {
   final String? chatGuid;
 }
 
+final class SyncConversationsCommand extends Command {
+  const SyncConversationsCommand({required this.requestId});
+  final int requestId;
+}
+
 final class ShutdownCommand extends Command {
   const ShutdownCommand({required this.requestId});
 
@@ -151,6 +156,15 @@ Command decodeCommand(String line) {
         text: text,
         chatGuid: _optionalChatGuid(decoded),
       );
+    case 'sync_conversations':
+      final requestId = decoded['request_id'];
+      if (requestId is! int) {
+        throw ProtocolException(
+          ProtocolCodes.invalidFrame,
+          'sync requires integer request_id',
+        );
+      }
+      return SyncConversationsCommand(requestId: requestId);
     case 'shutdown':
       final requestId = decoded['request_id'];
       if (requestId is! int) {
@@ -225,6 +239,19 @@ String sendConfirmFrame({
       'message_id': messageId,
       'accepted': accepted,
       if (error != null) 'error': error,
+    });
+
+/// Status and count for a completed conversation-list metadata sync.
+String syncResultFrame({
+  required int requestId,
+  required String status,
+  required int conversations,
+}) =>
+    _frame(<String, Object?>{
+      'type': 'sync_result',
+      'request_id': requestId,
+      'status': status,
+      'conversations': conversations,
     });
 
 /// Acknowledgement that the sidecar has begun shutting down.

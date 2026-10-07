@@ -19,6 +19,7 @@ import 'package:flutter_rust_bridge/flutter_rust_bridge_for_generated_io.dart';
 import '../lib/payload_codec.dart';
 import '../lib/protocol.dart';
 import '../lib/send_coordinator.dart';
+import '../lib/single_flight.dart';
 import '../lib/upstream/api/api.dart' as api;
 import '../lib/upstream/lib.dart' as upstream;
 import '../lib/upstream/frb_generated.dart';
@@ -260,14 +261,26 @@ Future<void> main(List<String> arguments) async {
     ),
   );
 
+  final syncFlight = SingleFlight<_SyncResult>();
+  Future<_SyncResult> runSync(
+    upstream.ArcCloudMessagesClientDefaultAnisetteProvider client,
+  ) =>
+      syncFlight.run(() => _syncChats(client));
+
   if (config.syncChats) {
     final client = cloudMessagesClient;
     if (client == null) {
       stderr.writeln('chat sync unavailable: no cloud messages client');
-      stdout.writeln(
-          historyCompleteFrame(conversations: 0, messages: 0, limited: true));
     } else {
-      unawaited(_syncChats(client));
+      // Request id zero is reserved for an unsolicited startup completion. The
+      // daemon uses it to publish the ordered conversation-list refresh event.
+      unawaited(runSync(client).then((result) {
+        stdout.writeln(syncResultFrame(
+          requestId: 0,
+          status: result.status,
+          conversations: result.count,
+        ));
+      }));
     }
   }
 
@@ -285,6 +298,23 @@ Future<void> main(List<String> arguments) async {
               line: line,
               deskState: deskState,
               sends: sends,
+              sync: (requestId) async {
+                final client = cloudMessagesClient;
+                if (client == null) {
+                  stdout.writeln(syncResultFrame(
+                    requestId: requestId,
+                    status: 'failed',
+                    conversations: 0,
+                  ));
+                  return;
+                }
+                final result = await runSync(client);
+                stdout.writeln(syncResultFrame(
+                  requestId: requestId,
+                  status: result.status,
+                  conversations: result.count,
+                ));
+              },
               stop: stop,
             ),
             onDone: stop,
@@ -302,6 +332,7 @@ Future<void> main(List<String> arguments) async {
       await Future<void>.delayed(const Duration(seconds: 1));
       continue;
     }
+    final receivedAt = Stopwatch()..start();
     await result.map(
       stop: (_) => stopping = true,
       cont: (value) async {
@@ -320,6 +351,11 @@ Future<void> main(List<String> arguments) async {
           }
         }
         stdout.writeln(inboundFrame(sequence: sequence, payload: payload));
+        if (Platform.environment['BLOOM_TIMING_DIAGNOSTICS'] == '1') {
+          stderr.writeln(
+            'bloom timing sidecar frame_encode_us=${receivedAt.elapsedMicroseconds} sequence=$sequence',
+          );
+        }
       },
     );
     if (!stopping) {
@@ -357,23 +393,52 @@ Map<String, Object?>? conversationFromChat({
 ///
 /// Runs off the receive path so live messaging is unaffected. Bounded, and marks
 /// the result limited rather than silently truncating.
-Future<void> _syncChats(
+class _SyncResult {
+  const _SyncResult(this.status, this.count);
+  final String status;
+  final int count;
+}
+
+const _maxSyncPages = 200;
+const _maxSyncRows = 20000;
+
+bool conversationSyncHasMore({
+  required int status,
+  required bool pageIsEmpty,
+  required bool hasContinuation,
+}) =>
+    !pageIsEmpty && status == 1 && hasContinuation;
+
+bool conversationSyncLimitReached({
+  required int pages,
+  required int rows,
+  required bool hasMore,
+}) =>
+    (pages >= _maxSyncPages && hasMore) || (rows >= _maxSyncRows && hasMore);
+
+Future<_SyncResult> _syncChats(
   upstream.ArcCloudMessagesClientDefaultAnisetteProvider client,
 ) async {
-  const maxPages = 200;
-  const maxRows = 20000;
   Uint8List? token;
   var pages = 0;
   var rows = 0;
   var limited = false;
+  var successfulListing = false;
+  var hasMore = false;
   final seen = <String>{};
   try {
-    while (pages < maxPages && rows < maxRows) {
+    while (pages < _maxSyncPages && rows < _maxSyncRows) {
       final (next, page, status) = await api.syncChats(
         cloudMessagesClient: client,
         continuationToken: token,
       );
       pages++;
+      successfulListing = true;
+      hasMore = conversationSyncHasMore(
+        status: status,
+        pageIsEmpty: page.isEmpty,
+        hasContinuation: next.isNotEmpty,
+      );
       if (page.isEmpty) break;
       for (final chat in page.values) {
         if (chat == null) continue;
@@ -385,7 +450,7 @@ Future<void> _syncChats(
         );
         if (mapped == null) continue;
         if (!seen.add(mapped['guid']! as String)) continue;
-        if (rows >= maxRows) {
+        if (rows >= _maxSyncRows) {
           limited = true;
           break;
         }
@@ -393,20 +458,31 @@ Future<void> _syncChats(
         stdout.writeln(conversationFrame(sequence: rows, conversation: mapped));
       }
       if (limited) break;
-      if (status != 1 || next.isEmpty) break;
+      if (!hasMore) break;
       token = next;
     }
-    if (pages >= maxPages || rows >= maxRows) limited = true;
+    limited = limited ||
+        conversationSyncLimitReached(
+          pages: pages,
+          rows: rows,
+          hasMore: hasMore,
+        );
   } catch (error) {
     stderr.writeln(
       'chat sync failed: ${error.runtimeType}: ${error.toString().split('\n').first}',
     );
-    limited = true;
+    limited = successfulListing;
   }
   stderr.writeln(
-      'chat sync complete: pages=$pages conversations=$rows limited=$limited');
-  stdout.writeln(
-    historyCompleteFrame(conversations: rows, messages: 0, limited: limited),
+    'chat sync complete: pages=$pages conversations=$rows limited=$limited',
+  );
+  return _SyncResult(
+    !successfulListing
+        ? 'failed'
+        : limited
+            ? 'limited'
+            : 'complete',
+    rows,
   );
 }
 
@@ -414,6 +490,7 @@ Future<void> _handleCommand({
   required String line,
   required dynamic deskState,
   required SendCoordinator sends,
+  required Future<void> Function(int) sync,
   required void Function() stop,
 }) async {
   final Command command;
@@ -426,6 +503,8 @@ Future<void> _handleCommand({
   }
 
   switch (command) {
+    case SyncConversationsCommand():
+      await sync(command.requestId);
     case ShutdownCommand():
       stdout.writeln(shutdownAckFrame(requestId: command.requestId));
       stop();

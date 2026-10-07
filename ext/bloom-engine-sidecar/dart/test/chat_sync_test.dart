@@ -4,6 +4,57 @@ import '../bin/bloom_engine.dart' as sidecar;
 import 'package:test/test.dart';
 
 void main() {
+  group('conversation sync bounds', () {
+    test('an empty page has no remaining results', () {
+      expect(
+        sidecar.conversationSyncHasMore(
+          status: 1,
+          pageIsEmpty: true,
+          hasContinuation: true,
+        ),
+        isFalse,
+      );
+    });
+
+    test('an exact row cap is complete when no continuation remains', () {
+      expect(
+        sidecar.conversationSyncLimitReached(
+          pages: 1,
+          rows: 20000,
+          hasMore: false,
+        ),
+        isFalse,
+      );
+      expect(
+        sidecar.conversationSyncLimitReached(
+          pages: 1,
+          rows: 20000,
+          hasMore: true,
+        ),
+        isTrue,
+      );
+    });
+
+    test('a page cap is limited only when a continuation remains', () {
+      expect(
+        sidecar.conversationSyncLimitReached(
+          pages: 200,
+          rows: 10,
+          hasMore: false,
+        ),
+        isFalse,
+      );
+      expect(
+        sidecar.conversationSyncLimitReached(
+          pages: 200,
+          rows: 10,
+          hasMore: true,
+        ),
+        isTrue,
+      );
+    });
+  });
+
   group('conversation mapping', () {
     test('uses the display name and flags a group', () {
       final mapped = sidecar.conversationFromChat(

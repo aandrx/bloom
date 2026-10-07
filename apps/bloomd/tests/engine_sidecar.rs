@@ -7,6 +7,7 @@
 use bloom_domain::{MessagePart, OutgoingBody};
 use bloom_ipc::EventKind;
 use bloom_secrets::SecretStoreError;
+use bloom_transport::Transport;
 use bloomd::{
     engine::{Engine, EngineConfig},
     ipc::{RequestHandler, SubscriptionHub},
@@ -60,6 +61,332 @@ done
     fs::write(&path, script).unwrap();
     fs::set_permissions(&path, fs::Permissions::from_mode(0o700)).unwrap();
     path
+}
+
+#[tokio::test]
+async fn malformed_stdout_terminates_engine_and_rejects_later_sends() {
+    let dir = tempfile::tempdir().unwrap();
+    let script = dir.path().join("malformed.sh");
+    fs::write(&script, "#!/bin/sh\nprintf '%s\\n' '{\"type\":\"ready\",\"handles\":[\"tel:+15550000000\"]}' 'not-json'\nexec sleep 30\n").unwrap();
+    fs::set_permissions(&script, fs::Permissions::from_mode(0o700)).unwrap();
+    let engine = Engine::new(EngineConfig {
+        dart_executable: script.clone(),
+        script: PathBuf::new(),
+        state_dir: dir.path().into(),
+        library: PathBuf::new(),
+        sync_chats: false,
+    });
+    let mut events = engine.take_events().await.unwrap();
+    engine.start().await.unwrap();
+    tokio::time::timeout(Duration::from_secs(4), async {
+        loop {
+            if matches!(
+                events.recv().await,
+                Some(bloom_transport::TransportEvent::Session {
+                    state: bloom_domain::SessionState::Disconnected,
+                    ..
+                })
+            ) {
+                break;
+            }
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(
+        engine
+            .send_text(&["tel:+15550000001".into()], None, "x")
+            .await,
+        Err(bloom_transport::TransportError::TransportUnavailable)
+    );
+    engine.stop().await.unwrap();
+    engine.stop().await.unwrap();
+}
+
+fn lifecycle_engine(script: PathBuf, dir: &std::path::Path) -> Arc<Engine> {
+    Arc::new(Engine::new(EngineConfig {
+        dart_executable: script,
+        script: PathBuf::new(),
+        state_dir: dir.into(),
+        library: PathBuf::new(),
+        sync_chats: false,
+    }))
+}
+
+fn child_running(script: &std::path::Path) -> bool {
+    let pid = fs::read_to_string(script.with_extension("pid")).unwrap();
+    std::process::Command::new("kill")
+        .args(["-0", pid.trim()])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .unwrap()
+        .success()
+}
+
+#[tokio::test]
+async fn stream_failure_preserves_prior_messages_fails_sync_and_reaps_child() {
+    let dir = tempfile::tempdir().unwrap();
+    let private = dir.path().join("private");
+    fs::create_dir(&private).unwrap();
+    fs::set_permissions(&private, fs::Permissions::from_mode(0o700)).unwrap();
+    let template = fs::read_to_string(fake_sidecar(dir.path())).unwrap();
+    let preamble = template.split_once("while IFS= read").unwrap().0;
+    let rejected_frame = template
+        .lines()
+        .find(|line| line.contains("\"id\":\"inbound-1\""))
+        .unwrap()
+        .replace("inbound-1", "after-stream-failure");
+    let script = dir.path().join("failure.sh");
+    fs::write(&script, format!(
+        "{preamble}\nprintf '%s' \"$$\" > \"${{0%.sh}}.pid\"\nwhile IFS= read -r line; do\n  case \"$line\" in\n    *'\"type\":\"sync_conversations\"'*)\n      printf '%s\\n' 'not-json' '{rejected_frame}'\n      exec sleep 30\n      ;;\n  esac\ndone\n"
+    )).unwrap();
+    fs::set_permissions(&script, fs::Permissions::from_mode(0o700)).unwrap();
+    let engine = lifecycle_engine(script.clone(), &private);
+    let events = engine.take_events().await.unwrap();
+    let store = Arc::new(Mutex::new(
+        EncryptedStore::open(private.join("store.db"), &TestSecrets).unwrap(),
+    ));
+    let hub = SubscriptionHub::with_default_capacity();
+    let mut subscriber = hub.subscribe();
+    let service = Arc::new(Service::new(store, engine.clone(), hub));
+    let persistence = tokio::spawn(service.clone().persist_events(events));
+    engine.start().await.unwrap();
+    let mut received = Vec::new();
+    tokio::time::timeout(Duration::from_secs(3), async {
+        while received.len() < 2 {
+            if let EventKind::Message {
+                conversation_id,
+                message,
+                ..
+            } = subscriber.recv().await.unwrap().event
+            {
+                received.push((conversation_id, message));
+            }
+        }
+    })
+    .await
+    .unwrap();
+    assert!(!engine.my_handles().is_empty());
+    assert_eq!(
+        tokio::time::timeout(Duration::from_secs(1), engine.sync_conversations())
+            .await
+            .unwrap(),
+        Err(bloom_transport::TransportError::TransportUnavailable),
+        "A dead reader must not leave metadata sync waiting for its 120-second deadline"
+    );
+    tokio::time::timeout(Duration::from_secs(4), async {
+        loop {
+            if matches!(
+                subscriber.recv().await.unwrap().event,
+                EventKind::Session {
+                    state: bloom_domain::SessionState::Disconnected,
+                    ..
+                }
+            ) {
+                break;
+            }
+        }
+    })
+    .await
+    .unwrap();
+    assert!(
+        !child_running(&script),
+        "Failed child must be reaped before disconnected is published"
+    );
+    assert!(engine.my_handles().is_empty());
+    for (id, message) in received {
+        let history = service.history(id, 10).await.unwrap();
+        assert_eq!(
+            history.len(),
+            1,
+            "Frames after malformed stdout must not be ingested"
+        );
+        assert_eq!(history[0].id(), message.id());
+    }
+    assert_eq!(
+        engine
+            .send_text(&["tel:+15550000001".into()], None, "x")
+            .await,
+        Err(bloom_transport::TransportError::TransportUnavailable)
+    );
+    assert_eq!(
+        engine.start().await,
+        Err(bloom_transport::TransportError::TransportUnavailable),
+        "One-shot Engine cannot restart and must not spawn an orphan on another start"
+    );
+    assert!(!child_running(&script));
+    engine.stop().await.unwrap();
+    engine.stop().await.unwrap();
+    tokio::time::timeout(Duration::from_secs(1), persistence)
+        .await
+        .unwrap()
+        .unwrap();
+}
+
+#[tokio::test]
+async fn graceful_shutdown_persists_the_sidecars_final_message() {
+    let dir = tempfile::tempdir().unwrap();
+    let private = dir.path().join("private");
+    fs::create_dir(&private).unwrap();
+    fs::set_permissions(&private, fs::Permissions::from_mode(0o700)).unwrap();
+    let template = fs::read_to_string(fake_sidecar(dir.path())).unwrap();
+    let preamble = template.split_once("while IFS= read").unwrap().0;
+    let final_frame = template
+        .lines()
+        .find(|line| line.contains("\"id\":\"inbound-1\""))
+        .unwrap()
+        .replace("inbound-1", "shutdown-final");
+    let script = dir.path().join("graceful.sh");
+    fs::write(&script, format!(
+        "{preamble}\nprintf '%s' \"$$\" > \"${{0%.sh}}.pid\"\nwhile IFS= read -r line; do\n  case \"$line\" in\n    *'\"type\":\"shutdown\"'*)\n      sleep 0.05\n      printf '%s\\n' '{final_frame}' '{{\"version\":1,\"type\":\"shutdown_ack\",\"request_id\":1}}'\n      exit 0\n      ;;\n  esac\ndone\n"
+    )).unwrap();
+    fs::set_permissions(&script, fs::Permissions::from_mode(0o700)).unwrap();
+    let engine = lifecycle_engine(script.clone(), &private);
+    let events = engine.take_events().await.unwrap();
+    let store = Arc::new(Mutex::new(
+        EncryptedStore::open(private.join("store.db"), &TestSecrets).unwrap(),
+    ));
+    let hub = SubscriptionHub::with_default_capacity();
+    let mut subscriber = hub.subscribe();
+    let service = Arc::new(Service::new(store, engine.clone(), hub));
+    let persistence = tokio::spawn(service.clone().persist_events(events));
+    engine.start().await.unwrap();
+    let mut received = Vec::new();
+    tokio::time::timeout(Duration::from_secs(3), async {
+        while received.len() < 2 {
+            if let EventKind::Message {
+                conversation_id, ..
+            } = subscriber.recv().await.unwrap().event
+            {
+                received.push(conversation_id);
+            }
+        }
+    })
+    .await
+    .unwrap();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        let (first, second) = tokio::join!(engine.stop(), engine.stop());
+        first.unwrap();
+        second.unwrap();
+    })
+    .await
+    .unwrap();
+    tokio::time::timeout(Duration::from_secs(3), persistence)
+        .await
+        .unwrap()
+        .unwrap();
+    let history = service.history(received[0].clone(), 10).await.unwrap();
+    let expected =
+        bloom_domain::MessageId::new(received[0].transport().clone(), "shutdown-final").unwrap();
+    assert!(
+        history.iter().any(|message| message.id() == &expected),
+        "A final message emitted before shutdown acknowledgment must be durably persisted"
+    );
+    assert!(!child_running(&script));
+    engine.stop().await.unwrap();
+}
+
+async fn blocked_shutdown_engine(
+    dir: &std::path::Path,
+) -> (
+    Arc<Engine>,
+    mpsc::Receiver<bloom_transport::TransportEvent>,
+    PathBuf,
+) {
+    let script = dir.join("blocked-shutdown.sh");
+    let ready = "{\"type\":\"ready\",\"handles\":[\"tel:+15550000000\"],\"capabilities\":{\"recipient_lists\":true}}\n";
+    fs::write(&script, format!(
+        "#!/bin/sh\nprintf '%s' \"$$\" > \"${{0%.sh}}.pid\"\ncat <<'FRAMES'\n{}FRAMES\nwhile IFS= read -r line; do\n  case \"$line\" in\n    *'\"type\":\"shutdown\"'*)\n      printf 'shutdown' > \"$0.shutdown\"\n      exec sleep 30\n      ;;\n  esac\ndone\n",
+        ready.repeat(bloomd::engine::EVENT_CAPACITY + 4)
+    )).unwrap();
+    fs::set_permissions(&script, fs::Permissions::from_mode(0o700)).unwrap();
+    let engine = lifecycle_engine(script.clone(), dir);
+    let mut events = engine.take_events().await.unwrap();
+    engine.start().await.unwrap();
+    tokio::time::timeout(Duration::from_secs(2), events.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    (engine, events, script)
+}
+
+#[tokio::test]
+async fn graceful_shutdown_is_bounded_with_a_stalled_event_consumer() {
+    let dir = tempfile::tempdir().unwrap();
+    let (engine, events, script) = blocked_shutdown_engine(dir.path()).await;
+    tokio::time::timeout(Duration::from_secs(18), engine.stop())
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        !child_running(&script),
+        "An uncooperative sidecar must be reaped after the drain deadline"
+    );
+    assert!(engine.my_handles().is_empty());
+    drop(events);
+    engine.stop().await.unwrap();
+}
+
+#[tokio::test]
+async fn cancelling_stop_does_not_cancel_the_readers_cleanup_deadline() {
+    let dir = tempfile::tempdir().unwrap();
+    let (engine, events, script) = blocked_shutdown_engine(dir.path()).await;
+    assert!(
+        tokio::time::timeout(Duration::from_millis(150), engine.stop())
+            .await
+            .is_err()
+    );
+    tokio::time::timeout(Duration::from_secs(15), async {
+        while child_running(&script) {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("Cancellation of the caller must not orphan the child");
+    assert!(
+        script.with_extension("sh.shutdown").exists(),
+        "The fixture must have received the shutdown request"
+    );
+    assert!(engine.my_handles().is_empty());
+    drop(events);
+    engine.stop().await.unwrap();
+}
+
+#[tokio::test]
+async fn dropping_event_consumer_reaps_child_even_with_backpressure() {
+    let dir = tempfile::tempdir().unwrap();
+    let script = dir.path().join("backpressure.sh");
+    let ready = "{\"type\":\"ready\",\"handles\":[\"tel:+15550000000\"],\"capabilities\":{\"recipient_lists\":true}}\n";
+    fs::write(&script, format!(
+        "#!/bin/sh\nprintf '%s' \"$$\" > \"${{0%.sh}}.pid\"\ncat <<'FRAMES'\n{}FRAMES\nexec sleep 30\n",
+        ready.repeat(bloomd::engine::EVENT_CAPACITY + 2)
+    )).unwrap();
+    fs::set_permissions(&script, fs::Permissions::from_mode(0o700)).unwrap();
+    let engine = lifecycle_engine(script.clone(), dir.path());
+    let mut events = engine.take_events().await.unwrap();
+    engine.start().await.unwrap();
+    tokio::time::timeout(Duration::from_secs(2), events.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(child_running(&script));
+    drop(events);
+    tokio::time::timeout(Duration::from_secs(4), async {
+        while child_running(&script) {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .unwrap();
+    assert!(engine.my_handles().is_empty());
+    assert_eq!(
+        engine
+            .send_text(&["tel:+15550000001".into()], None, "x")
+            .await,
+        Err(bloom_transport::TransportError::TransportUnavailable)
+    );
+    engine.stop().await.unwrap();
 }
 
 #[tokio::test]
@@ -145,6 +472,7 @@ async fn exact_direct_identity_reconciles_split_histories_at_the_service_boundar
         .persist(&TransportEvent::Message {
             conversation: engine.clone(),
             message: live,
+            push_sequence: None,
         })
         .unwrap());
 
@@ -190,6 +518,7 @@ async fn exact_direct_identity_reconciles_split_histories_at_the_service_boundar
         service.persist(&TransportEvent::Message {
             conversation: engine,
             message: mismatched,
+            push_sequence: None,
         }),
         Err(store::StoreError::MessageConversationMismatch)
     ));
@@ -238,6 +567,7 @@ async fn daemon_persists_inbound_and_sends_outbound_through_the_sidecar() {
             if let EventKind::Message {
                 conversation_id,
                 message,
+                ..
             } = event.event
             {
                 return (conversation_id, message);
@@ -293,6 +623,7 @@ async fn daemon_persists_inbound_and_sends_outbound_through_the_sidecar() {
             if let EventKind::Message {
                 conversation_id,
                 message,
+                ..
             } = event.event
             {
                 if conversation_id.value() == "iMessage;-;group-with-two-people" {
@@ -738,6 +1069,90 @@ done
     fs::write(&path, script).unwrap();
     fs::set_permissions(&path, fs::Permissions::from_mode(0o700)).unwrap();
     path
+}
+
+fn fake_sidecar_sync(dir: &std::path::Path) -> PathBuf {
+    let path = dir.join("fake_engine_sync.sh");
+    let script = r#"#!/bin/sh
+cat <<'FRAMES'
+{"version":1,"type":"ready","engine_version":"fake","handles":["mailto:me@example.invalid"],"capabilities":{"send":true,"history":false}}
+FRAMES
+while IFS= read -r line; do
+  case "$line" in
+    *'"type":"sync_conversations"'*)
+      id=$(printf '%s' "$line" | sed -n 's/.*"request_id":\([0-9]*\).*/\1/p')
+      printf '{"version":1,"type":"conversation","sequence":1,"conversation":{"guid":"iMessage;-;sync@example.invalid","title":"Synced","participants":["mailto:sync@example.invalid","mailto:me@example.invalid"],"is_group":false}}\n'
+      printf '{"version":1,"type":"sync_result","request_id":%s,"status":"complete","conversations":1}\n' "$id"
+      ;;
+    *'"type":"shutdown"'*)
+      printf '{"version":1,"type":"shutdown_ack","request_id":1}\n'
+      exit 0
+      ;;
+  esac
+done
+"#;
+    fs::write(&path, script).unwrap();
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o700)).unwrap();
+    path
+}
+
+#[tokio::test]
+async fn sync_waits_for_persistence_and_publishes_a_refresh() {
+    let dir = tempfile::tempdir().unwrap();
+    let private = dir.path().join("private");
+    fs::create_dir(&private).unwrap();
+    fs::set_permissions(&private, fs::Permissions::from_mode(0o700)).unwrap();
+    let fake = fake_sidecar_sync(dir.path());
+
+    let store = EncryptedStore::open(private.join("store.db"), &TestSecrets).unwrap();
+    let store = Arc::new(Mutex::new(store));
+    let hub = SubscriptionHub::with_default_capacity();
+    let mut subscriber = hub.subscribe();
+    let engine = Arc::new(Engine::new(EngineConfig {
+        sync_chats: false,
+        dart_executable: fake,
+        script: PathBuf::from("ignored"),
+        state_dir: private.clone(),
+        library: PathBuf::from("ignored"),
+    }));
+    let (sink, mut events) = mpsc::channel(64);
+    let mut supervisor = Supervisor::new(engine.clone(), sink);
+    let service = Arc::new(Service::new(store.clone(), engine, hub));
+    let service_for_persist = service.clone();
+    let persistence = tokio::spawn(async move {
+        while let Some(event) = events.recv().await {
+            service_for_persist.persist(&event).unwrap();
+        }
+    });
+    supervisor.start().await.expect("engine starts");
+
+    assert_eq!(
+        service.sync_conversations().await.unwrap(),
+        (bloom_ipc::ConversationSyncStatus::Complete, 1)
+    );
+    assert_eq!(
+        store::list_conversations(&store.lock().unwrap())
+            .unwrap()
+            .len(),
+        1,
+        "sync response must wait until the listing row is committed"
+    );
+    loop {
+        let event = tokio::time::timeout(Duration::from_secs(2), subscriber.recv())
+            .await
+            .expect("sync publishes a refresh")
+            .unwrap();
+        if matches!(event.event, EventKind::ConversationsChanged) {
+            break;
+        }
+    }
+
+    let report = supervisor
+        .shutdown(Duration::from_secs(5))
+        .await
+        .expect("shutdown completes");
+    assert!(!report.drain_incomplete);
+    persistence.abort();
 }
 
 #[tokio::test]

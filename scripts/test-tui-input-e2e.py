@@ -1,0 +1,156 @@
+#!/usr/bin/env python3
+"""Real-terminal input and recipient-safety regressions with synthetic IPC only.
+
+Run with a Python interpreter containing pyte after building bloom-tui.
+No engine, account or personal configuration is accessed.
+"""
+import fcntl
+import json
+import os
+from pathlib import Path
+import pty
+import runpy
+import select
+import signal
+import struct
+import termios
+import time
+import unittest
+
+HELPERS = runpy.run_path(str(Path(__file__).with_name('test-tui-messaging-e2e.py')), run_name='helpers')
+SHOT = HELPERS['SHOT']
+
+
+class InputFlows(unittest.TestCase):
+    def setUp(self):
+        self.fixture = HELPERS['MessagingFlows']()
+        self.fixture.setUp()
+        self.addCleanup(self.fixture.tearDown)
+        self.fixture.start_daemon()
+
+    def capture(self, keys):
+        fixture = self.fixture
+        with HELPERS['isolated_environment']({
+            'BLOOM_SOCKET_PATH': str(fixture.socket_path),
+            'XDG_CONFIG_HOME': str(fixture.root / 'config'),
+            'XDG_STATE_HOME': str(fixture.root / 'state'),
+            'XDG_DATA_HOME': str(fixture.root / 'data'),
+        }):
+            raw = SHOT['run_tui']([str(HELPERS['BINARY'])], 100, 30, keys, 1.0)
+        text = '\n'.join(SHOT['render'](raw, 100, 30).display)
+        artifacts = os.environ.get('BLOOM_E2E_ARTIFACTS')
+        if artifacts:
+            dest = Path(artifacts) / self._testMethodName
+            dest.mkdir(parents=True, exist_ok=True)
+            (dest / 'screen.txt').write_text(text + '\n')
+            (dest / 'screen.ansi').write_bytes(raw)
+        return text
+
+    def test_paste_is_visible_without_sending(self):
+        text = self.capture([b'\x1b[200~First pasted line\r\nSecond pasted line\x1b[201~'])
+        self.assertIn('First pasted line', text)
+        self.assertIn('Second pasted line', text)
+        self.assertEqual(self.fixture.persisted()['messages'], [])
+
+    def test_pasted_commands_send_as_exact_literal_body_only_on_enter(self):
+        body = '  /new\ncarol@example.invalid\nDO NOT EXECUTE  '
+        self.capture([b'\x1b[200~' + body.encode() + b'\x1b[201~', b'\r'])
+        messages = self.fixture.persisted()['messages']
+        self.assertEqual(len(messages), 1)
+        self.assertEqual(messages[0]['conversation_id']['value'], 'alice@example.invalid')
+        self.assertEqual(messages[0]['parts'], [{'type': 'text', 'value': body}])
+        self.assertEqual(len(self.fixture.persisted()['conversations']), 2)
+
+    def test_ctrl_j_is_newline_not_send(self):
+        self.capture([b'First line', b'\n', b'Second line', b'\r'])
+        messages = self.fixture.persisted()['messages']
+        self.assertEqual(len(messages), 1)
+        self.assertEqual(messages[0]['parts'], [{'type': 'text', 'value': 'First line\nSecond line'}])
+
+    def test_switching_chats_cannot_send_previous_recipients_draft(self):
+        text = self.capture([b'Private Alice message', b'\t', b'\x1b[B', b'\r', b'\r'])
+        self.assertIn('Bob', text.splitlines()[0])
+        self.assertEqual(self.fixture.persisted()['messages'], [], 'Alice draft must not be sendable to Bob')
+
+    def test_returning_to_chat_restores_its_own_draft(self):
+        self.capture([b'Private Alice message', b'\t', b'\x1b[B', b'\r', b'Bob draft', b'\t', b'\x1b[A', b'\r', b'\r'])
+        messages = self.fixture.persisted()['messages']
+        self.assertEqual(len(messages), 1)
+        self.assertEqual(messages[0]['conversation_id']['value'], 'alice@example.invalid')
+        self.assertEqual(messages[0]['parts'], [{'type': 'text', 'value': 'Private Alice message'}])
+
+    def test_new_chat_does_not_destroy_existing_draft(self):
+        text = self.capture([b'Keep Alice draft', b'\x02', b'n', b'/new', b'\r', b'carol@example.invalid', b'\r', b'Carol draft', b'\x1b', b'\x10'])
+        self.assertEqual(self.fixture.persisted()['messages'], [])
+        self.assertIn('Keep Alice draft', text)
+
+    def test_settings_preserves_chat_composition_and_new_chat_body(self):
+        text = self.capture([b'Alice draft', b'\x02', b's', b'\x1b'])
+        self.assertIn('Alice draft', text)
+        text = self.capture([b'/new', b'\r', b'carol@example.invalid', b'\r', b'Carol body', b'\x02', b's', b'\x1b'])
+        self.assertIn('Carol body', text)
+        self.assertIn('carol@example.invalid', text)
+
+    def test_modal_draft_does_not_follow_changed_selected_chat(self):
+        text = self.capture([b'Alice private', b'\x02', b's', b'\t', b'\x1b[B', b'\r', b'\x1b', b'\r'])
+        self.assertIn('Bob', text.splitlines()[0])
+        self.assertNotIn('Alice private', text, 'modal-suspended Alice text must not appear in Bob')
+        self.assertEqual(self.fixture.persisted()['messages'], [], 'closing a modal in Bob must not make Alice text sendable')
+
+    def test_nickname_command_is_local_and_persists_without_sending(self):
+        text = self.capture([b'/nickname Friendly Alice', b'\r'])
+        self.assertIn('Friendly Alice', text)
+        config = json.loads((self.fixture.root / 'config/bloom/tui.json').read_text())
+        self.assertIn('Friendly Alice', config['nicknames'].values())
+        self.assertEqual(self.fixture.persisted()['messages'], [])
+        self.capture([b'/nickname clear', b'\r'])
+        config = json.loads((self.fixture.root / 'config/bloom/tui.json').read_text())
+        self.assertNotIn('Friendly Alice', config['nicknames'].values())
+
+    def test_manual_sync_header_tracks_request_and_preserves_failure_priority(self):
+        self.fixture.stop_daemon()
+        self.fixture.start_daemon('--sync-delay', '8')
+        text = self.capture([b'/sync', b'\r'])
+        self.assertIn('Syncing', '\n'.join(text.splitlines()[:2]))
+        self.fixture.stop_daemon()
+        self.fixture.start_daemon('--sync-delay', '8', '--session-state', 'failed')
+        text = self.capture([b'/sync', b'\r'])
+        header = '\n'.join(text.splitlines()[:2])
+        self.assertIn('Failed', header)
+        self.assertNotIn('Syncing', header)
+
+    def test_resize_redraws_without_a_followup_key(self):
+        fixture = self.fixture
+        with HELPERS['isolated_environment']({
+            'BLOOM_SOCKET_PATH': str(fixture.socket_path),
+            'XDG_CONFIG_HOME': str(fixture.root / 'config'),
+            'XDG_STATE_HOME': str(fixture.root / 'state'),
+        }):
+            pid, master = pty.fork()
+            if pid == 0:
+                os.execv(str(HELPERS['BINARY']), [str(HELPERS['BINARY'])])
+        raw = bytearray()
+        def pump(seconds):
+            deadline = time.monotonic() + seconds
+            while time.monotonic() < deadline:
+                if select.select([master], [], [], .03)[0]:
+                    raw.extend(os.read(master, 65536))
+        try:
+            fcntl.ioctl(master, termios.TIOCSWINSZ, struct.pack('HHHH', 30, 100, 0, 0))
+            pump(1.5)
+            raw.clear()
+            fcntl.ioctl(master, termios.TIOCSWINSZ, struct.pack('HHHH', 18, 60, 0, 0))
+            os.kill(pid, signal.SIGWINCH)
+            pump(.6)
+            screen = SHOT['render'](bytes(raw), 60, 18)
+            text = '\n'.join(screen.display)
+            self.assertIn('Alice', text, 'Idle resize must produce a new frame before five-second reconciliation')
+            self.assertIn('›', text)
+        finally:
+            os.kill(pid, signal.SIGTERM)
+            os.waitpid(pid, 0)
+            os.close(master)
+
+
+if __name__ == '__main__':
+    unittest.main(verbosity=2)

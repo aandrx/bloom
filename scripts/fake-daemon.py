@@ -21,6 +21,9 @@ import time
 
 PROTOCOL_VERSION = 1
 SESSION_STATE = os.environ.get("BLOOM_FAKE_SESSION_STATE", "active")
+LONG_TITLE = os.environ.get("BLOOM_FAKE_LONG_TITLE") == "1"
+SUBSCRIBERS: set[socket.socket] = set()
+SUBSCRIBERS_LOCK = threading.Lock()
 
 
 def frame(payload: dict) -> bytes:
@@ -87,7 +90,14 @@ CONVERSATIONS = [
     conversation("weekend@example.invalid", "Weekend crew", 3, 1_700_000_400_000),
     # A direct chat the engine gave no title for: the UI must name it after the
     # other participant rather than showing `Conversation`.
-    conversation("dana@example.invalid", None, 2, 1_700_000_300_000),
+    conversation(
+        "dana@example.invalid",
+        "Direct chat with a deliberately long synthetic title for narrow terminal review"
+        if LONG_TITLE
+        else None,
+        2,
+        1_700_000_300_000,
+    ),
     conversation("jules@example.invalid", "Jules Lee", 2, 1_700_000_200_000),
     conversation("design@example.invalid", "Design systems", 4, 1_700_000_100_000),
 ]
@@ -156,7 +166,6 @@ HISTORY = {
 
 
 def serve_client(conn: socket.socket) -> None:
-    subscribers: list[socket.socket] = []
     while True:
         request = read_frame(conn)
         if request is None:
@@ -165,7 +174,30 @@ def serve_client(conn: socket.socket) -> None:
         kind = request.get("request", {})
         op = kind.get("op")
 
-        if op == "list_conversations":
+        if op == "sync_conversations":
+            if os.environ.get("BLOOM_FAKE_MISSED_MESSAGE") == "1":
+                # A stored phone message with no live Message event: the sidebar
+                # updates, and the open transcript must catch up from History.
+                ident = "missed-inbound-1"
+                thread = HISTORY["weekend@example.invalid"]
+                if not any(item["id"]["value"] == ident for item in thread):
+                    text = "Incoming after a missed live event"
+                    thread.append(message("weekend@example.invalid", ident, 1_700_000_520_000, text, False))
+                    CONVERSATIONS[0]["preview"] = text
+                    CONVERSATIONS[0]["last_message_at"] = 1_700_000_520_000
+                # Deliberately do not publish a Message or ConversationsChanged
+                # event: the /sync response alone must refresh the open thread.
+            else:
+                push_all({"event": "conversations_changed"})
+            conn.sendall(frame({
+                "request_id": request_id,
+                "response": {
+                    "result": "conversation_sync",
+                    "status": "complete",
+                    "conversations": len(CONVERSATIONS),
+                },
+            }))
+        elif op == "list_conversations":
             conn.sendall(frame({"request_id": request_id, "response": {"result": "conversations", "conversations": CONVERSATIONS}}))
         elif op == "history":
             key = kind.get("conversation_id", {}).get("value", "")
@@ -180,7 +212,8 @@ def serve_client(conn: socket.socket) -> None:
         elif op == "subscribe":
             conn.sendall(frame({"request_id": request_id, "response": {"result": "subscribed"}}))
             conn.sendall(frame({"event": {"event": "session", "state": SESSION_STATE}}))
-            subscribers.append(conn)
+            with SUBSCRIBERS_LOCK:
+                SUBSCRIBERS.add(conn)
             while True:
                 time.sleep(1)
 
@@ -190,6 +223,13 @@ def push(conn: socket.socket, event: dict) -> None:
         conn.sendall(frame({"event": event}))
     except OSError:
         pass
+
+
+def push_all(event: dict) -> None:
+    with SUBSCRIBERS_LOCK:
+        subscribers = tuple(SUBSCRIBERS)
+    for subscriber in subscribers:
+        push(subscriber, event)
 
 
 def main() -> int:

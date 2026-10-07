@@ -14,7 +14,7 @@ use bloom_domain::{
     HandleKind, Message, MessageId, MessagePart, OutgoingBody, Participant, SessionState,
     TransportId,
 };
-use bloom_transport::{Transport, TransportError, TransportEvent, TransportResult};
+use bloom_transport::{SyncCompletion, Transport, TransportError, TransportEvent, TransportResult};
 use serde_json::Value;
 use std::{
     collections::HashMap,
@@ -36,8 +36,9 @@ pub const MAX_FRAME_BYTES: usize = 1 << 20;
 pub const EVENT_CAPACITY: usize = 256;
 /// How long a send may wait for its confirmation before the result is uncertain.
 pub const SEND_TIMEOUT: Duration = Duration::from_secs(30);
-/// How long shutdown waits for the child before killing it.
+/// Grace period for final sidecar frames; also bounds individual shutdown I/O.
 pub const STOP_TIMEOUT: Duration = Duration::from_secs(10);
+const READER_STOP_TIMEOUT: Duration = Duration::from_secs(2);
 
 pub fn transport_id() -> TransportId {
     TransportId::new("openbubbles").expect("static transport id is valid")
@@ -97,39 +98,71 @@ struct Pending {
     waiters: Mutex<HashMap<u64, oneshot::Sender<TransportResult<MessageId>>>>,
 }
 
+type SyncResult = TransportResult<(bool, u32)>;
+type SyncWaiters = Arc<Mutex<HashMap<u64, oneshot::Sender<SyncResult>>>>;
+
+#[derive(Clone)]
+struct ReadFrameContext {
+    outgoing: mpsc::Sender<TransportEvent>,
+    pending: Arc<Pending>,
+    sync_waiters: SyncWaiters,
+    sync_events: Arc<tokio::sync::Mutex<()>>,
+    id: TransportId,
+    my_handles: Arc<Mutex<Vec<String>>>,
+    recipient_lists_supported: Arc<AtomicBool>,
+    started: Arc<AtomicBool>,
+    stdin: Arc<tokio::sync::Mutex<Option<ChildStdin>>>,
+    child: Arc<tokio::sync::Mutex<Option<Child>>>,
+    reader_stop: Arc<tokio::sync::Notify>,
+    reader_done: tokio::sync::watch::Sender<bool>,
+}
+
 pub struct Engine {
     config: EngineConfig,
     id: TransportId,
     incoming: Mutex<Option<mpsc::Receiver<TransportEvent>>>,
     outgoing: Mutex<Option<mpsc::Sender<TransportEvent>>>,
-    stdin: tokio::sync::Mutex<Option<ChildStdin>>,
-    child: tokio::sync::Mutex<Option<Child>>,
+    stdin: Arc<tokio::sync::Mutex<Option<ChildStdin>>>,
+    child: Arc<tokio::sync::Mutex<Option<Child>>>,
     pending: Arc<Pending>,
     next_request: AtomicU64,
-    started: AtomicBool,
+    started: Arc<AtomicBool>,
     /// Addresses the account can send from, learned from the sidecar's ready frame.
     my_handles: Arc<Mutex<Vec<String>>>,
     /// Whether the sidecar advertises multi-recipient send frames.
     recipient_lists_supported: Arc<AtomicBool>,
+    sync_waiters: SyncWaiters,
+    sync_events: Arc<tokio::sync::Mutex<()>>,
+    sync_lock: tokio::sync::Mutex<()>,
+    reader_stop: Arc<tokio::sync::Notify>,
+    reader_done: tokio::sync::watch::Sender<bool>,
+    lifecycle_lock: tokio::sync::Mutex<()>,
 }
 
 impl Engine {
     pub fn new(config: EngineConfig) -> Self {
         let (outgoing, incoming) = mpsc::channel(EVENT_CAPACITY);
+        let (reader_done, _) = tokio::sync::watch::channel(true);
         Self {
             config,
             id: transport_id(),
             incoming: Mutex::new(Some(incoming)),
             outgoing: Mutex::new(Some(outgoing)),
-            stdin: tokio::sync::Mutex::new(None),
-            child: tokio::sync::Mutex::new(None),
+            stdin: Arc::new(tokio::sync::Mutex::new(None)),
+            child: Arc::new(tokio::sync::Mutex::new(None)),
             pending: Arc::new(Pending {
                 waiters: Mutex::new(HashMap::new()),
             }),
             next_request: AtomicU64::new(1),
-            started: AtomicBool::new(false),
+            started: Arc::new(AtomicBool::new(false)),
             my_handles: Arc::new(Mutex::new(Vec::new())),
             recipient_lists_supported: Arc::new(AtomicBool::new(false)),
+            sync_waiters: Arc::new(Mutex::new(HashMap::new())),
+            sync_events: Arc::new(tokio::sync::Mutex::new(())),
+            sync_lock: tokio::sync::Mutex::new(()),
+            reader_stop: Arc::new(tokio::sync::Notify::new()),
+            reader_done,
+            lifecycle_lock: tokio::sync::Mutex::new(()),
         }
     }
 
@@ -208,6 +241,36 @@ impl Engine {
         }
     }
 
+    /// Request bounded remote conversation-list metadata sync. Does not fetch messages.
+    pub async fn sync_conversations(&self) -> TransportResult<(bool, u32)> {
+        let _serial = self.sync_lock.lock().await;
+        if !self.started.load(Ordering::SeqCst) {
+            return Err(TransportError::TransportUnavailable);
+        }
+        let request_id = self.next_request.fetch_add(1, Ordering::Relaxed);
+        let (tx, rx) = oneshot::channel();
+        self.sync_waiters.lock().unwrap().insert(request_id, tx);
+        if self
+            .write_frame(&serde_json::json!({
+                "version": 1,
+                "type": "sync_conversations",
+                "request_id": request_id
+            }))
+            .await
+            .is_err()
+        {
+            self.sync_waiters.lock().unwrap().remove(&request_id);
+            return Err(TransportError::TransportUnavailable);
+        }
+        match tokio::time::timeout(Duration::from_secs(120), rx).await {
+            Ok(Ok(result)) => result,
+            _ => {
+                self.sync_waiters.lock().unwrap().remove(&request_id);
+                Err(TransportError::Protocol)
+            }
+        }
+    }
+
     async fn write_frame(&self, frame: &Value) -> std::io::Result<()> {
         let mut guard = self.stdin.lock().await;
         let stdin = guard.as_mut().ok_or_else(|| {
@@ -251,14 +314,26 @@ impl Transport for Engine {
     }
 
     async fn start(&self) -> TransportResult<()> {
+        let _lifecycle = self.lifecycle_lock.lock().await;
         if self.started.swap(true, Ordering::SeqCst) {
             return Err(TransportError::TransportUnavailable);
         }
+        let outgoing = match self.outgoing.lock().unwrap().take() {
+            Some(outgoing) => outgoing,
+            None => {
+                self.started.store(false, Ordering::SeqCst);
+                return Err(TransportError::TransportUnavailable);
+            }
+        };
         let mut command = self.config.command();
-        let mut child = command.spawn().map_err(|_| {
-            self.started.store(false, Ordering::SeqCst);
-            TransportError::TransportUnavailable
-        })?;
+        let mut child = match command.spawn() {
+            Ok(child) => child,
+            Err(_) => {
+                *self.outgoing.lock().unwrap() = Some(outgoing);
+                self.started.store(false, Ordering::SeqCst);
+                return Err(TransportError::TransportUnavailable);
+            }
+        };
         eprintln!("bloomd: engine child started pid={:?}", child.id());
         let stdout = child.stdout.take().ok_or(TransportError::Internal)?;
         let stdin = child.stdin.take().ok_or(TransportError::Internal)?;
@@ -272,22 +347,33 @@ impl Transport for Engine {
             .store(false, Ordering::SeqCst);
         let my_handles = self.my_handles.clone();
         let recipient_lists_supported = self.recipient_lists_supported.clone();
-        let outgoing = self
-            .outgoing
-            .lock()
-            .unwrap()
-            .take()
-            .ok_or(TransportError::TransportUnavailable)?;
         let pending = self.pending.clone();
+        let sync_waiters = self.sync_waiters.clone();
+        let sync_events = self.sync_events.clone();
+        let started = self.started.clone();
+        let stdin = self.stdin.clone();
+        let child = self.child.clone();
+        let reader_stop = self.reader_stop.clone();
+        let reader_done = self.reader_done.clone();
+        reader_done.send_replace(false);
         let id = self.id.clone();
         tokio::spawn(async move {
             read_frames(
                 stdout,
-                outgoing,
-                pending,
-                id,
-                my_handles,
-                recipient_lists_supported,
+                ReadFrameContext {
+                    outgoing,
+                    pending,
+                    sync_waiters,
+                    sync_events,
+                    id,
+                    my_handles,
+                    recipient_lists_supported,
+                    started,
+                    stdin,
+                    child,
+                    reader_stop,
+                    reader_done,
+                },
             )
             .await;
         });
@@ -295,14 +381,27 @@ impl Transport for Engine {
     }
 
     async fn stop(&self) -> TransportResult<()> {
-        let _ = self
-            .write_frame(&serde_json::json!({
+        let _lifecycle = self.lifecycle_lock.lock().await;
+        self.started.store(false, Ordering::SeqCst);
+        let mut reader_done = self.reader_done.subscribe();
+        let _ = tokio::time::timeout(
+            STOP_TIMEOUT,
+            self.write_frame(&serde_json::json!({
                 "version": 1,
                 "type": "shutdown",
                 "request_id": self.next_request.fetch_add(1, Ordering::Relaxed),
-            }))
-            .await;
+            })),
+        )
+        .await;
         self.stdin.lock().await.take();
+        // The reader owns the drain deadline, so cancellation of this stop future
+        // cannot leave a backpressured reader and its child running indefinitely.
+        self.reader_stop.notify_one();
+        let _ = tokio::time::timeout(
+            STOP_TIMEOUT + READER_STOP_TIMEOUT * 3,
+            reader_done.wait_for(|done| *done),
+        )
+        .await;
         if let Some(mut child) = self.child.lock().await.take() {
             if tokio::time::timeout(STOP_TIMEOUT, child.wait())
                 .await
@@ -315,6 +414,7 @@ impl Transport for Engine {
         self.started.store(false, Ordering::SeqCst);
         self.recipient_lists_supported
             .store(false, Ordering::SeqCst);
+        self.my_handles.lock().unwrap().clear();
         Ok(())
     }
 
@@ -401,14 +501,75 @@ fn strip_terminator(mut bytes: Vec<u8>) -> FrameRead {
     FrameRead::Frame(bytes)
 }
 
-async fn read_frames(
-    stdout: tokio::process::ChildStdout,
-    outgoing: mpsc::Sender<TransportEvent>,
-    pending: Arc<Pending>,
-    id: TransportId,
-    my_handles_store: Arc<Mutex<Vec<String>>>,
-    recipient_lists_supported: Arc<AtomicBool>,
-) {
+async fn read_frames(stdout: tokio::process::ChildStdout, context: ReadFrameContext) {
+    {
+        let processing = process_frames(stdout, context.clone());
+        tokio::pin!(processing);
+        tokio::select! {
+            _ = context.reader_stop.notified() => {
+                // Preserve frames emitted during cooperative shutdown. A stalled
+                // consumer still cannot prevent bounded reader/child cleanup.
+                tokio::select! {
+                    _ = tokio::time::timeout(STOP_TIMEOUT, &mut processing) => {},
+                    _ = context.outgoing.closed() => {},
+                }
+            },
+            _ = context.outgoing.closed() => {},
+            _ = &mut processing => {},
+        }
+    }
+    cleanup_reader(&context).await;
+    context.reader_done.send_replace(true);
+}
+
+async fn cleanup_reader(context: &ReadFrameContext) {
+    context.started.store(false, Ordering::SeqCst);
+    context
+        .recipient_lists_supported
+        .store(false, Ordering::SeqCst);
+    context.my_handles.lock().unwrap().clear();
+    let waiters = std::mem::take(&mut *context.sync_waiters.lock().unwrap());
+    for (_, waiter) in waiters {
+        let _ = waiter.send(Err(TransportError::TransportUnavailable));
+    }
+    // Written-but-unacknowledged sends retain their timeout outcome: failure of
+    // the stream cannot prove that the remote service did not accept them.
+    context.stdin.lock().await.take();
+    if let Some(mut child) = context.child.lock().await.take() {
+        if tokio::time::timeout(READER_STOP_TIMEOUT, child.wait())
+            .await
+            .is_err()
+        {
+            let _ = child.kill().await;
+            let _ = child.wait().await;
+        }
+    }
+    // A stalled event consumer must not keep a dead engine's reader alive.
+    let _ = tokio::time::timeout(
+        READER_STOP_TIMEOUT,
+        context.outgoing.send(TransportEvent::Session {
+            state: SessionState::Disconnected,
+            reason: None,
+        }),
+    )
+    .await;
+}
+
+async fn process_frames(stdout: tokio::process::ChildStdout, context: ReadFrameContext) {
+    let ReadFrameContext {
+        outgoing,
+        pending,
+        sync_waiters,
+        sync_events,
+        id,
+        my_handles: my_handles_store,
+        recipient_lists_supported,
+        started: _,
+        stdin: _,
+        child: _,
+        reader_stop: _,
+        reader_done: _,
+    } = context;
     let mut reader = BufReader::new(stdout);
     let mut my_handles: Vec<String> = Vec::new();
     let mut skipped_conversations = 0usize;
@@ -429,6 +590,7 @@ async fn read_frames(
                 break;
             }
         };
+        let frame_started = std::time::Instant::now();
         let line = match String::from_utf8(bytes) {
             Ok(line) => line,
             Err(error) => {
@@ -443,6 +605,18 @@ async fn read_frames(
                 break;
             }
         };
+        if crate::diagnostics::enabled() {
+            if let Some(sequence) = frame
+                .get("sequence")
+                .and_then(Value::as_u64)
+                .filter(|_| frame.get("type").and_then(Value::as_str) == Some("inbound_message"))
+            {
+                eprintln!(
+                    "bloom timing daemon frame_decode_us={} sequence={sequence}",
+                    crate::diagnostics::elapsed_micros(frame_started)
+                );
+            }
+        }
         match frame.get("type").and_then(Value::as_str) {
             Some("ready") => {
                 if let Some(handles) = frame.get("handles").and_then(Value::as_array) {
@@ -477,7 +651,9 @@ async fn read_frames(
                     .or_else(|| frame.get("message"))
                     .cloned()
                     .unwrap_or(Value::Null);
-                match map_inbound(&payload, &my_handles, &id) {
+                let sequence = frame.get("sequence").and_then(Value::as_u64);
+                let trace_sequence = crate::diagnostics::enabled().then_some(sequence).flatten();
+                match map_inbound_with_sequence(&payload, &my_handles, &id, trace_sequence) {
                     Ok(event) => {
                         if outgoing.send(event).await.is_err() {
                             return;
@@ -527,6 +703,43 @@ async fn read_frames(
                 eprintln!("engine reported error: {code}");
             }
             Some("shutdown_ack") => {}
+            Some("sync_result") => {
+                let _guard = sync_events.lock().await;
+                let request_id = frame.get("request_id").and_then(Value::as_u64);
+                let status = frame.get("status").and_then(Value::as_str);
+                let count = frame
+                    .get("conversations")
+                    .and_then(Value::as_u64)
+                    .filter(|count| *count <= 20_000);
+                let result = match (status, count) {
+                    (Some("complete"), Some(count)) => Ok((false, count as u32)),
+                    (Some("limited"), Some(count)) => Ok((true, count as u32)),
+                    (Some("failed"), _) => Err(TransportError::TransportUnavailable),
+                    _ => Err(TransportError::Protocol),
+                };
+                let waiter = request_id.and_then(|id| sync_waiters.lock().unwrap().remove(&id));
+                let completion = Arc::new(SyncCompletion::default());
+                let wait_for_completion = completion.clone();
+                if outgoing
+                    .send(TransportEvent::ConversationSyncComplete { completion })
+                    .await
+                    .is_err()
+                {
+                    if let Some(waiter) = waiter {
+                        let _ = waiter.send(Err(TransportError::TransportUnavailable));
+                    }
+                    return;
+                }
+                wait_for_completion.wait().await;
+                let result = if wait_for_completion.persistence_failed() {
+                    Err(TransportError::Internal)
+                } else {
+                    result
+                };
+                if let Some(waiter) = waiter {
+                    let _ = waiter.send(result);
+                }
+            }
             Some("history_complete") => {
                 let conversations = frame
                     .get("conversations")
@@ -549,6 +762,7 @@ async fn read_frames(
                 }
             }
             Some("conversation") => {
+                let _guard = sync_events.lock().await;
                 match map_conversation(frame.get("conversation"), &my_handles, &id) {
                     Some(event) => {
                         if outgoing.send(event).await.is_err() {
@@ -569,12 +783,6 @@ async fn read_frames(
             .join(", ");
         eprintln!("engine skipped payloads: {summary}");
     }
-    let _ = outgoing
-        .send(TransportEvent::Session {
-            state: SessionState::Disconnected,
-            reason: None,
-        })
-        .await;
 }
 
 fn map_session_state(state: &str) -> SessionState {
@@ -656,6 +864,15 @@ pub fn map_inbound(
     payload: &Value,
     my_handles: &[String],
     id: &TransportId,
+) -> Result<TransportEvent, SkipReason> {
+    map_inbound_with_sequence(payload, my_handles, id, None)
+}
+
+fn map_inbound_with_sequence(
+    payload: &Value,
+    my_handles: &[String],
+    id: &TransportId,
+    push_sequence: Option<u64>,
 ) -> Result<TransportEvent, SkipReason> {
     if payload.get("variant").and_then(Value::as_str) != Some("iMessage") {
         return Err(SkipReason::NotAnInboundMessage);
@@ -799,6 +1016,7 @@ pub fn map_inbound(
     Ok(TransportEvent::Message {
         conversation,
         message,
+        push_sequence,
     })
 }
 
@@ -936,6 +1154,7 @@ mod tests {
         let TransportEvent::Message {
             conversation,
             message,
+            ..
         } = event
         else {
             panic!("expected a message event");
@@ -945,6 +1164,24 @@ mod tests {
         assert!(!message.from_me);
         assert_eq!(message.parts(), &[MessagePart::Text("hello".to_owned())]);
         assert_eq!(message.created_at, 1_700_000_000_000);
+    }
+
+    #[test]
+    fn carries_optional_push_sequence_with_inbound_message() {
+        let event = map_inbound_with_sequence(
+            &payload("tel:+15550000001", "hello"),
+            &[],
+            &transport(),
+            Some(17),
+        )
+        .expect("payload maps");
+        assert!(matches!(
+            event,
+            TransportEvent::Message {
+                push_sequence: Some(17),
+                ..
+            }
+        ));
     }
 
     #[test]
@@ -1025,6 +1262,7 @@ mod tests {
         let TransportEvent::Message {
             conversation,
             message,
+            ..
         } = map_inbound(
             &value,
             &["mailto:me@example.invalid".to_owned()],

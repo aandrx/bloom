@@ -9,6 +9,10 @@ use std::{
 
 static TEMP_FILE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
+fn default_true() -> bool {
+    true
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(default)]
 pub struct Config {
@@ -16,6 +20,8 @@ pub struct Config {
     /// `None` follows the detected terminal background.
     pub theme: Option<String>,
     pub compact_sidebar: bool,
+    #[serde(default = "default_true")]
+    pub wrap_composer: bool,
     /// Local display labels keyed by canonical participant identity.
     pub nicknames: HashMap<String, String>,
     /// Local conversation titles keyed by canonical conversation identity. Used by
@@ -33,6 +39,7 @@ impl Default for Config {
             version: 1,
             theme: None,
             compact_sidebar: false,
+            wrap_composer: true,
             nicknames: HashMap::new(),
             titles: HashMap::new(),
             hidden: Vec::new(),
@@ -238,6 +245,23 @@ mod tests {
         let (fallback, warning) = Config::load(&path);
         assert_eq!(fallback, Config::default());
         assert!(warning.is_some());
+    }
+
+    #[test]
+    fn composer_wrap_preference_persists_and_old_configs_default_on() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("settings.json");
+        fs::write(&path, r#"{"version":1}"#).unwrap();
+        let (old_config, warning) = Config::load(&path);
+        assert!(warning.is_none());
+        assert!(old_config.wrap_composer);
+
+        let config = Config {
+            wrap_composer: false,
+            ..Config::default()
+        };
+        config.save(&path).unwrap();
+        assert_eq!(Config::load(&path), (config, None));
     }
 
     #[test]

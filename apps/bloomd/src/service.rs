@@ -15,7 +15,10 @@ use bloom_domain::{
 };
 use bloom_ipc::{Event, EventKind, ProtocolError};
 use bloom_transport::{TransportError, TransportEvent};
-use std::sync::{Arc, Mutex};
+use std::{
+    sync::{Arc, Mutex},
+    time::Instant,
+};
 
 pub struct Service {
     store: Arc<Mutex<EncryptedStore>>,
@@ -38,40 +41,12 @@ impl Service {
             TransportEvent::Message {
                 conversation,
                 message,
-            }
-            | TransportEvent::MessageUpdated {
+                push_sequence,
+            } => self.persist_message(conversation, message, *push_sequence),
+            TransportEvent::MessageUpdated {
                 conversation,
                 message,
-            } => {
-                let (outcome, _created, canonical, stored_message) = {
-                    let mut store = self.store.lock().unwrap();
-                    let (canonical, linked) =
-                        store::reconcile_direct_conversation(&mut store, conversation)?;
-                    log_identity_links(linked);
-                    let message_conversation = message.conversation_id();
-                    if message_conversation != &canonical.id
-                        && !canonical.aliases.contains(message_conversation)
-                    {
-                        return Err(store::StoreError::MessageConversationMismatch);
-                    }
-                    let message = store::remap_message(message, &canonical.id)?;
-                    let (outcome, created) =
-                        store::ingest_inbound(&mut store, &canonical, &message)?;
-                    (outcome, created, canonical, message)
-                };
-                match outcome {
-                    store::MessageUpsertOutcome::Unchanged => return Ok(false),
-                    store::MessageUpsertOutcome::Inserted => {}
-                    store::MessageUpsertOutcome::Updated => {}
-                }
-                self.hub.publish(Event {
-                    event: EventKind::Message {
-                        conversation_id: canonical.id,
-                        message: stored_message,
-                    },
-                });
-                Ok(true)
-            }
+            } => self.persist_message(conversation, message, None),
             TransportEvent::DeliveryChanged {
                 conversation,
                 message,
@@ -108,6 +83,16 @@ impl Service {
                 log_identity_links(linked);
                 Ok(false)
             }
+            TransportEvent::ConversationSyncComplete { completion } => {
+                let published = !completion.persistence_failed();
+                if published {
+                    self.hub.publish(Event {
+                        event: EventKind::ConversationsChanged,
+                    });
+                }
+                completion.acknowledge();
+                Ok(published)
+            }
             TransportEvent::ConversationsChanged => {
                 // One refresh for a whole listing sync, after the rows are committed.
                 self.hub.publish(Event {
@@ -122,6 +107,80 @@ impl Service {
                     },
                 });
                 Ok(true)
+            }
+        }
+    }
+
+    fn persist_message(
+        &self,
+        conversation: &Conversation,
+        message: &Message,
+        push_sequence: Option<u64>,
+    ) -> Result<bool, store::StoreError> {
+        let persistence_started = Instant::now();
+        let (outcome, canonical, stored_message) = {
+            let mut store = self.store.lock().unwrap();
+            let (canonical, linked) =
+                store::reconcile_direct_conversation(&mut store, conversation)?;
+            log_identity_links(linked);
+            let message_conversation = message.conversation_id();
+            if message_conversation != &canonical.id
+                && !canonical.aliases.contains(message_conversation)
+            {
+                return Err(store::StoreError::MessageConversationMismatch);
+            }
+            let message = store::remap_message(message, &canonical.id)?;
+            let (outcome, _) = store::ingest_inbound(&mut store, &canonical, &message)?;
+            (outcome, canonical, message)
+        };
+        if crate::diagnostics::enabled() {
+            if let Some(sequence) = push_sequence {
+                eprintln!(
+                    "bloom timing daemon persist_us={} sequence={sequence}",
+                    crate::diagnostics::elapsed_micros(persistence_started)
+                );
+            }
+        }
+        if matches!(outcome, store::MessageUpsertOutcome::Unchanged) {
+            return Ok(false);
+        }
+        let publish_started = Instant::now();
+        self.hub.publish(Event {
+            event: EventKind::Message {
+                conversation_id: canonical.id,
+                message: stored_message,
+                push_sequence,
+            },
+        });
+        if crate::diagnostics::enabled() {
+            if let Some(sequence) = push_sequence {
+                eprintln!(
+                    "bloom timing daemon publish_us={} sequence={sequence}",
+                    crate::diagnostics::elapsed_micros(publish_started)
+                );
+            }
+        }
+        Ok(true)
+    }
+
+    pub async fn persist_events(
+        self: Arc<Self>,
+        mut events: tokio::sync::mpsc::Receiver<TransportEvent>,
+    ) {
+        let mut conversation_persistence_failed = false;
+        while let Some(event) = events.recv().await {
+            if let TransportEvent::ConversationSyncComplete { completion } = &event {
+                if conversation_persistence_failed {
+                    completion.mark_persistence_failed();
+                }
+                conversation_persistence_failed = false;
+            }
+            let is_conversation = matches!(&event, TransportEvent::Conversation { .. });
+            if let Err(error) = self.persist(&event) {
+                if is_conversation {
+                    conversation_persistence_failed = true;
+                }
+                eprintln!("bloomd: dropping event that failed to persist: {error}");
             }
         }
     }
@@ -195,6 +254,26 @@ impl RequestHandler for Service {
                     .map(preview_text);
             }
             Ok(conversations)
+        })
+    }
+
+    fn sync_conversations(&self) -> HandlerFuture<'_, (bloom_ipc::ConversationSyncStatus, u32)> {
+        Box::pin(async move {
+            let (limited, count) = self
+                .engine
+                .sync_conversations()
+                .await
+                .map_err(map_transport_error)?;
+            // The engine resolves only after its ordered completion marker is persisted and
+            // the conversation-list refresh event has been published.
+            Ok((
+                if limited {
+                    bloom_ipc::ConversationSyncStatus::Limited
+                } else {
+                    bloom_ipc::ConversationSyncStatus::Complete
+                },
+                count,
+            ))
         })
     }
 
@@ -315,6 +394,7 @@ impl RequestHandler for Service {
                 event: EventKind::Message {
                     conversation_id: canonical.id,
                     message,
+                    push_sequence: None,
                 },
             });
             Ok(message_id)
@@ -371,6 +451,7 @@ impl RequestHandler for Service {
                 event: EventKind::Message {
                     conversation_id: conversation.id,
                     message,
+                    push_sequence: None,
                 },
             });
             Ok(message_id)
@@ -478,6 +559,169 @@ fn now_millis() -> i64 {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|elapsed| elapsed.as_millis() as i64)
         .unwrap_or_default()
+}
+
+#[cfg(test)]
+mod sync_barrier_tests {
+    use super::*;
+    use bloom_domain::{ConversationId, HandleKind, TransportId};
+    use bloom_transport::{SyncCompletion, TransportEvent};
+    use std::{os::unix::fs::PermissionsExt, path::PathBuf, time::Duration};
+    use tokio::sync::mpsc;
+
+    #[tokio::test]
+    async fn sync_ack_follows_persisted_rows_and_refresh_publication() {
+        let directory = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(directory.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        let store = Arc::new(Mutex::new(
+            EncryptedStore::open_with_key(directory.path().join("store.db"), &[5; 32]).unwrap(),
+        ));
+        let engine = Arc::new(Engine::new(crate::engine::EngineConfig {
+            dart_executable: PathBuf::from("dart"),
+            script: PathBuf::from("engine.dart"),
+            state_dir: directory.path().join("state"),
+            library: PathBuf::from("engine.dylib"),
+            sync_chats: false,
+        }));
+        let hub = SubscriptionHub::new(4);
+        let mut subscriber = hub.subscribe();
+        let service = Arc::new(Service::new(store.clone(), engine, hub));
+        let (events_tx, events_rx) = mpsc::channel(2);
+
+        let transport = TransportId::new("openbubbles").unwrap();
+        let conversation = Conversation {
+            id: ConversationId::new(transport.clone(), "sync-group").unwrap(),
+            remote_id: "iMessage;-;sync-group".into(),
+            kind: ConversationKind::Group,
+            title: Some("Synced group".into()),
+            participants: vec![Participant {
+                handle: Handle::new(HandleKind::Opaque, "person@example.invalid").unwrap(),
+                display_name: None,
+                is_me: false,
+            }],
+            created_at: 1,
+            last_message_at: Some(1),
+            aliases: Vec::new(),
+            preview: None,
+        };
+        let completion = Arc::new(SyncCompletion::default());
+        let wait_for_completion = completion.clone();
+        events_tx
+            .send(TransportEvent::Conversation { conversation })
+            .await
+            .unwrap();
+        events_tx
+            .send(TransportEvent::ConversationSyncComplete { completion })
+            .await
+            .unwrap();
+        drop(events_tx);
+
+        let persistence = tokio::spawn(service.clone().persist_events(events_rx));
+        tokio::time::timeout(Duration::from_secs(1), wait_for_completion.wait())
+            .await
+            .expect("sync completion waits for ordered persistence");
+        assert!(!wait_for_completion.persistence_failed());
+        let stored_count = {
+            let stored = store.lock().unwrap();
+            store::list_conversations(&stored).unwrap().len()
+        };
+        assert_eq!(stored_count, 1);
+        assert!(matches!(
+            subscriber.recv().await.unwrap().event,
+            EventKind::ConversationsChanged
+        ));
+        persistence.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn sync_ack_reports_conversation_persistence_failure_without_refresh() {
+        let directory = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(directory.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        let store = Arc::new(Mutex::new(
+            EncryptedStore::open_with_key(directory.path().join("store.db"), &[6; 32]).unwrap(),
+        ));
+        let engine = Arc::new(Engine::new(crate::engine::EngineConfig {
+            dart_executable: PathBuf::from("dart"),
+            script: PathBuf::from("engine.dart"),
+            state_dir: directory.path().join("state"),
+            library: PathBuf::from("engine.dylib"),
+            sync_chats: false,
+        }));
+        let hub = SubscriptionHub::new(4);
+        let mut subscriber = hub.subscribe();
+        let service = Arc::new(Service::new(store.clone(), engine, hub));
+
+        let transport = TransportId::new("openbubbles").unwrap();
+        let person = Handle::new(HandleKind::Opaque, "person@example.invalid").unwrap();
+        let direct = Conversation {
+            id: ConversationId::new(transport.clone(), "shared-id").unwrap(),
+            remote_id: "direct-chat".into(),
+            kind: ConversationKind::Direct,
+            title: None,
+            participants: vec![Participant {
+                handle: person.clone(),
+                display_name: None,
+                is_me: false,
+            }],
+            created_at: 1,
+            last_message_at: None,
+            aliases: Vec::new(),
+            preview: None,
+        };
+        service
+            .persist(&TransportEvent::Conversation {
+                conversation: direct.clone(),
+            })
+            .unwrap();
+        let conflicting_group = Conversation {
+            id: direct.id,
+            remote_id: "group-chat".into(),
+            kind: ConversationKind::Group,
+            title: None,
+            participants: vec![Participant {
+                handle: person,
+                display_name: None,
+                is_me: false,
+            }],
+            created_at: 1,
+            last_message_at: None,
+            aliases: Vec::new(),
+            preview: None,
+        };
+
+        let (events_tx, events_rx) = mpsc::channel(2);
+        let completion = Arc::new(SyncCompletion::default());
+        let wait_for_completion = completion.clone();
+        events_tx
+            .send(TransportEvent::Conversation {
+                conversation: conflicting_group,
+            })
+            .await
+            .unwrap();
+        events_tx
+            .send(TransportEvent::ConversationSyncComplete { completion })
+            .await
+            .unwrap();
+        drop(events_tx);
+
+        let persistence = tokio::spawn(service.clone().persist_events(events_rx));
+        tokio::time::timeout(Duration::from_secs(1), wait_for_completion.wait())
+            .await
+            .expect("failed row still releases the sync waiter");
+        assert!(wait_for_completion.persistence_failed());
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), subscriber.recv())
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            store::list_conversations(&store.lock().unwrap())
+                .unwrap()
+                .len(),
+            1
+        );
+        persistence.await.unwrap();
+    }
 }
 
 #[cfg(test)]

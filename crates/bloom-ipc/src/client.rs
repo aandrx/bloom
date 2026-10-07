@@ -1,5 +1,6 @@
 use crate::{
-    read_event, read_response, write_request, CodecError, Event, Request, RequestKind, ResponseKind,
+    read_event, read_response, write_request, CodecError, ConversationSyncStatus, Event, Request,
+    RequestKind, ResponseKind,
 };
 use bloom_domain::{Conversation, ConversationId, Message, MessageId, OutgoingBody};
 use std::{
@@ -12,6 +13,7 @@ use tokio::net::UnixStream;
 
 static NEXT_ID: AtomicU64 = AtomicU64::new(1);
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+const SYNC_REQUEST_TIMEOUT: Duration = Duration::from_secs(150);
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 
 #[derive(Clone)]
@@ -92,9 +94,17 @@ impl BloomClient {
     }
 
     async fn request(&self, kind: RequestKind) -> Result<ResponseKind, ClientError> {
+        self.request_with_timeout(kind, self.request_timeout).await
+    }
+
+    async fn request_with_timeout(
+        &self,
+        kind: RequestKind,
+        timeout: Duration,
+    ) -> Result<ResponseKind, ClientError> {
         let id = Self::id();
         let mut stream = self.connect().await?;
-        tokio::time::timeout(self.request_timeout, async {
+        tokio::time::timeout(timeout, async {
             write_request(
                 &mut stream,
                 &Request {
@@ -122,6 +132,20 @@ impl BloomClient {
     pub async fn list_conversations(&self) -> Result<Vec<Conversation>, ClientError> {
         match self.request(RequestKind::ListConversations).await? {
             ResponseKind::Conversations { conversations } => Ok(conversations),
+            _ => Err(ClientError::UnexpectedResponse),
+        }
+    }
+
+    /// Force a conversation-list metadata sync. This does not fetch message history.
+    pub async fn sync_conversations(&self) -> Result<(ConversationSyncStatus, u32), ClientError> {
+        match self
+            .request_with_timeout(RequestKind::SyncConversations, SYNC_REQUEST_TIMEOUT)
+            .await?
+        {
+            ResponseKind::ConversationSync {
+                status,
+                conversations,
+            } => Ok((status, conversations)),
             _ => Err(ClientError::UnexpectedResponse),
         }
     }
@@ -302,6 +326,36 @@ mod tests {
             }
             task.await.unwrap();
         }
+    }
+
+    #[tokio::test]
+    async fn sync_request_returns_server_status_and_count() {
+        let d = tempfile::tempdir().unwrap();
+        let p = d.path().join("sync");
+        let listener = UnixListener::bind(&p).unwrap();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let request = crate::read_request(&mut stream).await.unwrap();
+            assert!(matches!(request.request, RequestKind::SyncConversations));
+            write_response(
+                &mut stream,
+                &Response {
+                    request_id: request.request_id,
+                    response: ResponseKind::ConversationSync {
+                        status: ConversationSyncStatus::Limited,
+                        conversations: 42,
+                    },
+                },
+            )
+            .await
+            .unwrap();
+        });
+
+        assert_eq!(
+            BloomClient::new(p).sync_conversations().await.unwrap(),
+            (ConversationSyncStatus::Limited, 42)
+        );
+        server.await.unwrap();
     }
 
     #[tokio::test]

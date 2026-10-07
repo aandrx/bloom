@@ -1,29 +1,35 @@
 //! Bloom TUI: a Bloom-native client for the daemon over its Unix-socket IPC.
 
 use anyhow::Result;
-use bloom_domain::{MessagePart, OutgoingBody};
-use bloom_ipc::{client::BloomClient, EventKind};
-use bloom_tui::app::{App, Theme};
+use bloom_domain::{MessageId, MessagePart, OutgoingBody};
+use bloom_ipc::{
+    client::{BloomClient, ClientError},
+    EventKind, ProtocolError,
+};
+use bloom_tui::app::{App, SendFailure, Theme};
 use bloom_tui::config::Config;
 use bloom_tui::daemon::{self, ConnectionState, Snapshot};
 use bloom_tui::diagnostics::{self, Stage};
-use std::sync::atomic::{AtomicU64, Ordering};
-
-static NEXT_ATTEMPT: AtomicU64 = AtomicU64::new(1);
 use bloom_tui::ui;
 use bloom_tui::RedrawScheduler;
 use crossterm::{
-    event::{self, DisableMouseCapture, EnableMouseCapture, Event, KeyEventKind},
+    event::{
+        self, DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
+        Event, KeyEventKind,
+    },
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
 use ratatui::{backend::CrosstermBackend, Terminal};
+use std::collections::VecDeque;
 use std::io::{Read, Write};
 use std::{io, path::PathBuf, time::Duration};
 use tokio::sync::{mpsc, watch};
 
 const FIRST_RETRY: Duration = Duration::from_millis(250);
 const MAX_RETRY: Duration = Duration::from_secs(8);
+/// How long a quiet inbound stream must last before catch-up is complete.
+const SYNC_IDLE: Duration = Duration::from_millis(2000);
 const OSC_TIMEOUT: Duration = Duration::from_millis(200);
 
 fn parse_osc11_reply(reply: Option<&[u8]>) -> Option<(u8, u8, u8)> {
@@ -63,6 +69,20 @@ fn parse_osc11_reply(reply: Option<&[u8]>) -> Option<(u8, u8, u8)> {
         return None;
     }
     Some(rgb)
+}
+
+fn sync_failure_message(error: &ClientError) -> String {
+    match error {
+        ClientError::Connect => "Could not connect to Bloom. Conversation sync did not start.".into(),
+        ClientError::Timeout => {
+            "Conversation sync timed out. It may finish in the background; refresh the list shortly."
+                .into()
+        }
+        ClientError::Server(ProtocolError::Unsupported) => {
+            "This engine does not support conversation-list sync.".into()
+        }
+        _ => "Conversation-list sync failed. Check the Bloom connection and try again.".into(),
+    }
 }
 
 fn theme_for_rgb((r, g, b): (u8, u8, u8)) -> bloom_tui::app::Theme {
@@ -124,7 +144,12 @@ struct TerminalGuard;
 impl TerminalGuard {
     fn enter() -> Result<Self> {
         enable_raw_mode()?;
-        if let Err(error) = execute!(io::stdout(), EnterAlternateScreen, EnableMouseCapture) {
+        if let Err(error) = execute!(
+            io::stdout(),
+            EnterAlternateScreen,
+            EnableMouseCapture,
+            EnableBracketedPaste
+        ) {
             let _ = disable_raw_mode();
             return Err(error.into());
         }
@@ -134,7 +159,12 @@ impl TerminalGuard {
 
 impl Drop for TerminalGuard {
     fn drop(&mut self) {
-        let _ = execute!(io::stdout(), DisableMouseCapture, LeaveAlternateScreen);
+        let _ = execute!(
+            io::stdout(),
+            DisableBracketedPaste,
+            DisableMouseCapture,
+            LeaveAlternateScreen
+        );
         let _ = disable_raw_mode();
     }
 }
@@ -154,8 +184,8 @@ async fn main() -> Result<()> {
         println!(
             "Bloom TUI\nUsage: bloom-tui [--help]\n\
              Reads BLOOM_SOCKET_PATH (or BLOOM_SOCKET) for the socket path.\n\
-             Keys: up/down select, Enter compose/send, Esc cancel, q quit.\n\
-             Herdr-style: Ctrl+B then h/l changes chat, j/k scrolls, n starts, f filters, t themes."
+             Keys: up/down scroll or select, Enter send/choose, Esc dismisses, Ctrl+C clears input then quits when empty.\n\
+             Herdr-style: Ctrl+B then n/p or h/l changes chat; Ctrl+P goes previous; j/k scroll. Use /new to start a chat."
         );
         return Ok(());
     }
@@ -176,6 +206,7 @@ async fn main() -> Result<()> {
         system_theme,
         theme_override,
         compact_sidebar: config.compact_sidebar,
+        wrap_composer: config.wrap_composer,
         nicknames: config.nicknames.clone(),
         titles: config.titles.clone(),
         hidden: config.hidden.iter().cloned().collect(),
@@ -188,14 +219,19 @@ async fn main() -> Result<()> {
     let (event_tx, mut event_rx) = mpsc::unbounded_channel::<EventKind>();
     let (snapshot_tx, mut snapshot_rx) = mpsc::unbounded_channel::<Snapshot>();
     let (status_tx, mut status_rx) = mpsc::unbounded_channel::<ConnectionState>();
-    let (send_tx, mut send_rx) =
-        mpsc::unbounded_channel::<(Option<bloom_domain::ConversationId>, Result<(), String>)>();
+    let (send_tx, mut send_rx) = mpsc::unbounded_channel::<(
+        u64,
+        Option<bloom_domain::ConversationId>,
+        Result<MessageId, SendFailure>,
+    )>();
     let (conversation_tx, mut conversation_rx) =
         mpsc::unbounded_channel::<Vec<bloom_domain::Conversation>>();
+    let (sync_tx, mut sync_rx) = mpsc::unbounded_channel();
     let (visible_tx, visible_rx) = watch::channel::<Option<bloom_domain::ConversationId>>(None);
 
     {
         let client = client.clone();
+        let snapshot_tx = snapshot_tx.clone();
         tokio::spawn(async move {
             let mut delay = FIRST_RETRY;
             loop {
@@ -233,7 +269,7 @@ async fn main() -> Result<()> {
                         return;
                     }
                 }
-                Ok(event @ Event::Mouse(_)) => {
+                Ok(event @ (Event::Mouse(_) | Event::Paste(_) | Event::Resize(_, _))) => {
                     if input_tx.send(event).is_err() {
                         return;
                     }
@@ -247,6 +283,10 @@ async fn main() -> Result<()> {
     let mut last_visible = app.selected.clone();
     let mut redraw = RedrawScheduler::default();
     let mut hits = ui::HitMap::default();
+    let mut inbound_redraws = VecDeque::<(u64, std::time::Instant)>::new();
+    // The daemon has no explicit catch-up completion frame, so treat a burst of
+    // inbound events as syncing until the stream has been quiet for a moment.
+    let mut last_sync_activity: Option<std::time::Instant> = None;
     redraw.request();
     let mut next_animation = tokio::time::Instant::now();
     loop {
@@ -256,6 +296,14 @@ async fn main() -> Result<()> {
             terminal.draw(|frame| {
                 hits = ui::render(frame, &app);
             })?;
+            let drawn_at = std::time::Instant::now();
+            while let Some((sequence, received_at)) = inbound_redraws.pop_front() {
+                diagnostics::inbound_timing(
+                    "event_to_redraw",
+                    sequence,
+                    drawn_at.duration_since(received_at),
+                );
+            }
         }
 
         let redraw_delay = redraw.wake_after(std::time::Instant::now());
@@ -271,8 +319,10 @@ async fn main() -> Result<()> {
                 app.thread_loading = false;
                 app.apply_snapshot(snapshot);
                 redraw.request();
-                last_visible = app.selected.clone();
-                let _ = visible_tx.send(last_visible.clone());
+                if app.selected != last_visible {
+                    last_visible = app.selected.clone();
+                    let _ = visible_tx.send(last_visible.clone());
+                }
             }
             Some(conversations) = conversation_rx.recv() => {
                 app.set_conversations(conversations);
@@ -285,66 +335,130 @@ async fn main() -> Result<()> {
                 if app.is_animating() { next_animation = tokio::time::Instant::now() + Duration::from_millis(33); }
             }
             Some(event) = event_rx.recv() => {
+                let received_at = std::time::Instant::now();
+                let push_sequence = match &event {
+                    EventKind::Message { push_sequence, .. } => *push_sequence,
+                    _ => None,
+                };
+                let apply_started = std::time::Instant::now();
+                let is_inbound = matches!(
+                    event,
+                    EventKind::Message { .. }
+                        | EventKind::Update { .. }
+                        | EventKind::Delivery { .. }
+                        | EventKind::ConversationsChanged
+                );
                 app.apply_event(event);
+                if is_inbound {
+                    last_sync_activity = Some(received_at);
+                    app.set_syncing(true);
+                }
+                if let Some(sequence) = push_sequence {
+                    diagnostics::inbound_timing("event_apply", sequence, apply_started.elapsed());
+                    inbound_redraws.push_back((sequence, received_at));
+                }
                 redraw.request();
                 if app.resync_conversations {
                     app.resync_conversations = false;
                     let client = client.clone();
                     let tx = conversation_tx.clone();
+                    let snapshots = snapshot_tx.clone();
+                    let selected = app.selected.clone();
                     tokio::spawn(async move {
-                        if let Ok(conversations) = daemon::conversations(&client).await {
-                            let _ = tx.send(conversations);
+                        match daemon::snapshot(&client, selected).await {
+                            Ok(snapshot) => { let _ = snapshots.send(snapshot); }
+                            Err(_) => {
+                                if let Ok(conversations) = daemon::conversations(&client).await {
+                                    let _ = tx.send(conversations);
+                                }
+                            }
                         }
                     });
                 }
             }
-            Some((conversation, result)) = send_rx.recv() => {
-                app.finish_send(conversation, result);
+            Some((attempt, conversation, result)) = send_rx.recv() => {
+                app.finish_send_receipt(attempt, conversation, result);
+                redraw.request();
+            },
+            Some(result) = sync_rx.recv() => {
+                app.finish_sync(result);
+                // `/sync` refreshes metadata, not remote message history. Re-read
+                // the selected thread from Bloom's store so already persisted
+                // messages cannot leave the transcript stale.
+                let client = client.clone();
+                let snapshots = snapshot_tx.clone();
+                let selected = app.selected.clone();
+                tokio::spawn(async move {
+                    if let Ok(snapshot) = daemon::snapshot(&client, selected).await {
+                        let _ = snapshots.send(snapshot);
+                    }
+                });
                 redraw.request();
             },
             Some(input) = input_rx.recv() => {
+                // Keep vertical cursor motion and mouse placement aligned with the
+                // responsive composer width currently on screen.
+                let size = terminal.size()?;
+                app.composer_columns = ui::composer_columns(size.width, app.compact_sidebar);
+                app.composer_prefix_columns =
+                    ui::composer_prefix_columns(&app, app.composer_columns);
                 // All input semantics live in `App::handle_key`/`handle_mouse` so the
                 // real path is testable; this loop only performs the async work an
                 // action asks for.
                 let action = match input {
                     Event::Key(key) => app.handle_key(key),
+                    Event::Paste(text) => { app.paste(&text); bloom_tui::app::Action::None }
+                    Event::Resize(_, _) => bloom_tui::app::Action::None,
                     Event::Mouse(mouse) => app.handle_mouse(mouse.kind, mouse.column, mouse.row, &hits),
                     _ => bloom_tui::app::Action::None,
                 };
                 match action {
                     bloom_tui::app::Action::Quit => break,
-                    bloom_tui::app::Action::SendMessage { conversation, body } => {
+                    bloom_tui::app::Action::SendMessage { attempt, conversation, body } => {
                         let target = Some(conversation.clone());
-                        app.begin_send(target.clone());
+                        app.begin_send(attempt, target.clone());
                         let client = client.clone();
                         let send_tx = send_tx.clone();
                         tokio::spawn(async move {
-                            let attempt = NEXT_ATTEMPT.fetch_add(1, Ordering::Relaxed);
                             let started = std::time::Instant::now();
                             diagnostics::record(&format!("request begin attempt={attempt} stage=send"));
                             let result = client.send(conversation, OutgoingBody {
                                 parts: vec![MessagePart::Text(body)],
                             }).await;
                             diagnostics::request_result(Stage::Send, attempt, started.elapsed(), result.as_ref().err());
-                            let result = result.map(|_| ()).map_err(|error| diagnostics::safe_reason(&error).to_owned());
-                            let _ = send_tx.send((target, result));
+                            let result = result.map_err(SendFailure::from);
+                            let _ = send_tx.send((attempt, target, result));
                         });
                     }
-                    bloom_tui::app::Action::StartConversation { address, body } => {
+                    bloom_tui::app::Action::StartConversation { attempt, address, body } => {
                         let target = None;
-                        app.begin_send(target.clone());
+                        app.begin_send(attempt, target.clone());
                         let client = client.clone();
                         let send_tx = send_tx.clone();
                         tokio::spawn(async move {
-                            let attempt = NEXT_ATTEMPT.fetch_add(1, Ordering::Relaxed);
                             let started = std::time::Instant::now();
                             diagnostics::record(&format!("request begin attempt={attempt} stage=start_conversation"));
                             let result = client.start_conversation(address, OutgoingBody {
                                 parts: vec![MessagePart::Text(body)],
                             }).await;
                             diagnostics::request_result(Stage::StartConversation, attempt, started.elapsed(), result.as_ref().err());
-                            let result = result.map(|_| ()).map_err(|error| diagnostics::safe_reason(&error).to_owned());
-                            let _ = send_tx.send((target, result));
+                            let result = result.map_err(SendFailure::from);
+                            let _ = send_tx.send((attempt, target, result));
+                        });
+                    }
+                    bloom_tui::app::Action::SyncConversations => {
+                        app.sync_in_flight = true;
+                        app.notice = Some("Syncing conversation-list metadata...".into());
+                        app.error = None;
+                        redraw.request();
+                        let client = client.clone();
+                        let tx = sync_tx.clone();
+                        tokio::spawn(async move {
+                            let result = client
+                                .sync_conversations()
+                                .await
+                                .map_err(|error| sync_failure_message(&error));
+                            let _ = tx.send(result);
                         });
                     }
                     bloom_tui::app::Action::None => {}
@@ -356,6 +470,7 @@ async fn main() -> Result<()> {
                         Theme::Light => "light".to_owned(),
                     }),
                     compact_sidebar: app.compact_sidebar,
+                    wrap_composer: app.wrap_composer,
                     nicknames: app.nicknames.clone(),
                     titles: app.titles.clone(),
                     hidden: {
@@ -389,9 +504,18 @@ async fn main() -> Result<()> {
                 }
             } => {
                 app.advance();
+                app.set_syncing(
+                    last_sync_activity.is_some_and(|at| at.elapsed() < SYNC_IDLE),
+                );
                 redraw.request();
                 next_animation = tokio::time::Instant::now() + Duration::from_millis(33);
             }
+        }
+        // Async acknowledgments, live events and metadata can also select a thread.
+        if app.selected != last_visible {
+            last_visible = app.selected.clone();
+            app.thread_loading = last_visible.is_some();
+            let _ = visible_tx.send(last_visible.clone());
         }
     }
 

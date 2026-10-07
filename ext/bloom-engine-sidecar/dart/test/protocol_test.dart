@@ -64,6 +64,28 @@ void main() {
       );
     });
 
+    test('accepts sync and requires an integer request id', () {
+      final command = decodeCommand(
+        jsonEncode(<String, Object?>{
+          'version': protocolVersion,
+          'type': 'sync_conversations',
+          'request_id': 9,
+        }),
+      );
+      expect(command, isA<SyncConversationsCommand>());
+      expect((command as SyncConversationsCommand).requestId, 9);
+      expect(
+        () => decodeCommand(
+          jsonEncode(<String, Object?>{
+            'version': protocolVersion,
+            'type': 'sync_conversations',
+            'request_id': '9',
+          }),
+        ),
+        throwsA(isA<ProtocolException>()),
+      );
+    });
+
     test('accepts shutdown', () {
       final command = decodeCommand(
         jsonEncode(<String, Object?>{
@@ -177,6 +199,17 @@ void main() {
   });
 
   group('frames', () {
+    test('sync result carries its correlated status and count', () {
+      final frame = decodeFrame(
+        syncResultFrame(requestId: 9, status: 'limited', conversations: 12),
+      );
+      expect(frame['type'], 'sync_result');
+      expect(frame['request_id'], 9);
+      expect(frame['status'], 'limited');
+      expect(frame['conversations'], 12);
+      expect(frame['version'], protocolVersion);
+    });
+
     test('every frame carries the protocol version', () {
       for (final line in <String>[
         readyFrame(engineVersion: 'v', canSend: true, canReadHistory: false),

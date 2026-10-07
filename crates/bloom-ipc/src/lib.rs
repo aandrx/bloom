@@ -51,6 +51,7 @@ pub struct Request {
 #[serde(tag = "op", rename_all = "snake_case")]
 pub enum RequestKind {
     ListConversations,
+    SyncConversations,
     Subscribe,
     History {
         conversation_id: ConversationId,
@@ -77,10 +78,29 @@ pub struct Response {
 #[serde(tag = "result", rename_all = "snake_case")]
 pub enum ResponseKind {
     Subscribed,
-    Conversations { conversations: Vec<Conversation> },
-    History { messages: Vec<Message> },
-    Send { message_id: MessageId },
-    Error { error: ProtocolError },
+    Conversations {
+        conversations: Vec<Conversation>,
+    },
+    ConversationSync {
+        status: ConversationSyncStatus,
+        conversations: u32,
+    },
+    History {
+        messages: Vec<Message>,
+    },
+    Send {
+        message_id: MessageId,
+    },
+    Error {
+        error: ProtocolError,
+    },
+}
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ConversationSyncStatus {
+    Complete,
+    Limited,
+    Failed,
 }
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -107,6 +127,8 @@ pub enum EventKind {
     Message {
         conversation_id: ConversationId,
         message: Message,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        push_sequence: Option<u64>,
     },
     Update {
         conversation_id: ConversationId,
@@ -264,6 +286,48 @@ mod tests {
             request_id: 7,
             request: RequestKind::ListConversations,
         }
+    }
+    #[test]
+    fn message_push_sequence_is_optional_and_omitted_when_absent() {
+        let transport = bloom_domain::TransportId::new("test").unwrap();
+        let conversation_id = ConversationId::new(transport.clone(), "conversation").unwrap();
+        let message = Message::new(
+            MessageId::new(transport, "message").unwrap(),
+            conversation_id.clone(),
+            None,
+            bloom_domain::Handle::new(bloom_domain::HandleKind::Opaque, "sender").unwrap(),
+            vec![bloom_domain::MessagePart::Text("body".into())],
+            1,
+            None,
+            DeliveryState::Delivered,
+            false,
+            None,
+            Vec::new(),
+            None,
+        )
+        .unwrap();
+        let encoded = serde_json::to_value(EventKind::Message {
+            conversation_id: conversation_id.clone(),
+            message: message.clone(),
+            push_sequence: Some(17),
+        })
+        .unwrap();
+        assert_eq!(encoded["push_sequence"], 17);
+
+        let mut legacy = encoded;
+        legacy.as_object_mut().unwrap().remove("push_sequence");
+        match serde_json::from_value::<EventKind>(legacy).unwrap() {
+            EventKind::Message { push_sequence, .. } => assert_eq!(push_sequence, None),
+            _ => panic!("expected a message event"),
+        }
+
+        let without_sequence = serde_json::to_value(EventKind::Message {
+            conversation_id,
+            message,
+            push_sequence: None,
+        })
+        .unwrap();
+        assert!(without_sequence.get("push_sequence").is_none());
     }
     #[tokio::test]
     async fn round_trip_and_fragmented_frame() {

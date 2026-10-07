@@ -17,6 +17,7 @@ pub type HandlerFuture<'a, T> = Pin<Box<dyn Future<Output = Result<T, ProtocolEr
 
 pub trait RequestHandler: Send + Sync {
     fn list_conversations(&self) -> HandlerFuture<'_, Vec<Conversation>>;
+    fn sync_conversations(&self) -> HandlerFuture<'_, (bloom_ipc::ConversationSyncStatus, u32)>;
     fn history(
         &self,
         conversation_id: ConversationId,
@@ -86,6 +87,13 @@ async fn serve_inner<H: RequestHandler>(
         let response = match request.request {
             RequestKind::ListConversations => match handler.list_conversations().await {
                 Ok(conversations) => ResponseKind::Conversations { conversations },
+                Err(error) => ResponseKind::Error { error },
+            },
+            RequestKind::SyncConversations => match handler.sync_conversations().await {
+                Ok((status, conversations)) => ResponseKind::ConversationSync {
+                    status,
+                    conversations,
+                },
                 Err(error) => ResponseKind::Error { error },
             },
             RequestKind::History {
@@ -170,6 +178,11 @@ mod tests {
         fn list_conversations(&self) -> HandlerFuture<'_, Vec<Conversation>> {
             Box::pin(async { Ok(vec![]) })
         }
+        fn sync_conversations(
+            &self,
+        ) -> HandlerFuture<'_, (bloom_ipc::ConversationSyncStatus, u32)> {
+            Box::pin(async { Ok((bloom_ipc::ConversationSyncStatus::Complete, 0)) })
+        }
         fn history(&self, _: ConversationId, _: u16) -> HandlerFuture<'_, Vec<Message>> {
             self.0.fetch_add(1, Ordering::SeqCst);
             Box::pin(async { Ok(vec![]) })
@@ -191,6 +204,11 @@ mod tests {
     impl RequestHandler for ErrorHandler {
         fn list_conversations(&self) -> HandlerFuture<'_, Vec<Conversation>> {
             Box::pin(async { Err(ProtocolError::AccountThrottled) })
+        }
+        fn sync_conversations(
+            &self,
+        ) -> HandlerFuture<'_, (bloom_ipc::ConversationSyncStatus, u32)> {
+            Box::pin(async { Err(ProtocolError::Unsupported) })
         }
         fn history(&self, _: ConversationId, _: u16) -> HandlerFuture<'_, Vec<Message>> {
             Box::pin(async { Err(ProtocolError::Internal) })
@@ -225,6 +243,39 @@ mod tests {
             response.response,
             ResponseKind::Error {
                 error: ProtocolError::AccountThrottled
+            }
+        ));
+        drop(client);
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn sync_request_returns_typed_status_and_count() {
+        let (_dir, listener, path) = socket();
+        let server = tokio::spawn(async move {
+            serve(
+                listener.accept().await.unwrap(),
+                &FakeHandler(Arc::new(AtomicUsize::new(0))),
+            )
+            .await;
+        });
+        let mut client = UnixStream::connect(path).await.unwrap();
+        write_request(
+            &mut client,
+            &Request {
+                request_id: 78,
+                request: RequestKind::SyncConversations,
+            },
+        )
+        .await
+        .unwrap();
+        let response = read_response(&mut client).await.unwrap();
+        assert_eq!(response.request_id, 78);
+        assert!(matches!(
+            response.response,
+            ResponseKind::ConversationSync {
+                status: bloom_ipc::ConversationSyncStatus::Complete,
+                conversations: 0
             }
         ));
         drop(client);

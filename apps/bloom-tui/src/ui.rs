@@ -1,6 +1,6 @@
 use crate::app::{
     conversation_subtitle, message_text, status_text, status_tone, timestamp, App, ComposerPrompt,
-    StatusTone, Theme,
+    Focus, StatusTone, Theme,
 };
 
 use bloom_domain::DeliveryState;
@@ -31,58 +31,199 @@ struct Palette {
     red: Color,
     /// A third speaker colour, so sender names separate at a glance.
     magenta: Color,
+    selection: Color,
 }
 
 const DARK: Palette = Palette {
-    bg: Color::Rgb(30, 30, 46),
-    surface: Color::Rgb(24, 24, 37),
-    input_surface: Color::Rgb(49, 50, 68),
-    rule: Color::Rgb(69, 71, 90),
-    text: Color::Rgb(205, 214, 244),
-    muted: Color::Rgb(166, 173, 200),
-    cyan: Color::Rgb(137, 220, 235),
-    green: Color::Rgb(166, 227, 161),
-    yellow: Color::Rgb(249, 226, 175),
-    magenta: Color::Rgb(203, 166, 247),
-    red: Color::Rgb(243, 139, 168),
+    bg: Color::Rgb(24, 24, 24),
+    surface: Color::Rgb(20, 20, 20),
+    input_surface: Color::Rgb(38, 38, 38),
+    rule: Color::Rgb(65, 65, 65),
+    text: Color::Rgb(230, 230, 230),
+    muted: Color::Rgb(163, 163, 163),
+    cyan: Color::Rgb(147, 197, 253),
+    green: Color::Rgb(134, 199, 151),
+    yellow: Color::Rgb(226, 190, 113),
+    magenta: Color::Rgb(190, 175, 218),
+    red: Color::Rgb(239, 143, 143),
+    selection: Color::Rgb(52, 52, 52),
 };
 const LIGHT: Palette = Palette {
     bg: Color::Rgb(255, 255, 255),
-    surface: Color::Rgb(255, 255, 255),
+    surface: Color::Rgb(250, 250, 250),
     input_surface: Color::Rgb(239, 239, 239),
     rule: Color::Rgb(199, 199, 199),
     text: Color::Rgb(0, 0, 0),
-    muted: Color::Rgb(127, 127, 127),
+    muted: Color::Rgb(104, 104, 104),
     cyan: Color::Rgb(0, 117, 138),
     green: Color::Rgb(40, 117, 47),
     yellow: Color::Rgb(128, 78, 0),
     magenta: Color::Rgb(130, 60, 170),
     red: Color::Rgb(160, 30, 45),
+    selection: Color::Rgb(220, 230, 242),
 };
 
-/// Below this header width the identity and the theme chip stop fitting, so the
-/// chip is dropped. It has a name so the guard can mutate one value and prove the
-/// narrow layout still keeps the control.
-const THEME_MIN_WIDTH: u16 = 38;
+const COMFORTABLE_RAIL_MIN_WIDTH: u16 = 70;
+
+fn sidebar_width_for(width: u16, compact_sidebar: bool) -> u16 {
+    let compact = compact_sidebar || width < COMFORTABLE_RAIL_MIN_WIDTH;
+    let rail_percent = if compact { 15 } else { 25 };
+    let desired = (u32::from(width) * rail_percent + 50) / 100;
+    let sidebar_min = if width < 45 {
+        10
+    } else {
+        // A compact rail still needs enough room for a useful chat identity.
+        16
+    };
+    desired
+        .clamp(sidebar_min, 34)
+        .min(width.saturating_sub(3) as u32) as u16
+}
+
+/// Usable composer columns after the responsive chat rail and text gutters.
+pub fn composer_columns(width: u16, compact_sidebar: bool) -> usize {
+    if width < 20 {
+        return usize::from(width.max(1));
+    }
+    usize::from(
+        width
+            .saturating_sub(sidebar_width_for(width, compact_sidebar) + 1 + 4)
+            .max(1),
+    )
+}
+
+/// Prompt width used by the draft's vertical cursor movement.
+pub fn composer_prefix_columns(app: &App, width: usize) -> usize {
+    let (prefix, _, _, editable, _) = composer_content(app, width);
+    let available = width.saturating_sub(if editable { width.min(10) } else { 0 });
+    unicode_width::UnicodeWidthStr::width(truncate_display_graphemes(&prefix, available).as_str())
+}
+
+#[derive(Clone)]
+struct ComposerLine {
+    text: String,
+    indicator: bool,
+}
 
 #[derive(Clone)]
 struct ComposerLayout {
     input: Rect,
-    prompt: String,
+    lines: Vec<ComposerLine>,
     cursor: Option<(u16, u16)>,
+    cursor_positions: Vec<(u16, u16, usize)>,
 }
 
 impl ComposerLayout {
-    fn new(rect: Rect, prefix: &str, value: &str, cursor_byte: usize, editable: bool) -> Self {
-        let input = Rect::new(rect.x, rect.y, rect.width, 1.min(rect.height));
+    fn new(
+        rect: Rect,
+        prefix: &str,
+        value: &str,
+        cursor_byte: usize,
+        editable: bool,
+        wrap: bool,
+    ) -> Self {
         let width = usize::from(rect.width);
         let prefix_limit = width.saturating_sub(if editable { width.min(10) } else { 0 });
         let visible_prefix = truncate_display_graphemes(prefix, prefix_limit);
         let prefix_width = unicode_width::UnicodeWidthStr::width(visible_prefix.as_str());
-        let available = width.saturating_sub(prefix_width);
         let graphemes: Vec<(usize, &str)> = value.grapheme_indices(true).collect();
         let cursor_byte = cursor_byte.min(value.len());
         let cursor_index = graphemes.partition_point(|(start, _)| *start < cursor_byte);
+
+        if wrap && editable && width > 0 {
+            let wrapped = crate::composer::wrap_draft(&visible_prefix, value, width);
+            let (start, end, top, bottom, combined) = composer_window(
+                wrapped.lines.len(),
+                wrapped.positions[cursor_index].0,
+                rect.height.max(1) as usize,
+            );
+            let mut lines = Vec::new();
+            if combined {
+                lines.push(ComposerLine {
+                    text: truncate_with_ellipsis(
+                        &format!("↑ {start} more · ↓ {} more", wrapped.lines.len() - end),
+                        width,
+                    ),
+                    indicator: true,
+                });
+            } else if top {
+                lines.push(ComposerLine {
+                    text: truncate_with_ellipsis(&format!("↑ {start} more"), width),
+                    indicator: true,
+                });
+            }
+            lines.extend(
+                wrapped.lines[start..end]
+                    .iter()
+                    .cloned()
+                    .map(|text| ComposerLine {
+                        text,
+                        indicator: false,
+                    }),
+            );
+            if bottom && !combined {
+                lines.push(ComposerLine {
+                    text: truncate_with_ellipsis(
+                        &format!("↓ {} more", wrapped.lines.len() - end),
+                        width,
+                    ),
+                    indicator: true,
+                });
+            }
+
+            let input = Rect::new(
+                rect.x,
+                rect.y,
+                rect.width,
+                lines.len().min(u16::MAX as usize) as u16,
+            );
+            let indicator_rows = usize::from(top || combined);
+            let cursor_line = wrapped.positions[cursor_index].0;
+            let cursor_column = wrapped.positions[cursor_index].1;
+            let indent = prefix_width.min(width.saturating_sub(1));
+            let cursor = (rect.width > 0
+                && cursor_line >= start
+                && cursor_line < end
+                && cursor_line < wrapped.lines.len())
+            .then(|| {
+                let base = if cursor_line == 0 {
+                    prefix_width
+                } else {
+                    indent
+                };
+                let line = indicator_rows + cursor_line - start;
+                (
+                    rect.x
+                        .saturating_add(base.saturating_add(cursor_column).min(width - 1) as u16),
+                    rect.y.saturating_add(line as u16),
+                )
+            });
+            let mut cursor_positions = Vec::new();
+            if rect.width > 0 {
+                for (index, (line, column)) in wrapped.positions.iter().copied().enumerate() {
+                    if line < start || line >= end || line >= wrapped.lines.len() {
+                        continue;
+                    }
+                    let base = if line == 0 { prefix_width } else { indent };
+                    let display_line = indicator_rows + line - start;
+                    cursor_positions.push((
+                        rect.x
+                            .saturating_add(base.saturating_add(column).min(width - 1) as u16),
+                        rect.y.saturating_add(display_line as u16),
+                        index,
+                    ));
+                }
+            }
+            return Self {
+                input,
+                lines,
+                cursor,
+                cursor_positions,
+            };
+        }
+
+        let input = Rect::new(rect.x, rect.y, rect.width, 1.min(rect.height));
+        let available = width.saturating_sub(prefix_width);
         let mut start_index = 0;
         let mut cursor_width = graphemes[..cursor_index]
             .iter()
@@ -95,7 +236,8 @@ impl ComposerLayout {
             start_index += 1;
         }
         let mut visible_value = String::new();
-        let mut used = 0;
+        let mut visible_count = 0usize;
+        let mut used = 0usize;
         for (_, grapheme) in graphemes.iter().skip(start_index) {
             let grapheme_width = unicode_width::UnicodeWidthStr::width(*grapheme);
             if used + grapheme_width > available {
@@ -103,6 +245,7 @@ impl ComposerLayout {
             }
             visible_value.push_str(grapheme);
             used += grapheme_width;
+            visible_count += 1;
         }
         let mut prompt = visible_prefix;
         prompt.push_str(&visible_value);
@@ -113,15 +256,105 @@ impl ComposerLayout {
                 .saturating_add(column.min(width.saturating_sub(1)) as u16);
             (x, rect.y)
         });
+        let mut cursor_positions = Vec::new();
+        if editable && rect.width > 0 {
+            let mut column = prefix_width;
+            for (index, grapheme_entry) in graphemes
+                .iter()
+                .enumerate()
+                .skip(start_index)
+                .take(visible_count + 1)
+            {
+                cursor_positions.push((
+                    rect.x
+                        .saturating_add(column.min(width.saturating_sub(1)) as u16),
+                    rect.y,
+                    index,
+                ));
+                if index < start_index + visible_count {
+                    column += unicode_width::UnicodeWidthStr::width(grapheme_entry.1);
+                }
+            }
+        }
         Self {
             input,
-            prompt,
+            lines: vec![ComposerLine {
+                text: prompt,
+                indicator: false,
+            }],
             cursor,
+            cursor_positions,
         }
     }
 }
 
+fn render_composer_layout(
+    frame: &mut Frame<'_>,
+    layout: &ComposerLayout,
+    muted: bool,
+    palette: Palette,
+    surface: Color,
+) {
+    let lines = layout
+        .lines
+        .iter()
+        .map(|row| {
+            let foreground = if muted || row.indicator {
+                palette.muted
+            } else {
+                palette.text
+            };
+            Line::from(Span::styled(
+                row.text.clone(),
+                Style::default().fg(foreground).bg(surface),
+            ))
+        })
+        .collect::<Vec<_>>();
+    frame.render_widget(
+        Paragraph::new(lines).style(Style::default().bg(surface)),
+        layout.input,
+    );
+    if let Some(cursor) = layout.cursor {
+        frame.set_cursor_position(cursor);
+    }
+}
+
+fn composer_window(total: usize, cursor: usize, budget: usize) -> (usize, usize, bool, bool, bool) {
+    if total <= budget {
+        return (0, total, false, false, false);
+    }
+    if budget <= 1 {
+        let start = cursor.min(total.saturating_sub(1));
+        return (start, start + 1, false, false, false);
+    }
+    if budget == 2 {
+        let start = cursor.min(total.saturating_sub(1));
+        let end = start + 1;
+        let top = start > 0;
+        let bottom = end < total;
+        return (start, end, top, bottom, top && bottom);
+    }
+    let near_top_slots = budget - 1;
+    if cursor < near_top_slots {
+        let end = near_top_slots.min(total);
+        return (0, end, false, end < total, false);
+    }
+    if cursor >= total.saturating_sub(near_top_slots) {
+        let start = total.saturating_sub(near_top_slots);
+        return (start, total, start > 0, false, false);
+    }
+    let text_slots = budget - 2;
+    let start = cursor
+        .saturating_sub(text_slots / 2)
+        .min(total.saturating_sub(text_slots));
+    let end = (start + text_slots).min(total);
+    (start, end, start > 0, end < total, false)
+}
+
 fn composer_content(app: &App, width: usize) -> (String, String, usize, bool, bool) {
+    if app.settings_open || app.theme_panel_open {
+        return ("›  ".to_owned(), String::new(), 0, false, true);
+    }
     if app.contacts_open {
         if app.contacts_editing.is_some() {
             return (
@@ -132,13 +365,7 @@ fn composer_content(app: &App, width: usize) -> (String, String, usize, bool, bo
                 app.draft.is_empty(),
             );
         }
-        return (
-            "›  ".to_owned(),
-            "Select a contact, then Enter to edit its nickname".to_owned(),
-            0,
-            false,
-            true,
-        );
+        return ("›  ".to_owned(), String::new(), 0, false, true);
     }
     if app.renaming.is_some() {
         return (
@@ -174,12 +401,8 @@ fn composer_content(app: &App, width: usize) -> (String, String, usize, bool, bo
             true,
             app.draft.is_empty(),
         ),
-        ComposerPrompt::Body(address) => (
-            if width < 24 {
-                "›  ".to_owned()
-            } else {
-                body_prefix(&address, width)
-            },
+        ComposerPrompt::Body(_) => (
+            "›  ".to_owned(),
             if app.draft.is_empty() {
                 "Message...".to_owned()
             } else {
@@ -218,65 +441,25 @@ fn composer_content(app: &App, width: usize) -> (String, String, usize, bool, bo
     }
 }
 
-fn body_prefix(address: &str, width: usize) -> String {
-    const LEAD: &str = "›  To ";
-    const TAIL: &str = " - ";
-    let prefix_budget = (width / 4).max(9).min(width.saturating_sub(10));
-    let address_budget = prefix_budget
-        .saturating_sub(unicode_width::UnicodeWidthStr::width(LEAD))
-        .saturating_sub(unicode_width::UnicodeWidthStr::width(TAIL));
-    if address_budget == 0 {
-        return format!("{LEAD}…{TAIL}");
-    }
-    let shown_address = if unicode_width::UnicodeWidthStr::width(address) <= address_budget {
-        address.to_owned()
-    } else if address_budget == 1 {
-        "…".to_owned()
-    } else {
-        format!(
-            "{}…",
-            truncate_display_graphemes(address, address_budget - 1)
-        )
-    };
-    format!("{LEAD}{shown_address}{TAIL}")
-}
-
-/// The chat's name with its participant count flush right on the same line.
+/// Conversation identity gets the whole rail width; counts are not unread badges.
 fn sidebar_name_line(
     app: &App,
     conversation: &bloom_domain::Conversation,
     width: usize,
     palette: Palette,
 ) -> Line<'static> {
-    let selected = Some(&conversation.id) == app.selected.as_ref();
-    let count = conversation.participants.len().to_string();
-    let count_width = unicode_width::UnicodeWidthStr::width(count.as_str()).min(width);
-    let gap_width = usize::from(width > count_width + 1);
-    let name_budget = width.saturating_sub(count_width + gap_width);
-    let name = truncate_display_graphemes(&app.conversation_name(conversation), name_budget);
-    let name_width = unicode_width::UnicodeWidthStr::width(name.as_str());
-    let pad = width.saturating_sub(name_width + count_width);
-    Line::from(vec![
-        Span::styled(
-            name,
-            Style::default()
-                .fg(if selected { palette.cyan } else { palette.text })
-                .add_modifier(if selected {
-                    Modifier::BOLD
-                } else {
-                    Modifier::empty()
-                }),
-        ),
-        Span::raw(" ".repeat(pad)),
-        Span::styled(
-            count,
-            Style::default().fg(if selected {
-                palette.cyan
+    let selected = Some(&conversation.id) == app.selected.as_ref() && !app.new_conversation;
+    let name = truncate_with_ellipsis(&app.conversation_name(conversation), width);
+    Line::from(vec![Span::styled(
+        name,
+        Style::default()
+            .fg(if selected { palette.cyan } else { palette.text })
+            .add_modifier(if selected {
+                Modifier::BOLD
             } else {
-                palette.muted
+                Modifier::empty()
             }),
-        ),
-    ])
+    )])
 }
 
 /// The newest message, clipped with an ellipsis when it cannot fit.
@@ -304,44 +487,74 @@ fn truncate_with_ellipsis(value: &str, width: usize) -> String {
     result
 }
 
-fn footer_hints(width: usize, palette: Palette, app: &App) -> Line<'static> {
+fn footer_hints(width: usize, palette: Palette, app: &App, wrapped_input: bool) -> Line<'static> {
     // The Codex-shaped home hints: arrows scroll the transcript, Tab moves to the
     // chat list, and the rest is discoverable through commands and the sheet.
     const HOME_FULL: [(&str, &str); 5] = [
-        ("↑↓", " scroll"),
-        ("Tab", " chats"),
         ("Enter", " send"),
+        ("Ctrl+J", " newline"),
+        ("Tab", " chats"),
         ("/", " commands"),
         ("?", " help"),
     ];
     const HOME_MEDIUM: [(&str, &str); 4] = [
-        ("↑↓", " scroll"),
-        ("Tab", " chats"),
+        ("Enter", " send"),
+        ("Ctrl+J", " newline"),
         ("/", " commands"),
         ("?", " help"),
     ];
-    const HOME_COMPACT: [(&str, &str); 3] = [("↑↓", " scroll"), ("/", " cmds"), ("?", " help")];
-    const HOME_NARROW: [(&str, &str); 2] = [("↑↓", " scroll"), ("/", " cmds")];
-    const HOME_TIGHT: [(&str, &str); 1] = [("↑↓", "")];
-    const LEADER_FULL: [(&str, &str); 6] = [
-        ("h/l", " chats"),
+    const HOME_COMPACT: [(&str, &str); 3] = [("↵", " send"), ("/", " cmds"), ("?", " help")];
+    const HOME_NARROW: [(&str, &str); 2] = [("↵", " send"), ("?", " help")];
+    const HOME_TIGHT: [(&str, &str); 1] = [("↵", "")];
+    const WRAPPED_HOME_FULL: [(&str, &str); 5] = [
+        ("Enter", " send"),
+        ("Ctrl+J", " newline"),
+        ("↑↓", " cursor"),
+        ("/", " commands"),
+        ("?", " help"),
+    ];
+    const WRAPPED_HOME_COMPACT: [(&str, &str); 3] =
+        [("↑↓", " cursor"), ("Tab", " chats"), ("/", " cmds")];
+    const SIDEBAR_FOCUS_FULL: [(&str, &str); 5] = [
+        ("↑↓", " chats"),
+        ("Tab", " composer"),
+        ("Ctrl+P", " previous"),
+        ("Ctrl+B n", " next"),
+        ("?", " help"),
+    ];
+    const SIDEBAR_FOCUS_COMPACT: [(&str, &str); 3] =
+        [("↑↓", " chats"), ("Tab", " composer"), ("Ctrl+P", " prev")];
+    const LEADER_FULL: [(&str, &str); 5] = [
+        ("n", " next"),
+        ("Ctrl+P", " previous"),
         ("j/k", " scroll"),
-        ("n", " new"),
-        ("s", " settings"),
-        ("t", " theme"),
+        ("f/s/t", " options"),
         ("Esc", " cancel"),
     ];
-    const LEADER_COMPACT: [(&str, &str); 2] = [("hjkl", " navigate"), ("Esc", " cancel")];
-    const FILTER_FULL: [(&str, &str); 3] =
-        [("↑↓", " select"), ("Enter", " open"), ("Esc", " cancel")];
-    const FILTER_MEDIUM: [(&str, &str); 3] = [("↑↓", " select"), ("Enter", ""), ("Esc", "")];
-    const FILTER_NARROW: [(&str, &str); 2] = [("↑↓", " select"), ("Esc", "")];
+    const LEADER_COMPACT: [(&str, &str); 3] =
+        [("n", " next"), ("Ctrl+P", " previous"), ("Esc", " cancel")];
+    const FILTER_FULL: [(&str, &str); 4] = [
+        ("←→", " type"),
+        ("↑↓", " select"),
+        ("Enter", " open"),
+        ("Esc", " cancel"),
+    ];
+    const FILTER_COMPACT: [(&str, &str); 4] =
+        [("←→", " type"), ("↑↓", ""), ("↵", " open"), ("Esc", "")];
+    const FILTER_NARROW: [(&str, &str); 3] = [("↑↓", ""), ("↵", ""), ("Esc", "")];
     const FILTER_TIGHT: [(&str, &str); 2] = [("↑↓", ""), ("Esc", "")];
     const RECIPIENT_FULL: [(&str, &str); 3] =
         [("Enter", " continue"), ("Esc", " cancel"), ("←→", " edit")];
     const RECIPIENT_MEDIUM: [(&str, &str); 2] = [("Enter", " continue"), ("Esc", " cancel")];
     const RECIPIENT_COMPACT: [(&str, &str); 2] = [("↵", " next"), ("Esc", " cancel")];
     const RECIPIENT_TIGHT: [(&str, &str); 2] = [("↵", " next"), ("Esc", "")];
+    const NEW_CONTACT_FULL: [(&str, &str); 4] = [
+        ("↑↓", " select"),
+        ("←→", " source"),
+        ("Enter", " choose"),
+        ("Esc", " cancel"),
+    ];
+    const NEW_CONTACT_COMPACT: [(&str, &str); 2] = [("↑↓", " select"), ("↵", " choose")];
     const START_FULL: [(&str, &str); 3] =
         [("Enter", " start"), ("Esc", " cancel"), ("←→", " edit")];
     const START_MEDIUM: [(&str, &str); 2] = [("Enter", " start"), ("Esc", " cancel")];
@@ -352,11 +565,31 @@ fn footer_hints(width: usize, palette: Palette, app: &App) -> Line<'static> {
         [("↑↓", " select"), ("Enter", " run"), ("Esc", " dismiss")];
     const COMMAND_COMPACT: [(&str, &str); 2] = [("↵", " run"), ("Esc", " dismiss")];
     const COMMAND_TIGHT: [(&str, &str); 1] = [("↵", " run")];
-    const SETTINGS_FULL: [(&str, &str); 3] =
-        [("↑↓", " select"), ("Enter", " change"), ("Esc", " close")];
-    const SETTINGS_TIGHT: [(&str, &str); 1] = [("Esc", " close")];
-    const CONTACTS_FULL: [(&str, &str); 3] =
-        [("↑↓", " select"), ("Enter", " name"), ("Esc", " close")];
+    const EMOJI_FULL: [(&str, &str); 2] = [("↑↓", " choose"), ("Enter", " insert")];
+    const SETTINGS_FULL: [(&str, &str); 5] = [
+        ("←→", " tabs"),
+        ("↑↓", " select"),
+        ("Space", " toggle"),
+        ("Enter", " set"),
+        ("Esc", " close"),
+    ];
+    const SETTINGS_MEDIUM: [(&str, &str); 3] =
+        [("←→/↑↓", " move"), ("Enter", " set"), ("Esc", " close")];
+    const SETTINGS_TIGHT: [(&str, &str); 2] = [("↑↓←→", " move"), ("Esc", " close")];
+    const THEME_FULL: [(&str, &str); 4] = [
+        ("↑↓", " choose"),
+        ("←→", " cycle"),
+        ("Enter", " apply"),
+        ("Esc", " close"),
+    ];
+    const THEME_MEDIUM: [(&str, &str); 3] =
+        [("↑↓", " choose"), ("Enter", " apply"), ("Esc", " close")];
+    const CONTACTS_FULL: [(&str, &str); 4] = [
+        ("↑↓", " select"),
+        ("Enter", " name"),
+        ("Tab", " chats"),
+        ("Esc", " close"),
+    ];
     const CONTACTS_EDIT: [(&str, &str); 2] = [("Enter", " save"), ("Esc", " cancel")];
     const CONTACTS_TIGHT: [(&str, &str); 1] = [("Esc", " close")];
     const RENAME_FULL: [(&str, &str); 2] = [("Enter", " save"), ("Esc", " cancel")];
@@ -378,11 +611,41 @@ fn footer_hints(width: usize, palette: Palette, app: &App) -> Line<'static> {
         } else {
             &CONTACTS_TIGHT
         }
-    } else if app.settings_open {
-        if width >= 32 {
-            &SETTINGS_FULL
+    } else if app.theme_panel_open {
+        if width >= 53 {
+            &THEME_FULL
+        } else if width >= 35 {
+            &THEME_MEDIUM
         } else {
             &SETTINGS_TIGHT
+        }
+    } else if app.settings_open {
+        if width >= 64 {
+            &SETTINGS_FULL
+        } else if width >= 38 {
+            &SETTINGS_MEDIUM
+        } else {
+            &SETTINGS_TIGHT
+        }
+    } else if app.new_conversation && app.pending_address.is_none() {
+        if app.new_contact_suggestions().is_empty() {
+            if width >= 37 {
+                &RECIPIENT_FULL
+            } else if width >= 27 {
+                &RECIPIENT_MEDIUM
+            } else if width >= 19 {
+                &RECIPIENT_COMPACT
+            } else if width >= 12 {
+                &RECIPIENT_TIGHT
+            } else {
+                &ENTER_ONLY
+            }
+        } else if width >= 38 {
+            &NEW_CONTACT_FULL
+        } else if width >= 16 {
+            &NEW_CONTACT_COMPACT
+        } else {
+            &RECIPIENT_TIGHT
         }
     } else if app.renaming.is_some() {
         if width >= 30 {
@@ -400,17 +663,31 @@ fn footer_hints(width: usize, palette: Palette, app: &App) -> Line<'static> {
         } else {
             return Line::default();
         }
+    } else if !app.emoji_suggestions().is_empty() {
+        &EMOJI_FULL
     } else if app.filter_query().is_some() {
-        if width >= 35 {
+        if width >= 45 {
             &FILTER_FULL
-        } else if width >= 23 {
-            &FILTER_MEDIUM
-        } else if width >= 15 {
+        } else if width >= 27 {
+            &FILTER_COMPACT
+        } else if width >= 12 {
             &FILTER_NARROW
         } else if width >= 8 {
             &FILTER_TIGHT
         } else {
             &FILTER_TIGHT[..1]
+        }
+    } else if app.focus == Focus::Sidebar {
+        if width >= 64 {
+            &SIDEBAR_FOCUS_FULL
+        } else {
+            &SIDEBAR_FOCUS_COMPACT
+        }
+    } else if wrapped_input {
+        if width >= 60 {
+            &WRAPPED_HOME_FULL
+        } else {
+            &WRAPPED_HOME_COMPACT
         }
     } else {
         match app.composer_prompt() {
@@ -473,8 +750,8 @@ fn footer_hints(width: usize, palette: Palette, app: &App) -> Line<'static> {
     Line::from(spans)
 }
 
-/// Composer geometry: a shaded band with padding above and below the single
-/// input row, plus footer rows for status and hints kept outside the band.
+/// Composer geometry: a shaded band with padding around wrapped draft rows, plus
+/// footer rows for status and hints kept outside the band.
 #[derive(Clone, Copy)]
 struct ComposerGeometry {
     band: Rect,
@@ -482,15 +759,24 @@ struct ComposerGeometry {
     footer: Option<Rect>,
 }
 
-fn composer_geometry(area: Rect) -> ComposerGeometry {
-    // Always reserve a row for the input; the rest may hold up to two footer rows
-    // (status plus hints) and at most one padding row on each side of the input.
-    let footer_rows = 2u16.min(area.height.saturating_sub(1));
-    let pads = area.height.saturating_sub(1 + footer_rows);
+fn composer_geometry(area: Rect, requested_input_rows: u16) -> ComposerGeometry {
+    let input_rows = requested_input_rows.max(1).min(area.height.max(1));
+    let footer_rows = 2u16.min(area.height.saturating_sub(input_rows));
+    let pads = area.height.saturating_sub(input_rows + footer_rows);
     let pad_top = u16::from(pads >= 2);
     let pad_bottom = pads.saturating_sub(pad_top).min(1);
-    let band = Rect::new(area.x, area.y, area.width, 1 + pad_top + pad_bottom);
-    let input = Rect::new(area.x, area.y.saturating_add(pad_top), area.width, 1);
+    let band = Rect::new(
+        area.x,
+        area.y,
+        area.width,
+        input_rows + pad_top + pad_bottom,
+    );
+    let input = Rect::new(
+        area.x,
+        area.y.saturating_add(pad_top),
+        area.width,
+        input_rows,
+    );
     let footer = (footer_rows > 0).then(|| {
         Rect::new(
             area.x,
@@ -506,8 +792,8 @@ fn composer_geometry(area: Rect) -> ComposerGeometry {
     }
 }
 
-/// The slash-command popup. It floats above the composer over a cleared panel so
-/// it takes priority over the transcript, the way a command palette should. The
+/// The slash-command popup. Its surface matches an outgoing chat line, and it
+/// takes priority over the transcript. The
 /// returned rectangle is the hitbox the mouse layer uses.
 fn render_command_menu(
     frame: &mut Frame<'_>,
@@ -521,14 +807,15 @@ fn render_command_menu(
     }
     let suggestions = app.command_suggestions();
     let item_count = suggestions.len().max(1);
-    let visible = item_count.min(9).min(content.height as usize);
+    let visible = item_count.min(11).min(content.height as usize);
     let first = app
         .command_selection
         .saturating_sub(visible.saturating_sub(1))
         .min(item_count.saturating_sub(visible));
     let panel_width = pane.width;
     let panel_height = visible.min(content.height as usize) as u16;
-    // Left-aligned with the chat, the way Codex anchors its pickers.
+    // Anchor the picker directly above the composer. Keep its bottom edge
+    // adjacent to the composer input row so no transcript row leaks between them.
     let area = Rect::new(
         pane.x,
         content.y + content.height.saturating_sub(panel_height),
@@ -537,7 +824,7 @@ fn render_command_menu(
     );
     frame.render_widget(Clear, area);
     frame.render_widget(
-        Block::default().style(Style::default().bg(palette.surface)),
+        Block::default().style(Style::default().bg(palette.input_surface)),
         area,
     );
     let inner = area;
@@ -561,9 +848,9 @@ fn render_command_menu(
         }
         let selected = !suggestions.is_empty() && row_index == app.command_selection;
         let row_bg = if selected {
-            palette.cyan
+            palette.selection
         } else {
-            palette.surface
+            palette.input_surface
         };
         frame.render_widget(
             Block::default().style(Style::default().bg(row_bg)),
@@ -592,7 +879,7 @@ fn render_command_menu(
             spans.push(Span::styled(
                 if selected { "› " } else { "  " },
                 Style::default()
-                    .fg(if selected { palette.bg } else { palette.cyan })
+                    .fg(palette.cyan)
                     .bg(row_bg)
                     .add_modifier(Modifier::BOLD),
             ));
@@ -601,7 +888,7 @@ fn render_command_menu(
             Span::styled(
                 shown_name,
                 Style::default()
-                    .fg(if selected { palette.bg } else { palette.cyan })
+                    .fg(palette.cyan)
                     .bg(row_bg)
                     .add_modifier(Modifier::BOLD),
             ),
@@ -612,26 +899,143 @@ fn render_command_menu(
             Span::styled(
                 shown_description,
                 Style::default()
-                    .fg(if selected { palette.bg } else { palette.muted })
+                    .fg(if selected {
+                        palette.text
+                    } else {
+                        palette.muted
+                    })
                     .bg(row_bg),
             ),
         ]);
         frame.render_widget(Paragraph::new(Line::from(spans)), text_row);
     }
-    // The panel sits above the composer; its hitbox is the panel itself.
+    // Bridge the reserved row between transcript and composer with the same
+    // surface, so the popup visibly touches the chat line.
+    if pane.height > 0 {
+        frame.render_widget(
+            Block::default().style(Style::default().bg(palette.input_surface)),
+            Rect::new(
+                pane.x,
+                content.y.saturating_add(content.height),
+                pane.width,
+                1,
+            ),
+        );
+    }
+    // The panel itself remains the selectable hitbox.
     Some((area, menu_rows))
 }
 
-/// Draw the settings panel and return the rect of each selectable row, so the
-/// mouse layer can toggle exactly what was drawn.
-/// Draw the settings pane and return the rect of each selectable row. It is a
-/// left-aligned list filling the content area, the way a Codex picker fills the
-/// pane, rather than a small floating box.
+/// Shared measured geometry for titled pickers, bottom-anchored to the composer.
+#[derive(Clone, Copy)]
+struct TitledPickerGeometry {
+    panel: Rect,
+    title: Rect,
+    tabs: Rect,
+    rows: Rect,
+    show_descriptions: bool,
+    show_note: bool,
+}
+
+/// Measure required content first, then optional Settings descriptions/note and
+/// finally outer breathing room. `optional_rows` is zero for simple list pickers.
+fn titled_picker_geometry(
+    bounds: Rect,
+    band_top: u16,
+    categories: usize,
+    content_rows: usize,
+    optional_rows: usize,
+) -> TitledPickerGeometry {
+    let inset = 2u16.min(bounds.width / 2);
+    let available = bounds.height.min(band_top.saturating_sub(bounds.y));
+    let has_tabs = u16::from(categories > 0);
+    let content_rows = content_rows.min(u16::MAX as usize) as u16;
+    let optional_rows = optional_rows.min(u16::MAX as usize) as u16;
+    let essential = 1u16.saturating_add(has_tabs).saturating_add(content_rows);
+    let mut remaining = available.saturating_sub(essential);
+
+    let show_descriptions = optional_rows >= content_rows && remaining >= content_rows;
+    let description_rows = if show_descriptions { content_rows } else { 0 };
+    remaining = remaining.saturating_sub(description_rows);
+    // Settings metadata is lower priority than options and descriptions. Keep a
+    // bottom row after the note; Contacts passes no optional rows.
+    let show_note = optional_rows > content_rows && remaining >= 2;
+    if show_note {
+        remaining = remaining.saturating_sub(2);
+    }
+    let shown_optional_rows = description_rows.saturating_add(u16::from(show_note));
+    let top_pad = u16::from(remaining > 0);
+    remaining = remaining.saturating_sub(top_pad);
+    let tab_gap = u16::from(has_tabs > 0 && remaining > 0);
+    remaining = remaining.saturating_sub(tab_gap);
+    let bottom_pad = if show_note {
+        1
+    } else {
+        u16::from(remaining > 0)
+    };
+
+    let desired = essential
+        .saturating_add(shown_optional_rows)
+        .saturating_add(top_pad)
+        .saturating_add(tab_gap)
+        .saturating_add(bottom_pad);
+    let height = desired.min(available);
+    let y = band_top.saturating_sub(height).max(bounds.y);
+    let panel = Rect::new(bounds.x, y, bounds.width, height);
+    let title_y = panel.y.saturating_add(top_pad);
+    let tabs_y = title_y.saturating_add(1);
+    let rows_y = tabs_y.saturating_add(has_tabs).saturating_add(tab_gap);
+    let rows_bottom = panel
+        .y
+        .saturating_add(panel.height)
+        .saturating_sub(bottom_pad);
+    TitledPickerGeometry {
+        panel,
+        title: Rect::new(
+            panel.x.saturating_add(inset),
+            title_y,
+            panel.width.saturating_sub(inset.saturating_mul(2)),
+            u16::from(panel.height > top_pad),
+        ),
+        tabs: Rect::new(
+            panel.x.saturating_add(inset),
+            tabs_y,
+            panel.width.saturating_sub(inset.saturating_mul(2)),
+            has_tabs.min(panel.y.saturating_add(panel.height).saturating_sub(tabs_y)),
+        ),
+        rows: Rect::new(
+            panel.x,
+            rows_y,
+            panel.width,
+            rows_bottom.saturating_sub(rows_y),
+        ),
+        show_descriptions,
+        show_note,
+    }
+}
+
+fn settings_geometry(
+    bounds: Rect,
+    band_top: u16,
+    categories: usize,
+    options: usize,
+) -> TitledPickerGeometry {
+    titled_picker_geometry(
+        bounds,
+        band_top,
+        categories,
+        options,
+        options.saturating_add(1),
+    )
+}
+
 fn render_settings(
     frame: &mut Frame<'_>,
     area: Rect,
     app: &App,
     palette: Palette,
+    show_descriptions: bool,
+    show_note: bool,
 ) -> Vec<(Rect, usize)> {
     let mut rows = Vec::new();
     if area.width < 8 || area.height == 0 {
@@ -646,44 +1050,54 @@ fn render_settings(
     } else {
         "Comfortable"
     };
-    let settings: [(&str, String, &str); 2] = [
-        (
+    let settings: Vec<(&str, String, &str)> = if app.settings_category == 0 {
+        vec![(
             "Theme",
             theme_value,
-            "Follows the terminal background unless pinned to Dark or Light.",
-        ),
-        (
-            "Sidebar",
-            sidebar_value.to_owned(),
-            "Comfortable names each chat and its count; Compact uses one line.",
-        ),
-    ];
-    let indent = 1u16.min(area.width);
-    let x = area.x + indent;
-    let width = area.width.saturating_sub(indent).max(1);
+            "Cycles Automatic, Dark, and Light terminal themes.",
+        )]
+    } else {
+        vec![
+            (
+                "Sidebar density",
+                sidebar_value.to_owned(),
+                "Comfortable shows previews; Compact uses one line per chat.",
+            ),
+            (
+                "Wrap composer",
+                if app.wrap_composer { "On" } else { "Off" }.to_owned(),
+                "Wrap long drafts across visible composer rows.",
+            ),
+        ]
+    };
+    let inset = 2u16.min(area.width / 2);
+    let text_x = area.x.saturating_add(inset);
+    let text_width = area.width.saturating_sub(inset.saturating_mul(2)).max(1);
+    let bottom = area.y.saturating_add(area.height);
     let mut y = area.y;
     for (index, (label, value, description)) in settings.iter().enumerate() {
-        if y >= area.y + area.height {
+        if y >= bottom {
             break;
         }
-        let row = Rect::new(x, y, width, 1);
+        let row = Rect::new(area.x, y, area.width, 1);
         rows.push((row, index));
         let selected = app.settings_selection == index;
         let background = if selected {
-            palette.cyan
+            palette.selection
         } else {
-            palette.surface
+            palette.input_surface
         };
-        let foreground = if selected { palette.bg } else { palette.text };
+        let foreground = palette.text;
         frame.render_widget(Block::default().style(Style::default().bg(background)), row);
-        let label_width = 12usize.min(width.saturating_sub(2) as usize);
-        let value_width = (width as usize).saturating_sub(label_width + 2);
+        let text_width_usize = text_width as usize;
+        let label_width = 16usize.min(text_width_usize.saturating_sub(2));
+        let value_width = text_width_usize.saturating_sub(label_width + 2);
         frame.render_widget(
             Paragraph::new(Line::from(vec![
                 Span::styled(
                     if selected { "› " } else { "  " },
                     Style::default()
-                        .fg(if selected { palette.bg } else { palette.cyan })
+                        .fg(palette.cyan)
                         .bg(background)
                         .add_modifier(Modifier::BOLD),
                 ),
@@ -701,30 +1115,77 @@ fn render_settings(
                         .bg(background),
                 ),
             ])),
-            row,
+            Rect::new(text_x, y, text_width, 1),
         );
-        y += 1;
-        if y < area.y + area.height {
+        y = y.saturating_add(1);
+        if show_descriptions && y < bottom {
             frame.render_widget(
-                Paragraph::new(truncate_display_graphemes(description, width as usize))
-                    .style(Style::default().fg(palette.muted).bg(palette.surface)),
-                Rect::new(x, y, width, 1),
+                Paragraph::new(truncate_with_ellipsis(description, text_width as usize))
+                    .style(Style::default().fg(palette.muted).bg(palette.input_surface)),
+                Rect::new(text_x, y, text_width, 1),
             );
-            y += 1;
+            y = y.saturating_add(1);
         }
-        y += 1;
     }
-    if y < area.y + area.height {
+    if show_note && y < bottom {
         frame.render_widget(
-            Paragraph::new("Theme and sidebar choices are stored locally.")
-                .style(Style::default().fg(palette.muted).bg(palette.surface)),
-            Rect::new(x, y, width, 1),
+            Paragraph::new(truncate_with_ellipsis(
+                "These choices are stored locally.",
+                text_width as usize,
+            ))
+            .style(Style::default().fg(palette.muted).bg(palette.input_surface)),
+            Rect::new(text_x, y, text_width, 1),
         );
     }
     rows
 }
 
-/// Draw the standalone contacts view and expose the actual rows as mouse hitboxes.
+/// Draw a compact category row using the popup surface and return its hitboxes.
+fn render_tabs(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    labels: &[&str],
+    selected: usize,
+    palette: Palette,
+) -> Vec<(Rect, usize)> {
+    let mut hits = Vec::new();
+    if area.width == 0 || area.height == 0 {
+        return hits;
+    }
+    frame.render_widget(
+        Block::default().style(Style::default().bg(palette.input_surface)),
+        area,
+    );
+    let mut x = area.x;
+    for (index, label) in labels.iter().enumerate() {
+        if x >= area.x.saturating_add(area.width) {
+            break;
+        }
+        let width = ((*label).len() as u16 + 4).min(area.x + area.width - x);
+        let row = Rect::new(x, area.y, width, 1);
+        let active = index == selected;
+        let background = palette.input_surface;
+        frame.render_widget(
+            Paragraph::new(format!(" {} ", label)).style(
+                Style::default()
+                    .fg(if active { palette.text } else { palette.muted })
+                    .bg(background)
+                    .add_modifier(if active {
+                        Modifier::BOLD | Modifier::UNDERLINED
+                    } else {
+                        Modifier::empty()
+                    }),
+            ),
+            row,
+        );
+        hits.push((row, index));
+        x = x.saturating_add(width).saturating_add(1);
+    }
+    hits
+}
+
+/// Draw the Contacts body. The shared picker owns title/tabs; this body owns
+/// the search prompt, count, empty hint, and consecutive selectable contact rows.
 fn render_contacts(
     frame: &mut Frame<'_>,
     area: Rect,
@@ -734,31 +1195,71 @@ fn render_contacts(
     if area.width == 0 || area.height == 0 {
         return Vec::new();
     }
-    let inset = 1u16.min(area.width);
-    let x = area.x + inset;
-    let width = area.width.saturating_sub(inset).max(1);
-    let handles = app.contact_handles();
-    if handles.is_empty() {
-        frame.render_widget(
-            Paragraph::new("No contacts yet. Contacts come from chats Bloom already knows.")
-                .style(Style::default().fg(palette.muted)),
-            Rect::new(x, area.y, width, area.height.min(2)),
-        );
-        return Vec::new();
-    }
-
+    let inset = 2u16.min(area.width / 2);
+    let text_x = area.x.saturating_add(inset);
+    let text_width = area.width.saturating_sub(inset.saturating_mul(2)).max(1);
+    let handles = app.visible_contact_handles();
+    let search_text = if app.contacts_query.is_empty() {
+        "Search by number or nickname".to_owned()
+    } else {
+        format!("Search: {}", app.contacts_query)
+    };
     frame.render_widget(
-        Paragraph::new(format!(
-            "{} known contacts · Enter to set a nickname",
-            handles.len()
+        Paragraph::new(truncate_display_graphemes(
+            &search_text,
+            text_width as usize,
         ))
-        .style(Style::default().fg(palette.muted)),
-        Rect::new(x, area.y, width, 1),
+        .style(Style::default().fg(if app.contacts_query.is_empty() {
+            palette.muted
+        } else {
+            palette.text
+        })),
+        Rect::new(text_x, area.y, text_width, 1),
     );
-    if area.height < 2 {
+    let show_count = area.height > 2;
+    if show_count {
+        let count_text = if !app.contacts_query.is_empty() {
+            format!("{} matches · Enter to edit", handles.len())
+        } else if app.contacts_tab == 0 {
+            format!(
+                "{} contact{} · Enter to nickname",
+                handles.len(),
+                if handles.len() == 1 { "" } else { "s" }
+            )
+        } else {
+            format!("{} nicknames · Enter to edit", handles.len())
+        };
+        frame.render_widget(
+            Paragraph::new(truncate_display_graphemes(&count_text, text_width as usize))
+                .style(Style::default().fg(palette.muted)),
+            Rect::new(text_x, area.y + 1, text_width, 1),
+        );
+    }
+    if handles.is_empty() {
+        let empty_row = area.y + if show_count { 2 } else { 1 };
+        if empty_row < area.y.saturating_add(area.height) {
+            let text = if !app.contacts_query.is_empty() {
+                format!("No contacts match \"{}\".", app.contacts_query)
+            } else if app.contacts_tab == 1 {
+                "No nicknames yet. Select a contact and press Enter to add one.".to_owned()
+            } else {
+                "No contacts yet. Contacts come from chats Bloom already knows.".to_owned()
+            };
+            frame.render_widget(
+                Paragraph::new(truncate_display_graphemes(&text, text_width as usize))
+                    .style(Style::default().fg(palette.muted)),
+                Rect::new(text_x, empty_row, text_width, 1),
+            );
+        }
         return Vec::new();
     }
-    let list_area = Rect::new(x, area.y + 1, width, area.height - 1);
+    let list_offset = if show_count { 2 } else { 1 };
+    let list_area = Rect::new(
+        area.x,
+        area.y.saturating_add(list_offset),
+        area.width,
+        area.height.saturating_sub(list_offset),
+    );
     let items = handles
         .iter()
         .map(|handle| {
@@ -768,21 +1269,25 @@ fn render_contacts(
                 bloom_domain::HandleKind::Tel => format!("tel:{}", handle.value()),
                 bloom_domain::HandleKind::Opaque => handle.value().to_owned(),
             };
-            let text = if !app
+            if !app
                 .nicknames
                 .contains_key(&crate::app::nickname_key(handle))
             {
                 Line::from(Span::styled(
-                    display_truncate(&address, width as usize),
+                    display_truncate(&address, text_width as usize),
                     Style::default().fg(palette.text),
                 ))
             } else {
                 let label_width = unicode_width::UnicodeWidthStr::width(label.as_str());
                 let separator_width = 2;
-                let address_width = (width as usize).saturating_sub(label_width + separator_width);
+                let address_width =
+                    (text_width as usize).saturating_sub(label_width + separator_width);
                 Line::from(vec![
                     Span::styled(
-                        truncate_display_graphemes(label.as_str(), label_width.min(width as usize)),
+                        truncate_display_graphemes(
+                            label.as_str(),
+                            label_width.min(text_width as usize),
+                        ),
                         Style::default()
                             .fg(palette.text)
                             .add_modifier(Modifier::BOLD),
@@ -793,38 +1298,294 @@ fn render_contacts(
                         Style::default().fg(palette.muted),
                     ),
                 ])
-            };
-            ListItem::new(text)
+            }
         })
         .collect::<Vec<_>>();
-    let mut state = ListState::default();
-    state.select(Some(app.contacts_selection.min(handles.len() - 1)));
-    frame.render_stateful_widget(
-        List::new(items)
-            .style(Style::default().bg(palette.surface))
-            .highlight_style(
-                Style::default()
-                    .bg(palette.input_surface)
-                    .add_modifier(Modifier::BOLD),
+    let visible = list_area.height as usize;
+    if visible == 0 {
+        return Vec::new();
+    }
+    let selected = app.contacts_selection.min(handles.len() - 1);
+    let first = selected
+        .saturating_sub(visible.saturating_sub(1))
+        .min(handles.len().saturating_sub(visible));
+    let mut hits = Vec::new();
+    for (index, item) in items.iter().enumerate().skip(first).take(visible) {
+        let row = Rect::new(
+            list_area.x,
+            list_area.y + (index - first) as u16,
+            list_area.width,
+            1,
+        );
+        let active = index == selected;
+        let background = if active {
+            palette.selection
+        } else {
+            palette.input_surface
+        };
+        frame.render_widget(Block::default().style(Style::default().bg(background)), row);
+        let mut spans = vec![Span::styled(
+            if active { "› " } else { "  " },
+            Style::default().fg(palette.cyan).bg(background),
+        )];
+        spans.extend(item.spans.iter().map(|span| {
+            Span::styled(
+                span.content.clone(),
+                span.style.bg(background).fg(if active {
+                    palette.text
+                } else {
+                    span.style.fg.unwrap_or(palette.text)
+                }),
             )
-            .highlight_symbol("› "),
-        list_area,
-        &mut state,
-    );
-    let first = state.offset();
-    (first..(first + list_area.height as usize).min(handles.len()))
-        .map(|index| {
-            (
-                Rect::new(
-                    list_area.x,
-                    list_area.y + (index - first) as u16,
-                    list_area.width,
-                    1,
+        }));
+        frame.render_widget(
+            Paragraph::new(Line::from(spans)),
+            Rect::new(text_x, row.y, text_width, 1),
+        );
+        hits.push((row, index));
+    }
+    hits
+}
+
+fn render_new_contacts(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    app: &App,
+    palette: Palette,
+    tab_hits: &mut Vec<(Rect, usize)>,
+) -> Vec<(Rect, usize)> {
+    if area.width == 0 || area.height == 0 {
+        return Vec::new();
+    }
+    tab_hits.extend(render_tabs(
+        frame,
+        Rect::new(area.x, area.y, area.width, 1),
+        &["Recent", "All"],
+        app.new_contact_tab,
+        palette,
+    ));
+    if area.height == 1 {
+        return Vec::new();
+    }
+    let handles = app.new_contact_suggestions();
+    let rows_area = Rect::new(area.x, area.y + 1, area.width, area.height - 1);
+    if handles.is_empty() {
+        let hint = if app.draft.trim().is_empty() {
+            "No known contacts yet. Type an address to start."
+        } else {
+            "No matches. Press Enter to use this address."
+        };
+        frame.render_widget(
+            Paragraph::new(truncate_display_graphemes(hint, area.width as usize))
+                .style(Style::default().fg(palette.muted)),
+            Rect::new(rows_area.x, rows_area.y, rows_area.width, 1),
+        );
+        return Vec::new();
+    }
+
+    let visible_count = rows_area.height as usize;
+    let selected = app.new_contact_selection.min(handles.len() - 1);
+    let first = selected
+        .saturating_sub(visible_count.saturating_sub(1))
+        .min(handles.len().saturating_sub(visible_count));
+    let mut hits = Vec::new();
+    let end = (first + visible_count).min(handles.len());
+    for (index, handle) in handles.iter().enumerate().take(end).skip(first) {
+        let y = rows_area.y + (index - first) as u16;
+        let row = Rect::new(rows_area.x, y, rows_area.width, 1);
+        let active = index == selected;
+        let background = if active {
+            palette.selection
+        } else {
+            palette.input_surface
+        };
+        let foreground = palette.text;
+        let address = match handle.kind() {
+            bloom_domain::HandleKind::Email => format!("mailto:{}", handle.value()),
+            bloom_domain::HandleKind::Tel => format!("tel:{}", handle.value()),
+            bloom_domain::HandleKind::Opaque => handle.value().to_owned(),
+        };
+        let nickname = app.nicknames.get(&crate::app::nickname_key(handle));
+        let mut spans = vec![Span::styled(
+            if active { "› " } else { "  " },
+            Style::default().fg(palette.cyan).bg(background),
+        )];
+        if let Some(label) = nickname {
+            let label_width = unicode_width::UnicodeWidthStr::width(label.as_str());
+            let address_width = (row.width as usize).saturating_sub(label_width + 3);
+            spans.extend([
+                Span::styled(
+                    truncate_display_graphemes(label, label_width.min(row.width as usize)),
+                    Style::default()
+                        .fg(foreground)
+                        .add_modifier(Modifier::BOLD)
+                        .bg(background),
                 ),
-                index,
-            )
-        })
-        .collect()
+                Span::styled("  ", Style::default().fg(palette.muted).bg(background)),
+                Span::styled(
+                    display_truncate(&address, address_width),
+                    Style::default()
+                        .fg(if active { palette.text } else { palette.muted })
+                        .bg(background),
+                ),
+            ]);
+        } else {
+            spans.push(Span::styled(
+                display_truncate(&address, row.width.saturating_sub(2) as usize),
+                Style::default()
+                    .fg(foreground)
+                    .add_modifier(Modifier::BOLD)
+                    .bg(background),
+            ));
+        }
+        frame.render_widget(Block::default().style(Style::default().bg(background)), row);
+        frame.render_widget(Paragraph::new(Line::from(spans)), row);
+        hits.push((row, index));
+    }
+    hits
+}
+
+fn render_emoji_suggestions(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    app: &App,
+    palette: Palette,
+) -> Vec<(Rect, usize)> {
+    if area.width == 0 || area.height == 0 {
+        return Vec::new();
+    }
+    let suggestions = app.emoji_suggestions();
+    if suggestions.is_empty() {
+        return Vec::new();
+    }
+    let selected = app.emoji_selection.min(suggestions.len() - 1);
+    let first = selected
+        .saturating_sub(area.height.saturating_sub(1) as usize)
+        .min(suggestions.len().saturating_sub(area.height as usize));
+    let mut hits = Vec::new();
+    let end = (first + area.height as usize).min(suggestions.len());
+    for (index, suggestion) in suggestions.iter().enumerate().take(end).skip(first) {
+        let row = Rect::new(area.x, area.y + (index - first) as u16, area.width, 1);
+        let active = index == selected;
+        let background = if active {
+            palette.selection
+        } else {
+            palette.input_surface
+        };
+        let text = format!(
+            "{} {}  :{}:  {}",
+            if active { "›" } else { " " },
+            suggestion.emoji,
+            suggestion.shortcode,
+            suggestion.name
+        );
+        frame.render_widget(
+            Paragraph::new(truncate_display_graphemes(&text, row.width as usize)).style(
+                Style::default()
+                    .fg(palette.text)
+                    .bg(background)
+                    .add_modifier(if active {
+                        Modifier::BOLD
+                    } else {
+                        Modifier::empty()
+                    }),
+            ),
+            row,
+        );
+        hits.push((row, index));
+    }
+    hits
+}
+
+fn render_filter_panel(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    app: &App,
+    palette: Palette,
+) -> Vec<(Rect, usize)> {
+    if area.width == 0 || area.height == 0 {
+        return Vec::new();
+    }
+    let rows = app.visible_conversations();
+    let rows_area = Rect::new(
+        area.x,
+        area.y.saturating_add(1),
+        area.width,
+        area.height.saturating_sub(1),
+    );
+    let inset = 2u16.min(area.width / 2);
+    let content_x = area.x.saturating_add(inset);
+    let content_width = area.width.saturating_sub(inset.saturating_mul(2)).max(1);
+    let count = Rect::new(content_x, area.y, content_width, 1);
+    frame.render_widget(
+        Paragraph::new(format!("{} conversations", rows.len()))
+            .style(Style::default().fg(palette.muted)),
+        count,
+    );
+    if rows_area.height == 0 {
+        return Vec::new();
+    }
+    if rows.is_empty() {
+        frame.render_widget(
+            Paragraph::new("No matching conversations").style(Style::default().fg(palette.muted)),
+            Rect::new(content_x, rows_area.y, content_width, 1),
+        );
+        return Vec::new();
+    }
+    let visible_count = rows_area.height as usize;
+    let selected = app
+        .selected
+        .as_ref()
+        .and_then(|id| rows.iter().position(|conversation| &conversation.id == id))
+        .unwrap_or(0);
+    let first = selected
+        .saturating_sub(visible_count.saturating_sub(1))
+        .min(rows.len().saturating_sub(visible_count));
+    let mut hits = Vec::new();
+    let end = (first + visible_count).min(rows.len());
+    for (index, conversation) in rows.iter().enumerate().take(end).skip(first) {
+        let conversation = *conversation;
+        let row = Rect::new(
+            rows_area.x,
+            rows_area.y + (index - first) as u16,
+            rows_area.width,
+            1,
+        );
+        let active = index == selected;
+        let background = if active {
+            palette.selection
+        } else {
+            palette.input_surface
+        };
+        let label = app.conversation_name(conversation);
+        let kind = match conversation.kind {
+            bloom_domain::ConversationKind::Direct => "Direct",
+            bloom_domain::ConversationKind::Group => "Group",
+        };
+        let label_width = (content_width as usize).saturating_sub(kind.len() + 5);
+        frame.render_widget(Block::default().style(Style::default().bg(background)), row);
+        frame.render_widget(
+            Paragraph::new(Line::from(vec![
+                Span::styled(
+                    if active { "› " } else { "  " },
+                    Style::default().fg(palette.cyan).bg(background),
+                ),
+                Span::styled(
+                    truncate_display_graphemes(&label, label_width),
+                    Style::default().fg(palette.text).bg(background),
+                ),
+                Span::styled(
+                    format!("  {kind}"),
+                    Style::default()
+                        .fg(if active { palette.text } else { palette.muted })
+                        .bg(background),
+                ),
+            ])),
+            Rect::new(content_x, row.y, content_width, 1),
+        );
+        hits.push((row, index));
+    }
+    hits
 }
 
 /// Wrap text into display rows the way the transcript paragraph does, breaking at
@@ -915,8 +1676,16 @@ pub enum Hit {
     Composer,
     Transcript,
     MenuRow(usize),
+    SettingsTab(usize),
     SettingsRow(usize),
     ContactRow(usize),
+    ContactTab(usize),
+    NewContactRow(usize),
+    NewContactTab(usize),
+    FilterRow(usize),
+    FilterTab(usize),
+    EmojiRow(usize),
+    ThemeRow(usize),
     ContextMenuRow(usize),
     HeaderSettings,
     HeaderHelp,
@@ -928,12 +1697,22 @@ pub struct HitMap {
     pub sidebar: Rect,
     pub transcript: Rect,
     pub composer: Rect,
+    pub composer_positions: Vec<(u16, u16, usize)>,
     pub sidebar_rows: Vec<(Rect, bloom_domain::ConversationId)>,
     /// The command popup's outer panel and its clickable rows.
     pub menu: Option<Rect>,
     pub menu_rows: Vec<(Rect, usize)>,
+    pub popup: Option<Rect>,
+    pub settings_tabs: Vec<(Rect, usize)>,
     pub settings_rows: Vec<(Rect, usize)>,
     pub contacts_rows: Vec<(Rect, usize)>,
+    pub contacts_tabs: Vec<(Rect, usize)>,
+    pub new_contact_rows: Vec<(Rect, usize)>,
+    pub new_contact_tabs: Vec<(Rect, usize)>,
+    pub filter_rows: Vec<(Rect, usize)>,
+    pub filter_tabs: Vec<(Rect, usize)>,
+    pub emoji_rows: Vec<(Rect, usize)>,
+    pub theme_rows: Vec<(Rect, usize)>,
     /// The conversation context menu and its items.
     pub context_menu: Option<Rect>,
     pub context_menu_rows: Vec<(Rect, usize)>,
@@ -956,13 +1735,22 @@ impl HitMap {
             .map(|(_, index)| *index)
     }
 
+    pub fn composer_cursor_at(&self, column: u16, row: u16) -> Option<usize> {
+        self.composer_positions
+            .iter()
+            .min_by_key(|(x, y, _)| {
+                u32::from(y.abs_diff(row)) * 1024 + u32::from(x.abs_diff(column))
+            })
+            .map(|(_, _, index)| *index)
+    }
+
     /// Resolve a pointer position. Overlays take priority over the panes below
     /// them, which is what makes the command popup own the mouse while it is up.
     pub fn at(&self, column: u16, row: u16) -> Option<Hit> {
-        if let Some(help) = self.help {
-            if Self::contains(help, column, row) {
-                return Some(Hit::CloseOverlay);
-            }
+        if self.help.is_some() {
+            // Help is modal: clicks anywhere dismiss it without reaching panes
+            // rendered underneath, even when the pointer is outside the sheet.
+            return Some(Hit::CloseOverlay);
         }
         if let Some(menu) = self.menu {
             if Self::contains(menu, column, row) {
@@ -979,11 +1767,71 @@ impl HitMap {
                 .map(Hit::ContextMenuRow)
                 .or(Some(Hit::CloseOverlay));
         }
+        if self
+            .popup
+            .is_some_and(|area| Self::contains(area, column, row))
+        {
+            if let Some(index) = Self::row_at(&self.settings_tabs, column, row) {
+                return Some(Hit::SettingsTab(index));
+            }
+            if let Some(index) = Self::row_at(&self.settings_rows, column, row) {
+                return Some(Hit::SettingsRow(index));
+            }
+            if let Some(index) = Self::row_at(&self.contacts_rows, column, row) {
+                return Some(Hit::ContactRow(index));
+            }
+            if let Some(index) = Self::row_at(&self.contacts_tabs, column, row) {
+                return Some(Hit::ContactTab(index));
+            }
+            if let Some(index) = Self::row_at(&self.new_contact_rows, column, row) {
+                return Some(Hit::NewContactRow(index));
+            }
+            if let Some(index) = Self::row_at(&self.new_contact_tabs, column, row) {
+                return Some(Hit::NewContactTab(index));
+            }
+            if let Some(index) = Self::row_at(&self.filter_rows, column, row) {
+                return Some(Hit::FilterRow(index));
+            }
+            if let Some(index) = Self::row_at(&self.filter_tabs, column, row) {
+                return Some(Hit::FilterTab(index));
+            }
+            if let Some(index) = Self::row_at(&self.emoji_rows, column, row) {
+                return Some(Hit::EmojiRow(index));
+            }
+            if let Some(index) = Self::row_at(&self.theme_rows, column, row) {
+                return Some(Hit::ThemeRow(index));
+            }
+            return Some(Hit::CloseOverlay);
+        }
+        if let Some(index) = Self::row_at(&self.settings_tabs, column, row) {
+            return Some(Hit::SettingsTab(index));
+        }
         if let Some(index) = Self::row_at(&self.settings_rows, column, row) {
             return Some(Hit::SettingsRow(index));
         }
         if let Some(index) = Self::row_at(&self.contacts_rows, column, row) {
             return Some(Hit::ContactRow(index));
+        }
+        if let Some(index) = Self::row_at(&self.contacts_tabs, column, row) {
+            return Some(Hit::ContactTab(index));
+        }
+        if let Some(index) = Self::row_at(&self.new_contact_rows, column, row) {
+            return Some(Hit::NewContactRow(index));
+        }
+        if let Some(index) = Self::row_at(&self.new_contact_tabs, column, row) {
+            return Some(Hit::NewContactTab(index));
+        }
+        if let Some(index) = Self::row_at(&self.filter_rows, column, row) {
+            return Some(Hit::FilterRow(index));
+        }
+        if let Some(index) = Self::row_at(&self.filter_tabs, column, row) {
+            return Some(Hit::FilterTab(index));
+        }
+        if let Some(index) = Self::row_at(&self.emoji_rows, column, row) {
+            return Some(Hit::EmojiRow(index));
+        }
+        if let Some(index) = Self::row_at(&self.theme_rows, column, row) {
+            return Some(Hit::ThemeRow(index));
         }
         if self
             .header_settings
@@ -1035,6 +1883,7 @@ fn render_with_mode(frame: &mut Frame<'_>, app: &App, monochrome: bool) -> HitMa
         palette.yellow = Color::Reset;
         palette.magenta = Color::Reset;
         palette.red = Color::Reset;
+        palette.selection = Color::Reset;
     }
     let area = frame.area();
     // Codex runs flush to the window edges: no outer frame, content starts at the
@@ -1051,7 +1900,7 @@ fn render_with_mode(frame: &mut Frame<'_>, app: &App, monochrome: bool) -> HitMa
         let (prefix, value, cursor_byte, editable, muted) =
             composer_content(app, inner.width as usize);
         let compact = Rect::new(inner.x, inner.y, inner.width, u16::from(inner.height > 0));
-        let layout = ComposerLayout::new(compact, &prefix, &value, cursor_byte, editable);
+        let layout = ComposerLayout::new(compact, &prefix, &value, cursor_byte, editable, false);
         if inner.width > 0 && inner.height > 0 {
             frame.render_widget(
                 Block::default().style(Style::default().bg(palette.input_surface)),
@@ -1059,20 +1908,17 @@ fn render_with_mode(frame: &mut Frame<'_>, app: &App, monochrome: bool) -> HitMa
             );
         }
         if layout.input.width > 0 && layout.input.height > 0 {
-            frame.render_widget(
-                Paragraph::new(layout.prompt).style(
-                    Style::default()
-                        .fg(if muted { palette.muted } else { palette.text })
-                        .bg(palette.input_surface),
-                ),
-                layout.input,
-            );
-            if let Some(cursor) = layout.cursor {
-                frame.set_cursor_position(cursor);
-            }
+            render_composer_layout(frame, &layout, muted, palette, palette.input_surface);
         }
+        let help = render_help(frame, app, inner, palette);
         return HitMap {
+            help,
             composer: layout.input,
+            composer_positions: if !muted && app.filter_query().is_none() {
+                layout.cursor_positions
+            } else {
+                Vec::new()
+            },
             ..Default::default()
         };
     }
@@ -1080,24 +1926,9 @@ fn render_with_mode(frame: &mut Frame<'_>, app: &App, monochrome: bool) -> HitMa
 
     // Measured from the mockup: the rail is about 21% of the window. Compact mode
     // gives more room to the transcript and uses one-line sidebar entries.
-    // Below this width a two-line rail leaves only fragments of names and previews,
-    // so the sidebar collapses to one-line entries on its own.
-    const COMFORTABLE_RAIL_MIN_WIDTH: u16 = 70;
+    // Below the comfortable threshold the rail collapses so chats stay identifiable.
     let compact = app.compact_sidebar || inner.width < COMFORTABLE_RAIL_MIN_WIDTH;
-    let rail_percent = if compact { 15 } else { 25 };
-    let desired = (inner.width as u32 * rail_percent + 50) / 100;
-    // Preserve transcript room on narrow terminals; each chat remains identifiable
-    // even when the title is clipped to a smaller responsive rail.
-    let sidebar_min = if inner.width < 45 {
-        10
-    } else if inner.width < 70 {
-        12
-    } else {
-        16
-    };
-    let sidebar_width = desired
-        .clamp(sidebar_min, 34)
-        .min(inner.width.saturating_sub(3) as u32) as u16;
+    let sidebar_width = sidebar_width_for(inner.width, app.compact_sidebar);
     let body = Layout::horizontal([
         Constraint::Length(sidebar_width),
         Constraint::Length(1),
@@ -1122,11 +1953,13 @@ fn render_with_mode(frame: &mut Frame<'_>, app: &App, monochrome: bool) -> HitMa
             1 => ("1 MATCH".to_owned(), true),
             count => (format!("{count} MATCHES"), true),
         },
+        None if app.focus == Focus::Sidebar => ("› Chats".to_owned(), false),
         None => ("Chats".to_owned(), false),
     };
-    let label_style = if is_filter {
+    let label_style = if is_filter || app.focus == Focus::Sidebar {
         Style::default()
             .fg(palette.cyan)
+            .bg(palette.input_surface)
             .add_modifier(Modifier::BOLD)
     } else {
         Style::default().fg(palette.muted)
@@ -1138,7 +1971,7 @@ fn render_with_mode(frame: &mut Frame<'_>, app: &App, monochrome: bool) -> HitMa
         Rect::new(body[0].x, body[0].y, body[0].width, 1),
     );
     // Match the transcript's header-to-content breathing room in the sidebar.
-    let sidebar_spacer = u16::from(body[0].height >= 6 && !app.settings_open && !app.help_open);
+    let sidebar_spacer = u16::from(body[0].height >= 6);
     // The rail carries one item per chat: a name line and, unless the sidebar is
     // compact, a preview of the newest message. The selection fills both lines.
     const SELECTION_MARKER_WIDTH: usize = 2;
@@ -1156,11 +1989,15 @@ fn render_with_mode(frame: &mut Frame<'_>, app: &App, monochrome: bool) -> HitMa
         .collect::<Vec<_>>();
     // Render with state so a selection deep in a long list scrolls into view
     // rather than moving off-screen invisibly.
-    let selected_index = app.selected.as_ref().and_then(|id| {
-        visible
-            .iter()
-            .position(|conversation| &conversation.id == id)
-    });
+    let selected_index = app
+        .selected
+        .as_ref()
+        .filter(|_| !app.new_conversation)
+        .and_then(|id| {
+            visible
+                .iter()
+                .position(|conversation| &conversation.id == id)
+        });
     let mut list_state = ListState::default();
     list_state.select(selected_index);
     let list_area = Rect::new(
@@ -1207,19 +2044,39 @@ fn render_with_mode(frame: &mut Frame<'_>, app: &App, monochrome: bool) -> HitMa
             .border_style(Style::default().fg(palette.rule)),
         body[1],
     );
-    // Shrink the header and composer blocks on short terminals so their heights can
-    // never exceed the area they are given.
-    let (header_height, composer_height) = if inner.height >= 12 {
-        (2u16, 5u16)
+    let header_height = if inner.height >= 12 { 2u16 } else { 1u16 };
+    let spacer_rows = u16::from(inner.height >= 6 && !app.settings_open && !app.help_open);
+    let min_transcript_rows = if inner.height >= 12 { 3u16 } else { 1u16 };
+    let composer_width = body[2].width.saturating_sub(4).max(1) as usize;
+    let (prefix, value, cursor_byte, editable, muted) = composer_content(app, composer_width);
+    let wrap_draft =
+        (app.wrap_composer || value.contains('\n')) && editable && !muted && !value.is_empty();
+    // On a very short screen, give a wrapped draft its rows before spending space
+    // on the usual input padding and footer. This preserves the overflow viewport.
+    let composer_overhead = if wrap_draft && inner.height < 8 {
+        0u16
+    } else if inner.height >= 12 {
+        4u16
     } else if inner.height >= 10 {
-        (1u16, 4u16)
+        3u16
     } else if inner.height >= 6 {
-        (1u16, 3u16)
-    } else if inner.height >= 5 {
-        (1u16, 2u16)
+        2u16
     } else {
-        (1u16, 1u16)
+        0u16
     };
+    let wrapped_rows = if wrap_draft {
+        crate::composer::wrap_draft(&prefix, &value, composer_width)
+            .lines
+            .len()
+    } else {
+        1
+    };
+    let max_input_rows = inner
+        .height
+        .saturating_sub(header_height + min_transcript_rows + spacer_rows + composer_overhead)
+        .clamp(1, 5) as usize;
+    let input_rows = wrapped_rows.min(max_input_rows).max(1) as u16;
+    let composer_height = input_rows + composer_overhead;
     let right = Layout::vertical([
         Constraint::Length(header_height),
         Constraint::Min(1),
@@ -1232,7 +2089,6 @@ fn render_with_mode(frame: &mut Frame<'_>, app: &App, monochrome: bool) -> HitMa
         horizontal: 2,
         vertical: 0,
     };
-    let spacer_rows = u16::from(inner.height >= 6 && !app.settings_open && !app.help_open);
     let transcript_area = if right[1].height > spacer_rows {
         Rect::new(
             right[1].x,
@@ -1245,23 +2101,17 @@ fn render_with_mode(frame: &mut Frame<'_>, app: &App, monochrome: bool) -> HitMa
     };
     let content = transcript_area.inner(gutter);
     let composer_area = right[2].inner(gutter);
-    let geometry = composer_geometry(composer_area);
+    let geometry = composer_geometry(composer_area, input_rows);
     hits.transcript = content;
     hits.composer = geometry.input;
     let selected = app.selected_conversation();
+    let new_message = app.new_conversation;
     // The left of the header leads with the chat itself; the app name lives on the
     // right, next to the other quiet affordances.
     let mut heading = Vec::new();
-    if app.contacts_open {
+    if new_message {
         heading.push(Span::styled(
-            "Contacts",
-            Style::default()
-                .fg(palette.text)
-                .add_modifier(Modifier::BOLD),
-        ));
-    } else if app.settings_open {
-        heading.push(Span::styled(
-            "Settings",
+            "New message",
             Style::default()
                 .fg(palette.text)
                 .add_modifier(Modifier::BOLD),
@@ -1284,33 +2134,99 @@ fn render_with_mode(frame: &mut Frame<'_>, app: &App, monochrome: bool) -> HitMa
             ]);
         }
     }
-    let mut title_width = right[0].width;
-    let mut theme_control = None;
-    let mut status_control = None;
-    // Small clickable controls at the right edge, the way Codex tucks its
-    // affordances there: `Bloom` next to `?` for the shortcut sheet and `⚙` for
-    // settings.
-    let mut cursor = right[0].x.saturating_add(right[0].width);
-    if right[0].width >= 32 {
-        let width = 5u16;
-        let area = Rect::new(cursor.saturating_sub(width), right[0].y, width, 1);
+    let pane = right[0];
+    let gutter = 2u16.min(pane.width / 4);
+    let left = pane.x.saturating_add(gutter);
+    let right_edge = pane.x.saturating_add(pane.width).saturating_sub(gutter);
+    let available = right_edge.saturating_sub(left);
+    let compact = available < 48 && pane.height > 1;
+    let title_row = pane.y;
+    let status_row = if compact && !new_message {
+        pane.y + 1
+    } else {
+        pane.y
+    };
+    let context_row = (pane.height > 1 && (!compact || new_message)).then_some(pane.y + 1);
+
+    let status_text = status_text(app).map(|status| {
+        let tone = status_tone(app);
+        let label = match app.connection_state {
+            crate::daemon::ConnectionState::Disconnected => {
+                format!("{} Offline", spinner_frame(app.frame))
+            }
+            crate::daemon::ConnectionState::Connecting => {
+                format!("{} Connecting", spinner_frame(app.frame))
+            }
+            _ if status == "Syncing" => format!("{} Syncing", spinner_frame(app.frame)),
+            _ => status,
+        };
+        (label, tone)
+    });
+    let mut controls_width = 0u16;
+    let mut help = false;
+    let mut settings = false;
+    let mut theme = false;
+    let mut branding = false;
+    let reserve_status = status_text.as_ref().map_or(0, |(text, _)| {
+        (unicode_width::UnicodeWidthStr::width(text.as_str()) as u16 + 3).min(
+            if compact && !new_message {
+                available
+            } else {
+                available.saturating_sub(10)
+            },
+        )
+    });
+    let title_min = 24u16.min(available / 2);
+    let budget = available
+        .saturating_sub(title_min)
+        .saturating_sub(reserve_status);
+    if !compact {
+        // Drop optional branding first; identity and status always get their budget.
+        if controls_width + 2 <= budget {
+            help = true;
+            controls_width += 2;
+        }
+        if controls_width + 4 <= budget {
+            settings = true;
+            controls_width += 4;
+        }
+        if controls_width + 9 <= budget {
+            theme = true;
+            controls_width += 9;
+        }
+        if controls_width + 6 <= budget {
+            branding = true;
+            controls_width += 6;
+        }
+    }
+    let title_width =
+        available
+            .saturating_sub(controls_width)
+            .saturating_sub(if status_row == title_row {
+                reserve_status
+            } else {
+                0
+            });
+    if branding {
         frame.render_widget(
             Paragraph::new("Bloom").style(Style::default().fg(palette.muted)),
-            area,
+            Rect::new(right_edge - 5, title_row, 5, 1),
         );
-        cursor = area.x.saturating_sub(1);
     }
-    if right[0].width >= 26 {
-        let area = Rect::new(cursor.saturating_sub(1), right[0].y, 1, 1);
+    let mut control_x = right_edge.saturating_sub(u16::from(branding) * 6);
+    if help {
+        control_x = control_x.saturating_sub(1);
+        let area = Rect::new(control_x, title_row, 1, 1);
         hits.header_help = Some(area);
         frame.render_widget(
             Paragraph::new("?").style(Style::default().fg(palette.muted)),
             area,
         );
-        cursor = area.x;
+        control_x = control_x.saturating_sub(1);
     }
-    if right[0].width >= 30 {
-        let area = Rect::new(cursor.saturating_sub(3), right[0].y, 3, 1);
+    if settings {
+        control_x = control_x.saturating_sub(3);
+        let area = Rect::new(control_x, title_row, 3, 1);
         hits.header_settings = Some(Rect::new(area.x + 1, area.y, 1, 1));
         frame.render_widget(
             Paragraph::new(" ⚙ ")
@@ -1318,68 +2234,29 @@ fn render_with_mode(frame: &mut Frame<'_>, app: &App, monochrome: bool) -> HitMa
                 .style(Style::default().fg(palette.muted)),
             area,
         );
-        cursor = area.x;
     }
-    let mut status_edge = cursor;
-    if right[0].width >= THEME_MIN_WIDTH {
+    let heading_width: usize = heading
+        .iter()
+        .map(|span| unicode_width::UnicodeWidthStr::width(span.content.as_ref()))
+        .sum();
+    if heading_width > usize::from(title_width) {
+        heading.truncate(1);
+    }
+    let title_text: String = heading.iter().map(|span| span.content.as_ref()).collect();
+    frame.render_widget(
+        Paragraph::new(truncate_with_ellipsis(&title_text, title_width as usize)).style(
+            Style::default()
+                .fg(palette.text)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Rect::new(left, title_row, title_width, 1),
+    );
+    if theme {
         let label = match app.theme {
             Theme::Dark => " Dark ",
             Theme::Light => " Light ",
         };
         let width = unicode_width::UnicodeWidthStr::width(label) as u16 + 2;
-        let x = cursor.saturating_sub(width);
-        theme_control = Some((label, x, width));
-        title_width = x.saturating_sub(right[0].x.saturating_add(1));
-        status_edge = x;
-    }
-    if let Some(mut status) = status_text(app) {
-        let tone = status_tone(app);
-        if matches!(
-            app.connection_state,
-            crate::daemon::ConnectionState::Connecting
-                | crate::daemon::ConnectionState::Disconnected
-        ) {
-            status = format!("{} {status}", spinner_frame(app.frame));
-        }
-        let max_status_width =
-            usize::from(status_edge.saturating_sub(right[0].x.saturating_add(7)));
-        if max_status_width >= 8 {
-            if unicode_width::UnicodeWidthStr::width(status.as_str()) + 2 > max_status_width {
-                status = match app.connection_state {
-                    crate::daemon::ConnectionState::Connecting => {
-                        format!("{} Connecting", spinner_frame(app.frame))
-                    }
-                    crate::daemon::ConnectionState::Disconnected => {
-                        format!("{} Offline", spinner_frame(app.frame))
-                    }
-                    _ => status,
-                };
-            }
-            let text_budget = max_status_width.saturating_sub(2);
-            let status = truncate_display_graphemes(&status, text_budget);
-            let status_width = (2 + unicode_width::UnicodeWidthStr::width(status.as_str()))
-                .min(max_status_width) as u16;
-            if status_width > 2 {
-                let status_x = status_edge.saturating_sub(status_width + 1);
-                title_width = status_x.saturating_sub(right[0].x.saturating_add(1));
-                status_control = Some((status, status_x, status_width, tone));
-            }
-        }
-    }
-    // A subtitle is a nicety: drop it whole rather than clip it mid-word when the
-    // status and controls leave too little room.
-    let heading_width: usize = heading
-        .iter()
-        .map(|span| unicode_width::UnicodeWidthStr::width(span.content.as_ref()))
-        .sum();
-    if heading_width > title_width as usize && heading.len() > 1 {
-        heading.truncate(1);
-    }
-    frame.render_widget(
-        Paragraph::new(Line::from(heading)),
-        Rect::new(right[0].x, right[0].y, title_width, 1),
-    );
-    if let Some((label, x, width)) = theme_control {
         frame.render_widget(
             Paragraph::new(label)
                 .alignment(Alignment::Center)
@@ -1390,39 +2267,64 @@ fn render_with_mode(frame: &mut Frame<'_>, app: &App, monochrome: bool) -> HitMa
                         .border_type(BorderType::Rounded)
                         .border_style(Style::default().fg(palette.rule)),
                 ),
-            Rect::new(x, right[0].y, width, 1),
+            Rect::new(control_x.saturating_sub(width), title_row, width, 1),
         );
     }
-    if let Some((status, x, width, tone)) = status_control {
-        let dot_color = match tone {
-            StatusTone::Healthy => palette.green,
-            StatusTone::Attention => palette.yellow,
-            StatusTone::Failure => palette.red,
-        };
-        let label_color = if tone == StatusTone::Healthy {
-            palette.muted
+    if let Some((status, tone)) = status_text {
+        let width = reserve_status;
+        let status = truncate_with_ellipsis(&status, usize::from(width.saturating_sub(2)));
+        if width >= 3 {
+            let status_x = right_edge
+                .saturating_sub(controls_width)
+                .saturating_sub(width);
+            let dot_color = match tone {
+                StatusTone::Healthy => palette.green,
+                StatusTone::Attention => palette.yellow,
+                StatusTone::Failure => palette.red,
+            };
+            let label_color = if tone == StatusTone::Healthy {
+                palette.muted
+            } else {
+                dot_color
+            };
+            frame.render_widget(
+                Paragraph::new(Line::from(vec![
+                    Span::styled("● ", Style::default().fg(dot_color)),
+                    Span::styled(status, Style::default().fg(label_color)),
+                ])),
+                Rect::new(status_x, status_row, width, 1),
+            );
+        }
+    }
+    if let Some(context_row) = context_row {
+        let context = if new_message {
+            app.pending_address
+                .as_ref()
+                .map(|address| format!("To: {address}"))
+                .unwrap_or_else(|| "Choose a recipient below".into())
         } else {
-            dot_color
+            "─".repeat(available as usize)
         };
         frame.render_widget(
-            Paragraph::new(Line::from(vec![
-                Span::styled("● ", Style::default().fg(dot_color)),
-                Span::styled(status, Style::default().fg(label_color)),
-            ])),
-            Rect::new(x, right[0].y, width, 1),
-        );
-    }
-    if right[0].height > 1 {
-        frame.render_widget(
-            Paragraph::new("─".repeat(right[0].width as usize))
-                .style(Style::default().fg(palette.rule)),
-            Rect::new(right[0].x, right[0].y + 1, right[0].width, 1),
+            Paragraph::new(truncate_with_ellipsis(&context, available as usize)).style(
+                Style::default().fg(if new_message {
+                    palette.cyan
+                } else {
+                    palette.rule
+                }),
+            ),
+            Rect::new(left, context_row, available, 1),
         );
     }
     let transcript_width = content.width.max(1) as usize;
     let mut lines = Vec::new();
     let mut header_lines: Vec<usize> = Vec::new();
-    if let Some(messages) = app.selected.as_ref().and_then(|id| app.messages.get(id)) {
+    if let Some(messages) = app
+        .selected
+        .as_ref()
+        .filter(|_| !new_message)
+        .and_then(|id| app.messages.get(id))
+    {
         // Pad speaker names to a common column so timestamps line up, the way the
         // mockup's transcript does. Capped so one long name cannot push the times
         // off the visible line.
@@ -1608,19 +2510,35 @@ fn render_with_mode(frame: &mut Frame<'_>, app: &App, monochrome: bool) -> HitMa
         }
     }
     let scroll = max_scroll.saturating_sub(back).min(u16::MAX as usize) as u16;
-    if app.contacts_open {
-        hits.contacts_rows = render_contacts(frame, content, app, palette);
-    } else if app.settings_open {
-        hits.settings_rows = render_settings(frame, content, app, palette);
-    } else if lines.is_empty() {
-        let (title, key, description) = if app.filter_has_no_matches() {
+    if lines.is_empty() && app.filter_query().is_none() {
+        let (title, key, description) = if new_message {
+            if app.pending_address.is_some() {
+                ("New conversation", "", "Write a message below")
+            } else {
+                ("New conversation", "", "Enter a phone number or email")
+            }
+        } else if app.connection_state == crate::daemon::ConnectionState::Disconnected {
+            (
+                "Daemon unavailable",
+                "",
+                "Reconnecting; drafts stay on this device",
+            )
+        } else if app.connection_state == crate::daemon::ConnectionState::Connecting {
+            ("Connecting to Bloom", "", "Waiting for the local daemon")
+        } else if app.thread_loading {
+            (
+                "Loading stored messages",
+                "",
+                "Reading this conversation from Bloom",
+            )
+        } else if app.filter_has_no_matches() {
             ("No matching conversations", "Esc", " clear the filter")
         } else if app.conversations.is_empty() {
-            ("No conversations yet", "n", " start a conversation")
+            ("No conversations yet", "/new", " start a conversation")
         } else if app.selected.is_none() {
             ("Choose a conversation", "↑↓", " browse · Enter compose")
         } else {
-            ("No messages yet", "Enter", " write the first message")
+            ("No stored messages", "", "Older history is not imported")
         };
         let empty_state = vec![
             Line::from(Span::styled(
@@ -1656,6 +2574,218 @@ fn render_with_mode(frame: &mut Frame<'_>, app: &App, monochrome: bool) -> HitMa
             content,
         );
     }
+    let new_recipient_open = app.new_conversation && app.pending_address.is_none();
+    let filter_open = app.filter_query().is_some();
+    let emoji_open = !app.emoji_suggestions().is_empty();
+    if app.contacts_open
+        || app.settings_open
+        || app.theme_panel_open
+        || new_recipient_open
+        || filter_open
+        || emoji_open
+    {
+        let picker_bounds = Rect::new(body[2].x, content.y, body[2].width, content.height);
+        let settings_layout = app.settings_open.then(|| {
+            let options = if app.settings_category == 0 { 1 } else { 2 };
+            settings_geometry(picker_bounds, geometry.band.y, 2, options)
+        });
+        let filter_layout = filter_open.then(|| {
+            let rows = app.visible_conversations().len().max(1) + 1;
+            titled_picker_geometry(picker_bounds, geometry.band.y, 3, rows, 0)
+        });
+        let contacts_layout = app.contacts_open.then(|| {
+            let handles = app.visible_contact_handles();
+            let body_rows = 2 + handles.len().max(1);
+            titled_picker_geometry(picker_bounds, geometry.band.y, 2, body_rows, 0)
+        });
+        let theme_layout = app
+            .theme_panel_open
+            .then(|| titled_picker_geometry(picker_bounds, geometry.band.y, 0, 3, 0));
+        let panel = if let Some(settings) = settings_layout {
+            settings.panel
+        } else if let Some(contacts) = contacts_layout {
+            contacts.panel
+        } else if let Some(filter) = filter_layout {
+            filter.panel
+        } else if let Some(theme) = theme_layout {
+            theme.panel
+        } else {
+            let available_height = content.height;
+            let panel_height = if new_recipient_open || filter_open {
+                available_height.min(9)
+            } else if emoji_open {
+                available_height.min(8)
+            } else {
+                available_height.min(7)
+            };
+            Rect::new(
+                body[2].x,
+                content
+                    .y
+                    .saturating_add(content.height.saturating_sub(panel_height)),
+                body[2].width,
+                panel_height,
+            )
+        };
+        if panel.width > 0 && panel.height > 0 {
+            hits.popup = Some(panel);
+            // Keep the popup attached to the shaded composer across the
+            // transcript's reserved spacer row.
+            let bridge_end = geometry.band.y;
+            let bridge_start = panel.y.saturating_add(panel.height);
+            if bridge_end > bridge_start {
+                frame.render_widget(
+                    Block::default().style(Style::default().bg(palette.input_surface)),
+                    Rect::new(
+                        panel.x,
+                        bridge_start,
+                        panel.width,
+                        bridge_end - bridge_start,
+                    ),
+                );
+            }
+            frame.render_widget(Clear, panel);
+            frame.render_widget(
+                Block::default().style(Style::default().bg(palette.input_surface)),
+                panel,
+            );
+            let title = if app.settings_open {
+                "Settings"
+            } else if app.contacts_open {
+                "Contacts"
+            } else if new_recipient_open {
+                "New conversation"
+            } else if filter_open {
+                "Filter conversations"
+            } else if emoji_open {
+                "Emoji suggestions"
+            } else {
+                "Theme"
+            };
+            let title_area = settings_layout
+                .or(contacts_layout)
+                .or(filter_layout)
+                .or(theme_layout)
+                .map_or_else(
+                    || {
+                        Rect::new(
+                            panel.x.saturating_add(1),
+                            panel.y,
+                            panel.width.saturating_sub(1),
+                            1,
+                        )
+                    },
+                    |picker| picker.title,
+                );
+            frame.render_widget(
+                Paragraph::new(Span::styled(
+                    title,
+                    Style::default()
+                        .fg(palette.cyan)
+                        .add_modifier(Modifier::BOLD),
+                )),
+                title_area,
+            );
+            let top_inset = if panel.height >= 10 {
+                2
+            } else {
+                u16::from(panel.height >= 6)
+            };
+            if app.settings_open {
+                let settings = settings_layout.expect("settings geometry was measured");
+                hits.settings_tabs = render_tabs(
+                    frame,
+                    settings.tabs,
+                    &["Appearance", "Layout"],
+                    app.settings_category,
+                    palette,
+                );
+                hits.settings_rows = render_settings(
+                    frame,
+                    settings.rows,
+                    app,
+                    palette,
+                    settings.show_descriptions,
+                    settings.show_note,
+                );
+            } else {
+                let rows_area = Rect::new(
+                    panel.x,
+                    panel.y.saturating_add(1 + top_inset),
+                    panel.width,
+                    panel.height.saturating_sub(1 + top_inset),
+                );
+                if app.contacts_open {
+                    let contacts = contacts_layout.expect("contacts geometry was measured");
+                    hits.contacts_tabs = render_tabs(
+                        frame,
+                        contacts.tabs,
+                        &["All", "Nicknamed"],
+                        app.contacts_tab,
+                        palette,
+                    );
+                    hits.contacts_rows = render_contacts(frame, contacts.rows, app, palette);
+                } else if new_recipient_open {
+                    hits.new_contact_rows = render_new_contacts(
+                        frame,
+                        rows_area,
+                        app,
+                        palette,
+                        &mut hits.new_contact_tabs,
+                    );
+                } else if filter_open {
+                    let filter = filter_layout.expect("filter geometry was measured");
+                    hits.filter_tabs = render_tabs(
+                        frame,
+                        filter.tabs,
+                        &["All", "Direct", "Groups"],
+                        app.filter_category,
+                        palette,
+                    );
+                    hits.filter_rows = render_filter_panel(frame, filter.rows, app, palette);
+                } else if emoji_open {
+                    hits.emoji_rows = render_emoji_suggestions(frame, rows_area, app, palette);
+                } else {
+                    let options = ["Automatic", "Dark", "Light"];
+                    let theme = theme_layout.expect("theme geometry was measured");
+                    let inset = 2u16.min(theme.rows.width / 2);
+                    let text = Rect::new(
+                        theme.rows.x.saturating_add(inset),
+                        theme.rows.y,
+                        theme.rows.width.saturating_sub(inset.saturating_mul(2)),
+                        theme.rows.height,
+                    );
+                    for (index, option) in
+                        options.iter().enumerate().take(theme.rows.height as usize)
+                    {
+                        let row = Rect::new(
+                            theme.rows.x,
+                            theme.rows.y + index as u16,
+                            theme.rows.width,
+                            1,
+                        );
+                        let selected = app.theme_panel_selection == index;
+                        let bg = if selected {
+                            palette.selection
+                        } else {
+                            palette.input_surface
+                        };
+                        frame.render_widget(Block::default().style(Style::default().bg(bg)), row);
+                        frame.render_widget(
+                            Paragraph::new(if selected {
+                                format!("› {option}")
+                            } else {
+                                format!("  {option}")
+                            })
+                            .style(Style::default().fg(palette.text).bg(bg)),
+                            Rect::new(text.x, row.y, text.width, 1),
+                        );
+                        hits.theme_rows.push((row, index));
+                    }
+                }
+            }
+        }
+    }
     if let Some((panel, rows)) = render_command_menu(frame, app, content, body[2], palette) {
         hits.menu = Some(panel);
         hits.menu_rows = rows;
@@ -1664,15 +2794,23 @@ fn render_with_mode(frame: &mut Frame<'_>, app: &App, monochrome: bool) -> HitMa
         hits.context_menu = Some(panel);
         hits.context_menu_rows = rows;
     }
-    hits.help = render_help(frame, app, content, palette);
-    let (prefix, value, cursor_byte, editable, muted) = if app.settings_open {
-        // The settings pane carries its own copy; leave the composer row quiet and
-        // keep the footer hints visible underneath it.
-        (String::new(), String::new(), 0, false, true)
-    } else {
-        composer_content(app, geometry.input.width as usize)
-    };
-    let layout = ComposerLayout::new(geometry.input, &prefix, &value, cursor_byte, editable);
+    let layout = ComposerLayout::new(
+        geometry.input,
+        &prefix,
+        &value,
+        cursor_byte,
+        editable,
+        wrap_draft,
+    );
+    if !muted && app.filter_query().is_none() {
+        let draft_graphemes = app.draft.graphemes(true).count();
+        hits.composer_positions = layout
+            .cursor_positions
+            .iter()
+            .copied()
+            .filter(|(_, _, index)| *index <= draft_graphemes)
+            .collect();
+    }
     // The input surface is a band with padding above and below the input row.
     // Footer rows stay outside the shaded band.
     // The shaded band spans the full chat pane; the input text keeps its gutter.
@@ -1682,28 +2820,25 @@ fn render_with_mode(frame: &mut Frame<'_>, app: &App, monochrome: bool) -> HitMa
         body[2].width,
         geometry.band.height,
     );
+    let input_surface = palette.input_surface;
     if input_band.width > 0 && input_band.height > 0 {
         frame.render_widget(
-            Block::default().style(Style::default().bg(palette.input_surface)),
+            Block::default().style(Style::default().bg(input_surface)),
             input_band,
         );
     }
     if layout.input.width > 0 && layout.input.height > 0 {
-        frame.render_widget(
-            Paragraph::new(layout.prompt.clone()).style(
-                Style::default()
-                    .fg(if muted { palette.muted } else { palette.text })
-                    .bg(palette.input_surface),
-            ),
-            layout.input,
-        );
-    }
-    if let Some(cursor) = layout.cursor {
-        frame.set_cursor_position(cursor);
+        render_composer_layout(frame, &layout, muted, palette, input_surface);
     }
     if let Some(footer_area) = geometry.footer {
         if footer_area.width > 0 && footer_area.height > 0 {
             let feedback = composer_feedback(app, &palette, back);
+            let hints = footer_hints(
+                footer_area.width as usize,
+                palette,
+                app,
+                wrap_draft && input_rows > 1,
+            );
             let row = |offset: u16| {
                 Rect::new(footer_area.x, footer_area.y + offset, footer_area.width, 1)
             };
@@ -1711,54 +2846,123 @@ fn render_with_mode(frame: &mut Frame<'_>, app: &App, monochrome: bool) -> HitMa
             match (two_rows, feedback) {
                 (true, Some((message, color))) => {
                     render_footer_row(frame, row(0), &message, color);
-                    frame.render_widget(
-                        Paragraph::new(footer_hints(footer_area.width as usize, palette, app)),
-                        row(1),
-                    );
+                    frame.render_widget(Paragraph::new(hints), row(1));
                 }
                 (true, None) => {
-                    frame.render_widget(
-                        Paragraph::new(footer_hints(footer_area.width as usize, palette, app)),
-                        row(1),
-                    );
+                    frame.render_widget(Paragraph::new(hints), row(1));
                 }
                 (false, Some((message, color))) => {
                     render_footer_row(frame, row(0), &message, color)
                 }
                 (false, None) => {
-                    frame.render_widget(
-                        Paragraph::new(footer_hints(footer_area.width as usize, palette, app)),
-                        row(0),
-                    );
+                    frame.render_widget(Paragraph::new(hints), row(0));
                 }
             }
         }
     }
+    if let Some(popup) = hits.popup {
+        let excerpt_rows = popup.y.saturating_sub(content.y);
+        if excerpt_rows > 0 && excerpt_rows < 3 {
+            // One orphan body/byline row above a tall picker has no useful context.
+            let excerpt = Rect::new(body[2].x, content.y, body[2].width, excerpt_rows);
+            frame.render_widget(Clear, excerpt);
+            frame.render_widget(
+                Block::default().style(Style::default().bg(palette.surface)),
+                excerpt,
+            );
+        }
+    }
+    // Help is a modal over the entire terminal, including the composer on
+    // shorter viewports. Draw it last so the composer cannot erase its bottom.
+    hits.help = render_help(frame, app, inner, palette);
     hits
 }
 
 /// The `?` shortcut sheet, mirroring Codex's grouped key list. Returns its panel
 /// so a click anywhere on it dismisses.
 fn render_help(frame: &mut Frame<'_>, app: &App, content: Rect, palette: Palette) -> Option<Rect> {
-    if !app.help_open || content.height < 4 || content.width < 20 {
+    if !app.help_open || content.height == 0 || content.width == 0 {
         return None;
     }
-    let rows: [(&str, &str); 12] = [
-        ("↑↓ / wheel", "scroll the transcript"),
-        ("PgUp / PgDn", "scroll a screenful"),
-        ("Ctrl+Home / End", "oldest / latest"),
-        ("Tab", "focus the chat list"),
-        ("Enter", "send the message"),
-        ("/", "commands"),
-        ("?", "this sheet"),
-        (",", "settings"),
-        ("Ctrl+B h/l", "previous / next chat"),
-        ("Ctrl+B s", "settings"),
-        ("Ctrl+W", "delete a word"),
-        ("Ctrl+C", "quit"),
+    let rows: [(&str, &str, &str); crate::app::HELP_ROW_COUNT] = [
+        ("↑↓ / wheel", "cursor, chats, or scroll", "move / scroll"),
+        ("PgUp / PgDn", "scroll a screenful", "page scroll"),
+        ("Ctrl+Home / End", "oldest / latest", "oldest / latest"),
+        ("Tab", "toggle composer / chat list", "toggle focus"),
+        ("Enter", "send the message", "send"),
+        ("Ctrl+J", "new line (Alt/Shift+Enter too)", "new line"),
+        (
+            "Ctrl+R",
+            "recover a saved failed draft",
+            "recover failed draft",
+        ),
+        ("/new", "start a new conversation", "new chat"),
+        (
+            "/sync",
+            "refresh conversation-list metadata",
+            "refresh list",
+        ),
+        ("/", "commands", "commands"),
+        ("?", "this sheet", "help"),
+        (",", "settings", "settings"),
+        ("Ctrl+B n/p", "next / previous chat", "next / prev chat"),
+        ("Ctrl+P", "previous chat", "previous chat"),
+        (
+            "Ctrl+B f/s/t",
+            "filter / settings / theme",
+            "filter / settings / theme",
+        ),
+        ("Ctrl+C", "clear input; quit when empty", "clear / quit"),
     ];
+    if content.height < 4 || content.width < 4 {
+        let panel = content;
+        let selected = app.help_scroll.min(rows.len() - 1);
+        frame.render_widget(Clear, panel);
+        frame.render_widget(
+            Block::default().style(Style::default().bg(palette.input_surface)),
+            panel,
+        );
+        if panel.height >= 2 {
+            let (key, _, compact) = rows[selected];
+            let entry = format!("{key}: {compact}");
+            frame.render_widget(
+                Paragraph::new(truncate_display_graphemes(&entry, panel.width as usize))
+                    .style(Style::default().fg(palette.text).bg(palette.input_surface)),
+                Rect::new(panel.x, panel.y, panel.width, 1),
+            );
+        }
+        if panel.height >= 3 {
+            frame.render_widget(
+                Paragraph::new(truncate_display_graphemes(
+                    "↑↓ scroll · ? close",
+                    panel.width as usize,
+                ))
+                .style(Style::default().fg(palette.muted).bg(palette.input_surface)),
+                Rect::new(panel.x, panel.y + panel.height - 1, panel.width, 1),
+            );
+        } else if panel.height == 1 {
+            frame.render_widget(
+                Paragraph::new(truncate_display_graphemes(
+                    "? help · ↑↓ scroll",
+                    panel.width as usize,
+                ))
+                .style(Style::default().fg(palette.muted).bg(palette.input_surface)),
+                panel,
+            );
+        } else {
+            frame.render_widget(
+                Paragraph::new(truncate_display_graphemes(
+                    "↑↓ scroll · ? close",
+                    panel.width as usize,
+                ))
+                .style(Style::default().fg(palette.muted).bg(palette.input_surface)),
+                Rect::new(panel.x, panel.y + 1, panel.width, 1),
+            );
+        }
+        return Some(panel);
+    }
     let width = content.width.min(56);
-    let height = (rows.len() as u16 + 2).min(content.height);
+    let height = (rows.len() as u16 + 3).min(content.height);
     let panel = Rect::new(
         content.x + (content.width - width) / 2,
         content.y + content.height.saturating_sub(height) / 2,
@@ -1775,37 +2979,47 @@ fn render_help(frame: &mut Frame<'_>, app: &App, content: Rect, palette: Palette
             .borders(Borders::ALL)
             .border_type(BorderType::Rounded)
             .border_style(Style::default().fg(palette.rule))
-            .style(Style::default().bg(palette.surface)),
+            .style(Style::default().bg(palette.input_surface)),
         panel,
     );
     let inner = panel.inner(Margin {
         horizontal: 1,
         vertical: 1,
     });
-    for (index, (key, description)) in rows.iter().enumerate() {
-        if index as u16 >= inner.height.saturating_sub(1) {
-            break;
-        }
+    let visible_rows = inner.height.saturating_sub(1) as usize;
+    let first = app.help_scroll.min(rows.len().saturating_sub(visible_rows));
+    for (index, (key, description, compact_description)) in
+        rows.iter().skip(first).take(visible_rows).enumerate()
+    {
         let row = Rect::new(inner.x, inner.y + index as u16, inner.width, 1);
-        let key_width = 18usize.min(inner.width as usize);
-        frame.render_widget(
-            Paragraph::new(Line::from(vec![
-                Span::styled(
-                    display_pad(key, key_width),
-                    Style::default()
-                        .fg(palette.cyan)
-                        .add_modifier(Modifier::BOLD),
-                ),
-                Span::styled(
-                    truncate_display_graphemes(
-                        description,
-                        (inner.width as usize).saturating_sub(key_width),
+        if inner.width < 36 {
+            let text = format!("{key}: {compact_description}");
+            frame.render_widget(
+                Paragraph::new(truncate_display_graphemes(&text, inner.width as usize))
+                    .style(Style::default().fg(palette.text)),
+                row,
+            );
+        } else {
+            let key_width = 18usize.min(inner.width as usize);
+            frame.render_widget(
+                Paragraph::new(Line::from(vec![
+                    Span::styled(
+                        display_pad(key, key_width),
+                        Style::default()
+                            .fg(palette.cyan)
+                            .add_modifier(Modifier::BOLD),
                     ),
-                    Style::default().fg(palette.muted),
-                ),
-            ])),
-            row,
-        );
+                    Span::styled(
+                        truncate_display_graphemes(
+                            description,
+                            (inner.width as usize).saturating_sub(key_width),
+                        ),
+                        Style::default().fg(palette.muted),
+                    ),
+                ])),
+                row,
+            );
+        }
     }
     if inner.height > 1 {
         let hint = Rect::new(
@@ -1814,8 +3028,18 @@ fn render_help(frame: &mut Frame<'_>, app: &App, content: Rect, palette: Palette
             inner.width,
             1,
         );
+        let above = first;
+        let below = rows.len().saturating_sub(first + visible_rows);
+        let hint_text = if inner.width < 36 {
+            "↑↓ scroll · ? close".to_owned()
+        } else if above > 0 || below > 0 {
+            format!("↑ {above} above · ↓ {below} more · ↑↓ scroll · esc / ? close")
+        } else {
+            "esc / ? close".to_owned()
+        };
         frame.render_widget(
-            Paragraph::new("esc / ? close").style(Style::default().fg(palette.muted)),
+            Paragraph::new(truncate_display_graphemes(&hint_text, hint.width as usize))
+                .style(Style::default().fg(palette.muted)),
             hint,
         );
     }
@@ -1861,7 +3085,7 @@ fn render_context_menu(
             .borders(Borders::ALL)
             .border_type(BorderType::Rounded)
             .border_style(Style::default().fg(palette.rule))
-            .style(Style::default().bg(palette.surface)),
+            .style(Style::default().bg(palette.input_surface)),
         panel,
     );
     let inner = panel.inner(Margin {
@@ -1876,11 +3100,11 @@ fn render_context_menu(
         let item = Rect::new(inner.x, inner.y + index as u16, inner.width, 1);
         let selected = index == menu.selection;
         let bg = if selected {
-            palette.cyan
+            palette.selection
         } else {
-            palette.surface
+            palette.input_surface
         };
-        let fg = if selected { palette.bg } else { palette.text };
+        let fg = palette.text;
         frame.render_widget(
             Paragraph::new(format!("{} {label}", if selected { "›" } else { " " }))
                 .style(Style::default().fg(fg).bg(bg)),
@@ -1904,7 +3128,18 @@ fn render_footer_row(frame: &mut Frame<'_>, area: Rect, message: &str, color: Co
 /// cue. Hints are always rendered on their own row when two rows are available.
 fn composer_feedback(app: &App, palette: &Palette, back: usize) -> Option<(String, Color)> {
     if let Some(message) = app.error.as_deref() {
-        return Some((message.to_owned(), palette.red));
+        let message = if app.deferred_sends.is_empty() {
+            message.to_owned()
+        } else if app
+            .deferred_sends
+            .front()
+            .is_some_and(|draft| draft.uncertain)
+        {
+            "Outcome uncertain; verify before retry. Ctrl+R: saved draft.".into()
+        } else {
+            format!("Ctrl+R: saved draft. {message}")
+        };
+        return Some((message, palette.red));
     }
     if let Some(message) = app.notice.as_deref() {
         return Some((message.to_owned(), palette.green));
@@ -1912,9 +3147,31 @@ fn composer_feedback(app: &App, palette: &Palette, back: usize) -> Option<(Strin
     if let Some(feedback) = app.visible_send_feedback() {
         let (message, color) = match feedback.phase {
             crate::app::SendPhase::Sending => ("Sending…", palette.yellow),
+            crate::app::SendPhase::Sent if feedback.conversation.is_none() => {
+                ("New-chat message sent.", palette.green)
+            }
             crate::app::SendPhase::Sent => ("Message sent.", palette.green),
         };
-        return Some((message.to_owned(), color));
+        let message = if app.deferred_sends.is_empty() {
+            message.to_owned()
+        } else if app.pending_send_attempt.is_some() {
+            format!("{message} {} saved draft(s).", app.deferred_sends.len())
+        } else {
+            format!(
+                "{message} Ctrl+R: {} saved draft(s).",
+                app.deferred_sends.len()
+            )
+        };
+        return Some((message, color));
+    }
+    if !app.deferred_sends.is_empty() {
+        return Some((
+            format!(
+                "Ctrl+R: recover {} saved draft(s).",
+                app.deferred_sends.len()
+            ),
+            palette.yellow,
+        ));
     }
     if app.is_scrolled_back() && back > 0 {
         return Some((
@@ -1944,6 +3201,83 @@ mod animation_accessibility_tests {
             assert_eq!(spinner_frame(tick as u64), *expected);
         }
         assert_eq!(spinner_frame(10), frames[0]);
+    }
+
+    #[test]
+    fn selected_chat_marker_remains_visible_without_color() {
+        let id = bloom_domain::ConversationId::new(
+            bloom_domain::TransportId::new("openbubbles").unwrap(),
+            "selected",
+        )
+        .unwrap();
+        let conversation = bloom_domain::Conversation {
+            id: id.clone(),
+            remote_id: "selected".into(),
+            kind: bloom_domain::ConversationKind::Direct,
+            title: Some("Selected chat".into()),
+            participants: vec![bloom_domain::Participant {
+                handle: bloom_domain::Handle::new(bloom_domain::HandleKind::Opaque, "me").unwrap(),
+                display_name: None,
+                is_me: true,
+            }],
+            created_at: 1,
+            last_message_at: Some(1),
+            aliases: Vec::new(),
+            preview: Some("Selected preview".into()),
+        };
+        for focus in [Focus::Composer, Focus::Sidebar] {
+            let app = App {
+                selected: Some(id.clone()),
+                conversations: vec![conversation.clone()],
+                focus,
+                ..Default::default()
+            };
+            let backend = ratatui::backend::TestBackend::new(100, 30);
+            let mut terminal = ratatui::Terminal::new(backend).unwrap();
+            terminal
+                .draw(|frame| {
+                    render_with_mode(frame, &app, true);
+                })
+                .unwrap();
+            let grid = terminal.backend().buffer();
+            assert!(
+                (0..grid.area.height)
+                    .any(|y| (0..grid.area.width).any(|x| grid[(x, y)].symbol() == "▎")),
+                "the selected-chat marker remains visible without color"
+            );
+            for y in 0..grid.area.height {
+                for x in 0..grid.area.width {
+                    assert_eq!(grid[(x, y)].fg, Color::Reset);
+                    assert_eq!(grid[(x, y)].bg, Color::Reset);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn popup_selection_has_a_readable_marker_with_and_without_color() {
+        for monochrome in [false, true] {
+            let mut app = App::default();
+            app.open_settings();
+            let mut terminal =
+                ratatui::Terminal::new(ratatui::backend::TestBackend::new(66, 18)).unwrap();
+            let mut hits = HitMap::default();
+            terminal
+                .draw(|frame| hits = render_with_mode(frame, &app, monochrome))
+                .unwrap();
+            let row = hits.settings_rows[0].0;
+            let cell = &terminal.backend().buffer()[(row.x + 2, row.y)];
+            assert_eq!(cell.symbol(), "›");
+            assert!(cell.modifier.contains(Modifier::BOLD));
+            if monochrome {
+                assert_eq!(cell.fg, Color::Reset);
+                assert_eq!(cell.bg, Color::Reset);
+            } else {
+                assert_eq!(cell.fg, DARK.cyan);
+                assert_eq!(cell.bg, DARK.selection);
+                assert_ne!(cell.fg, DARK.bg);
+            }
+        }
     }
 
     #[test]

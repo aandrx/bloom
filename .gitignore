@@ -1,6 +1,10 @@
 # Rust build output
 /target/
 
+# Python review/test tooling caches
+__pycache__/
+*.pyc
+
 # Local environment and credentials
 .env
 .env.*

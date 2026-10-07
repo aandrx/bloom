@@ -25,9 +25,12 @@ import time
 from pathlib import Path
 
 import pyte
+from wcwidth import wcswidth
 
-DEFAULT_FG = "#cdd6f4"
-DEFAULT_BG = "#1e1e2e"
+# Terminal-default colors are only a review assumption (notably for NO_COLOR).
+# Explicit RGB emitted by the TUI always wins.
+DEFAULT_FG = "#e6e6e6"
+DEFAULT_BG = "#181818"
 KEY_SEQUENCES = {
     "up": b"\x1b[A",
     "down": b"\x1b[B",
@@ -214,25 +217,26 @@ def to_html(screen: pyte.Screen, cols: int, rows: int) -> str:
     for y in range(rows):
         row = screen.buffer[y]
         spans = []
-        current = None
+        continuation = 0
         for x in range(cols):
+            if continuation:
+                continuation -= 1
+                continue
             char = row[x]
             fg = normalise_colour(char.fg, DEFAULT_FG)
             bg = normalise_colour(char.bg, DEFAULT_BG)
-            style = f"{fg}|{bg}|{int(bool(char.bold))}"
-            if style != current:
-                if current is not None:
-                    spans.append("</span>")
-                spans.append(
-                    f'<span style="color:{fg};background:{bg};'
-                    f'font-weight:{"700" if char.bold else "400"};padding:0.11em 0">'
-                )
-                current = style
             text = char.data or " "
+            cells = min(max(1, wcswidth(text)), cols - x)
+            continuation = cells - 1
+            escaped = text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+            # Terminal cells have fixed geometry, even when browser fallback fonts
+            # give bold text or symbols different advances. Never draw an extra
+            # space for the continuation cell of a wide character.
             spans.append(
-                text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+                f'<span style="color:{fg};background:{bg};'
+                f'font-weight:{"700" if char.bold else "400"};display:inline-block;'
+                f'width:{cells * 9}px;height:18px;vertical-align:top">{escaped}</span>'
             )
-        spans.append("</span>")
         body.append("".join(spans))
     content = "\n".join(body)
     return f"""<!doctype html>
@@ -240,7 +244,7 @@ def to_html(screen: pyte.Screen, cols: int, rows: int) -> str:
   body {{ margin:0; background:{DEFAULT_BG}; }}
   pre {{
     margin:0; padding:14px 16px;
-    font: 15px/1.22 "JetBrains Mono","Geist Mono",ui-monospace,SFMono-Regular,Menlo,monospace;
+    font: 15px/18px "JetBrains Mono","Geist Mono",ui-monospace,SFMono-Regular,Menlo,monospace;
     white-space: pre; color:{DEFAULT_FG}; background:{DEFAULT_BG};
   }}
 </style></head><body><pre>{content}</pre></body></html>

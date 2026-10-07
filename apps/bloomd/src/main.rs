@@ -100,7 +100,7 @@ async fn main() -> ExitCode {
     let hub = SubscriptionHub::with_default_capacity();
     let engine = Arc::new(Engine::new(engine_config));
 
-    let (sink, mut events) = mpsc::channel(EVENT_CAPACITY);
+    let (sink, events) = mpsc::channel(EVENT_CAPACITY);
     let mut supervisor = Supervisor::new(engine.clone(), sink);
     if let Err(error) = supervisor.start().await {
         eprintln!("bloomd: engine unavailable: {error}");
@@ -108,16 +108,7 @@ async fn main() -> ExitCode {
     }
 
     let service = Arc::new(Service::new(store, engine.clone(), hub.clone()));
-    let persistence = {
-        let service = service.clone();
-        tokio::spawn(async move {
-            while let Some(event) = events.recv().await {
-                if let Err(error) = service.persist(&event) {
-                    eprintln!("bloomd: dropping event that failed to persist: {error}");
-                }
-            }
-        })
-    };
+    let persistence = tokio::spawn(service.clone().persist_events(events));
 
     loop {
         tokio::select! {
@@ -141,11 +132,40 @@ async fn main() -> ExitCode {
     drop(listener);
     // Leave no stale socket behind for the next start to trip over.
     let _ = std::fs::remove_file(&config.socket_path);
-    let _ = supervisor.shutdown(SHUTDOWN_DRAIN).await;
+    let shutdown = supervisor.shutdown(SHUTDOWN_DRAIN).await;
+    drop(supervisor); // closes the final sender so persistence observes end-of-stream
     drop(service);
-    persistence.abort();
-    eprintln!("bloomd: clean shutdown");
-    ExitCode::SUCCESS
+    let persistence_result = tokio::time::timeout(SHUTDOWN_DRAIN, persistence).await;
+
+    let mut clean = true;
+    match shutdown {
+        Ok(report) if report.discarded_events == 0 && !report.drain_incomplete => {}
+        Ok(_) => {
+            eprintln!("bloomd: shutdown incomplete: engine event forwarding did not fully drain");
+            clean = false;
+        }
+        Err(_) => {
+            eprintln!("bloomd: shutdown incomplete: engine producer failed to stop");
+            clean = false;
+        }
+    }
+    match persistence_result {
+        Ok(Ok(())) => {}
+        Ok(Err(_)) => {
+            eprintln!("bloomd: shutdown incomplete: persistence task failed");
+            clean = false;
+        }
+        Err(_) => {
+            eprintln!("bloomd: shutdown incomplete: persistence drain timed out");
+            clean = false;
+        }
+    }
+    if clean {
+        eprintln!("bloomd: clean shutdown");
+        ExitCode::SUCCESS
+    } else {
+        ExitCode::from(4)
+    }
 }
 
 fn create_private_dir(path: &std::path::Path) -> std::io::Result<()> {

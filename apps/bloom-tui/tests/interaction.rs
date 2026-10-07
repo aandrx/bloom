@@ -9,6 +9,7 @@ use bloom_domain::{
 use bloom_ipc::EventKind;
 use bloom_tui::{
     app::{Action, App, SendPhase},
+    daemon::Snapshot,
     KeyCode, KeyEvent, KeyModifiers,
 };
 
@@ -89,21 +90,23 @@ fn app_with(titles: &[&str]) -> App {
 }
 
 #[test]
-fn q_is_text_while_the_filter_is_open_and_quits_from_the_list() {
+fn q_is_text_and_ctrl_c_clears_before_quitting() {
     let mut app = app_with(&["Quinn Callahan", "Jules Lee"]);
 
-    // q is text in the composer; Ctrl+C remains the quit path.
     assert_eq!(app.handle_key(key(KeyCode::Char('q'))), Action::None);
     assert_eq!(app.draft, "q");
+    assert_eq!(app.handle_key(ctrl(KeyCode::Char('c'))), Action::None);
+    assert!(app.draft.is_empty());
     assert_eq!(app.handle_key(ctrl(KeyCode::Char('c'))), Action::Quit);
 
-    // With the filter open it must be an ordinary character, or names containing a
-    // q are unsearchable and the app exits while the user is typing.
     app.begin_filter();
     assert_eq!(app.handle_key(key(KeyCode::Char('q'))), Action::None);
     assert_eq!(app.filter_query(), Some("q"));
     assert_eq!(app.handle_key(key(KeyCode::Char('u'))), Action::None);
     assert_eq!(app.filter_query(), Some("qu"));
+    assert_eq!(app.handle_key(ctrl(KeyCode::Char('c'))), Action::None);
+    assert_eq!(app.filter_query(), Some(""));
+    assert_eq!(app.handle_key(ctrl(KeyCode::Char('c'))), Action::Quit);
 }
 
 #[test]
@@ -112,6 +115,132 @@ fn q_is_text_while_composing_a_message() {
     app.composing = true;
     assert_eq!(app.handle_key(key(KeyCode::Char('q'))), Action::None);
     assert_eq!(app.draft, "q");
+}
+
+#[test]
+fn wrapped_composer_uses_vertical_keys_to_move_the_draft_cursor() {
+    let mut app = app_with(&["Weekend crew"]);
+    app.draft = "abcdefghijkl".into();
+    app.draft_cursor = 12;
+    app.composing = true;
+    app.composer_columns = 10;
+    app.composer_prefix_columns = 3;
+
+    app.handle_key(key(KeyCode::Up));
+    assert_eq!(app.draft_cursor, 5);
+    app.handle_key(key(KeyCode::Down));
+    assert_eq!(app.draft_cursor, 12);
+}
+
+#[test]
+fn wrapped_composer_preserves_preferred_column_across_short_lines() {
+    let mut app = app_with(&["Weekend crew"]);
+    app.draft = "123456789 ABCDEFGH x".into();
+    app.draft_cursor = 5;
+    app.composing = true;
+    app.composer_columns = 12;
+    app.composer_prefix_columns = 3;
+
+    app.handle_key(key(KeyCode::Down));
+    let long_line_cursor = app.draft_cursor;
+    app.handle_key(key(KeyCode::Down));
+    assert!(app.draft_cursor > long_line_cursor);
+    app.handle_key(key(KeyCode::Up));
+    assert_eq!(app.draft_cursor, long_line_cursor);
+}
+
+#[test]
+fn slash_picker_draft_stays_with_its_chat_after_sidebar_switching() {
+    let mut app = app_with(&["Weekend crew", "Jules Lee"]);
+    let original = app.selected.clone();
+    app.draft = "/new".into();
+    app.draft_cursor = 4;
+    app.command_menu = true;
+    app.focus = bloom_tui::app::Focus::Sidebar;
+
+    app.handle_key(key(KeyCode::Down));
+    assert_ne!(app.selected, original);
+    assert_eq!(
+        app.draft, "",
+        "a command draft must not leak into another chat"
+    );
+    assert!(!app.command_menu);
+
+    // Returning to the original chat restores its in-progress command.
+    app.handle_key(key(KeyCode::Up));
+    assert_eq!(app.selected, original);
+    assert_eq!(app.draft, "/new");
+    assert!(app.command_menu);
+
+    app.handle_key(key(KeyCode::Backspace));
+    assert_eq!(app.draft, "/ne");
+    assert!(app.command_menu);
+    assert_eq!(app.focus, bloom_tui::app::Focus::Composer);
+    app.handle_key(key(KeyCode::Char('w')));
+    assert_eq!(app.draft, "/new");
+
+    app.draft = "/".into();
+    app.draft_cursor = 1;
+    app.command_menu = true;
+    app.focus = bloom_tui::app::Focus::Sidebar;
+    assert_eq!(app.handle_key(key(KeyCode::Tab)), Action::None);
+    assert_eq!(app.focus, bloom_tui::app::Focus::Composer);
+    app.handle_key(key(KeyCode::Backspace));
+    assert!(app.draft.is_empty());
+    assert!(!app.command_menu);
+}
+
+#[test]
+fn sync_command_returns_an_action_and_reports_truthful_outcomes() {
+    use bloom_ipc::ConversationSyncStatus;
+
+    let mut app = app_with(&["Weekend crew"]);
+    app.composing = true;
+    for character in "/sync".chars() {
+        assert_eq!(app.handle_key(key(KeyCode::Char(character))), Action::None);
+    }
+    assert_eq!(
+        app.handle_key(key(KeyCode::Enter)),
+        Action::SyncConversations
+    );
+    assert!(!app.sync_requested);
+    assert!(app.draft.is_empty());
+    app.sync_in_flight = true;
+    app.session = "Failed".into();
+    assert_eq!(bloom_tui::app::status_text(&app).as_deref(), Some("Failed"));
+    assert_eq!(
+        bloom_tui::app::status_tone(&app),
+        bloom_tui::app::StatusTone::Failure
+    );
+    app.session = "Active".into();
+    assert_eq!(
+        bloom_tui::app::status_text(&app).as_deref(),
+        Some("Syncing")
+    );
+    assert_eq!(
+        app.notice.as_deref(),
+        Some("Syncing conversation-list metadata...")
+    );
+
+    app.finish_sync(Ok((ConversationSyncStatus::Complete, 12)));
+    assert_eq!(
+        app.notice.as_deref(),
+        Some("Sync complete: 12 conversations listed.")
+    );
+    assert!(!app.sync_in_flight);
+    app.finish_sync(Ok((ConversationSyncStatus::Limited, 8)));
+    assert_eq!(
+        app.notice.as_deref(),
+        Some("Sync limited after 8 conversations; older chats may be missing.")
+    );
+    app.finish_sync(Ok((ConversationSyncStatus::Failed, 0)));
+    assert!(app
+        .error
+        .as_deref()
+        .unwrap()
+        .contains("sync failed after 0 conversations"));
+    app.finish_sync(Err("Conversation sync unavailable.".into()));
+    assert_eq!(app.error.as_deref(), Some("Conversation sync unavailable."));
 }
 
 #[test]
@@ -127,18 +256,29 @@ fn slash_picker_completes_commands_and_never_sends_command_text() {
         vec![("/theme", "Choose system, dark, or light theme")]
     );
 
-    // Enter completes the highlighted partial command instead of submitting it.
+    // The first Enter opens the theme choices without applying a default.
     assert_eq!(app.handle_key(key(KeyCode::Enter)), Action::None);
-    assert_eq!(app.draft, "/theme ");
-    assert!(app.composing);
-    assert_eq!(app.draft, "/theme ");
+    assert!(app.theme_panel_open);
     assert!(!app.command_menu);
-    app.draft.push_str("dark");
-    app.draft_cursor = app.draft.len();
-    app.composing = true;
-    assert_eq!(app.handle_key(key(KeyCode::Enter)), Action::None);
-    assert_eq!(app.theme, bloom_tui::app::Theme::Dark);
     assert!(app.draft.is_empty());
+    assert_eq!(app.handle_key(key(KeyCode::Down)), Action::None);
+    assert_eq!(app.theme_panel_selection, 1);
+    assert_eq!(app.handle_key(key(KeyCode::Enter)), Action::None);
+    assert!(!app.theme_panel_open);
+    assert_eq!(app.theme_override, Some(bloom_tui::app::Theme::Dark));
+    assert!(app.draft.is_empty());
+
+    // Explicit theme arguments remain one-step commands.
+    for character in "/theme light".chars() {
+        app.handle_key(key(KeyCode::Char(character)));
+    }
+    assert_eq!(app.handle_key(key(KeyCode::Enter)), Action::None);
+    assert_eq!(app.theme_override, Some(bloom_tui::app::Theme::Light));
+    for character in "/theme auto".chars() {
+        app.handle_key(key(KeyCode::Char(character)));
+    }
+    assert_eq!(app.handle_key(key(KeyCode::Enter)), Action::None);
+    assert_eq!(app.theme_override, None);
 
     // Unknown leading-slash input stays local even after the menu closes.
     for character in "/unknown".chars() {
@@ -150,6 +290,335 @@ fn slash_picker_completes_commands_and_never_sends_command_text() {
     assert!(app.error.as_deref().unwrap().contains("Unknown command"));
     assert_eq!(app.handle_key(key(KeyCode::Enter)), Action::None);
     assert_eq!(app.draft, draft);
+}
+
+#[test]
+fn slash_picker_dismisses_on_backspace_and_wraps_selection() {
+    let mut app = app_with(&["Jules Lee"]);
+    app.composing = true;
+    app.handle_key(key(KeyCode::Char('/')));
+    assert!(app.command_menu);
+    let count = app.command_suggestions().len();
+    assert!(count > 1);
+
+    app.handle_key(key(KeyCode::Up));
+    assert_eq!(app.command_selection, count - 1);
+    app.handle_key(key(KeyCode::Down));
+    assert_eq!(app.command_selection, 0);
+
+    app.handle_key(key(KeyCode::Backspace));
+    assert!(app.draft.is_empty());
+    assert!(!app.command_menu);
+}
+
+#[test]
+fn contact_tabs_filter_to_only_saved_local_nicknames() {
+    let mut app = app_with(&["Maya conversation", "Jules conversation"]);
+    let handle = app.contact_handles()[0].clone();
+    app.nicknames
+        .insert(bloom_tui::app::nickname_key(&handle), "Maya".into());
+    app.begin_contacts();
+    assert_eq!(app.visible_contact_handles().len(), 2);
+    app.handle_key(key(KeyCode::Right));
+    assert_eq!(app.contacts_tab, 1);
+    assert_eq!(app.visible_contact_handles().len(), 1);
+    assert_eq!(app.selected_contact_handle(), Some(handle));
+    assert_eq!(app.handle_key(key(KeyCode::Enter)), Action::None);
+    assert!(app.contacts_editing.is_some());
+}
+
+#[test]
+fn contacts_search_matches_numbers_and_nicknames_case_insensitively() {
+    let mut phone_chat = conversation("Phone Contact", 2);
+    phone_chat.participants[1].handle = Handle::new(HandleKind::Tel, "+1 (555) 123-4567").unwrap();
+    let phone = phone_chat.participants[1].handle.clone();
+    let mut app = App::default();
+    app.set_conversations(vec![phone_chat, conversation("Other Person", 2)]);
+    app.nicknames
+        .insert(bloom_tui::app::nickname_key(&phone), "Mira Violet".into());
+    app.begin_contacts();
+
+    for character in "551234".chars() {
+        app.handle_key(key(KeyCode::Char(character)));
+    }
+    assert_eq!(app.visible_contact_handles(), vec![phone.clone()]);
+    assert_eq!(app.selected_contact_handle(), Some(phone.clone()));
+
+    app.handle_key(key(KeyCode::Delete));
+    for character in "mIrA vIo".chars() {
+        app.handle_key(key(KeyCode::Char(character)));
+    }
+    assert_eq!(app.visible_contact_handles(), vec![phone.clone()]);
+    app.handle_key(key(KeyCode::Right));
+    assert_eq!(app.contacts_tab, 1);
+    assert_eq!(app.visible_contact_handles(), vec![phone.clone()]);
+
+    // Contacts are a modal search target: ordinary shortcut letters stay query text.
+    app.handle_key(key(KeyCode::Char('n')));
+    assert!(app.contacts_open);
+    assert_eq!(app.contacts_query, "mIrA vIon");
+    assert!(app.visible_contact_handles().is_empty());
+    assert_eq!(app.handle_key(key(KeyCode::Enter)), Action::None);
+    assert!(app.contacts_editing.is_none());
+
+    app.handle_key(key(KeyCode::Delete));
+    assert!(app.contacts_query.is_empty());
+    assert_eq!(app.visible_contact_handles(), vec![phone.clone()]);
+
+    app.handle_key(key(KeyCode::Char('x')));
+    app.handle_key(key(KeyCode::Esc));
+    assert!(!app.contacts_open);
+    assert!(app.contacts_query.is_empty());
+    app.begin_contacts();
+    assert!(app.contacts_query.is_empty());
+}
+
+#[test]
+fn contacts_search_preserves_selection_when_results_change_and_backspace_clears() {
+    let mut app = app_with(&["Alpha Person", "Zed Person"]);
+    app.begin_contacts();
+    let selected = app.contact_handles()[1].clone();
+    app.contacts_selection = 1;
+
+    for character in "zedperson".chars() {
+        app.handle_key(key(KeyCode::Char(character)));
+    }
+    assert_eq!(app.contacts_selection, 0);
+    assert_eq!(app.selected_contact_handle(), Some(selected.clone()));
+
+    app.handle_key(key(KeyCode::Char('x')));
+    assert!(app.visible_contact_handles().is_empty());
+    assert_eq!(app.contacts_selection, 0);
+    app.handle_key(key(KeyCode::Backspace));
+    assert_eq!(
+        app.selected_contact_handle(),
+        app.contact_handles().get(1).cloned()
+    );
+    while !app.contacts_query.is_empty() {
+        app.handle_key(key(KeyCode::Backspace));
+    }
+    assert_eq!(app.visible_contact_handles().len(), 2);
+    assert_eq!(app.contacts_selection, 1);
+    assert_eq!(app.selected_contact_handle(), Some(selected));
+}
+
+#[test]
+fn opening_composer_popups_from_sidebar_focuses_the_composer() {
+    let mut app = app_with(&["Weekend crew", "Jules Lee"]);
+    app.focus = bloom_tui::app::Focus::Sidebar;
+    app.begin_filter();
+    assert_eq!(app.focus, bloom_tui::app::Focus::Composer);
+    app.handle_key(key(KeyCode::Char('j')));
+    assert_eq!(app.filter_query(), Some("j"));
+
+    app.cancel_filter();
+    app.focus = bloom_tui::app::Focus::Sidebar;
+    app.begin_new_conversation();
+    assert_eq!(app.focus, bloom_tui::app::Focus::Composer);
+    app.handle_key(key(KeyCode::Char('a')));
+    assert_eq!(app.draft, "a");
+
+    app.focus = bloom_tui::app::Focus::Sidebar;
+    app.open_settings();
+    assert_eq!(app.focus, bloom_tui::app::Focus::Composer);
+}
+
+#[test]
+fn new_contact_sources_rank_recent_and_all_contacts() {
+    let mut older = conversation("Alpha old", 2);
+    older.last_message_at = Some(1);
+    let mut recent = conversation("Zulu recent", 2);
+    recent.last_message_at = Some(100);
+    let mut app = App::default();
+    app.set_conversations(vec![older, recent]);
+    app.begin_new_conversation();
+    assert!(app.new_contact_suggestions()[0]
+        .value()
+        .starts_with("zulurecent"));
+    app.handle_key(key(KeyCode::Right));
+    assert_eq!(app.new_contact_tab, 1);
+    assert!(app.new_contact_suggestions()[0]
+        .value()
+        .starts_with("alphaold"));
+}
+
+#[test]
+fn new_conversation_recommends_contacts_and_enters_the_body_step() {
+    let mut app = app_with(&["Weekend crew", "Jules Lee"]);
+    app.begin_new_conversation();
+    assert_eq!(app.new_contact_suggestions().len(), 2);
+    app.handle_key(key(KeyCode::Down));
+    assert_eq!(app.new_contact_selection, 1);
+    assert_eq!(app.handle_key(key(KeyCode::Enter)), Action::None);
+    assert_eq!(
+        app.pending_address.as_deref(),
+        Some("mailto:weekendcrew-1@example.invalid")
+    );
+    assert!(app.new_conversation);
+    assert!(app.draft.is_empty());
+
+    for character in "hello again".chars() {
+        app.handle_key(key(KeyCode::Char(character)));
+    }
+    assert_eq!(
+        app.handle_key(key(KeyCode::Enter)),
+        Action::StartConversation {
+            attempt: 1,
+            address: "mailto:weekendcrew-1@example.invalid".into(),
+            body: "hello again".into(),
+        }
+    );
+}
+
+#[test]
+fn filter_tabs_limit_results_to_real_conversation_categories() {
+    let mut app = App::default();
+    let direct = conversation("Jules Lee", 2);
+    let group = conversation("Weekend crew", 3);
+    app.set_conversations(vec![direct.clone(), group.clone()]);
+    app.begin_filter();
+    assert_eq!(app.visible_ids().len(), 2);
+
+    app.handle_key(key(KeyCode::Right));
+    assert_eq!(app.filter_category, 1);
+    assert_eq!(app.visible_ids(), vec![direct.id]);
+    app.handle_key(key(KeyCode::Right));
+    assert_eq!(app.filter_category, 2);
+    assert_eq!(app.visible_ids(), vec![group.id.clone()]);
+    app.handle_key(key(KeyCode::Enter));
+    assert_eq!(app.filter_query(), None);
+    assert_eq!(app.selected.as_ref(), Some(&group.id));
+}
+
+#[test]
+fn refresh_cannot_select_a_chat_outside_the_active_filter() {
+    let mut app = app_with(&["Alice", "Bob"]);
+    app.begin_filter();
+    app.filter_category = 1; // Direct only.
+    let mut refreshed = app.conversations.clone();
+    for chat in &mut refreshed {
+        chat.kind = ConversationKind::Group;
+    }
+    app.set_conversations(refreshed);
+    assert!(app.visible_conversations().is_empty());
+    assert!(app.selected.is_none());
+    app.cancel_filter();
+    app.set_conversations(app.conversations.clone());
+    assert!(app.selected.is_some());
+}
+
+#[test]
+fn settings_switched_to_contacts_keeps_original_recipient_draft() {
+    let mut app = app_with(&["Alice", "Bob"]);
+    let alice = app.selected.clone().unwrap();
+    app.paste("Private Alice");
+    app.open_settings();
+    app.begin_contacts();
+    app.close_contacts();
+    assert_eq!(app.draft, "Private Alice");
+    app.open_settings();
+    let bob = app
+        .conversations
+        .iter()
+        .find(|c| c.id != alice)
+        .unwrap()
+        .id
+        .clone();
+    app.select(Some(bob));
+    app.handle_key(key(KeyCode::Esc));
+    assert!(app.draft.is_empty());
+    app.select(Some(alice));
+    assert_eq!(app.draft, "Private Alice");
+}
+
+#[test]
+fn modal_draft_suspend_preserves_body_cursor_and_literal_paste_provenance() {
+    let mut app = app_with(&["Alice"]);
+    app.paste("/new");
+    app.paste(" literal body");
+    app.draft_cursor = 5;
+    app.open_settings();
+    assert!(app.draft.is_empty());
+    app.handle_key(key(KeyCode::Esc));
+    assert_eq!(app.draft, "/new literal body");
+    assert_eq!(app.draft_cursor, 5);
+    assert!(app.pasted_body);
+    assert!(!app.command_menu);
+}
+
+#[test]
+fn new_chat_body_does_not_follow_changed_recipient_and_modal_restores_matching_context() {
+    let mut app = app_with(&["Alice"]);
+    app.new_conversation = true;
+    app.pending_address = Some("mailto:carol@example.invalid".into());
+    app.draft = "/new Carol body".into();
+    app.draft_cursor = 5;
+    app.pasted_body = true;
+    app.open_settings();
+    app.handle_key(key(KeyCode::Esc));
+    assert_eq!(
+        app.pending_address.as_deref(),
+        Some("mailto:carol@example.invalid")
+    );
+    assert_eq!(app.draft, "/new Carol body");
+    app.open_settings();
+    app.pending_address = Some("mailto:dave@example.invalid".into());
+    app.handle_key(key(KeyCode::Esc));
+    assert!(app.draft.is_empty(), "Carol's body must not route to Dave");
+}
+
+#[test]
+fn tab_switches_focus_while_panels_are_open() {
+    let mut app = app_with(&["Weekend crew", "Jules Lee"]);
+    app.open_settings();
+    app.handle_key(key(KeyCode::Tab));
+    assert_eq!(app.focus, bloom_tui::app::Focus::Sidebar);
+    assert!(app.settings_open);
+    let before = app.selected.clone();
+    app.handle_key(key(KeyCode::Down));
+    assert_ne!(app.selected, before);
+    app.handle_key(key(KeyCode::Tab));
+    assert_eq!(app.focus, bloom_tui::app::Focus::Composer);
+
+    app.begin_contacts();
+    app.handle_key(key(KeyCode::Tab));
+    assert_eq!(app.focus, bloom_tui::app::Focus::Sidebar);
+    assert!(app.contacts_open);
+    app.handle_key(key(KeyCode::Tab));
+    assert_eq!(app.focus, bloom_tui::app::Focus::Composer);
+}
+
+#[test]
+fn emoji_shortcodes_autocomplete_at_the_cursor_without_losing_suffix_text() {
+    let mut app = App {
+        composing: true,
+        draft: "hello :smi!".into(),
+        draft_cursor: "hello :smi".chars().count(),
+        ..Default::default()
+    };
+    let suggestions = app.emoji_suggestions();
+    assert!(suggestions
+        .iter()
+        .any(|suggestion| suggestion.shortcode == "smile"));
+    assert_eq!(app.handle_key(key(KeyCode::Enter)), Action::None);
+    assert_eq!(app.draft, "hello 😄!");
+    assert_eq!(app.draft_cursor, "hello 😄".chars().count());
+    assert!(app.emoji_suggestions().is_empty());
+}
+
+#[test]
+fn direct_theme_command_opens_choices_on_first_enter() {
+    let mut app = App {
+        composing: true,
+        ..Default::default()
+    };
+    for character in "/theme".chars() {
+        app.handle_key(key(KeyCode::Char(character)));
+    }
+    assert!(app.command_menu);
+    app.handle_key(key(KeyCode::Enter));
+    assert!(app.theme_panel_open);
+    assert!(app.draft.is_empty());
 }
 
 #[test]
@@ -168,8 +637,8 @@ fn herdr_style_leader_chords_navigate_without_breaking_composition() {
 
     app.handle_key(ctrl(KeyCode::Char('b')));
     app.handle_key(key(KeyCode::Char('n')));
-    assert!(app.new_conversation);
-    assert!(app.composing);
+    assert_ne!(app.selected, first, "prefix+n selects the next chat");
+    assert!(!app.new_conversation);
 
     // Ctrl+B is a leader even with the composer focused, because the composer is
     // always focused; the chord must not be swallowed as draft text.
@@ -183,6 +652,57 @@ fn herdr_style_leader_chords_navigate_without_breaking_composition() {
     );
     composing.handle_key(key(KeyCode::Char('s')));
     assert!(composing.settings_open, "Ctrl+B s opens settings");
+}
+
+#[test]
+fn drafts_follow_their_chat_even_when_a_snapshot_establishes_the_selection() {
+    let alice = conversation("Alice", 2);
+    let bob = conversation("Bob", 2);
+    let mut app = App::default();
+    // An initial snapshot selects the first chat before any key is pressed; that
+    // selection must still establish draft ownership.
+    app.apply_snapshot(Snapshot {
+        revision: 1,
+        visible: Some(alice.id.clone()),
+        conversations: vec![alice.clone(), bob.clone()],
+        history: Vec::new(),
+    });
+    for ch in "draft for alice".chars() {
+        app.handle_key(key(KeyCode::Char(ch)));
+    }
+    app.select_step(1);
+    assert_eq!(
+        app.draft, "",
+        "a draft must never follow the user to another chat"
+    );
+    app.select_step(-1);
+    assert_eq!(app.draft, "draft for alice");
+}
+
+#[test]
+fn ctrl_p_selects_the_previous_chat_and_keeps_drafts_with_their_own_chat() {
+    let mut app = app_with(&["Weekend crew", "Jules Lee", "Design systems"]);
+    let first = app.selected.clone();
+    app.select_step(1);
+    let second = app.selected.clone();
+    assert_ne!(second, first);
+    app.composing = true;
+    app.draft = "keep this draft".into();
+    app.draft_cursor = app.draft.len();
+
+    assert_eq!(app.handle_key(ctrl(KeyCode::Char('p'))), Action::None);
+    assert_eq!(app.selected, first);
+    assert_eq!(
+        app.draft, "",
+        "a draft must never follow the user to another chat"
+    );
+
+    app.select_step(1);
+    assert_eq!(app.selected, second);
+    assert_eq!(
+        app.draft, "keep this draft",
+        "returning to a chat restores its own draft"
+    );
 }
 
 #[test]
@@ -219,11 +739,361 @@ fn slash_actions_open_new_chat_and_filter_or_toggle_the_sidebar() {
     assert!(compact.composing);
 }
 
+fn submit_pending(app: &mut App) -> (u64, Option<ConversationId>) {
+    let (attempt, target) = match app.handle_key(key(KeyCode::Enter)) {
+        Action::SendMessage {
+            attempt,
+            conversation,
+            ..
+        } => (attempt, Some(conversation)),
+        Action::StartConversation { attempt, .. } => (attempt, None),
+        _ => panic!("actual send expected"),
+    };
+    app.begin_send(attempt, target.clone());
+    (attempt, target)
+}
+
+#[test]
+fn pending_submission_preserves_exact_newer_draft_and_blocks_recovery() {
+    let mut app = App {
+        selected: Some(conversation("a", 1).id),
+        draft: "original".into(),
+        ..Default::default()
+    };
+    let (attempt, target) = submit_pending(&mut app);
+    app.handle_key(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::CONTROL));
+    assert!(
+        app.draft.is_empty(),
+        "An in-flight message is not a recovery draft"
+    );
+    app.draft = "  newer draft  ".into();
+    app.draft_cursor = 3;
+    assert_eq!(app.handle_key(key(KeyCode::Enter)), Action::None);
+    assert_eq!(app.draft, "  newer draft  ");
+    assert_eq!(app.draft_cursor, 3);
+    app.finish_send(attempt, target, Ok(()));
+    assert_eq!(app.draft, "  newer draft  ");
+}
+
+#[test]
+fn deferred_recovery_never_routes_original_body_into_another_recipient_prompt() {
+    let a = conversation("a", 1).id;
+    let mut app = App {
+        selected: Some(a.clone()),
+        draft: "for a only".into(),
+        ..Default::default()
+    };
+    let (attempt, target) = submit_pending(&mut app);
+    app.draft = "newer".into();
+    app.finish_send(attempt, target, Err("rejected".into()));
+    app.selected = Some(conversation("b", 1).id);
+    app.draft.clear();
+    app.handle_key(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::CONTROL));
+    assert!(app.draft.is_empty());
+    app.selected = Some(a.clone());
+    app.new_conversation = true;
+    app.pending_address = Some("mailto:wrong@example.invalid".into());
+    app.handle_key(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::CONTROL));
+    assert!(
+        app.draft.is_empty(),
+        "Do not restore into an unrelated recipient prompt"
+    );
+    app.new_conversation = false;
+    app.pending_address = None;
+    app.handle_key(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::CONTROL));
+    assert_eq!(app.draft, "for a only");
+    match app.handle_key(key(KeyCode::Enter)) {
+        Action::SendMessage {
+            conversation, body, ..
+        } => {
+            assert_eq!(conversation, a);
+            assert_eq!(body, "for a only");
+        }
+        _ => panic!("Recovered draft must retain its original target"),
+    }
+}
+
+#[test]
+fn deferred_failure_survives_a_later_successful_new_conversation() {
+    let a = conversation("a", 1).id;
+    let mut app = App {
+        selected: Some(a.clone()),
+        draft: "older failed body".into(),
+        ..Default::default()
+    };
+    let (first, target) = submit_pending(&mut app);
+    app.draft = "newer first message".into();
+    app.finish_send(first, target, Err("rejected".into()));
+    app.new_conversation = true;
+    app.pending_address = Some("mailto:carol@example.invalid".into());
+    let (second, target) = submit_pending(&mut app);
+    app.finish_send(second, target, Ok(()));
+    app.selected = Some(a);
+    app.handle_key(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::CONTROL));
+    assert_eq!(app.draft, "older failed body");
+}
+
+#[test]
+fn failed_start_after_changing_chat_requires_explicit_recovery() {
+    let mut app = App {
+        selected: Some(conversation("a", 1).id),
+        new_conversation: true,
+        pending_address: Some("mailto:carol@example.invalid".into()),
+        draft: "for carol".into(),
+        ..Default::default()
+    };
+    let (attempt, target) = submit_pending(&mut app);
+    app.selected = Some(conversation("b", 1).id);
+    app.finish_send(attempt, target, Err("rejected".into()));
+    assert!(
+        app.draft.is_empty(),
+        "Changed chat must not receive automatic restoration"
+    );
+    assert!(!app.new_conversation);
+    app.handle_key(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::CONTROL));
+    assert_eq!(app.draft, "for carol");
+    assert_eq!(
+        app.pending_address.as_deref(),
+        Some("mailto:carol@example.invalid")
+    );
+}
+
+#[test]
+fn stale_send_results_cannot_retire_a_new_pending_attempt() {
+    let mut app = App {
+        selected: Some(conversation("a", 1).id),
+        draft: "first".into(),
+        ..Default::default()
+    };
+    let (first, target) = submit_pending(&mut app);
+    app.finish_send(first, target.clone(), Ok(()));
+    app.draft = "second".into();
+    let (second, second_target) = submit_pending(&mut app);
+    app.finish_send(first, target, Err("late stale error".into()));
+    assert_eq!(app.pending_send_attempt, Some(second));
+    assert!(app.error.is_none());
+    app.finish_send(second, second_target, Err("rejected".into()));
+    assert_eq!(app.draft, "second");
+}
+
+#[test]
+fn uncertain_failures_keep_warning_during_auto_and_explicit_recovery() {
+    for deferred in [false, true] {
+        let mut app = App {
+            selected: Some(conversation("a", 1).id),
+            draft: "uncertain body".into(),
+            ..Default::default()
+        };
+        let (attempt, target) = submit_pending(&mut app);
+        if deferred {
+            app.draft = "newer text".into();
+        }
+        app.finish_send(
+            attempt,
+            target,
+            Err(bloom_ipc::client::ClientError::Timeout.into()),
+        );
+        assert!(app.error.as_deref().unwrap().contains("uncertain"));
+        assert!(!app.error.as_deref().unwrap().contains("not sent"));
+        if deferred {
+            assert_eq!(app.draft, "newer text");
+            assert!(app.deferred_sends.front().unwrap().uncertain);
+            app.draft.clear();
+            app.handle_key(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::CONTROL));
+            assert!(app.notice.as_deref().unwrap().contains("uncertain"));
+        }
+        assert_eq!(app.draft, "uncertain body");
+        assert!(
+            app.pending_send_attempt.is_none(),
+            "Recovery never automatically sends"
+        );
+    }
+}
+
+#[test]
+fn failed_send_in_another_popup_waits_for_safe_explicit_recovery() {
+    let mut app = App {
+        selected: Some(conversation("a", 1).id),
+        draft: "body".into(),
+        ..Default::default()
+    };
+    let (attempt, target) = submit_pending(&mut app);
+    app.settings_open = true;
+    app.finish_send(attempt, target, Err("rejected".into()));
+    app.handle_key(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::CONTROL));
+    assert!(app.draft.is_empty());
+    assert_eq!(app.deferred_sends.len(), 1);
+    app.settings_open = false;
+    app.handle_key(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::CONTROL));
+    assert_eq!(app.draft, "body");
+}
+
+#[test]
+fn new_chat_receipt_event_and_metadata_can_arrive_in_any_order() {
+    for order in [
+        [0, 1, 2],
+        [0, 2, 1],
+        [1, 0, 2],
+        [1, 2, 0],
+        [2, 0, 1],
+        [2, 1, 0],
+    ] {
+        let alice = conversation("Alice", 2);
+        let carol = conversation("Carol", 2);
+        let mut sent = message(&carol, "acknowledged-new");
+        sent.from_me = true;
+        let mut app = App::default();
+        app.set_conversations(vec![alice.clone()]);
+        app.new_conversation = true;
+        app.pending_address = Some("mailto:carol@example.invalid".into());
+        app.draft = "first Carol message".into();
+        let (attempt, target) = submit_pending(&mut app);
+        for step in order {
+            match step {
+                0 => app.finish_send_receipt(attempt, target.clone(), Ok(sent.id().clone())),
+                1 => app.apply_event(EventKind::Message {
+                    conversation_id: carol.id.clone(),
+                    message: sent.clone(),
+                    push_sequence: None,
+                }),
+                2 => app.set_conversations(vec![alice.clone(), carol.clone()]),
+                _ => unreachable!(),
+            }
+        }
+        assert_eq!(
+            app.selected.as_ref(),
+            Some(&carol.id),
+            "arrival order {order:?}"
+        );
+        assert_eq!(app.messages[&carol.id][0].id(), sent.id());
+        assert_eq!(
+            app.visible_send_feedback().unwrap().conversation.as_ref(),
+            Some(&carol.id)
+        );
+    }
+}
+
+#[test]
+fn new_chat_completion_does_not_steal_changed_context_or_match_unrelated_messages() {
+    for changed in [0, 1, 2] {
+        let alice = conversation("Alice", 2);
+        let carol = conversation("Carol", 2);
+        let mut sent = message(&carol, "expected-receipt");
+        sent.from_me = true;
+        let mut app = App::default();
+        app.set_conversations(vec![alice.clone(), carol.clone()]);
+        app.new_conversation = true;
+        app.pending_address = Some("mailto:carol@example.invalid".into());
+        app.draft = "first".into();
+        let (attempt, target) = submit_pending(&mut app);
+        app.finish_send_receipt(attempt + 100, target.clone(), Ok(sent.id().clone()));
+        assert_eq!(app.pending_send_attempt, Some(attempt));
+        app.apply_event(EventKind::Message {
+            conversation_id: carol.id.clone(),
+            message: message(&carol, "unrelated"),
+            push_sequence: None,
+        });
+        assert_eq!(app.selected, Some(alice.id.clone()));
+        match changed {
+            0 => app.draft = "newer draft".into(),
+            1 => app.select(Some(carol.id.clone())),
+            2 => app.settings_open = true,
+            _ => unreachable!(),
+        }
+        let selected = app.selected.clone();
+        app.finish_send_receipt(attempt, target, Ok(sent.id().clone()));
+        app.apply_event(EventKind::Message {
+            conversation_id: carol.id.clone(),
+            message: sent,
+            push_sequence: None,
+        });
+        assert_eq!(app.selected, selected);
+        if changed == 0 {
+            assert_eq!(app.draft, "newer draft");
+        }
+    }
+}
+
+#[test]
+fn failed_send_recovers_draft_and_success_retires_it() {
+    let mut app = App::default();
+    let target = Some(conversation("recover-send", 1).id);
+    app.selected = target.clone();
+    app.draft = "keep this".into();
+    let action = app.handle_key(key(KeyCode::Enter));
+    let Action::SendMessage { attempt, .. } = action else {
+        panic!("send expected")
+    };
+    app.begin_send(attempt, target.clone());
+    app.finish_send(attempt, target.clone(), Err("rejected".into()));
+    assert_eq!(app.draft, "keep this");
+
+    app.draft.clear();
+    app.handle_key(key(KeyCode::Char('x')));
+    let Action::SendMessage { attempt, .. } = app.handle_key(key(KeyCode::Enter)) else {
+        panic!("retry expected")
+    };
+    app.begin_send(attempt, target.clone());
+    app.finish_send(attempt, target, Ok(()));
+    assert!(app.recoverable_send.is_none());
+}
+
+#[test]
+fn failed_start_recovers_recipient_and_body_even_with_selected_chat() {
+    let mut app = App {
+        selected: Some(conversation("existing", 1).id),
+        new_conversation: true,
+        pending_address: Some("mailto:new@example.test".into()),
+        draft: "first message".into(),
+        ..Default::default()
+    };
+    let Action::StartConversation { attempt, .. } = app.handle_key(key(KeyCode::Enter)) else {
+        panic!("start expected")
+    };
+    app.begin_send(attempt, None);
+    app.finish_send(attempt, None, Err("rejected".into()));
+    assert_eq!(app.draft, "first message");
+    assert_eq!(
+        app.pending_address.as_deref(),
+        Some("mailto:new@example.test")
+    );
+    assert!(app.new_conversation);
+}
+
+#[test]
+fn changed_context_recovery_never_overwrites_new_text_and_ctrl_r_recovers() {
+    let mut app = App::default();
+    let target = Some(conversation("recover-context", 1).id);
+    app.selected = target.clone();
+    app.draft = "original".into();
+    let Action::SendMessage { attempt, .. } = app.handle_key(key(KeyCode::Enter)) else {
+        panic!("send expected")
+    };
+    app.begin_send(attempt, target);
+    app.draft = "newer text".into();
+    app.finish_send(attempt, app.selected.clone(), Err("rejected".into()));
+    assert_eq!(app.draft, "newer text");
+    app.draft.clear();
+    app.handle_key(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::CONTROL));
+    assert_eq!(app.draft, "original");
+}
+
+#[test]
+fn recipient_step_does_not_create_recoverable_send() {
+    let mut app = App {
+        new_conversation: true,
+        draft: "new@example.test".into(),
+        ..Default::default()
+    };
+    assert_eq!(app.handle_key(key(KeyCode::Enter)), Action::None);
+    assert!(app.recoverable_send.is_none());
+}
+
 #[test]
 fn send_feedback_is_contextual_and_never_claims_delivery() {
     let mut app = app_with(&["Jules Lee", "Quinn Callahan"]);
     let target = app.selected.clone();
-    app.begin_send(target.clone());
+    app.begin_send(1, target.clone());
     assert_eq!(
         app.visible_send_feedback().unwrap().phase,
         SendPhase::Sending
@@ -231,14 +1101,15 @@ fn send_feedback_is_contextual_and_never_claims_delivery() {
 
     app.select_step(1);
     assert!(app.visible_send_feedback().is_none());
-    app.finish_send(target.clone(), Ok(()));
+    app.finish_send(1, target.clone(), Ok(()));
     assert!(app.visible_send_feedback().is_none());
     app.selected = target;
     assert_eq!(app.visible_send_feedback().unwrap().phase, SendPhase::Sent);
     app.handle_key(key(KeyCode::Char('j')));
     assert!(app.send_feedback.is_none());
 
-    app.finish_send(None, Err("transport unavailable".into()));
+    app.begin_send(2, None);
+    app.finish_send(2, None, Err("transport unavailable".into()));
     assert!(app
         .error
         .as_deref()
@@ -263,16 +1134,24 @@ fn local_settings_are_keyboard_accessible_and_theme_can_return_to_automatic() {
     assert!(!app.composing);
     assert_eq!(app.draft, "");
 
-    // Theme choice cycles from automatic to explicit dark, then light, then auto.
+    // Appearance cycles Automatic, Dark, and Light with Enter.
     assert_eq!(app.theme, Theme::Light);
     app.handle_key(key(KeyCode::Enter));
     assert_eq!(app.theme_override, Some(Theme::Dark));
     assert_eq!(app.theme, Theme::Dark);
     app.handle_key(key(KeyCode::Enter));
-    app.handle_key(key(KeyCode::Down));
+    assert_eq!(app.theme_override, Some(Theme::Light));
+
+    // Left/Right switches categories; Up/Down selects Layout toggles.
+    app.handle_key(key(KeyCode::Right));
+    assert_eq!(app.settings_category, 1);
     app.handle_key(key(KeyCode::Enter));
     assert!(app.compact_sidebar);
-    app.handle_key(key(KeyCode::Up));
+    app.handle_key(key(KeyCode::Down));
+    app.handle_key(key(KeyCode::Char(' ')));
+    assert!(!app.wrap_composer);
+    app.handle_key(key(KeyCode::Left));
+    assert_eq!(app.settings_category, 0);
     app.handle_key(key(KeyCode::Enter));
     assert_eq!(app.theme_override, None);
     assert_eq!(app.theme, Theme::Light);
@@ -379,6 +1258,7 @@ fn escape_dismisses_command_menu_without_losing_draft_and_slashes_in_prose_send_
     assert_eq!(
         prose.handle_key(key(KeyCode::Enter)),
         Action::SendMessage {
+            attempt: 1,
             conversation: expected_conversation,
             body: text.to_owned(),
         }
@@ -538,7 +1418,7 @@ fn the_two_step_composer_keeps_the_draft_between_the_steps() {
     assert_eq!(app.draft, "see you soon");
 
     match app.handle_key(key(KeyCode::Enter)) {
-        Action::StartConversation { address, body } => {
+        Action::StartConversation { address, body, .. } => {
             assert_eq!(body, "see you soon");
             assert!(
                 address.contains("friend@example.invalid"),
@@ -571,7 +1451,9 @@ fn a_message_makes_the_draft_sendable_to_the_selected_thread() {
         app.handle_key(key(KeyCode::Char(character)));
     }
     match app.handle_key(key(KeyCode::Enter)) {
-        Action::SendMessage { conversation, body } => {
+        Action::SendMessage {
+            conversation, body, ..
+        } => {
             assert_eq!(conversation, selected);
             assert_eq!(body, "hello");
         }
@@ -590,6 +1472,7 @@ fn an_unknown_conversation_event_asks_for_a_refresh() {
     app.apply_event(EventKind::Message {
         conversation_id: unknown.id.clone(),
         message: message(&unknown, "m9"),
+        push_sequence: None,
     });
     assert!(
         app.resync_conversations,
@@ -646,6 +1529,7 @@ fn page_keys_move_the_reading_position_and_clamp_at_the_newest() {
     app.apply_event(EventKind::Message {
         conversation_id: selected.clone(),
         message: message(&conversation("Jules Lee", 2), "m1"),
+        push_sequence: None,
     });
     assert!(
         !app.is_scrolled_back(),
@@ -681,12 +1565,14 @@ fn scrolling_does_not_disturb_the_composer_or_the_filter() {
 
 #[test]
 fn the_recipient_step_keeps_the_composer_open_all_the_way_to_sending() {
-    // The whole two-step flow through the real key path: the leader chord starts a
-    // new chat, then recipient, Enter, body, Enter must send to the typed address.
-    // A bare `n` is text now that the composer is always focused.
+    // `/new` starts a chat. Then recipient, Enter, body, Enter must send to the
+    // typed address, while prefix+n remains available for chat navigation.
     let mut app = app_with(&["Jules Lee"]);
-    app.handle_key(ctrl(KeyCode::Char('b')));
-    app.handle_key(key(KeyCode::Char('n')));
+    for character in "/new".chars() {
+        app.handle_key(key(KeyCode::Char(character)));
+    }
+    assert_eq!(app.handle_key(key(KeyCode::Enter)), Action::None);
+    assert!(app.new_conversation);
     for character in "newfriend@example.invalid".chars() {
         app.handle_key(key(KeyCode::Char(character)));
     }
@@ -695,7 +1581,7 @@ fn the_recipient_step_keeps_the_composer_open_all_the_way_to_sending() {
         app.handle_key(key(KeyCode::Char(character)));
     }
     match app.handle_key(key(KeyCode::Enter)) {
-        Action::StartConversation { address, body } => {
+        Action::StartConversation { address, body, .. } => {
             assert_eq!(address, "newfriend@example.invalid");
             assert_eq!(body, "hello there");
         }

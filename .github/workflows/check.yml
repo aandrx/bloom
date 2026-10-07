@@ -43,6 +43,17 @@ jobs:
         run: cargo test --workspace --all-targets
         env:
           TZ: UTC
+      - name: Real-terminal messaging regressions (synthetic accounts only)
+        run: |
+          cargo build -p bloom-tui
+          python3 -m venv "$RUNNER_TEMP/bloom-e2e"
+          "$RUNNER_TEMP/bloom-e2e/bin/pip" install pyte==0.8.2
+          "$RUNNER_TEMP/bloom-e2e/bin/python" scripts/test-launcher-e2e.py
+          "$RUNNER_TEMP/bloom-e2e/bin/python" scripts/test-stateful-fake-daemon.py
+          "$RUNNER_TEMP/bloom-e2e/bin/python" scripts/test-tui-input-e2e.py
+          "$RUNNER_TEMP/bloom-e2e/bin/python" scripts/test-tui-messaging-e2e.py
+        env:
+          TZ: UTC
       - name: TUI tests under a second timezone
         run: cargo test -p bloom-tui
         env:
@@ -65,9 +76,9 @@ jobs:
       - name: Resolve dependencies
         run: dart pub get
       - name: Formatting
-        run: dart format --output=none --set-exit-if-changed bin lib/payload_codec.dart lib/protocol.dart test
+        run: dart format --output=none --set-exit-if-changed bin lib/payload_codec.dart lib/protocol.dart lib/single_flight.dart test
       - name: Analyze
-        run: dart analyze bin lib/payload_codec.dart lib/protocol.dart test
+        run: dart analyze bin lib/payload_codec.dart lib/protocol.dart lib/single_flight.dart test
       - name: Tests
         run: dart test
       - name: Engine stays out of the repository

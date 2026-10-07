@@ -39,10 +39,23 @@ impl Stage {
     }
 }
 
+pub fn is_uncertain(error: &ClientError) -> bool {
+    matches!(
+        error,
+        ClientError::Io
+            | ClientError::Timeout
+            | ClientError::Codec(_)
+            | ClientError::WrongRequestId
+            | ClientError::UnexpectedResponse
+            | ClientError::Server(bloom_ipc::ProtocolError::Protocol)
+            | ClientError::Server(bloom_ipc::ProtocolError::Internal)
+    )
+}
+
 pub fn safe_reason(error: &ClientError) -> &'static str {
     match error {
         ClientError::Connect => "Could not connect to Bloom. The message was not sent.",
-        ClientError::Io | ClientError::Codec(_) | ClientError::WrongRequestId | ClientError::UnexpectedResponse => "Bloom communication failed. Delivery is uncertain; check the conversation before retrying.",
+        ClientError::Io | ClientError::Codec(_) | ClientError::WrongRequestId | ClientError::UnexpectedResponse | ClientError::Server(bloom_ipc::ProtocolError::Protocol | bloom_ipc::ProtocolError::Internal) => "Bloom communication failed. Delivery is uncertain; check the conversation before retrying.",
         ClientError::Timeout => "Bloom did not respond in time. Delivery is uncertain; check the conversation before retrying.",
         ClientError::WrongPeer => "Bloom rejected the daemon connection. The message was not sent.",
         ClientError::Server(bloom_ipc::ProtocolError::AccountThrottled) => "Bloom is rate limited. The message was not sent.",
@@ -82,6 +95,15 @@ pub fn category(error: &ClientError) -> &'static str {
 pub fn record(line: &str) {
     let Some(path) = path() else { return };
     let _ = append(&path, line);
+}
+
+pub fn inbound_timing(stage: &'static str, sequence: u64, elapsed: Duration) {
+    if std::env::var("BLOOM_TIMING_DIAGNOSTICS").as_deref() == Ok("1") {
+        record(&format!(
+            "bloom timing tui stage={stage} elapsed_us={} sequence={sequence}",
+            elapsed.as_micros()
+        ));
+    }
 }
 
 fn append(path: &PathBuf, line: &str) -> std::io::Result<()> {
@@ -145,6 +167,33 @@ pub fn request_result(stage: Stage, attempt: u64, elapsed: Duration, error: Opti
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn uncertainty_is_classified_from_client_error_variants() {
+        use bloom_ipc::ProtocolError;
+        for error in [
+            ClientError::Io,
+            ClientError::Timeout,
+            ClientError::Codec(bloom_ipc::CodecError::InvalidJson),
+            ClientError::WrongRequestId,
+            ClientError::UnexpectedResponse,
+            ClientError::Server(ProtocolError::Protocol),
+            ClientError::Server(ProtocolError::Internal),
+        ] {
+            assert!(is_uncertain(&error));
+            let failure = crate::app::SendFailure::from(error);
+            assert!(failure.uncertain);
+            assert!(failure.message.contains("uncertain"));
+            assert!(!failure.message.contains("not sent"));
+        }
+        for error in [
+            ClientError::Connect,
+            ClientError::WrongPeer,
+            ClientError::Server(ProtocolError::RecipientUnreachable),
+        ] {
+            assert!(!is_uncertain(&error));
+        }
+    }
+
     #[test]
     fn typed_reasons_do_not_expose_error_payload() {
         let err = ClientError::Server(bloom_ipc::ProtocolError::RecipientUnreachable);
