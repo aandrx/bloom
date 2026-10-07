@@ -24,8 +24,8 @@ run_guard() {
         failed=1
         return
     fi
-    if ! grep -Fq "$old" "$file"; then
-        echo "$name: ERROR (mutation text not found: $old)" >&2
+    if ! OLD_TEXT=$old perl -0777 -ne 'my $count = () = /\Q$ENV{OLD_TEXT}\E/g; exit($count == 1 ? 0 : 1)' "$file"; then
+        echo "$name: ERROR (mutation text must match exactly once: $old)" >&2
         failed=1
         return
     fi
