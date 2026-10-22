@@ -36,7 +36,7 @@ The current bounded UI pass implements stable message-owned reading anchors, a m
 
 Remaining:
 
-- Cursor-based local pagination is implemented: keyset paging in the store and IPC (protocol version 2), and the transcript loads the previous page when the reader reaches the oldest loaded row, keeps paged history across reconciliation for that chat, and bounds retained pages. Remaining work is paging affordances for very deep histories and message-content search, not the base older-page load.
+- Cursor-based local pagination is implemented: keyset paging in the store and IPC (protocol version 3), and the transcript loads the previous page when the reader reaches the oldest loaded row, keeps paged history across reconciliation for that chat, and bounds retained pages. Remaining work is paging affordances for very deep histories and the message-content search surface; the search backend exists in the store and IPC.
 - Local message-content search and authoritative unread navigation. Chats searches conversation names/addresses only, not message content.
 - Undo and, only after privacy/retention review, encrypted durable drafts.
 - Consider typed interaction modes to reduce independent flag combinations, but only behind regression coverage for modal transitions, recipient changes, aliases, filters and asynchronous results.

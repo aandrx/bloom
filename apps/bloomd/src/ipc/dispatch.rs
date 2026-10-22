@@ -2,7 +2,9 @@
 use std::{future::Future, pin::Pin, time::Duration};
 
 use bloom_domain::{Conversation, ConversationId, Message, MessageId, OutgoingBody};
-use bloom_ipc::{HistoryCursor, ProtocolError, RequestKind, Response, ResponseKind};
+use bloom_ipc::{
+    HistoryCursor, MessageSearchHit, ProtocolError, RequestKind, Response, ResponseKind,
+};
 use tokio::{io::AsyncWrite, time::timeout};
 
 use super::{
@@ -29,6 +31,11 @@ pub trait RequestHandler: Send + Sync {
         limit: u16,
         before: HistoryCursor,
     ) -> HandlerFuture<'_, Vec<Message>>;
+    fn search_messages(
+        &self,
+        query: String,
+        limit: u16,
+    ) -> HandlerFuture<'_, Vec<MessageSearchHit>>;
     fn send(
         &self,
         conversation_id: ConversationId,
@@ -139,6 +146,18 @@ async fn serve_inner<H: RequestHandler>(
                     Err(error) => ResponseKind::Error { error },
                 }
             }
+            RequestKind::SearchMessages { query, limit } => {
+                if limit == 0 || limit > u16::MAX as u32 {
+                    ResponseKind::Error {
+                        error: ProtocolError::InvalidRequest,
+                    }
+                } else {
+                    match handler.search_messages(query, limit as u16).await {
+                        Ok(hits) => ResponseKind::SearchResults { hits },
+                        Err(error) => ResponseKind::Error { error },
+                    }
+                }
+            }
             RequestKind::Subscribe => ResponseKind::Error {
                 error: if hub.is_some() {
                     ProtocolError::InvalidRequest
@@ -190,7 +209,7 @@ mod tests {
 
     /// Counts newest-page reads and cursored reads separately, so a test can prove
     /// which handler a request reached.
-    struct FakeHandler(Arc<AtomicUsize>, Arc<AtomicUsize>);
+    struct FakeHandler(Arc<AtomicUsize>, Arc<AtomicUsize>, Arc<AtomicUsize>);
     impl RequestHandler for FakeHandler {
         fn list_conversations(&self) -> HandlerFuture<'_, Vec<Conversation>> {
             Box::pin(async { Ok(vec![]) })
@@ -212,6 +231,21 @@ mod tests {
         ) -> HandlerFuture<'_, Vec<Message>> {
             self.1.fetch_add(1, Ordering::SeqCst);
             Box::pin(async { Ok(vec![]) })
+        }
+        fn search_messages(&self, _: String, _: u16) -> HandlerFuture<'_, Vec<MessageSearchHit>> {
+            self.2.fetch_add(1, Ordering::SeqCst);
+            Box::pin(async {
+                Ok(vec![MessageSearchHit {
+                    conversation_id: ConversationId::new(
+                        TransportId::new("fake").unwrap(),
+                        "conversation",
+                    )
+                    .unwrap(),
+                    message_id: MessageId::new(TransportId::new("fake").unwrap(), "hit").unwrap(),
+                    created_at: 7,
+                    snippet: "a hit snippet".into(),
+                }])
+            })
         }
         fn send(&self, _: ConversationId, _: OutgoingBody) -> HandlerFuture<'_, MessageId> {
             Box::pin(async {
@@ -245,6 +279,9 @@ mod tests {
             _: u16,
             _: HistoryCursor,
         ) -> HandlerFuture<'_, Vec<Message>> {
+            Box::pin(async { Err(ProtocolError::Internal) })
+        }
+        fn search_messages(&self, _: String, _: u16) -> HandlerFuture<'_, Vec<MessageSearchHit>> {
             Box::pin(async { Err(ProtocolError::Internal) })
         }
         fn send(&self, _: ConversationId, _: OutgoingBody) -> HandlerFuture<'_, MessageId> {
@@ -289,7 +326,11 @@ mod tests {
         let server = tokio::spawn(async move {
             serve(
                 listener.accept().await.unwrap(),
-                &FakeHandler(Arc::new(AtomicUsize::new(0)), Arc::new(AtomicUsize::new(0))),
+                &FakeHandler(
+                    Arc::new(AtomicUsize::new(0)),
+                    Arc::new(AtomicUsize::new(0)),
+                    Arc::new(AtomicUsize::new(0)),
+                ),
             )
             .await;
         });
@@ -323,7 +364,11 @@ mod tests {
             let server = tokio::spawn(async move {
                 serve(
                     listener.accept().await.unwrap(),
-                    &FakeHandler(Arc::new(AtomicUsize::new(0)), Arc::new(AtomicUsize::new(0))),
+                    &FakeHandler(
+                        Arc::new(AtomicUsize::new(0)),
+                        Arc::new(AtomicUsize::new(0)),
+                        Arc::new(AtomicUsize::new(0)),
+                    ),
                 )
                 .await;
             });
@@ -369,7 +414,11 @@ mod tests {
         let server = tokio::spawn(async move {
             serve_with_subscriptions(
                 listener.accept().await.unwrap(),
-                &FakeHandler(Arc::new(AtomicUsize::new(0)), Arc::new(AtomicUsize::new(0))),
+                &FakeHandler(
+                    Arc::new(AtomicUsize::new(0)),
+                    Arc::new(AtomicUsize::new(0)),
+                    Arc::new(AtomicUsize::new(0)),
+                ),
                 &server_hub,
             )
             .await;
@@ -404,7 +453,11 @@ mod tests {
         let server = tokio::spawn(async move {
             serve_with_subscriptions(
                 listener.accept().await.unwrap(),
-                &FakeHandler(Arc::new(AtomicUsize::new(0)), Arc::new(AtomicUsize::new(0))),
+                &FakeHandler(
+                    Arc::new(AtomicUsize::new(0)),
+                    Arc::new(AtomicUsize::new(0)),
+                    Arc::new(AtomicUsize::new(0)),
+                ),
                 &SubscriptionHub::new(4),
             )
             .await;
@@ -469,7 +522,11 @@ mod tests {
         let server_paged = paged.clone();
         let server = tokio::spawn(async move {
             let stream = listener.accept().await.unwrap();
-            serve(stream, &FakeHandler(server_calls, server_paged)).await;
+            serve(
+                stream,
+                &FakeHandler(server_calls, server_paged, Arc::new(AtomicUsize::new(0))),
+            )
+            .await;
         });
         let mut client = UnixStream::connect(path).await.unwrap();
         let conversation_id = ConversationId::new(TransportId::new("fake").unwrap(), "c").unwrap();
@@ -583,13 +640,77 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn search_reaches_handler_only_for_valid_limits() {
+        let (_dir, listener, path) = socket();
+        let searches = Arc::new(AtomicUsize::new(0));
+        let server_searches = searches.clone();
+        let server = tokio::spawn(async move {
+            let stream = listener.accept().await.unwrap();
+            serve(
+                stream,
+                &FakeHandler(
+                    Arc::new(AtomicUsize::new(0)),
+                    Arc::new(AtomicUsize::new(0)),
+                    server_searches,
+                ),
+            )
+            .await;
+        });
+        let mut client = UnixStream::connect(path).await.unwrap();
+        for (request_id, limit, rejected) in [(21, 5, false), (22, 0, true), (23, 65_536, true)] {
+            write_request(
+                &mut client,
+                &Request {
+                    request_id,
+                    request: RequestKind::SearchMessages {
+                        query: "needle".into(),
+                        limit,
+                    },
+                },
+            )
+            .await
+            .unwrap();
+            let response = read_response(&mut client).await.unwrap();
+            assert_eq!(response.request_id, request_id);
+            if rejected {
+                assert!(matches!(
+                    response.response,
+                    ResponseKind::Error {
+                        error: ProtocolError::InvalidRequest
+                    }
+                ));
+            } else {
+                match response.response {
+                    ResponseKind::SearchResults { hits } => {
+                        assert_eq!(hits.len(), 1, "the handler's hit reaches the client");
+                        assert_eq!(hits[0].snippet, "a hit snippet");
+                        assert_eq!(hits[0].created_at, 7);
+                    }
+                    _ => panic!("expected search results"),
+                }
+            }
+        }
+        drop(client);
+        server.await.unwrap();
+        assert_eq!(
+            searches.load(Ordering::SeqCst),
+            1,
+            "invalid limits are rejected before the search handler runs"
+        );
+    }
+
+    #[tokio::test]
     async fn malformed_frame_and_idle_first_request_close_connection() {
         let (_dir, listener, path) = socket();
         let server = tokio::spawn(async move {
             let stream = listener.accept().await.unwrap();
             serve(
                 stream,
-                &FakeHandler(Arc::new(AtomicUsize::new(0)), Arc::new(AtomicUsize::new(0))),
+                &FakeHandler(
+                    Arc::new(AtomicUsize::new(0)),
+                    Arc::new(AtomicUsize::new(0)),
+                    Arc::new(AtomicUsize::new(0)),
+                ),
             )
             .await;
         });
@@ -609,7 +730,11 @@ mod tests {
             let stream = listener.accept().await.unwrap();
             serve_with_first_timeout(
                 stream,
-                &FakeHandler(Arc::new(AtomicUsize::new(0)), Arc::new(AtomicUsize::new(0))),
+                &FakeHandler(
+                    Arc::new(AtomicUsize::new(0)),
+                    Arc::new(AtomicUsize::new(0)),
+                    Arc::new(AtomicUsize::new(0)),
+                ),
                 Duration::from_millis(20),
             )
             .await;

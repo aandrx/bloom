@@ -4,13 +4,16 @@ mod conversations;
 mod identity;
 mod ingest;
 mod messages;
+pub use bloom_ipc::MessageSearchHit;
 pub use conversations::{
     get_conversation, list_conversations, merge_conversation, upsert_conversation,
 };
 pub(crate) use identity::direct_conversation_matches;
 pub use identity::{reconcile_direct_conversation, reconcile_stored_direct_conversations};
 pub use ingest::{ingest_inbound, ingest_message, update_delivery};
-pub use messages::{get_message, history, history_before, upsert_message, MessageUpsertOutcome};
+pub use messages::{
+    get_message, history, history_before, search_messages, upsert_message, MessageUpsertOutcome,
+};
 pub(crate) use messages::{history_for_conversation, remap_message};
 
 use bloom_secrets::{SecretStore, SecretStoreError};
@@ -286,6 +289,7 @@ impl EncryptedStore {
              CREATE INDEX IF NOT EXISTS conversations_last_message_order ON conversations(last_message_at DESC, id ASC);
              CREATE TABLE IF NOT EXISTS messages (id TEXT PRIMARY KEY, conversation_id TEXT NOT NULL REFERENCES conversations(id), created_at INTEGER NOT NULL, data BLOB NOT NULL);
              CREATE INDEX IF NOT EXISTS messages_conversation_history ON messages(conversation_id, created_at DESC, id DESC);
+             CREATE INDEX IF NOT EXISTS messages_recent_order ON messages(created_at DESC, id DESC);
              COMMIT;"
         ).map_err(|_| StoreError::Schema)?;
         restrict_permissions(&path, false)?;

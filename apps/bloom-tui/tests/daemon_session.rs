@@ -225,6 +225,16 @@ impl FakeDaemon {
                                     )
                                     .await;
                                 }
+                                RequestKind::SearchMessages { .. } => {
+                                    let _ = write_response(
+                                        &mut stream,
+                                        &Response {
+                                            request_id,
+                                            response: ResponseKind::SearchResults { hits: vec![] },
+                                        },
+                                    )
+                                    .await;
+                                }
                                 RequestKind::Subscribe => {
                                     // Register before acknowledging, so an event
                                     // published after the client sees Subscribed

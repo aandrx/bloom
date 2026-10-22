@@ -12,6 +12,7 @@ Usage: fake-daemon.py <socket path>
 from __future__ import annotations
 
 import json
+import re
 import os
 import socket
 import struct
@@ -19,7 +20,7 @@ import sys
 import threading
 import time
 
-PROTOCOL_VERSION = 2
+PROTOCOL_VERSION = 3
 SESSION_STATE = os.environ.get("BLOOM_FAKE_SESSION_STATE", "active")
 LONG_TITLE = os.environ.get("BLOOM_FAKE_LONG_TITLE") == "1"
 SUBSCRIBERS: set[socket.socket] = set()
@@ -133,6 +134,21 @@ def history_key(item: dict) -> tuple[int, str]:
     return item["created_at"], json.dumps(item["id"], separators=(",", ":"), ensure_ascii=False)
 
 
+def search_snippet(text, query):
+    """Return a 30-character context window around the match, or None.
+
+    The match is located with a case-insensitive regex so the offsets index the
+    original text: lowercasing can change length, which would slice the wrong run.
+    """
+    match = re.search(re.escape(query), text, re.IGNORECASE)
+    if match is None:
+        return None
+    start = max(0, match.start() - 30)
+    stop = min(len(text), match.end() + 30)
+    body = text[start:stop].replace("\r\n", " ").replace("\r", " ").replace("\n", " ")
+    return ("\u2026" if start > 0 else "") + body + ("\u2026" if stop < len(text) else "")
+
+
 HISTORY = {
     "weekend@example.invalid": [
         message("weekend@example.invalid", "m1", 1_700_000_100_000, "Saturday looks perfect for the coast. Should we take the early train?", False),
@@ -204,6 +220,37 @@ def serve_client(conn: socket.socket) -> None:
             }))
         elif op == "list_conversations":
             conn.sendall(frame({"request_id": request_id, "response": {"result": "conversations", "conversations": CONVERSATIONS}}))
+        elif op == "search_messages":
+            if not isinstance(kind.get("limit", 0), int) or kind.get("limit", 0) <= 0:
+                conn.sendall(frame({"request_id": request_id, "response": {"result": "error", "error": "invalid_request"}}))
+                continue
+            query = kind.get("query")
+            limit = kind.get("limit", 0)
+            hits = []
+            if isinstance(query, str) and query.strip() and isinstance(limit, int) and limit > 0:
+                messages = sorted(
+                    (item for thread in HISTORY.values() for item in thread),
+                    key=history_key,
+                    reverse=True,
+                )
+                for item in messages:
+                    snippet = None
+                    for part in item.get("parts", []):
+                        if part.get("type") == "text" and isinstance(part.get("value"), str):
+                            snippet = search_snippet(part["value"], query.strip())
+                            if snippet is not None:
+                                break
+                    if snippet is None:
+                        continue
+                    hits.append({
+                        "conversation_id": item["conversation_id"],
+                        "message_id": item["id"],
+                        "created_at": item["created_at"],
+                        "snippet": snippet,
+                    })
+                    if len(hits) >= limit:
+                        break
+            conn.sendall(frame({"request_id": request_id, "response": {"result": "search_results", "hits": hits}}))
         elif op == "history":
             key = kind.get("conversation_id", {}).get("value", "")
             messages = HISTORY.get(key, [])

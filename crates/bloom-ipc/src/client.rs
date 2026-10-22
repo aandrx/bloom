@@ -1,6 +1,6 @@
 use crate::{
     read_event, read_response, write_request, CodecError, ConversationSyncStatus, Event,
-    HistoryCursor, Request, RequestKind, ResponseKind,
+    HistoryCursor, MessageSearchHit, Request, RequestKind, ResponseKind,
 };
 use bloom_domain::{Conversation, ConversationId, Message, MessageId, OutgoingBody};
 use std::{
@@ -184,6 +184,24 @@ impl BloomClient {
             .await?
         {
             ResponseKind::History { messages } => Ok(messages),
+            _ => Err(ClientError::UnexpectedResponse),
+        }
+    }
+
+    /// Search stored message text locally. Results are newest first.
+    pub async fn search_messages(
+        &self,
+        query: &str,
+        limit: u32,
+    ) -> Result<Vec<MessageSearchHit>, ClientError> {
+        match self
+            .request(RequestKind::SearchMessages {
+                query: query.to_owned(),
+                limit,
+            })
+            .await?
+        {
+            ResponseKind::SearchResults { hits } => Ok(hits),
             _ => Err(ClientError::UnexpectedResponse),
         }
     }

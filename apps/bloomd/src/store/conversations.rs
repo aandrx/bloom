@@ -88,6 +88,31 @@ pub(crate) fn list_all_conversations(
         .collect()
 }
 
+/// Maps every known identity, canonical or alias, to its canonical conversation id.
+pub(crate) fn alias_map(
+    store: &EncryptedStore,
+) -> Result<std::collections::HashMap<ConversationId, ConversationId>, StoreError> {
+    let conversations = list_all_conversations(store)?;
+    let aliases: std::collections::HashSet<&ConversationId> = conversations
+        .iter()
+        .flat_map(|conversation| conversation.aliases.iter())
+        .collect();
+    let mut map = std::collections::HashMap::new();
+    // Canonical identities first, then aliases, so a retired row that still exists
+    // in the table cannot shadow the canonical mapping.
+    for conversation in &conversations {
+        if !aliases.contains(&conversation.id) {
+            map.insert(conversation.id.clone(), conversation.id.clone());
+        }
+    }
+    for conversation in &conversations {
+        for alias in &conversation.aliases {
+            map.insert(alias.clone(), conversation.id.clone());
+        }
+    }
+    Ok(map)
+}
+
 pub fn list_conversations(store: &EncryptedStore) -> Result<Vec<Conversation>, StoreError> {
     let mut conversations = list_all_conversations(store)?;
     let aliases = conversations

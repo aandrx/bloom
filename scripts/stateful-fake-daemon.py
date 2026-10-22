@@ -11,7 +11,7 @@ import threading
 import time
 import uuid
 
-VERSION = 2
+VERSION = 3
 MAX_FRAME = 1024 * 1024
 LOCK = threading.RLock()
 SUBS = set()
@@ -61,6 +61,28 @@ def read_frame(c):
 def history_key(item):
     """Match the store ordering (created_at, id) with the id's stable JSON form."""
     return item["created_at"], json.dumps(item["id"], separators=(",", ":"), ensure_ascii=False)
+
+
+def search_snippet(text, query):
+    """Return a 30-character context window around the match, or None.
+
+    The match is located with a case-insensitive regex so the offsets index the
+    original text: lowercasing can change length, which would slice the wrong run.
+    """
+    match = re.search(re.escape(query), text, re.IGNORECASE)
+    if match is None:
+        return None
+    start = max(0, match.start() - 30)
+    stop = min(len(text), match.end() + 30)
+    body = text[start:stop].replace("\r\n", " ").replace("\r", " ").replace("\n", " ")
+    return ("\u2026" if start > 0 else "") + body + ("\u2026" if stop < len(text) else "")
+
+
+def canonical_conversation(state, conversation_id):
+    for conversation in state["conversations"]:
+        if conversation_id in conversation.get("aliases", []):
+            return conversation["id"]
+    return conversation_id
 
 
 def save(state, path):
@@ -277,6 +299,33 @@ def serve(client, args, state):
                                 older.sort(key=history_key)
                                 selected = older[-limit:]
                             response = {"result": "history", "messages": copy.deepcopy(selected)}
+                        elif op == "search_messages":
+                            query = body.get("query")
+                            limit = body.get("limit", 0)
+                            hits = []
+                            if not isinstance(limit, int) or limit <= 0:
+                                # Match the daemon: an invalid limit is rejected, not
+                                # silently answered with an empty result.
+                                response = {"result": "error", "error": "invalid_request"}
+                                write(client, {"request_id": request_id, "response": response})
+                                continue
+                            if isinstance(query, str) and query.strip():
+                                for message in sorted(state["messages"], key=history_key, reverse=True):
+                                    snippet = None
+                                    for part in message.get("parts", []):
+                                        if part.get("type") == "text" and isinstance(part.get("value"), str):
+                                            snippet = search_snippet(part["value"], query.strip())
+                                            if snippet is not None:
+                                                break
+                                    if snippet is None:
+                                        continue
+                                    hits.append({"conversation_id": canonical_conversation(state, message["conversation_id"]),
+                                                 "message_id": message["id"],
+                                                 "created_at": message["created_at"],
+                                                 "snippet": snippet})
+                                    if len(hits) >= limit:
+                                        break
+                            response = {"result": "search_results", "hits": hits}
                         elif op == "sync_conversations":
                             response = {"result": "conversation_sync", "status": "complete", "conversations": len(state["conversations"])}
                         else:

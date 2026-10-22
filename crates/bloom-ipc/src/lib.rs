@@ -18,7 +18,7 @@ use serde::{Deserialize, Serialize};
 use std::{fmt, io};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
-pub const PROTOCOL_VERSION: u16 = 2;
+pub const PROTOCOL_VERSION: u16 = 3;
 /// Default daemon socket, shared by the daemon and its clients so both sides
 /// agree without configuration.
 pub fn default_socket_path() -> std::path::PathBuf {
@@ -54,6 +54,15 @@ pub struct HistoryCursor {
     pub created_at: i64,
     pub id: MessageId,
 }
+/// One message matched by a local content search. The snippet is a short window
+/// around the matched run, with ellipses when it was truncated.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MessageSearchHit {
+    pub conversation_id: ConversationId,
+    pub message_id: MessageId,
+    pub created_at: i64,
+    pub snippet: String,
+}
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "op", rename_all = "snake_case")]
 pub enum RequestKind {
@@ -80,6 +89,12 @@ pub enum RequestKind {
         address: String,
         body: OutgoingBody,
     },
+    /// Local content search over stored message text. `limit == 0` and limits
+    /// above `u16::MAX` are invalid.
+    SearchMessages {
+        query: String,
+        limit: u32,
+    },
 }
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Response {
@@ -102,6 +117,9 @@ pub enum ResponseKind {
     },
     Send {
         message_id: MessageId,
+    },
+    SearchResults {
+        hits: Vec<MessageSearchHit>,
     },
     Error {
         error: ProtocolError,
@@ -380,6 +398,40 @@ mod tests {
         {
             RequestKind::History { before, .. } => assert_eq!(before, None),
             _ => panic!("expected a history request"),
+        }
+    }
+
+    #[test]
+    fn search_request_and_results_round_trip() {
+        let transport = bloom_domain::TransportId::new("test").unwrap();
+        let request = Request {
+            request_id: 11,
+            request: RequestKind::SearchMessages {
+                query: "coast".into(),
+                limit: 25,
+            },
+        };
+        let bytes = serde_json::to_vec(&request).unwrap();
+        let decoded: Request = serde_json::from_slice(&bytes).unwrap();
+        assert!(decoded.request == request.request);
+
+        let hit = MessageSearchHit {
+            conversation_id: ConversationId::new(transport.clone(), "conversation").unwrap(),
+            message_id: MessageId::new(transport, "message").unwrap(),
+            created_at: 1_700_000_000_000,
+            snippet: "…early train to the coast…".into(),
+        };
+        let response = Response {
+            request_id: 12,
+            response: ResponseKind::SearchResults {
+                hits: vec![hit.clone()],
+            },
+        };
+        let bytes = serde_json::to_vec(&response).unwrap();
+        let decoded: Response = serde_json::from_slice(&bytes).unwrap();
+        match decoded.response {
+            ResponseKind::SearchResults { hits } => assert_eq!(hits, vec![hit]),
+            _ => panic!("expected search results"),
         }
     }
 

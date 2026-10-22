@@ -17,7 +17,7 @@ TIMEOUT = 2.0
 
 def send(client, obj):
     payload = json.dumps(obj).encode()
-    client.sendall(b"\x02" + struct.pack(">I", len(payload)) + payload)
+    client.sendall(b"\x03" + struct.pack(">I", len(payload)) + payload)
 
 
 def recv_exact(client, size):
@@ -33,7 +33,7 @@ def recv_exact(client, size):
 def recv(client):
     header = recv_exact(client, 5)
     version, size = struct.unpack(">BI", header)
-    if version != 2 or not 0 < size <= 1048576:
+    if version != 3 or not 0 < size <= 1048576:
         raise AssertionError("invalid response frame")
     return json.loads(recv_exact(client, size))
 
@@ -249,6 +249,33 @@ class Tests(unittest.TestCase):
         collected = [message["parts"][0]["value"] for page in reversed(pages) for message in page]
         self.assertEqual(collected, expected)
         self.assertEqual(len(collected), len(set(collected)))
+
+
+    def test_search_messages_returns_snippet_and_ignores_empty_query(self):
+        conversation = {"transport": "openbubbles", "value": "alice@example.invalid"}
+        prefix = "0123456789" * 4
+        suffix = "abcdefghij" * 4
+        text = prefix + "NEEDLE" + suffix
+        request(self.sock, "fixture_append_message", conversation_id=conversation, text=text)
+
+        response = request(self.sock, "search_messages", query="  needle  ", limit=10)
+        self.assertEqual(response["result"], "search_results")
+        self.assertEqual(len(response["hits"]), 1)
+        hit = response["hits"][0]
+        self.assertEqual(hit["conversation_id"], conversation)
+        with open(self.store, encoding="utf-8") as stream:
+            stored = json.load(stream)["messages"][0]
+        self.assertEqual(hit["created_at"], stored["created_at"])
+        self.assertEqual(hit["message_id"], stored["id"])
+        self.assertEqual(hit["snippet"], "\u2026" + prefix[-30:] + "NEEDLE" + suffix[:30] + "\u2026")
+
+        self.assertEqual(request(self.sock, "search_messages", query="", limit=10)["hits"], [])
+        self.assertEqual(request(self.sock, "search_messages", query="   ", limit=10)["hits"], [])
+        # The daemon rejects an invalid limit rather than answering with an empty set.
+        self.assertEqual(
+            request(self.sock, "search_messages", query="needle", limit=0),
+            {"result": "error", "error": "invalid_request"},
+        )
 
 
 if __name__ == "__main__":

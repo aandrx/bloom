@@ -1,6 +1,13 @@
 use super::{EncryptedStore, StoreError};
-use bloom_domain::{ConversationId, Message, MessageId};
+use bloom_domain::{ConversationId, Message, MessageId, MessagePart};
 use rusqlite::{params, OptionalExtension};
+use std::collections::HashSet;
+
+pub use bloom_ipc::MessageSearchHit;
+
+const SEARCH_SCAN_LIMIT: usize = 20_000;
+const SNIPPET_CONTEXT_CHARS: usize = 30;
+const ELLIPSIS: char = '\u{2026}';
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum MessageUpsertOutcome {
@@ -71,6 +78,126 @@ pub fn get_message(store: &EncryptedStore, id: &MessageId) -> Result<Option<Mess
         .optional()?;
     data.map(|data| serde_json::from_slice(&data).map_err(|_| StoreError::Schema))
         .transpose()
+}
+
+/// Search text parts of stored messages, newest first. The scan is bounded to the
+/// newest [`SEARCH_SCAN_LIMIT`] rows so one query cannot walk an unbounded store,
+/// and it stops as soon as `limit` hits have been collected.
+pub fn search_messages(
+    store: &EncryptedStore,
+    query: &str,
+    limit: u16,
+) -> Result<Vec<MessageSearchHit>, StoreError> {
+    let query = query.trim();
+    if query.is_empty() || limit == 0 {
+        return Ok(Vec::new());
+    }
+    let query_lower = query.to_lowercase();
+    if query_lower.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    // `messages_recent_order` serves this ordering, so the LIMIT bounds the rows
+    // read rather than sorting the whole table first.
+    let mut statement = store
+        ._connection
+        .prepare("SELECT id, data FROM messages ORDER BY created_at DESC, id DESC LIMIT ?1")?;
+    let mut rows = statement.query(params![SEARCH_SCAN_LIMIT as i64])?;
+    // Resolve aliases from one read instead of decoding every conversation per hit.
+    let lookup = super::conversations::alias_map(store)?;
+    let mut hits = Vec::new();
+    let mut seen = HashSet::new();
+    while let Some(row) = rows.next()? {
+        let key: String = row.get(0)?;
+        let data: Vec<u8> = row.get(1)?;
+        let message: Message = serde_json::from_slice(&data).map_err(|_| StoreError::Schema)?;
+        let Some(snippet) = search_snippet(&message, &query_lower) else {
+            continue;
+        };
+        if !seen.insert(key) {
+            continue;
+        }
+        let conversation_id = lookup
+            .get(message.conversation_id())
+            .cloned()
+            .unwrap_or_else(|| message.conversation_id().clone());
+        hits.push(MessageSearchHit {
+            conversation_id,
+            message_id: message.id().clone(),
+            created_at: message.created_at,
+            snippet,
+        });
+        if hits.len() >= limit as usize {
+            break;
+        }
+    }
+    Ok(hits)
+}
+
+fn search_snippet(message: &Message, query_lower: &str) -> Option<String> {
+    for part in message.parts() {
+        let MessagePart::Text(text) = part else {
+            continue;
+        };
+        let (lower, boundaries) = lowercase_with_boundaries(text);
+        let Some(start_lower) = lower.find(query_lower) else {
+            continue;
+        };
+        let end_lower = start_lower + query_lower.len();
+        let start = boundaries[start_lower].0;
+        let end = boundaries[end_lower - 1].1;
+        return Some(snippet_window(text, start, end));
+    }
+    None
+}
+
+/// Lowercase a string and record the original character span of every lowered
+/// byte. Unicode lowercasing can change byte lengths, so slicing the lowered text
+/// and reusing those offsets on the original would not be char-boundary safe.
+fn lowercase_with_boundaries(text: &str) -> (String, Vec<(usize, usize)>) {
+    let mut lower = String::with_capacity(text.len());
+    let mut boundaries = Vec::with_capacity(text.len());
+    for (start, character) in text.char_indices() {
+        let end = start + character.len_utf8();
+        let before = lower.len();
+        lower.extend(character.to_lowercase());
+        boundaries.extend(std::iter::repeat_n((start, end), lower.len() - before));
+    }
+    (lower, boundaries)
+}
+
+fn snippet_window(text: &str, start: usize, end: usize) -> String {
+    let before: Vec<usize> = text[..start]
+        .char_indices()
+        .map(|(index, _)| index)
+        .collect();
+    let context_start = if before.len() > SNIPPET_CONTEXT_CHARS {
+        before[before.len() - SNIPPET_CONTEXT_CHARS]
+    } else {
+        0
+    };
+    let after: Vec<usize> = text[end..]
+        .char_indices()
+        .map(|(index, _)| end + index)
+        .collect();
+    let context_end = if after.len() > SNIPPET_CONTEXT_CHARS {
+        after[SNIPPET_CONTEXT_CHARS]
+    } else {
+        text.len()
+    };
+
+    let body = text[context_start..context_end]
+        .replace("\r\n", " ")
+        .replace(&['\r', '\n'][..], " ");
+    let mut snippet = String::with_capacity(body.len() + 2 * ELLIPSIS.len_utf8());
+    if context_start > 0 {
+        snippet.push(ELLIPSIS);
+    }
+    snippet.push_str(&body);
+    if context_end < text.len() {
+        snippet.push(ELLIPSIS);
+    }
+    snippet
 }
 
 pub(crate) fn remap_message(
@@ -317,6 +444,284 @@ mod tests {
 
     fn message_id(transport: &str, value: &str) -> MessageId {
         MessageId::new(TransportId::new(transport).unwrap(), value).unwrap()
+    }
+
+    fn fixture_message_parts(
+        message: &str,
+        conversation: &str,
+        at: i64,
+        parts: Vec<MessagePart>,
+    ) -> Message {
+        let transport = TransportId::new("alpha").unwrap();
+        Message::new(
+            MessageId::new(transport.clone(), message).unwrap(),
+            ConversationId::new(transport, conversation).unwrap(),
+            None,
+            Handle::new(HandleKind::Opaque, "synthetic-sender").unwrap(),
+            parts,
+            at,
+            None,
+            DeliveryState::Sent,
+            false,
+            None,
+            vec![],
+            None,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn search_matches_case_insensitively_and_ignores_non_text_parts() {
+        let (_temp, mut store, conversation) = setup();
+        for message in [
+            fixture_message(
+                "alpha",
+                "m1",
+                "room",
+                1,
+                "HeLLo NeEdLe",
+                DeliveryState::Sent,
+            ),
+            fixture_message_parts(
+                "m2",
+                "room",
+                2,
+                vec![MessagePart::Unsupported {
+                    kind: "needle".into(),
+                }],
+            ),
+        ] {
+            upsert_message(&mut store, &message).unwrap();
+        }
+
+        let hits = search_messages(&store, "needle", 10).unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].message_id.value(), "m1");
+        assert_eq!(hits[0].conversation_id, conversation);
+        assert_eq!(hits[0].snippet, "HeLLo NeEdLe");
+    }
+
+    #[test]
+    fn search_empty_or_whitespace_query_returns_nothing() {
+        let (_temp, mut store, _conversation) = setup();
+        upsert_message(
+            &mut store,
+            &fixture_message("alpha", "m1", "room", 1, "needle", DeliveryState::Sent),
+        )
+        .unwrap();
+        assert!(search_messages(&store, "", 10).unwrap().is_empty());
+        assert!(search_messages(&store, "   \t\n", 10).unwrap().is_empty());
+        assert!(search_messages(&store, "needle", 0).unwrap().is_empty());
+    }
+
+    #[test]
+    fn search_snippet_marks_only_the_side_it_truncates() {
+        let (_temp, mut store, _conversation) = setup();
+        let tail = "abcdefghijklmnopqrstuvwxyz0123456789";
+        let head_text = format!("MATCH{tail}");
+        let tail_text = format!("{tail}MATCH");
+        upsert_message(
+            &mut store,
+            &fixture_message("alpha", "head", "room", 2, &head_text, DeliveryState::Sent),
+        )
+        .unwrap();
+        upsert_message(
+            &mut store,
+            &fixture_message("alpha", "tail", "room", 1, &tail_text, DeliveryState::Sent),
+        )
+        .unwrap();
+
+        let hits = search_messages(&store, "match", 10).unwrap();
+        assert_eq!(hits.len(), 2);
+        assert_eq!(
+            hits[0].snippet,
+            format!("MATCH{}…", &tail[..30]),
+            "a match at the start has no leading ellipsis"
+        );
+        assert_eq!(
+            hits[1].snippet,
+            format!("…{}MATCH", &tail[tail.len() - 30..]),
+            "a match at the end has no trailing ellipsis"
+        );
+    }
+
+    #[test]
+    fn search_snippet_uses_original_offsets_when_lowercasing_expands() {
+        let (_temp, mut store, _conversation) = setup();
+        // U+0130 lowercases to two chars, so lowered byte offsets no longer match
+        // the original string; the snippet must still slice the real match.
+        let text = format!("{}needle{}", "\u{0130}".repeat(40), "tail".repeat(10));
+        upsert_message(
+            &mut store,
+            &fixture_message("alpha", "expand", "room", 1, &text, DeliveryState::Sent),
+        )
+        .unwrap();
+
+        let hits = search_messages(&store, "NEEDLE", 10).unwrap();
+        assert_eq!(hits.len(), 1);
+        assert!(
+            hits[0].snippet.contains("needle"),
+            "the snippet must contain the matched run: {:?}",
+            hits[0].snippet
+        );
+        assert!(hits[0].snippet.starts_with('…'));
+        assert!(hits[0].snippet.ends_with('…'));
+    }
+
+    #[test]
+    fn search_snippet_has_context_and_ellipses() {
+        let (_temp, mut store, _conversation) = setup();
+        let prefix = "abcdefghijklmnopqrstuvwxyz0123456789";
+        let suffix = "abcdefghijklmnopqrstuvwxyz0123456789";
+        let text = format!("{prefix}MATCH{suffix}");
+        upsert_message(
+            &mut store,
+            &fixture_message("alpha", "m1", "room", 1, &text, DeliveryState::Sent),
+        )
+        .unwrap();
+
+        let hits = search_messages(&store, "match", 10).unwrap();
+        assert_eq!(
+            hits[0].snippet,
+            "\u{2026}ghijklmnopqrstuvwxyz0123456789MATCHabcdefghijklmnopqrstuvwxyz0123\u{2026}"
+        );
+    }
+
+    #[test]
+    fn search_snippet_replaces_newlines_with_spaces() {
+        let (_temp, mut store, _conversation) = setup();
+        upsert_message(
+            &mut store,
+            &fixture_message(
+                "alpha",
+                "m1",
+                "room",
+                1,
+                "line one\nneedle\r\nline three",
+                DeliveryState::Sent,
+            ),
+        )
+        .unwrap();
+
+        let hits = search_messages(&store, "needle", 10).unwrap();
+        assert_eq!(hits[0].snippet, "line one needle line three");
+    }
+
+    #[test]
+    fn search_snippet_is_char_boundary_safe_for_multibyte_text() {
+        let (_temp, mut store, _conversation) = setup();
+        let text = format!(
+            "{}\u{e9}needle\u{e9}{}",
+            "\u{e9}".repeat(40),
+            "\u{e9}".repeat(40)
+        );
+        upsert_message(
+            &mut store,
+            &fixture_message("alpha", "m1", "room", 1, &text, DeliveryState::Sent),
+        )
+        .unwrap();
+
+        let hits = search_messages(&store, "NEEDLE", 10).unwrap();
+        assert_eq!(hits.len(), 1);
+        let snippet = &hits[0].snippet;
+        assert!(snippet.starts_with('\u{2026}'), "{snippet}");
+        assert!(snippet.ends_with('\u{2026}'), "{snippet}");
+        assert!(snippet.contains("needle"), "{snippet}");
+        assert_eq!(
+            snippet
+                .chars()
+                .filter(|character| *character == '\u{e9}')
+                .count(),
+            60,
+            "30 context characters on each side"
+        );
+    }
+
+    #[test]
+    fn search_respects_limit_and_orders_newest_first_without_duplicates() {
+        let (_temp, mut store, _conversation) = setup();
+        for at in 1..=5 {
+            let message = fixture_message(
+                "alpha",
+                &format!("m{at}"),
+                "room",
+                at,
+                "needle",
+                DeliveryState::Sent,
+            );
+            upsert_message(&mut store, &message).unwrap();
+        }
+        // Two matching text parts in one message must still produce one hit.
+        upsert_message(
+            &mut store,
+            &fixture_message_parts(
+                "multi",
+                "room",
+                6,
+                vec![
+                    MessagePart::Text("needle one".into()),
+                    MessagePart::Text("needle two".into()),
+                ],
+            ),
+        )
+        .unwrap();
+
+        let hits = search_messages(&store, "needle", 3).unwrap();
+        assert_eq!(
+            hits.iter()
+                .map(|hit| hit.message_id.value())
+                .collect::<Vec<_>>(),
+            vec!["multi", "m5", "m4"]
+        );
+        let all = search_messages(&store, "needle", 10).unwrap();
+        let ids: Vec<_> = all.iter().map(|hit| hit.message_id.value()).collect();
+        let unique: std::collections::HashSet<_> = ids.iter().collect();
+        assert_eq!(unique.len(), ids.len());
+    }
+
+    #[test]
+    fn search_reports_canonical_conversation_for_alias() {
+        let (_temp, mut store, conversation) = setup();
+        let alias = ConversationId::new(TransportId::new("alpha").unwrap(), "legacy").unwrap();
+        super::super::conversations::upsert_conversation(
+            &mut store,
+            &Conversation {
+                id: alias.clone(),
+                remote_id: "legacy".into(),
+                kind: ConversationKind::Direct,
+                title: None,
+                participants: Vec::new(),
+                created_at: 0,
+                last_message_at: None,
+                aliases: Vec::new(),
+                preview: None,
+            },
+        )
+        .unwrap();
+        super::super::conversations::upsert_conversation(
+            &mut store,
+            &Conversation {
+                id: conversation.clone(),
+                remote_id: "room".into(),
+                kind: ConversationKind::Direct,
+                title: None,
+                participants: Vec::new(),
+                created_at: 0,
+                last_message_at: None,
+                aliases: vec![alias],
+                preview: None,
+            },
+        )
+        .unwrap();
+        upsert_message(
+            &mut store,
+            &fixture_message("alpha", "a1", "legacy", 1, "needle", DeliveryState::Sent),
+        )
+        .unwrap();
+
+        let hits = search_messages(&store, "needle", 10).unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].conversation_id, conversation);
     }
 
     #[test]
