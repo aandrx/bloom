@@ -474,6 +474,35 @@ impl App {
         }
         self.latest_snapshot_revision = snapshot.revision;
         if let Some(id) = snapshot.visible.clone() {
+            // Carry paged state across an identity alias before merging. The
+            // snapshot names the canonical conversation while the cached messages and
+            // the paged flag may still sit under a retired id, and `set_conversations`
+            // only migrates after this merge has already run.
+            if let Some(canonical) = snapshot
+                .conversations
+                .iter()
+                .find(|conversation| conversation.id == id)
+            {
+                for alias in canonical.aliases.clone() {
+                    // An alias that is still a listed conversation belongs to a live
+                    // chat of its own; moving its cache would empty that chat.
+                    if snapshot.conversations.iter().any(|other| other.id == alias) {
+                        continue;
+                    }
+                    self.migrate_older_state(&alias, &canonical.id);
+                    let retired = self.messages.remove(&alias);
+                    if let Some(retired) = retired {
+                        // The canonical id may already hold an older cache; union the
+                        // two instead of discarding either one.
+                        let mut merged = self.messages.remove(&canonical.id).unwrap_or_default();
+                        merged.extend(retired);
+                        let mut seen = HashSet::new();
+                        merged.retain(|message| seen.insert(message.id().clone()));
+                        merged.sort_by(message_order);
+                        self.messages.insert(canonical.id.clone(), merged);
+                    }
+                }
+            }
             let latest_live = self
                 .latest_live_revision
                 .get(&id)
@@ -604,6 +633,8 @@ impl App {
             .get(&conversation_id)
             .and_then(|floor| existing.iter().find(|message| message.id() == floor))
             .cloned();
+        let oldest_before = oldest_message(&existing).cloned();
+        let fetched_older = !older.is_empty();
         let mut merged = older;
         merged.extend(existing);
         // Sort before trimming: `upsert` only orders by timestamp, so tie groups are
@@ -616,10 +647,18 @@ impl App {
                 merged.drain(..older_count - OLDER_HISTORY_BUDGET);
             }
         }
+        // A page that the budget immediately trims away leaves the oldest loaded
+        // message unchanged. Treat that as the end of useful paging: otherwise the
+        // same cursor is requested forever and every result is discarded.
+        let reached_budget = fetched_older
+            && oldest_before
+                .as_ref()
+                .zip(oldest_message(&merged))
+                .is_some_and(|(before, after)| before.id() == after.id());
         self.messages.insert(conversation_id.clone(), merged);
         self.older_loaded.insert(conversation_id.clone());
         self.older_error = None;
-        if short_page {
+        if short_page || reached_budget {
             self.older_exhausted.insert(conversation_id.clone());
         }
     }
@@ -718,6 +757,9 @@ impl App {
         if self.selected != id {
             self.older_requested = false;
             self.older_error = None;
+            // A page still in flight belongs to the chat being left; its result is
+            // ignored, so the slot must not block the next chat.
+            self.older_loading = None;
             self.scroll_to_newest();
             self.transcript_viewport = None;
             self.send_feedback = None;
@@ -2504,6 +2546,10 @@ impl App {
             return Action::Quit;
         }
         self.notice = None;
+        // Status lines are transient: the next interaction acknowledges them, so a
+        // page failure is never silently replaced by an arriving snapshot before it
+        // has been on screen.
+        self.older_error = None;
         if self
             .send_feedback
             .as_ref()
@@ -5032,6 +5078,213 @@ mod tests {
         assert_eq!(kept_anchor.conversation, chat.id);
         assert_eq!(kept_anchor.message, window_two.id().clone());
         assert_eq!(kept_anchor.row, 3);
+    }
+
+    #[test]
+    fn a_page_trimmed_by_the_budget_stops_paging_instead_of_repeating() {
+        let mut app = App::default();
+        let chat = conversation("budget-stop", Some(10_000_000));
+        app.set_conversations(vec![chat.clone()]);
+        app.apply_snapshot(crate::daemon::Snapshot {
+            revision: crate::daemon::next_revision(),
+            visible: Some(chat.id.clone()),
+            conversations: vec![chat.clone()],
+            history: vec![message(&chat, "window", 10_000_000, "window")],
+        });
+        // Fill the paged budget, then ask for one more page.
+        for round in 0..5i64 {
+            let page: Vec<Message> = (0..200i64)
+                .map(|offset| {
+                    let at = 1_000_000 - (round + 1) * 200 + offset;
+                    message(&chat, &format!("r{round}-{offset}"), at, "paged")
+                })
+                .collect();
+            let (id, _) = app.begin_load_older().expect("cursor");
+            app.finish_load_older(id, page, OLDER_PAGE_LIMIT);
+        }
+        assert!(app.can_load_older(), "the budget was exactly filled");
+
+        let extra: Vec<Message> = (0..200i64)
+            .map(|offset| message(&chat, &format!("extra-{offset}"), 900_000 + offset, "paged"))
+            .collect();
+        let (id, _) = app.begin_load_older().expect("cursor");
+        let before = app.messages[&chat.id].len();
+        app.finish_load_older(id, extra, OLDER_PAGE_LIMIT);
+
+        assert_eq!(
+            app.messages[&chat.id].len(),
+            before,
+            "a page the budget discards changes nothing"
+        );
+        assert!(
+            !app.can_load_older(),
+            "a discarded page must end paging instead of repeating the same request"
+        );
+    }
+
+    #[test]
+    fn a_page_failure_stays_readable_until_the_next_interaction() {
+        let mut app = App::default();
+        let chat = conversation("stale-error", Some(50));
+        app.set_conversations(vec![chat.clone()]);
+        app.selected = Some(chat.id.clone());
+        app.messages
+            .insert(chat.id.clone(), vec![message(&chat, "w", 50, "window")]);
+        let (id, _) = app.begin_load_older().expect("cursor");
+        app.fail_load_older(id, "Older messages could not be loaded.".into());
+        assert!(app.older_error.is_some());
+
+        // A reconciliation landing straight after the failure must not erase the
+        // line before it has been on screen.
+        app.apply_snapshot(crate::daemon::Snapshot {
+            revision: crate::daemon::next_revision(),
+            visible: Some(chat.id.clone()),
+            conversations: vec![chat.clone()],
+            history: vec![message(&chat, "w", 50, "window")],
+        });
+        assert!(
+            app.older_error.is_some(),
+            "an arriving snapshot must not consume the failure message"
+        );
+
+        // The next input acknowledges it.
+        app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert_eq!(app.older_error, None);
+    }
+
+    #[test]
+    fn leaving_a_chat_releases_the_page_request_slot() {
+        let mut app = App::default();
+        let first = conversation("first", Some(10));
+        let second = conversation("second", Some(10));
+        app.set_conversations(vec![first.clone(), second.clone()]);
+        app.selected = Some(first.id.clone());
+        app.messages
+            .insert(first.id.clone(), vec![message(&first, "a", 10, "a")]);
+        app.messages
+            .insert(second.id.clone(), vec![message(&second, "b", 10, "b")]);
+
+        app.begin_load_older().expect("cursor");
+        assert!(!app.can_load_older());
+
+        app.select(Some(second.id.clone()));
+        assert!(
+            app.can_load_older(),
+            "the next chat must not inherit the previous chat's in-flight page"
+        );
+    }
+
+    #[test]
+    fn paged_history_survives_an_alias_that_arrives_with_the_snapshot() {
+        let legacy = conversation("legacy-paged", Some(20));
+        let mut canonical = conversation("canonical-paged", Some(20));
+        canonical.aliases = vec![legacy.id.clone()];
+        let mut app = App::default();
+        app.set_conversations(vec![legacy.clone()]);
+        app.selected = Some(legacy.id.clone());
+        app.messages.insert(
+            legacy.id.clone(),
+            vec![
+                message(&legacy, "paged", 10, "paged older"),
+                message(&legacy, "window", 20, "window"),
+            ],
+        );
+        app.older_loaded.insert(legacy.id.clone());
+        app.older_window_floor.insert(
+            legacy.id.clone(),
+            MessageId::new(legacy.id.transport().clone(), "window").unwrap(),
+        );
+
+        app.apply_snapshot(crate::daemon::Snapshot {
+            revision: crate::daemon::next_revision(),
+            visible: Some(canonical.id.clone()),
+            conversations: vec![canonical.clone()],
+            history: vec![message(&canonical, "window", 20, "window")],
+        });
+
+        let texts: Vec<String> = app.messages[&canonical.id]
+            .iter()
+            .map(message_text)
+            .collect();
+        assert_eq!(
+            texts,
+            vec!["paged older", "window"],
+            "the first snapshot after an alias must not drop paged history"
+        );
+        assert!(app.older_loaded.contains(&canonical.id));
+        assert!(!app.messages.contains_key(&legacy.id));
+    }
+
+    #[test]
+    fn alias_migration_unions_two_caches_instead_of_dropping_one() {
+        let legacy = conversation("legacy-union", Some(20));
+        let mut canonical = conversation("canonical-union", Some(20));
+        canonical.aliases = vec![legacy.id.clone()];
+        let mut app = App::default();
+        app.set_conversations(vec![legacy.clone()]);
+        app.selected = Some(legacy.id.clone());
+        // The canonical id already holds a cache from an earlier read, and the
+        // paged copy sits under the retired id the snapshot aliases away.
+        app.messages.insert(
+            canonical.id.clone(),
+            vec![message(&canonical, "window", 20, "window")],
+        );
+        app.messages.insert(
+            legacy.id.clone(),
+            vec![
+                message(&legacy, "paged", 10, "paged older"),
+                message(&legacy, "window", 20, "window"),
+            ],
+        );
+        app.older_loaded.insert(legacy.id.clone());
+        app.older_window_floor.insert(
+            legacy.id.clone(),
+            MessageId::new(legacy.id.transport().clone(), "window").unwrap(),
+        );
+
+        app.apply_snapshot(crate::daemon::Snapshot {
+            revision: crate::daemon::next_revision(),
+            visible: Some(canonical.id.clone()),
+            conversations: vec![canonical.clone()],
+            history: vec![message(&canonical, "window", 20, "window")],
+        });
+
+        let texts: Vec<String> = app.messages[&canonical.id]
+            .iter()
+            .map(message_text)
+            .collect();
+        assert_eq!(
+            texts,
+            vec!["paged older", "window"],
+            "neither cache may be discarded, and the duplicate is removed"
+        );
+    }
+
+    #[test]
+    fn an_alias_that_is_also_a_live_chat_keeps_its_own_history() {
+        let retired = conversation("retired-live", Some(20));
+        let mut canonical = conversation("canonical-live", Some(20));
+        canonical.aliases = vec![retired.id.clone()];
+        let mut app = App::default();
+        app.set_conversations(vec![retired.clone(), canonical.clone()]);
+        app.selected = Some(retired.id.clone());
+        app.messages.insert(
+            retired.id.clone(),
+            vec![message(&retired, "own", 10, "retired own")],
+        );
+
+        app.apply_snapshot(crate::daemon::Snapshot {
+            revision: crate::daemon::next_revision(),
+            visible: Some(canonical.id.clone()),
+            conversations: vec![retired.clone(), canonical.clone()],
+            history: vec![message(&canonical, "window", 20, "window")],
+        });
+
+        assert!(
+            app.messages.contains_key(&retired.id),
+            "a chat that is still listed keeps its cache"
+        );
+        assert_eq!(message_text(&app.messages[&retired.id][0]), "retired own");
     }
 
     #[test]

@@ -516,6 +516,11 @@ async fn main() -> Result<()> {
                             let _ = tx.send((conversation, result));
                         });
                         redraw.request();
+                    } else if !app.can_load_older() {
+                        // Nothing is loading and no page can be fetched, so the request
+                        // is fully satisfied; clearing it stops a later input from
+                        // firing a page the user did not ask for.
+                        app.older_requested = false;
                     }
                 }
                 // A selection change is a request for a fresh read, not an event.
