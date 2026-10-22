@@ -31,6 +31,12 @@ class ReadingFlows(unittest.TestCase):
         self.fixture.start_daemon()
         for index in range(60):
             self.send_message(index)
+        self.start_tui()
+        self.addCleanup(self.stop_tui)
+        self.resize(100, 30)
+        self.wait_for(lambda: 'READ_MARKER_059' in self.text())
+
+    def start_tui(self):
         with H['isolated_environment']({
             'BLOOM_SOCKET_PATH': str(self.fixture.socket_path),
             'XDG_CONFIG_HOME': str(self.fixture.root / 'config'),
@@ -41,9 +47,6 @@ class ReadingFlows(unittest.TestCase):
             self.pid, self.master = pty.fork()
             if self.pid == 0:
                 os.execv(str(H['BINARY']), [str(H['BINARY'])])
-        self.addCleanup(self.stop_tui)
-        self.resize(100, 30)
-        self.wait_for(lambda: 'READ_MARKER_059' in self.text())
 
     def stop_tui(self):
         try:
@@ -84,7 +87,8 @@ class ReadingFlows(unittest.TestCase):
         # at the actual sidebar boundary; a full-width narrow layout has none.
         divider = self.screen.display[0].find('│')
         left = divider + 3 if divider >= 0 else 2
-        return re.findall(r'READ_MARKER_\d+', '\n'.join(line[left:] for line in self.screen.display[2:-5]))
+        return re.findall(r'(?:READ|OLDER)_MARKER_\d+',
+                          '\n'.join(line[left:] for line in self.screen.display[2:-5]))
 
     def key(self, value):
         os.write(self.master, value)
@@ -139,6 +143,70 @@ class ReadingFlows(unittest.TestCase):
         self.assertEqual(len(messages), 65)
         self.assertEqual(messages[-1]['conversation_id'], CID)
         self.assertEqual(messages[-1]['parts'], [{'type': 'text', 'value': body}])
+
+    def test_older_history_pages_from_the_top_without_moving_the_reader(self):
+        # Rebuild the thread with enough older history that the newest 200-message
+        # page hides the oldest 80 messages, so one page load is a short page.
+        self.stop_tui()
+        self.fixture.stop_daemon()
+        state = self.fixture.persisted()
+        chat = next(item for item in state['conversations'] if item['id'] == CID)
+        sender = next(participant['handle'] for participant in chat['participants']
+                      if not participant['is_me'])
+        baseline = min(item['created_at'] for item in state['messages'])
+        seeded = []
+        for index in range(220):
+            seeded.append({
+                'id': {'transport': 'openbubbles', 'value': f'older-{index:03d}'},
+                'conversation_id': CID,
+                'remote_id': None,
+                'sender': sender,
+                'parts': [{'type': 'text',
+                           'value': f'OLDER_MARKER_{index:03d} synthetic context'}],
+                'created_at': baseline - (220 - index) * 10,
+                'sent_at': None,
+                'delivery': 'delivered',
+                'from_me': False,
+                'edited_at': None,
+                'reactions': [],
+                'unsent_at': None,
+            })
+        state['messages'] = seeded + state['messages']
+        self.fixture.store_path.write_text(json.dumps(state))
+        self.fixture.start_daemon()
+        self.start_tui()
+        self.resize(100, 30)
+        self.wait_for(lambda: 'READ_MARKER_059' in self.text())
+        self.assertNotIn('OLDER_MARKER_079', self.text(),
+                         'the newest page must stop before the oldest stored messages')
+
+        # Reaching the oldest loaded row asks for the older page directly.
+        anchor = 'OLDER_MARKER_080'
+        for _ in range(80):
+            self.key(b'\x1b[5~')
+            self.pump(.05)
+            if self.markers()[:1] == [anchor]:
+                break
+        self.assertEqual(self.markers()[:1], [anchor],
+                         'the newest page ends at its oldest stored message')
+
+        # No further input: the arriving page must not move what is being read.
+        # Wait for the request to settle rather than racing a fixed delay.
+        self.wait_for(lambda: 'Loading older messages' not in self.text(), timeout=10)
+        self.pump(.3)  # Let the settled frame flush before reading the top row.
+        self.assertEqual(self.markers()[0], anchor,
+                         'loading older history must not move the reader')
+        self.artifact('older-anchored')
+
+        # The fetched messages are now reachable above the anchor.
+        for _ in range(40):
+            if 'OLDER_MARKER_000' in self.markers():
+                break
+            self.key(b'\x1b[5~')
+            self.pump(.05)
+        self.assertIn('OLDER_MARKER_000', self.markers(),
+                      'the loaded page contributes the previously hidden history')
+        self.artifact('older-loaded')
 
     def test_settings_wheel_cannot_scroll_hidden_history(self):
         before = self.markers()

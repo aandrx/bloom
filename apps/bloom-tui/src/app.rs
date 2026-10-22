@@ -18,6 +18,12 @@ const SCROLL_PAGE: usize = 10;
 
 pub const HELP_ROW_COUNT: usize = 16;
 
+/// Messages requested per older-history page.
+pub const OLDER_PAGE_LIMIT: u32 = 200;
+/// Maximum number of paged-back messages retained per conversation, in addition
+/// to the newest window loaded by a snapshot.
+pub const OLDER_HISTORY_BUDGET: usize = 1000;
+
 /// What a key press wants the shell to do.
 ///
 /// The key semantics live here rather than inside the event loop so the real key
@@ -99,6 +105,22 @@ pub struct EmojiSuggestion {
     pub shortcode: String,
     pub emoji: String,
     pub name: String,
+}
+
+/// The store orders messages ascending by `(created_at, id)`. Never assume a
+/// loaded vector is already sorted before deriving or merging history.
+/// Matches the daemon's ordering exactly: `created_at`, then the stable JSON encoding
+/// of the message id, which is what the store indexes and what a page cursor means.
+fn message_order(a: &Message, b: &Message) -> std::cmp::Ordering {
+    a.created_at.cmp(&b.created_at).then_with(|| {
+        serde_json::to_string(a.id())
+            .unwrap_or_default()
+            .cmp(&serde_json::to_string(b.id()).unwrap_or_default())
+    })
+}
+
+fn oldest_message(messages: &[Message]) -> Option<&Message> {
+    messages.iter().min_by(|a, b| message_order(a, b))
 }
 
 fn sanitize_paste(input: &str) -> String {
@@ -204,6 +226,20 @@ pub struct App {
     pub conversations: Vec<Conversation>,
     pub selected: Option<ConversationId>,
     pub messages: HashMap<ConversationId, Vec<Message>>,
+    /// Conversations where the user has paged back beyond the newest window.
+    pub older_loaded: HashSet<ConversationId>,
+    /// Conversations whose paged-back history is exhausted.
+    pub older_exhausted: HashSet<ConversationId>,
+    /// The conversation with an older-page request in flight, at most one.
+    pub older_loading: Option<ConversationId>,
+    /// The oldest message that still belongs to a conversation's newest window.
+    /// Everything strictly older is paged-back history subject to the budget.
+    pub older_window_floor: HashMap<ConversationId, MessageId>,
+    /// The last failed older-page load.
+    pub older_error: Option<String>,
+    /// Set when a scroll gesture reaches the oldest loaded row and older history
+    /// may still exist; the shell consumes it to start one page request.
+    pub older_requested: bool,
     /// Reject out-of-order snapshots and keep their history/list components ordered
     /// independently from live events.
     pub latest_snapshot_revision: u64,
@@ -352,6 +388,12 @@ impl Default for App {
             conversations: Vec::new(),
             selected: None,
             messages: HashMap::new(),
+            older_loaded: HashSet::new(),
+            older_exhausted: HashSet::new(),
+            older_loading: None,
+            older_window_floor: HashMap::new(),
+            older_error: None,
+            older_requested: false,
             latest_snapshot_revision: 0,
             latest_conversations_revision: 0,
             latest_live_revision: HashMap::new(),
@@ -438,7 +480,9 @@ impl App {
                 .copied()
                 .unwrap_or_default();
             if snapshot.revision > latest_live {
-                self.messages.insert(id.clone(), snapshot.history);
+                let incoming = snapshot.history;
+                let history = self.merge_snapshot_history(&id, incoming);
+                self.messages.insert(id.clone(), history);
                 // Adopt the snapshot's conversation only when nothing is selected yet;
                 // a deliberate user selection must not be pulled back. Route through
                 // `select` so the draft buffer is attributed to the right chat.
@@ -454,6 +498,168 @@ impl App {
         self.resolve_completed_start();
     }
 
+    /// Combine an incoming authoritative window with paged-back history. Only
+    /// conversations that the user explicitly paged keep anything outside the
+    /// window; everyone else still replaces history wholesale.
+    fn merge_snapshot_history(
+        &mut self,
+        id: &ConversationId,
+        incoming: Vec<Message>,
+    ) -> Vec<Message> {
+        // Every snapshot records where its newest window begins, even for a thread
+        // the user never paged back, so the budget always has a boundary to measure.
+        let window_oldest = oldest_message(&incoming).cloned();
+        match &window_oldest {
+            Some(oldest) => {
+                self.older_window_floor
+                    .insert(id.clone(), oldest.id().clone());
+            }
+            None => {
+                self.older_window_floor.remove(id);
+            }
+        }
+        if !self.older_loaded.contains(id) {
+            return incoming;
+        }
+        let Some(window_oldest) = window_oldest else {
+            // The store says the thread is empty, so there is nothing to retain.
+            self.older_loaded.remove(id);
+            self.older_exhausted.remove(id);
+            if self.older_loading.as_ref() == Some(id) {
+                self.older_loading = None;
+            }
+            return incoming;
+        };
+        let existing = self.messages.remove(id).unwrap_or_default();
+        let mut seen: HashSet<MessageId> = incoming.iter().map(|m| m.id().clone()).collect();
+        let mut older: Vec<Message> = existing
+            .into_iter()
+            .filter(|message| message_order(message, &window_oldest).is_lt())
+            .filter(|message| seen.insert(message.id().clone()))
+            .collect();
+        older.sort_by(message_order);
+        if older.len() > OLDER_HISTORY_BUDGET {
+            older.drain(..older.len() - OLDER_HISTORY_BUDGET);
+        }
+        older.extend(incoming);
+        older
+    }
+
+    /// Whether an older history page can be requested for the selected thread.
+    pub fn can_load_older(&self) -> bool {
+        let Some(id) = self.selected.as_ref() else {
+            return false;
+        };
+        if self.older_loading.is_some() || self.older_exhausted.contains(id) {
+            return false;
+        }
+        self.messages
+            .get(id)
+            .is_some_and(|messages| !messages.is_empty())
+    }
+
+    /// Mark the selected conversation as loading and return the cursor for the
+    /// page before its true oldest loaded message.
+    pub fn begin_load_older(&mut self) -> Option<(ConversationId, bloom_ipc::HistoryCursor)> {
+        if !self.can_load_older() {
+            return None;
+        }
+        let id = self.selected.clone()?;
+        let oldest = oldest_message(self.messages.get(&id)?)?.clone();
+        let cursor = bloom_ipc::HistoryCursor {
+            created_at: oldest.created_at,
+            id: oldest.id().clone(),
+        };
+        self.older_loading = Some(id.clone());
+        self.older_error = None;
+        self.older_requested = false;
+        Some((id, cursor))
+    }
+
+    /// Prepend an older page, ignoring results for a conversation that is no
+    /// longer the one loading. Newest-window content is left untouched.
+    pub fn finish_load_older(
+        &mut self,
+        conversation_id: ConversationId,
+        page: Vec<Message>,
+        requested: u32,
+    ) {
+        self.older_requested = false;
+        if self.older_loading.as_ref() != Some(&conversation_id) {
+            return;
+        }
+        self.older_loading = None;
+        let short_page = page.len() < requested as usize;
+        let existing = self.messages.remove(&conversation_id).unwrap_or_default();
+        let mut seen: HashSet<MessageId> = existing.iter().map(|m| m.id().clone()).collect();
+        let oldest = existing.iter().min_by(|a, b| message_order(a, b));
+        let mut older: Vec<Message> = page
+            .into_iter()
+            .filter(|message| oldest.is_none_or(|oldest| message_order(message, oldest).is_lt()))
+            .filter(|message| seen.insert(message.id().clone()))
+            .collect();
+        older.sort_by(message_order);
+        let floor = self
+            .older_window_floor
+            .get(&conversation_id)
+            .and_then(|floor| existing.iter().find(|message| message.id() == floor))
+            .cloned();
+        let mut merged = older;
+        merged.extend(existing);
+        // Sort before trimming: `upsert` only orders by timestamp, so tie groups are
+        // not guaranteed to be in store order yet.
+        merged.sort_by(message_order);
+        if let Some(floor) = floor {
+            let older_count =
+                merged.partition_point(|message| message_order(message, &floor).is_lt());
+            if older_count > OLDER_HISTORY_BUDGET {
+                merged.drain(..older_count - OLDER_HISTORY_BUDGET);
+            }
+        }
+        self.messages.insert(conversation_id.clone(), merged);
+        self.older_loaded.insert(conversation_id.clone());
+        self.older_error = None;
+        if short_page {
+            self.older_exhausted.insert(conversation_id.clone());
+        }
+    }
+
+    /// Record a failed older-page load without disturbing the loaded history.
+    pub fn fail_load_older(&mut self, conversation_id: ConversationId, message: String) {
+        self.older_requested = false;
+        if self.older_loading.as_ref() != Some(&conversation_id) {
+            return;
+        }
+        let showing = self.selected.as_ref() == Some(&conversation_id);
+        self.older_loading = None;
+        // A failure for a chat the user already left must not colour the next one.
+        if showing {
+            self.older_error = Some(message);
+        }
+    }
+
+    /// Carry paged-back history across an identity alias, like drafts do.
+    fn migrate_older_state(&mut self, from: &ConversationId, to: &ConversationId) {
+        if from == to {
+            return;
+        }
+        if self.older_loaded.remove(from) {
+            self.older_loaded.insert(to.clone());
+        }
+        if self.older_exhausted.remove(from) {
+            self.older_exhausted.insert(to.clone());
+        }
+        // The in-flight reply still carries the retired id and will be ignored, so
+        // drop the slot instead of rewriting it: a rewritten id could never match
+        // and would block every later page load.
+        if self.older_loading.as_ref() == Some(from) {
+            self.older_loading = None;
+        }
+        if let Some(floor) = self.older_window_floor.remove(from) {
+            self.older_window_floor.entry(to.clone()).or_insert(floor);
+        }
+    }
+
     pub fn set_conversations(&mut self, mut conversations: Vec<Conversation>) {
         if let Some(selected) = self.selected.clone() {
             if let Some(canonical) = conversations
@@ -464,6 +670,7 @@ impl App {
                 // under the retired row.
                 let canonical_id = canonical.id.clone();
                 self.migrate_draft_owner(&selected, &canonical_id);
+                self.migrate_older_state(&selected, &canonical_id);
                 // An alias is not navigation. Keep the semantic reading context
                 // through the gap before the canonical identity's history loads.
                 self.selected = Some(canonical_id.clone());
@@ -509,6 +716,8 @@ impl App {
     /// so opening a different thread returns to that thread's newest message.
     pub fn select(&mut self, id: Option<ConversationId>) {
         if self.selected != id {
+            self.older_requested = false;
+            self.older_error = None;
             self.scroll_to_newest();
             self.transcript_viewport = None;
             self.send_feedback = None;
@@ -683,10 +892,48 @@ impl App {
         // so restoring a usable terminal size does not silently jump to latest.
     }
 
+    /// True when a panel or popup consumes input instead of the transcript.
+    fn overlay_owns_input(&self) -> bool {
+        self.chat_drawer.is_some()
+            || self.help_open
+            || self.settings_open
+            || self.theme_panel_open
+            || self.contacts_open
+            || self.renaming.is_some()
+            || self.context_menu.is_some()
+            || self.filter_query().is_some()
+            || self.command_menu
+    }
+
+    /// True when the recorded viewport is the selected thread and pinned to its
+    /// oldest loaded row.
+    fn transcript_at_oldest(&self) -> bool {
+        let Some(view) = self.transcript_viewport.as_ref() else {
+            return false;
+        };
+        self.selected.as_ref() == Some(&view.conversation)
+            && !self.new_conversation
+            // The renderer may step one row down from the very top so a byline
+            // does not sit alone on the last visible row.
+            && (self.scroll >= view.max_scroll() || view.top <= 1)
+    }
+
+    /// Ask the shell for another page when a scroll gesture reaches the oldest row.
+    ///
+    /// Reaching the top is itself the request: the affordance would otherwise be
+    /// drawn from the previous frame's geometry and only appear on the same gesture
+    /// that already triggered the load.
+    fn note_older_request(&mut self) {
+        if !self.overlay_owns_input() && self.transcript_at_oldest() && self.can_load_older() {
+            self.older_requested = true;
+        }
+    }
+
     /// Scroll the transcript back through older messages, in display rows.
     pub fn scroll_back(&mut self, rows: usize) {
         self.scroll = self.scroll.saturating_add(rows);
         self.anchor_scroll();
+        self.note_older_request();
     }
 
     /// Scroll forward towards the newest message. Zero means pinned to the newest.
@@ -699,6 +946,7 @@ impl App {
     pub fn scroll_to_oldest(&mut self) {
         self.scroll = usize::MAX;
         self.anchor_scroll();
+        self.note_older_request();
     }
 
     /// Return to the newest message without changing composition.
@@ -4726,5 +4974,219 @@ mod tests {
             day_label(1_700_000_000_000).1,
             day_label(1_700_000_060_000).1
         );
+    }
+
+    #[test]
+    fn older_cursor_uses_the_true_oldest_even_when_unsorted() {
+        let mut app = App::default();
+        let chat = conversation("cursor", Some(30));
+        app.messages.insert(
+            chat.id.clone(),
+            vec![
+                message(&chat, "b", 20, "b"),
+                message(&chat, "c", 30, "c"),
+                message(&chat, "a", 10, "a"),
+            ],
+        );
+        app.select(Some(chat.id.clone()));
+
+        let (id, cursor) = app.begin_load_older().expect("cursor");
+        assert_eq!(id, chat.id);
+        assert_eq!(cursor.created_at, 10);
+        assert_eq!(cursor.id.value(), "a");
+        assert!(app.begin_load_older().is_none(), "one request at a time");
+    }
+
+    #[test]
+    fn older_page_prepends_in_order_deduplicates_and_keeps_reading_state() {
+        let mut app = App::default();
+        let chat = conversation("prepend", Some(300));
+        let window_two = message(&chat, "w2", 200, "window-2");
+        let window_three = message(&chat, "w3", 300, "window-3");
+        app.messages.insert(
+            chat.id.clone(),
+            vec![window_two.clone(), window_three.clone()],
+        );
+        app.select(Some(chat.id.clone()));
+        app.scroll = 5;
+        app.reading_anchor = Some(crate::transcript::ReadingAnchor {
+            conversation: chat.id.clone(),
+            message: window_two.id().clone(),
+            row: 3,
+        });
+
+        let (id, _) = app.begin_load_older().expect("cursor");
+        app.finish_load_older(
+            id,
+            vec![
+                message(&chat, "old", 100, "older"),
+                message(&chat, "w2", 200, "duplicate"),
+            ],
+            OLDER_PAGE_LIMIT,
+        );
+
+        let texts: Vec<String> = app.messages[&chat.id].iter().map(message_text).collect();
+        assert_eq!(texts, vec!["older", "window-2", "window-3"]);
+        assert_eq!(app.scroll, 5);
+        let kept_anchor = app.reading_anchor.as_ref().expect("anchor kept");
+        assert_eq!(kept_anchor.conversation, chat.id);
+        assert_eq!(kept_anchor.message, window_two.id().clone());
+        assert_eq!(kept_anchor.row, 3);
+    }
+
+    #[test]
+    fn short_older_page_is_exhausted_and_still_prepends() {
+        let mut app = App::default();
+        let chat = conversation("short", Some(200));
+        app.messages
+            .insert(chat.id.clone(), vec![message(&chat, "w", 200, "window")]);
+        app.select(Some(chat.id.clone()));
+
+        let (id, _) = app.begin_load_older().expect("cursor");
+        app.finish_load_older(
+            id,
+            vec![message(&chat, "old", 100, "older")],
+            OLDER_PAGE_LIMIT,
+        );
+
+        assert!(app.older_exhausted.contains(&chat.id));
+        let ids: Vec<&str> = app.messages[&chat.id]
+            .iter()
+            .map(|message| message.id().value())
+            .collect();
+        assert_eq!(ids, vec!["old", "w"]);
+        assert!(!app.can_load_older(), "exhausted history cannot page again");
+    }
+
+    #[test]
+    fn snapshot_replaces_newest_window_but_retains_paged_history() {
+        let mut app = App::default();
+        let chat = conversation("retain", Some(20));
+        app.messages.insert(
+            chat.id.clone(),
+            vec![message(&chat, "window", 20, "original")],
+        );
+        app.select(Some(chat.id.clone()));
+        let (id, _) = app.begin_load_older().expect("cursor");
+        app.finish_load_older(
+            id,
+            vec![message(&chat, "old", 10, "paged")],
+            OLDER_PAGE_LIMIT,
+        );
+        assert!(app.older_loaded.contains(&chat.id));
+
+        app.apply_snapshot(Snapshot {
+            revision: crate::daemon::next_revision(),
+            visible: Some(chat.id.clone()),
+            conversations: vec![chat.clone()],
+            history: vec![
+                message(&chat, "window", 20, "replaced"),
+                message(&chat, "new", 30, "newest"),
+            ],
+        });
+
+        let texts: Vec<String> = app.messages[&chat.id].iter().map(message_text).collect();
+        assert_eq!(texts, vec!["paged", "replaced", "newest"]);
+    }
+
+    #[test]
+    fn older_history_budget_keeps_the_newest_paged_messages() {
+        let mut app = App::default();
+        let chat = conversation("budget", Some(10_000_000));
+        // History reaches the app through a snapshot, which also records the
+        // newest-window boundary the budget is measured against.
+        app.set_conversations(vec![chat.clone()]);
+        app.apply_snapshot(crate::daemon::Snapshot {
+            revision: crate::daemon::next_revision(),
+            visible: Some(chat.id.clone()),
+            conversations: vec![chat.clone()],
+            history: vec![message(&chat, "window", 10_000_000, "window")],
+        });
+
+        for round in 0..6i64 {
+            let page: Vec<Message> = (0..200i64)
+                .map(|offset| {
+                    let at = 1_000_000 - (round + 1) * 200 + offset;
+                    message(&chat, &format!("r{round}-{offset}"), at, "paged")
+                })
+                .collect();
+            let (id, _) = app.begin_load_older().expect("cursor");
+            app.finish_load_older(id, page, OLDER_PAGE_LIMIT);
+        }
+
+        let ids: Vec<&str> = app.messages[&chat.id]
+            .iter()
+            .map(|message| message.id().value())
+            .collect();
+        assert_eq!(ids.len(), OLDER_HISTORY_BUDGET + 1);
+        assert_eq!(
+            ids.first(),
+            Some(&"r4-0"),
+            "oldest page beyond budget trimmed"
+        );
+        assert!(ids.iter().all(|id| !id.starts_with("r5-")));
+        assert_eq!(ids.last(), Some(&"window"));
+    }
+
+    #[test]
+    fn stale_older_result_does_not_clear_current_loading() {
+        let mut app = App::default();
+        let first = conversation("first", Some(20));
+        let second = conversation("second", Some(20));
+        app.messages
+            .insert(first.id.clone(), vec![message(&first, "a", 10, "a")]);
+        app.messages
+            .insert(second.id.clone(), vec![message(&second, "b", 10, "b")]);
+        app.select(Some(first.id.clone()));
+        let (id, _) = app.begin_load_older().expect("cursor");
+        assert_eq!(id, first.id);
+
+        app.finish_load_older(
+            second.id.clone(),
+            vec![message(&second, "old", 5, "old")],
+            1,
+        );
+
+        assert_eq!(app.older_loading, Some(first.id.clone()));
+        assert_eq!(app.messages[&second.id].len(), 1);
+        assert!(!app.older_loaded.contains(&second.id));
+    }
+
+    #[test]
+    fn alias_migration_carries_older_page_state() {
+        let mut app = App::default();
+        let legacy = conversation("legacy", Some(20));
+        let mut canonical = conversation("canonical", Some(20));
+        canonical.aliases = vec![legacy.id.clone()];
+        let floor = message(&legacy, "floor", 10, "floor");
+        app.selected = Some(legacy.id.clone());
+        app.older_loaded.insert(legacy.id.clone());
+        app.older_exhausted.insert(legacy.id.clone());
+        app.older_loading = Some(legacy.id.clone());
+        app.older_window_floor
+            .insert(legacy.id.clone(), floor.id().clone());
+
+        app.set_conversations(vec![canonical.clone()]);
+
+        assert_eq!(app.selected, Some(canonical.id.clone()));
+        assert!(app.older_loaded.contains(&canonical.id));
+        assert!(app.older_exhausted.contains(&canonical.id));
+        assert_eq!(app.older_window_floor.get(&canonical.id), Some(floor.id()));
+        assert!(!app.older_loaded.contains(&legacy.id));
+        assert!(!app.older_exhausted.contains(&legacy.id));
+        assert!(!app.older_window_floor.contains_key(&legacy.id));
+        assert_eq!(
+            app.older_loading, None,
+            "an in-flight reply still carries the retired id, so the slot is dropped"
+        );
+
+        // The dropped slot must not wedge paging for the canonical conversation.
+        app.messages.insert(
+            canonical.id.clone(),
+            vec![message(&canonical, "only", 30, "only")],
+        );
+        app.older_exhausted.remove(&canonical.id);
+        assert!(app.can_load_older());
+        assert!(app.begin_load_older().is_some());
     }
 }

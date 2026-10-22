@@ -36,7 +36,7 @@ The current bounded UI pass implements stable message-owned reading anchors, a m
 
 Remaining:
 
-- Cursor-based local pagination beyond 200 stored messages, with stable viewport and bounded memory. The daemon, store and IPC now provide keyset paging (`History` with an optional `before` cursor, protocol version 2) with ordering and boundary tests; the TUI still requests only the newest page. Remaining work is the in-app older-page load itself: a bounded page fetch, prepend without moving the reading anchor, and reconciliation that does not discard loaded pages on the five-second snapshot.
+- Cursor-based local pagination is implemented: keyset paging in the store and IPC (protocol version 2), and the transcript loads the previous page when the reader reaches the oldest loaded row, keeps paged history across reconciliation for that chat, and bounds retained pages. Remaining work is paging affordances for very deep histories and message-content search, not the base older-page load.
 - Local message-content search and authoritative unread navigation. Chats searches conversation names/addresses only, not message content.
 - Undo and, only after privacy/retention review, encrypted durable drafts.
 - Consider typed interaction modes to reduce independent flag combinations, but only behind regression coverage for modal transitions, recipient changes, aliases, filters and asynchronous results.

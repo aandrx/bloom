@@ -9,7 +9,7 @@ use bloom_domain::{
     MessageId, MessagePart, Participant, TransportId,
 };
 use bloom_tui::{
-    app::{App, Focus, SendFeedback, SendPhase, Theme},
+    app::{App, Focus, SendFeedback, SendPhase, Theme, OLDER_PAGE_LIMIT},
     daemon::ConnectionState,
     ui,
 };
@@ -3188,6 +3188,166 @@ fn the_command_popup_aligns_with_the_chat_not_the_center() {
         row_text(&narrow, 9).contains("/help")
             || (0..12).any(|y| row_text(&narrow, y).contains("/help")),
         "menu survives narrow short layout"
+    );
+}
+
+#[test]
+fn older_page_keeps_every_visible_message_on_screen_when_the_thread_fits() {
+    let only = conversation("Short thread", 2, 1);
+    let mut app = App::default();
+    app.set_conversations(vec![only.clone()]);
+    app.selected = Some(only.id.clone());
+    for index in 0..3 {
+        app.upsert(
+            only.id.clone(),
+            message(
+                &only,
+                &format!("s{index:03}"),
+                1_700_000_000_000 + index,
+                &format!("short message {index:03}"),
+                false,
+            ),
+        );
+    }
+    let (buffer, _) = tracked_frame(&mut app, 100, 24);
+    assert_eq!(app.scroll, 0, "the whole thread fits on screen");
+    assert!((0..24).any(|y| row_text(&buffer, y).contains("short message 000")));
+
+    app.scroll_back(1);
+    assert!(
+        app.older_requested,
+        "the fitting thread is already at its oldest row"
+    );
+    let (id, _) = app.begin_load_older().expect("a cursor");
+    app.finish_load_older(
+        id,
+        // Enough to push the whole thread past the viewport once merged.
+        (0..40)
+            .map(|index| {
+                message(
+                    &only,
+                    &format!("older{index:03}"),
+                    1_699_999_999_000 + index,
+                    &format!("older message {index:03}"),
+                    false,
+                )
+            })
+            .collect(),
+        OLDER_PAGE_LIMIT,
+    );
+
+    let (buffer, _) = tracked_frame(&mut app, 100, 24);
+    let screen = (0..24)
+        .map(|y| row_text(&buffer, y))
+        .collect::<Vec<_>>()
+        .join("\n");
+    for index in 0..3 {
+        let marker = format!("short message {index:03}");
+        assert!(
+            (0..24).any(|y| row_text(&buffer, y).contains(&marker)),
+            "every message that was on screen must stay on screen: {marker}\n{screen}"
+        );
+    }
+}
+
+#[test]
+fn older_page_requests_fire_only_at_the_top_and_preserve_the_reading_anchor() {
+    let only = conversation("Long thread", 2, 1);
+    let mut app = App::default();
+    app.set_conversations(vec![only.clone()]);
+    app.selected = Some(only.id.clone());
+    for index in 0..80 {
+        app.upsert(
+            only.id.clone(),
+            message(
+                &only,
+                &format!("m{index:03}"),
+                1_700_000_000_000 + index,
+                &format!("message number {index:03}"),
+                false,
+            ),
+        );
+    }
+    tracked_frame(&mut app, 100, 24);
+    assert!(
+        app.transcript_viewport
+            .as_ref()
+            .is_some_and(|view| view.max_scroll() > 0),
+        "the fixture must be long enough to scroll"
+    );
+
+    app.handle_key(KeyEvent::new(KeyCode::PageUp, KeyModifiers::NONE));
+    tracked_frame(&mut app, 100, 24);
+    assert!(
+        !app.older_requested,
+        "a mid-thread scroll must not request older history"
+    );
+    assert!(app.is_scrolled_back());
+
+    for _ in 0..100 {
+        if app.older_requested {
+            break;
+        }
+        app.handle_key(KeyEvent::new(KeyCode::PageUp, KeyModifiers::NONE));
+        tracked_frame(&mut app, 100, 24);
+    }
+    assert!(
+        app.older_requested,
+        "reaching the oldest loaded row must request older history"
+    );
+
+    // An overlay owns the transcript and must not page history underneath itself.
+    tracked_frame(&mut app, 100, 24);
+    app.older_requested = false;
+    app.open_settings();
+    app.scroll_back(10);
+    assert!(
+        !app.older_requested,
+        "an overlay must keep the transcript from paging"
+    );
+    app.settings_open = false;
+
+    tracked_frame(&mut app, 100, 24);
+    assert!(
+        !rendered(&app).contains("↑ older"),
+        "reaching the top requests the page directly, so no separate affordance is drawn:\n{}",
+        rendered(&app)
+    );
+    let anchor = app
+        .reading_anchor
+        .as_ref()
+        .expect("a scrolled view records its reading anchor")
+        .message
+        .clone();
+
+    let (id, _) = app.begin_load_older().expect("an older page cursor");
+    app.finish_load_older(
+        id,
+        (0..10)
+            .map(|index| {
+                message(
+                    &only,
+                    &format!("old{index:03}"),
+                    1_699_999_999_000 + index,
+                    &format!("older message {index:03}"),
+                    false,
+                )
+            })
+            .collect(),
+        OLDER_PAGE_LIMIT,
+    );
+    assert!(
+        !app.older_requested,
+        "starting and finishing a page clears the pending request"
+    );
+
+    tracked_frame(&mut app, 100, 24);
+    assert_eq!(
+        app.reading_anchor
+            .as_ref()
+            .map(|anchor| anchor.message.clone()),
+        Some(anchor),
+        "loading older history must keep the message being read at the top"
     );
 }
 

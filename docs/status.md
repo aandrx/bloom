@@ -7,6 +7,7 @@
 - Rust daemon serving authenticated local Unix-socket IPC, external Dart engine adapter, encrypted SQLite storage/keychain integration, idempotent message ingestion and persistence before inbound fanout.
 - TUI conversation list, local stored transcript, sender grouping, text composition/sending, existing/new-chat correlation, event-driven delivery labels, uncertain-outcome warnings and explicit failed-draft recovery.
 - Recipient-owned session drafts and modal suspension, literal bracketed paste, grapheme editing/wrapping, exact multiline whitespace and responsive resize.
+- On-demand older-page loading from local storage: reaching the oldest loaded row fetches the previous keyset page, keeps it across reconciliation for chats you paged back, and bounds retained paged history. Chats you never paged still replace wholesale, and no remote history is fetched.
 - Message-owned reading anchors across arrivals/reconciliation/edits/reflow and canonical identities; measured mouse/End Latest action and painted-overlay wheel ownership.
 - Below 70 columns, full-width conversations with a searchable Chats navigator. Query/candidate stay separate from actual recipient and parked composition until explicit open.
 - Known-participant contacts/search/local nicknames, local titles/hiding, conversation filtering, settings/theme/command pickers, keyboard/mouse paths, light/dark/automatic themes and monochrome cues.
@@ -18,7 +19,7 @@
 
 | Area | Boundary |
 | --- | --- |
-| History | Only Bloom's stored messages; TUI shows the latest 200; keyset paging exists in the daemon/IPC but no in-app older-page load yet; no remote/app historical import |
+| History | Only Bloom's stored messages; the transcript opens the newest 200 and loads earlier pages from local storage on demand (bounded paged budget, session only); no remote/app historical import |
 | Live service | Synthetic sidecar/IPC/PTY coverage; current real-engine changes not live-revalidated; no automatic engine-generation recovery |
 | Groups | Existing group text conditional on recipient-list capability; no group-management workflow |
 | Rich messaging | Unsupported inbound parts are placeholders; no attachment send/open/download, reactions, edits or unsend UI |
@@ -45,6 +46,6 @@ Independent source review for the current UI pass found a canonical-alias readin
 
 ## Release blockers and next work
 
-The user-directed priority remains UI/UX; this bounded reading/navigation pass is accepted, not permission to resume integrations or access a live account. [The roadmap](implementation-plan.md) keeps backend work queued: generation-scoped engine recovery, verified historical ingestion semantics/implementation, the in-app older-page load plus message search and unread navigation, then standalone runtime packaging. Keep the existing registration exclusively owned and do not automatically replay uncertain sends. [IDS validation](ids-validation-gate.md) remains separate and blocked.
+The user-directed priority remains UI/UX; this bounded reading/navigation pass is accepted, not permission to resume integrations or access a live account. [The roadmap](implementation-plan.md) keeps backend work queued: generation-scoped engine recovery, verified historical ingestion semantics/implementation, message search and unread navigation, then standalone runtime packaging. Keep the existing registration exclusively owned and do not automatically replay uncertain sends. [IDS validation](ids-validation-gate.md) remains separate and blocked.
 
 Optional mutation guards in `scripts/check-guards` require clean files and restore their mutations; they are not CI evidence or permission to reset working changes. Inspect the manifest and current tests before running them.

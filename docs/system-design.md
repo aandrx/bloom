@@ -62,7 +62,7 @@ The real schema is versioned and stores serialized conversation/message domain d
 
 The database key comes from the secret store. Provision a key only for a new database. An existing database with a missing key returns `ExistingDatabaseKeyMissing`; never replace its key, fall back to plaintext, or delete the database as recovery.
 
-Engine events enter the daemon's bounded event path, are persisted, and then fan out to IPC subscribers. Duplicate messages upsert by message ID. After IPC reconnect the client subscribes/resnapshots and preserves revision ordering; visible history reconciles every five seconds. The TUI requests the latest 200 stored messages. The daemon can page backwards from a known message, but the TUI does not request older pages yet. Remote historical import is absent.
+Engine events enter the daemon's bounded event path, are persisted, and then fan out to IPC subscribers. Duplicate messages upsert by message ID. After IPC reconnect the client subscribes/resnapshots and preserves revision ordering; visible history reconciles every five seconds. The TUI opens the latest 200 stored messages and asks for the previous keyset page when the reader reaches the oldest loaded row. Paged history is kept in the session up to a bounded budget and survives reconciliation for that chat; a chat the user never paged still replaces wholesale. Remote historical import is absent.
 
 Outbound sends first await engine acceptance, then persist the outgoing message as Sent and publish it before returning the accepted ID. There is no durable pre-send intent. A local persistence failure after remote acceptance cannot undo that send and must not justify automatic retry.
 

@@ -3560,6 +3560,18 @@ fn composer_feedback(app: &App, palette: &Palette, back: usize) -> Option<(Strin
             palette.yellow,
         ));
     }
+    // Older-history feedback sits below everything actionable, so a page failure
+    // never hides a send result or a saved draft the user can recover.
+    if let Some(message) = app.older_error.as_deref() {
+        return Some((message.to_owned(), palette.red));
+    }
+    if app
+        .older_loading
+        .as_ref()
+        .is_some_and(|id| app.selected.as_ref() == Some(id))
+    {
+        return Some(("Loading older messages…".to_owned(), palette.muted));
+    }
     if app.is_scrolled_back() && back > 0 {
         return Some((
             "↑ reading back · End returns to the newest".to_owned(),

@@ -6,7 +6,7 @@ use bloom_ipc::{
     client::{BloomClient, ClientError},
     EventKind, ProtocolError,
 };
-use bloom_tui::app::{App, SendFailure, Theme};
+use bloom_tui::app::{App, SendFailure, Theme, OLDER_PAGE_LIMIT};
 use bloom_tui::config::Config;
 use bloom_tui::daemon::{self, ConnectionState, Snapshot};
 use bloom_tui::diagnostics::{self, Stage};
@@ -227,6 +227,7 @@ async fn main() -> Result<()> {
     let (conversation_tx, mut conversation_rx) =
         mpsc::unbounded_channel::<Vec<bloom_domain::Conversation>>();
     let (sync_tx, mut sync_rx) = mpsc::unbounded_channel();
+    let (older_tx, mut older_rx) = mpsc::unbounded_channel();
     let (visible_tx, visible_rx) = watch::channel::<Option<bloom_domain::ConversationId>>(None);
 
     {
@@ -383,6 +384,16 @@ async fn main() -> Result<()> {
                 app.finish_send_receipt(attempt, conversation, result);
                 redraw.request();
             },
+            Some((conversation, result)) = older_rx.recv() => {
+                match result {
+                    Ok(page) => app.finish_load_older(conversation, page, OLDER_PAGE_LIMIT),
+                    Err(_) => app.fail_load_older(
+                        conversation,
+                        "Older messages could not be loaded.".into(),
+                    ),
+                }
+                redraw.request();
+            },
             Some(result) = sync_rx.recv() => {
                 app.finish_sync(result);
                 // `/sync` refreshes metadata, not remote message history. Re-read
@@ -489,6 +500,22 @@ async fn main() -> Result<()> {
                         Err(error) => {
                             app.error = Some(format!("Could not save local settings: {error}"));
                         }
+                    }
+                }
+                if app.older_requested {
+                    // Keep the request pending while another page is in flight, so a
+                    // gesture is not silently dropped by the single-request rule.
+                    if let Some((conversation, cursor)) = app.begin_load_older() {
+                        app.older_requested = false;
+                        let client = client.clone();
+                        let tx = older_tx.clone();
+                        tokio::spawn(async move {
+                            let result = client
+                                .history_before(conversation.clone(), OLDER_PAGE_LIMIT, cursor)
+                                .await;
+                            let _ = tx.send((conversation, result));
+                        });
+                        redraw.request();
                     }
                 }
                 // A selection change is a request for a fresh read, not an event.
