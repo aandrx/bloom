@@ -4,6 +4,12 @@
 Build bloom-tui first and run with the Python/pyte environment used by the E2E
 suites. Measures input to readable reconstructed terminal state, not compositor
 presentation or a real engine. Example stress case: --body-repeat 100.
+
+The very first chat_next_body sample is the cold layout miss: BOB has never
+been laid out at startup, so later samples are warm cache hits. That first
+sample is also recorded once as chat_first_visit, without changing the
+existing series. Returning to ALICE is not a cold case: it was laid out at
+startup and stays inside the four-entry cache with only two chats.
 """
 import argparse
 import fcntl
@@ -94,7 +100,9 @@ def benchmark(args):
             started = time.perf_counter()
             os.write(master, key)
             until(predicate)
-            timings.setdefault(label, []).append((time.perf_counter() - started) * 1000)
+            elapsed = (time.perf_counter() - started) * 1000
+            timings.setdefault(label, []).append(elapsed)
+            return elapsed
 
         for _ in range(args.samples):
             measure('settings_open', b',', lambda: 'Settings' in text())
@@ -103,7 +111,10 @@ def benchmark(args):
             measure('help_close', b'\x1b', lambda: 'Keyboard shortcuts' not in text())
         if args.columns >= 70:
             for _ in range(args.samples):
-                measure('chat_next_body', b'\x02n', lambda: chat_visible('BOB'))
+                next_elapsed = measure('chat_next_body', b'\x02n', lambda: chat_visible('BOB'))
+                if 'chat_first_visit' not in timings:
+                    # Only the first BOB layout has no cached dimensions or text.
+                    timings['chat_first_visit'] = [next_elapsed]
                 measure('chat_previous_body', b'\x02p', lambda: chat_visible('ALICE'))
         else:
             for _ in range(args.samples):

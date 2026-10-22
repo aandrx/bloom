@@ -61,26 +61,86 @@ pub struct Snapshot {
 ///
 /// If the requested conversation no longer exists the first conversation is chosen
 /// instead, so the caller never shows an empty thread for a deleted conversation.
+///
+/// An explicit selection reads its history concurrently with the conversation list,
+/// then accepts that read only if the selection is still visible afterwards. The
+/// trade-off is freshness: history can predate the list by one list round trip, so a
+/// message stored in that window is picked up by the next reconciliation rather than
+/// this snapshot.
 pub async fn snapshot(
     client: &BloomClient,
     requested: Option<ConversationId>,
 ) -> Result<Snapshot, ClientError> {
     let revision = next_revision();
-    let conversations = client.list_conversations().await?;
-    let visible = requested
-        .filter(|id| {
-            conversations
-                .iter()
-                .any(|conversation| &conversation.id == id)
-        })
+    let Some(requested_id) = requested else {
+        // Nothing is selected, so there is no history to read until the list names
+        // the conversation to show.
+        let conversations = client.list_conversations().await?;
+        let visible = conversations
+            .first()
+            .map(|conversation| conversation.id.clone());
+        let history = match &visible {
+            Some(id) => client.history(id.clone(), HISTORY_LIMIT).await?,
+            None => Vec::new(),
+        };
+        return Ok(Snapshot {
+            revision,
+            visible,
+            conversations,
+            history,
+        });
+    };
+
+    // Poll both reads concurrently and let the conversation list win: its error is
+    // the one callers saw before history was speculative, so a slow history read
+    // must never delay it. Boxing keeps the speculative read cancellable, so a
+    // fallback can drop it instead of waiting.
+    let mut listed = Box::pin(client.list_conversations());
+    let mut speculative = Some(Box::pin(
+        client.history(requested_id.clone(), HISTORY_LIMIT),
+    ));
+    let mut speculative_result = None;
+    let conversations = loop {
+        if speculative_result.is_some() {
+            break listed.as_mut().await?;
+        }
+        tokio::select! {
+            biased;
+            listed_result = &mut listed => break listed_result?,
+            history_result = speculative
+                .as_mut()
+                .expect("speculative history is pending") => {
+                speculative_result = Some(history_result);
+            }
+        }
+    };
+    let visible = conversations
+        .iter()
+        .any(|conversation| conversation.id == requested_id)
+        .then(|| requested_id.clone())
         .or_else(|| {
             conversations
                 .first()
                 .map(|conversation| conversation.id.clone())
         });
-    let history = match &visible {
-        Some(id) => client.history(id.clone(), HISTORY_LIMIT).await?,
-        None => Vec::new(),
+    let history = if visible.as_ref() == Some(&requested_id) {
+        match speculative_result {
+            Some(history) => history?,
+            None => {
+                speculative
+                    .take()
+                    .expect("speculative history is still pending")
+                    .await?
+            }
+        }
+    } else {
+        // The requested conversation fell back or disappeared: cancel the read
+        // instead of waiting for history that will never be published.
+        drop(speculative.take());
+        match &visible {
+            Some(id) => client.history(id.clone(), HISTORY_LIMIT).await?,
+            None => Vec::new(),
+        }
     };
     Ok(Snapshot {
         revision,

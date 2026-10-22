@@ -6,10 +6,12 @@ use bloom_domain::{
     MessageId, MessagePart, Participant, TransportId,
 };
 use bloom_ipc::{
-    read_request, write_event, write_response, ConversationSyncStatus, Event, EventKind,
-    RequestKind, Response, ResponseKind,
+    client::ClientError, read_request, write_event, write_response, ConversationSyncStatus, Event,
+    EventKind, ProtocolError, RequestKind, Response, ResponseKind,
 };
-use bloom_tui::daemon::{pump_session, pump_session_with_interval, ConnectionState, Snapshot};
+use bloom_tui::daemon::{
+    pump_session, pump_session_with_interval, snapshot, ConnectionState, Snapshot,
+};
 use std::{
     fs,
     os::unix::fs::PermissionsExt,
@@ -68,6 +70,9 @@ struct FakeDaemon {
     history_requests: Arc<Mutex<Vec<String>>>,
     first_thread_updates: Arc<Mutex<Vec<Message>>>,
     history_delay: Arc<Mutex<Duration>>,
+    list_delay: Arc<Mutex<Duration>>,
+    list_failure: Arc<Mutex<bool>>,
+    timeline: Arc<Mutex<Vec<String>>>,
     accept: tokio::task::JoinHandle<()>,
     _dir: tempfile::TempDir,
 }
@@ -89,12 +94,18 @@ impl FakeDaemon {
         let history_requests = Arc::new(Mutex::new(Vec::new()));
         let first_thread_updates = Arc::new(Mutex::new(Vec::new()));
         let history_delay = Arc::new(Mutex::new(Duration::ZERO));
+        let list_delay = Arc::new(Mutex::new(Duration::ZERO));
+        let list_failure = Arc::new(Mutex::new(false));
+        let timeline = Arc::new(Mutex::new(Vec::new()));
 
         let accept = {
             let events = events.clone();
             let history_requests = history_requests.clone();
             let first_thread_updates = first_thread_updates.clone();
             let history_delay = history_delay.clone();
+            let list_delay = list_delay.clone();
+            let list_failure = list_failure.clone();
+            let timeline = timeline.clone();
             tokio::spawn(async move {
                 loop {
                     let Ok((mut stream, _)) = listener.accept().await else {
@@ -104,12 +115,32 @@ impl FakeDaemon {
                     let history_requests = history_requests.clone();
                     let first_thread_updates = first_thread_updates.clone();
                     let history_delay = history_delay.clone();
+                    let list_delay = list_delay.clone();
+                    let list_failure = list_failure.clone();
+                    let timeline = timeline.clone();
                     let conversations = conversations.clone();
                     tokio::spawn(async move {
                         while let Ok(request) = read_request(&mut stream).await {
                             let request_id = request.request_id;
                             match request.request {
                                 RequestKind::ListConversations => {
+                                    timeline.lock().unwrap().push("list:start".to_owned());
+                                    if *list_failure.lock().unwrap() {
+                                        let _ = write_response(
+                                            &mut stream,
+                                            &Response {
+                                                request_id,
+                                                response: ResponseKind::Error {
+                                                    error: ProtocolError::Internal,
+                                                },
+                                            },
+                                        )
+                                        .await;
+                                        continue;
+                                    }
+                                    let delay = *list_delay.lock().unwrap();
+                                    tokio::time::sleep(delay).await;
+                                    timeline.lock().unwrap().push("list:end".to_owned());
                                     let _ = write_response(
                                         &mut stream,
                                         &Response {
@@ -129,6 +160,10 @@ impl FakeDaemon {
                                         .lock()
                                         .unwrap()
                                         .push(conversation_id.value().to_owned());
+                                    timeline
+                                        .lock()
+                                        .unwrap()
+                                        .push(format!("history:{}", conversation_id.value()));
                                     let delay = *history_delay.lock().unwrap();
                                     tokio::time::sleep(delay).await;
                                     let target = conversations
@@ -227,6 +262,9 @@ impl FakeDaemon {
             history_requests,
             first_thread_updates,
             history_delay,
+            list_delay,
+            list_failure,
+            timeline,
             accept,
             _dir: dir,
         }
@@ -246,6 +284,18 @@ impl FakeDaemon {
 
     fn delay_history(&self, duration: Duration) {
         *self.history_delay.lock().unwrap() = duration;
+    }
+
+    fn delay_list(&self, duration: Duration) {
+        *self.list_delay.lock().unwrap() = duration;
+    }
+
+    fn fail_list(&self) {
+        *self.list_failure.lock().unwrap() = true;
+    }
+
+    fn timeline(&self) -> Vec<String> {
+        self.timeline.lock().unwrap().clone()
     }
 
     fn receive_without_event(&self, conversation: &Conversation) {
@@ -283,6 +333,107 @@ async fn next_snapshot(receiver: &mut mpsc::UnboundedReceiver<Snapshot>) -> Snap
         .await
         .expect("a snapshot arrives")
         .expect("snapshot channel open")
+}
+
+#[tokio::test]
+async fn explicit_selection_reads_history_before_the_slow_list_returns() {
+    let daemon = FakeDaemon::start(false);
+    let client = bloom_ipc::client::BloomClient::new(daemon.socket());
+    daemon.delay_list(Duration::from_millis(300));
+    let requested = conversation("second@example.com", 10).id;
+
+    let snap = snapshot(&client, Some(requested.clone()))
+        .await
+        .expect("an explicit selection snapshots");
+
+    let timeline = daemon.timeline();
+    let history_at = timeline
+        .iter()
+        .position(|entry| entry == "history:second@example.com")
+        .unwrap_or_else(|| {
+            panic!("history for the requested thread reached the daemon: {timeline:?}")
+        });
+    let list_end_at = timeline
+        .iter()
+        .position(|entry| entry == "list:end")
+        .expect("the list response completed");
+    assert!(
+        history_at < list_end_at,
+        "explicit history must start before the delayed list response completes: {timeline:?}"
+    );
+    assert_eq!(snap.visible.as_ref(), Some(&requested));
+    assert_eq!(snap.history.len(), 1);
+    assert_eq!(
+        snap.history[0].parts(),
+        &[MessagePart::Text("from history".into())]
+    );
+    assert_eq!(
+        daemon.history_requests(),
+        vec!["second@example.com".to_owned()],
+        "the speculative history result is used, not fetched twice"
+    );
+}
+
+#[tokio::test]
+async fn list_failure_is_not_held_up_by_a_concurrent_history_read() {
+    // This guards the speculative design, not a pre-existing defect: the previous
+    // serial order returned the list error immediately only because it never issued
+    // history first. Once history is speculative, a slow read must not delay it.
+    let daemon = FakeDaemon::start(false);
+    let client = bloom_ipc::client::BloomClient::new(daemon.socket());
+    daemon.fail_list();
+    daemon.delay_history(Duration::from_millis(600));
+    let requested = conversation("second@example.com", 10).id;
+
+    let started = std::time::Instant::now();
+    let result = snapshot(&client, Some(requested)).await;
+    let elapsed = started.elapsed();
+
+    assert_eq!(result, Err(ClientError::Server(ProtocolError::Internal)));
+    // Keep a wide margin below the 600 ms delay so a loaded machine cannot turn
+    // promptness into a flake.
+    assert!(
+        elapsed < Duration::from_millis(500),
+        "a list error must not wait for the speculative history read: {elapsed:?}"
+    );
+}
+
+#[tokio::test]
+async fn missing_requested_conversation_falls_back_to_the_first_thread_history() {
+    let daemon = FakeDaemon::start(false);
+    let client = bloom_ipc::client::BloomClient::new(daemon.socket());
+    let missing = conversation("missing@example.com", 1).id;
+
+    let snap = snapshot(&client, Some(missing.clone()))
+        .await
+        .expect("a missing selection still snapshots the first thread");
+
+    assert_eq!(
+        snap.visible.as_ref().map(|id| id.value().to_owned()),
+        Some("first@example.com".to_owned()),
+        "a deleted selection falls back to the first conversation"
+    );
+    assert_eq!(snap.history.len(), 1);
+    assert_eq!(
+        snap.history[0].conversation_id(),
+        &conversation("first@example.com", 20).id,
+        "only the visible thread's history is published"
+    );
+    assert!(
+        snap.history
+            .iter()
+            .all(|entry| entry.conversation_id() != &missing),
+        "the vanished selection's history is never published"
+    );
+    // Outcome, not an exact request sequence: whether the speculative miss reaches
+    // the daemon before the list resolves is a scheduling detail, not a contract.
+    assert!(
+        daemon
+            .history_requests()
+            .iter()
+            .any(|requested| requested == "first@example.com"),
+        "the fallback thread's history is read"
+    );
 }
 
 #[tokio::test]
