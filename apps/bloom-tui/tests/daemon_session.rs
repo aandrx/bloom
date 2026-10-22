@@ -155,6 +155,7 @@ impl FakeDaemon {
                                 RequestKind::History {
                                     conversation_id,
                                     limit,
+                                    before: _,
                                 } => {
                                     history_requests
                                         .lock()

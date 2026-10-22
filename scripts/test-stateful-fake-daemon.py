@@ -17,7 +17,7 @@ TIMEOUT = 2.0
 
 def send(client, obj):
     payload = json.dumps(obj).encode()
-    client.sendall(b"\x01" + struct.pack(">I", len(payload)) + payload)
+    client.sendall(b"\x02" + struct.pack(">I", len(payload)) + payload)
 
 
 def recv_exact(client, size):
@@ -33,7 +33,7 @@ def recv_exact(client, size):
 def recv(client):
     header = recv_exact(client, 5)
     version, size = struct.unpack(">BI", header)
-    if version != 1 or not 0 < size <= 1048576:
+    if version != 2 or not 0 < size <= 1048576:
         raise AssertionError("invalid response frame")
     return json.loads(recv_exact(client, size))
 
@@ -202,6 +202,53 @@ class Tests(unittest.TestCase):
         self.assertEqual(len(request(self.sock, "history", conversation_id=args["conversation_id"], limit=50)["messages"]), 1)
         sub = self.subscriber()
         sub.close()
+
+    def test_history_before_pages_contiguously_and_default_is_newest(self):
+        conversation = {"transport": "openbubbles", "value": "alice@example.invalid"}
+        for index in range(5):
+            result = request(self.sock, "fixture_append_message",
+                             conversation_id=conversation, text=f"page {index}")
+            self.assertEqual(result["result"], "fixture_append_message")
+        # Freeze the fixture timestamps and ids so ordering is deterministic even
+        # when the sends above land in the same millisecond.
+        self.stop()
+        with open(self.store, encoding="utf-8") as stream:
+            state = json.load(stream)
+        for index, message in enumerate(state["messages"]):
+            message["created_at"] = 1000 + index * 10
+            message["id"]["value"] = f"page-{index}"
+        with open(self.store, "w", encoding="utf-8") as stream:
+            json.dump(state, stream)
+        self.start()
+
+        full = request(self.sock, "history", conversation_id=conversation, limit=50)["messages"]
+        expected = [f"page {index}" for index in range(5)]
+        self.assertEqual([m["parts"][0]["value"] for m in full], expected)
+
+        newest = request(self.sock, "history", conversation_id=conversation, limit=2)["messages"]
+        self.assertEqual(newest, full[-2:])
+
+        pages = []
+        cursor = None
+        # Bound the loop so a cursor that repeats a page fails the coverage assertion
+        # below instead of hanging the suite.
+        for _ in range(len(expected) + 2):
+            arguments = {"conversation_id": conversation, "limit": 2}
+            if cursor is not None:
+                arguments["before"] = cursor
+            page = request(self.sock, "history", **arguments)["messages"]
+            if not page:
+                break
+            pages.append(page)
+            if len(page) < 2:
+                break
+            cursor = {"created_at": page[0]["created_at"], "id": page[0]["id"]}
+        else:
+            self.fail("paging never reached the oldest message")
+
+        collected = [message["parts"][0]["value"] for page in reversed(pages) for message in page]
+        self.assertEqual(collected, expected)
+        self.assertEqual(len(collected), len(set(collected)))
 
 
 if __name__ == "__main__":

@@ -11,7 +11,7 @@ import threading
 import time
 import uuid
 
-VERSION = 1
+VERSION = 2
 MAX_FRAME = 1024 * 1024
 LOCK = threading.RLock()
 SUBS = set()
@@ -56,6 +56,11 @@ def read_frame(c):
     if payload is None:
         raise ValueError("truncated frame")
     return json.loads(payload)
+
+
+def history_key(item):
+    """Match the store ordering (created_at, id) with the id's stable JSON form."""
+    return item["created_at"], json.dumps(item["id"], separators=(",", ":"), ensure_ascii=False)
 
 
 def save(state, path):
@@ -260,7 +265,18 @@ def serve(client, args, state):
                             if cid.get("transport") != "openbubbles":
                                 raise LookupError
                             messages = [m for m in state["messages"] if m["conversation_id"] == cid]
-                            response = {"result": "history", "messages": copy.deepcopy(messages[-body.get("limit", len(messages)):])}
+                            limit = body.get("limit", len(messages))
+                            cursor = body.get("before")
+                            if not limit:
+                                selected = []
+                            elif cursor is None:
+                                selected = messages[-limit:]
+                            else:
+                                bound = history_key(cursor)
+                                older = [m for m in messages if history_key(m) < bound]
+                                older.sort(key=history_key)
+                                selected = older[-limit:]
+                            response = {"result": "history", "messages": copy.deepcopy(selected)}
                         elif op == "sync_conversations":
                             response = {"result": "conversation_sync", "status": "complete", "conversations": len(state["conversations"])}
                         else:

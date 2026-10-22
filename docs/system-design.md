@@ -62,7 +62,7 @@ The real schema is versioned and stores serialized conversation/message domain d
 
 The database key comes from the secret store. Provision a key only for a new database. An existing database with a missing key returns `ExistingDatabaseKeyMissing`; never replace its key, fall back to plaintext, or delete the database as recovery.
 
-Engine events enter the daemon's bounded event path, are persisted, and then fan out to IPC subscribers. Duplicate messages upsert by message ID. After IPC reconnect the client subscribes/resnapshots and preserves revision ordering; visible history reconciles every five seconds. The TUI requests the latest 200 stored messages. Remote historical import and local pagination are absent.
+Engine events enter the daemon's bounded event path, are persisted, and then fan out to IPC subscribers. Duplicate messages upsert by message ID. After IPC reconnect the client subscribes/resnapshots and preserves revision ordering; visible history reconciles every five seconds. The TUI requests the latest 200 stored messages. The daemon can page backwards from a known message, but the TUI does not request older pages yet. Remote historical import is absent.
 
 Outbound sends first await engine acceptance, then persist the outgoing message as Sent and publish it before returning the accepted ID. There is no durable pre-send intent. A local persistence failure after remote acceptance cannot undo that send and must not justify automatic retry.
 
@@ -71,6 +71,8 @@ Conversation metadata refresh is a separate operation with a correlated result. 
 ## Lifecycle and concurrency
 
 The daemon claims its private IPC socket before starting the engine child. Peer identity, private socket parent and bounded protocol framing are enforced. One owner per registration is a deployment requirement; using different sockets is not permission for multiple owners.
+
+IPC carries an explicit protocol version byte. It is currently 2: version 2 adds an optional keyset `before` cursor to history reads, so a client can page backwards from a known message without offsets. A peer that disagrees on the version is rejected when the frame is read rather than having fields silently ignored; the launcher and the documented `cargo install` steps build both binaries from the same tree. Because the launcher reuses a daemon that is already listening, an upgraded TUI talking to a daemon left over from an earlier build fails with "unsupported IPC protocol version" until that daemon is restarted. The TUI does not send a cursor yet, so user-visible history is still the latest stored page.
 
 The engine adapter rejects malformed/oversized output, fails pending waiters on stream failure and reaps the old child. Clean shutdown drains forwarding and persistence within bounds; it does not simply abort the store consumer. The launcher grants a 30-second daemon stop budget to cover drain stages, then forces termination/reaps if necessary. Signals during startup and active TUI operation clean up owned children. Pre-existing daemons are not terminated by a reusing launcher. Original terminal modes are restored on launcher exit.
 

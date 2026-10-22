@@ -2,7 +2,7 @@
 use std::{future::Future, pin::Pin, time::Duration};
 
 use bloom_domain::{Conversation, ConversationId, Message, MessageId, OutgoingBody};
-use bloom_ipc::{ProtocolError, RequestKind, Response, ResponseKind};
+use bloom_ipc::{HistoryCursor, ProtocolError, RequestKind, Response, ResponseKind};
 use tokio::{io::AsyncWrite, time::timeout};
 
 use super::{
@@ -22,6 +22,12 @@ pub trait RequestHandler: Send + Sync {
         &self,
         conversation_id: ConversationId,
         limit: u16,
+    ) -> HandlerFuture<'_, Vec<Message>>;
+    fn history_before(
+        &self,
+        conversation_id: ConversationId,
+        limit: u16,
+        before: HistoryCursor,
     ) -> HandlerFuture<'_, Vec<Message>>;
     fn send(
         &self,
@@ -99,13 +105,22 @@ async fn serve_inner<H: RequestHandler>(
             RequestKind::History {
                 conversation_id,
                 limit,
+                before,
             } => {
                 if limit == 0 || limit > u16::MAX as u32 {
                     ResponseKind::Error {
                         error: ProtocolError::InvalidRequest,
                     }
                 } else {
-                    match handler.history(conversation_id, limit as u16).await {
+                    let result = match before {
+                        Some(before) => {
+                            handler
+                                .history_before(conversation_id, limit as u16, before)
+                                .await
+                        }
+                        None => handler.history(conversation_id, limit as u16).await,
+                    };
+                    match result {
                         Ok(messages) => ResponseKind::History { messages },
                         Err(error) => ResponseKind::Error { error },
                     }
@@ -173,7 +188,9 @@ mod tests {
         net::UnixStream,
     };
 
-    struct FakeHandler(Arc<AtomicUsize>);
+    /// Counts newest-page reads and cursored reads separately, so a test can prove
+    /// which handler a request reached.
+    struct FakeHandler(Arc<AtomicUsize>, Arc<AtomicUsize>);
     impl RequestHandler for FakeHandler {
         fn list_conversations(&self) -> HandlerFuture<'_, Vec<Conversation>> {
             Box::pin(async { Ok(vec![]) })
@@ -185,6 +202,15 @@ mod tests {
         }
         fn history(&self, _: ConversationId, _: u16) -> HandlerFuture<'_, Vec<Message>> {
             self.0.fetch_add(1, Ordering::SeqCst);
+            Box::pin(async { Ok(vec![]) })
+        }
+        fn history_before(
+            &self,
+            _: ConversationId,
+            _: u16,
+            _: HistoryCursor,
+        ) -> HandlerFuture<'_, Vec<Message>> {
+            self.1.fetch_add(1, Ordering::SeqCst);
             Box::pin(async { Ok(vec![]) })
         }
         fn send(&self, _: ConversationId, _: OutgoingBody) -> HandlerFuture<'_, MessageId> {
@@ -211,6 +237,14 @@ mod tests {
             Box::pin(async { Err(ProtocolError::Unsupported) })
         }
         fn history(&self, _: ConversationId, _: u16) -> HandlerFuture<'_, Vec<Message>> {
+            Box::pin(async { Err(ProtocolError::Internal) })
+        }
+        fn history_before(
+            &self,
+            _: ConversationId,
+            _: u16,
+            _: HistoryCursor,
+        ) -> HandlerFuture<'_, Vec<Message>> {
             Box::pin(async { Err(ProtocolError::Internal) })
         }
         fn send(&self, _: ConversationId, _: OutgoingBody) -> HandlerFuture<'_, MessageId> {
@@ -255,7 +289,7 @@ mod tests {
         let server = tokio::spawn(async move {
             serve(
                 listener.accept().await.unwrap(),
-                &FakeHandler(Arc::new(AtomicUsize::new(0))),
+                &FakeHandler(Arc::new(AtomicUsize::new(0)), Arc::new(AtomicUsize::new(0))),
             )
             .await;
         });
@@ -289,7 +323,7 @@ mod tests {
             let server = tokio::spawn(async move {
                 serve(
                     listener.accept().await.unwrap(),
-                    &FakeHandler(Arc::new(AtomicUsize::new(0))),
+                    &FakeHandler(Arc::new(AtomicUsize::new(0)), Arc::new(AtomicUsize::new(0))),
                 )
                 .await;
             });
@@ -335,7 +369,7 @@ mod tests {
         let server = tokio::spawn(async move {
             serve_with_subscriptions(
                 listener.accept().await.unwrap(),
-                &FakeHandler(Arc::new(AtomicUsize::new(0))),
+                &FakeHandler(Arc::new(AtomicUsize::new(0)), Arc::new(AtomicUsize::new(0))),
                 &server_hub,
             )
             .await;
@@ -370,7 +404,7 @@ mod tests {
         let server = tokio::spawn(async move {
             serve_with_subscriptions(
                 listener.accept().await.unwrap(),
-                &FakeHandler(Arc::new(AtomicUsize::new(0))),
+                &FakeHandler(Arc::new(AtomicUsize::new(0)), Arc::new(AtomicUsize::new(0))),
                 &SubscriptionHub::new(4),
             )
             .await;
@@ -430,10 +464,12 @@ mod tests {
     async fn serves_requests_and_echoes_ids_without_invalid_history_call() {
         let (_dir, listener, path) = socket();
         let calls = Arc::new(AtomicUsize::new(0));
+        let paged = Arc::new(AtomicUsize::new(0));
         let server_calls = calls.clone();
+        let server_paged = paged.clone();
         let server = tokio::spawn(async move {
             let stream = listener.accept().await.unwrap();
-            serve(stream, &FakeHandler(server_calls)).await;
+            serve(stream, &FakeHandler(server_calls, server_paged)).await;
         });
         let mut client = UnixStream::connect(path).await.unwrap();
         let conversation_id = ConversationId::new(TransportId::new("fake").unwrap(), "c").unwrap();
@@ -444,13 +480,14 @@ mod tests {
                 RequestKind::History {
                     conversation_id: conversation_id.clone(),
                     limit: 0,
+                    before: None,
                 },
             ),
             (11, RequestKind::Subscribe),
             (
                 12,
                 RequestKind::Send {
-                    conversation_id,
+                    conversation_id: conversation_id.clone(),
                     body: OutgoingBody { parts: vec![] },
                 },
             ),
@@ -487,9 +524,62 @@ mod tests {
                 _ => unreachable!(),
             }
         }
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            0,
+            "invalid limits must be rejected before the handler runs"
+        );
+
+        // A cursored read must reach the paging path, not the newest-page one.
+        write_request(
+            &mut client,
+            &Request {
+                request_id: 13,
+                request: RequestKind::History {
+                    conversation_id: conversation_id.clone(),
+                    limit: 5,
+                    before: Some(HistoryCursor {
+                        created_at: 10,
+                        id: MessageId::new(TransportId::new("fake").unwrap(), "cursor").unwrap(),
+                    }),
+                },
+            },
+        )
+        .await
+        .unwrap();
+        let response = read_response(&mut client).await.unwrap();
+        assert_eq!(response.request_id, 13);
+        assert!(matches!(response.response, ResponseKind::History { .. }));
+
+        // And a cursor-free read must still reach the newest-page handler.
+        write_request(
+            &mut client,
+            &Request {
+                request_id: 14,
+                request: RequestKind::History {
+                    conversation_id,
+                    limit: 5,
+                    before: None,
+                },
+            },
+        )
+        .await
+        .unwrap();
+        let response = read_response(&mut client).await.unwrap();
+        assert_eq!(response.request_id, 14);
+        assert!(matches!(response.response, ResponseKind::History { .. }));
         client.shutdown().await.unwrap();
         server.await.unwrap();
-        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            paged.load(Ordering::SeqCst),
+            1,
+            "the cursor is forwarded to the paging handler"
+        );
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "a cursor-free read stays on the newest-page handler"
+        );
     }
 
     #[tokio::test]
@@ -497,7 +587,11 @@ mod tests {
         let (_dir, listener, path) = socket();
         let server = tokio::spawn(async move {
             let stream = listener.accept().await.unwrap();
-            serve(stream, &FakeHandler(Arc::new(AtomicUsize::new(0)))).await;
+            serve(
+                stream,
+                &FakeHandler(Arc::new(AtomicUsize::new(0)), Arc::new(AtomicUsize::new(0))),
+            )
+            .await;
         });
         let mut client = UnixStream::connect(path).await.unwrap();
         client.write_all(&[99, 0, 0, 0, 0]).await.unwrap();
@@ -515,7 +609,7 @@ mod tests {
             let stream = listener.accept().await.unwrap();
             serve_with_first_timeout(
                 stream,
-                &FakeHandler(Arc::new(AtomicUsize::new(0))),
+                &FakeHandler(Arc::new(AtomicUsize::new(0)), Arc::new(AtomicUsize::new(0))),
                 Duration::from_millis(20),
             )
             .await;

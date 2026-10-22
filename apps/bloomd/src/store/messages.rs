@@ -108,12 +108,81 @@ pub fn history(
     history_for_identities(store, conversation_id, &[], limit)
 }
 
+pub fn history_before(
+    store: &EncryptedStore,
+    conversation_id: &ConversationId,
+    before_created_at: i64,
+    before_id: &MessageId,
+    limit: u16,
+) -> Result<Vec<Message>, StoreError> {
+    if limit == 0 {
+        return Ok(Vec::new());
+    }
+    if let Some(canonical) = super::conversations::get_conversation(store, conversation_id)? {
+        return history_before_for_identities(
+            store,
+            &canonical.id,
+            &canonical.aliases,
+            before_created_at,
+            before_id,
+            limit,
+        );
+    }
+    history_before_for_identities(
+        store,
+        conversation_id,
+        &[],
+        before_created_at,
+        before_id,
+        limit,
+    )
+}
+
 pub(crate) fn history_for_conversation(
     store: &EncryptedStore,
     conversation: &bloom_domain::Conversation,
     limit: u16,
 ) -> Result<Vec<Message>, StoreError> {
     history_for_identities(store, &conversation.id, &conversation.aliases, limit)
+}
+
+fn history_before_for_identities(
+    store: &EncryptedStore,
+    canonical_id: &ConversationId,
+    aliases: &[ConversationId],
+    before_created_at: i64,
+    before_id: &MessageId,
+    limit: u16,
+) -> Result<Vec<Message>, StoreError> {
+    if limit == 0 {
+        return Ok(Vec::new());
+    }
+    let canonical_id = canonical_id.clone();
+    let before_id = stable_id(before_id)?;
+    let mut identities = vec![canonical_id.clone()];
+    identities.extend(aliases.iter().cloned());
+    identities.sort_by(|left, right| left.value().cmp(right.value()));
+    identities.dedup();
+
+    let mut messages = Vec::new();
+    for identity in identities {
+        let key = stable_conversation_id(&identity)?;
+        let mut statement = store._connection.prepare("SELECT data FROM (SELECT id, data, created_at FROM messages WHERE conversation_id=?1 AND (created_at < ?2 OR (created_at = ?2 AND id < ?3)) ORDER BY created_at DESC, id DESC LIMIT ?4) ORDER BY created_at ASC, id ASC")?;
+        let records = statement
+            .query_map(params![key, before_created_at, before_id, limit], |row| {
+                row.get::<_, Vec<u8>>(0)
+            })?;
+        for record in records {
+            let message: Message =
+                serde_json::from_slice(&record?).map_err(|_| StoreError::Schema)?;
+            messages.push(remap_message(&message, &canonical_id)?);
+        }
+    }
+    sort_by_store_order(&mut messages)?;
+    if messages.len() > limit as usize {
+        messages.drain(..messages.len() - limit as usize);
+    }
+    Ok(messages)
 }
 
 fn history_for_identities(
@@ -142,15 +211,43 @@ fn history_for_identities(
             messages.push(remap_message(&message, &canonical_id)?);
         }
     }
-    messages.sort_by(|left, right| {
-        left.created_at
-            .cmp(&right.created_at)
-            .then_with(|| left.id().value().cmp(right.id().value()))
-    });
+    sort_by_store_order(&mut messages)?;
     if messages.len() > limit as usize {
         messages.drain(..messages.len() - limit as usize);
     }
     Ok(messages)
+}
+
+/// Orders a merged page exactly the way the store does. The SQL index orders by the
+/// stable JSON encoding of the id, so a merge that compared raw id values would
+/// disagree with the keyset predicate for ids containing escaped characters, and a
+/// page boundary inside a `created_at` tie could repeat or skip a message.
+fn sort_by_store_order(messages: &mut [Message]) -> Result<(), StoreError> {
+    let mut keyed = Vec::with_capacity(messages.len());
+    for message in messages.iter() {
+        keyed.push((stable_id(message.id())?, message.created_at));
+    }
+    let mut order: Vec<usize> = (0..messages.len()).collect();
+    order.sort_by(|left, right| {
+        keyed[*left]
+            .1
+            .cmp(&keyed[*right].1)
+            .then_with(|| keyed[*left].0.cmp(&keyed[*right].0))
+    });
+    if order
+        .iter()
+        .enumerate()
+        .all(|(index, source)| index == *source)
+    {
+        return Ok(());
+    }
+    let mut slots: Vec<Option<Message>> = messages.iter().cloned().map(Some).collect();
+    for (target, source) in order.into_iter().enumerate() {
+        if let Some(message) = slots[source].take() {
+            messages[target] = message;
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -216,6 +313,249 @@ mod tests {
         )
         .unwrap();
         (temp, store, conversation)
+    }
+
+    fn message_id(transport: &str, value: &str) -> MessageId {
+        MessageId::new(TransportId::new(transport).unwrap(), value).unwrap()
+    }
+
+    #[test]
+    fn history_before_pages_without_gaps_or_duplicates() {
+        let (_temp, mut store, conversation) = setup();
+        for at in 1..=6 {
+            let message = fixture_message(
+                "alpha",
+                &format!("m{at}"),
+                "room",
+                at,
+                "body",
+                DeliveryState::Sent,
+            );
+            upsert_message(&mut store, &message).unwrap();
+        }
+
+        let newest =
+            history_before(&store, &conversation, 7, &message_id("alpha", "m7"), 3).unwrap();
+        assert_eq!(
+            newest
+                .iter()
+                .map(|message| message.id().value())
+                .collect::<Vec<_>>(),
+            vec!["m4", "m5", "m6"]
+        );
+
+        let oldest_loaded = newest.first().unwrap();
+        let older = history_before(
+            &store,
+            &conversation,
+            oldest_loaded.created_at,
+            oldest_loaded.id(),
+            3,
+        )
+        .unwrap();
+        assert_eq!(
+            older
+                .iter()
+                .map(|message| message.id().value())
+                .collect::<Vec<_>>(),
+            vec!["m1", "m2", "m3"]
+        );
+
+        let ids: Vec<_> = older
+            .iter()
+            .chain(newest.iter())
+            .map(|message| message.id().value())
+            .collect();
+        assert_eq!(ids, vec!["m1", "m2", "m3", "m4", "m5", "m6"]);
+        let unique: std::collections::HashSet<_> = ids.iter().collect();
+        assert_eq!(unique.len(), ids.len());
+    }
+
+    #[test]
+    fn history_order_matches_the_keyset_order_for_escaped_ids() {
+        // Raw id text and its JSON encoding sort differently once a value contains a
+        // quote: raw `a"x` is below `a*x`, but the encoded form `a\\"x` is above
+        // `a*x`. The store indexes and compares the encoded form, so a page whose
+        // boundary sits inside a `created_at` tie must be ordered the same way or the
+        // next cursor re-serves a message that was already delivered.
+        let (_temp, mut store, conversation) = setup();
+        let older = fixture_message("alpha", "old", "room", 1, "body", DeliveryState::Sent);
+        upsert_message(&mut store, &older).unwrap();
+        for value in ["a\"x", "a*x"] {
+            let message = fixture_message("alpha", value, "room", 10, "body", DeliveryState::Sent);
+            upsert_message(&mut store, &message).unwrap();
+        }
+
+        let newest =
+            history_before(&store, &conversation, 20, &message_id("alpha", "after"), 2).unwrap();
+        assert_eq!(
+            newest
+                .iter()
+                .map(|message| message.id().value())
+                .collect::<Vec<_>>(),
+            vec!["a*x", "a\"x"],
+            "the merged page follows the store's encoded ordering"
+        );
+
+        let oldest_loaded = newest.first().unwrap();
+        let older_page = history_before(
+            &store,
+            &conversation,
+            oldest_loaded.created_at,
+            oldest_loaded.id(),
+            2,
+        )
+        .unwrap();
+        assert_eq!(
+            older_page
+                .iter()
+                .map(|message| message.id().value())
+                .collect::<Vec<_>>(),
+            vec!["old"],
+            "no already-delivered message reappears across the tie boundary"
+        );
+    }
+
+    #[test]
+    fn history_before_splits_created_at_ties_by_id() {
+        let (_temp, mut store, conversation) = setup();
+        let earlier = fixture_message("alpha", "z", "room", 5, "body", DeliveryState::Sent);
+        upsert_message(&mut store, &earlier).unwrap();
+        for value in ["a", "b", "c", "d", "e"] {
+            let message = fixture_message("alpha", value, "room", 10, "body", DeliveryState::Sent);
+            upsert_message(&mut store, &message).unwrap();
+        }
+        let later = fixture_message("alpha", "y", "room", 20, "body", DeliveryState::Sent);
+        upsert_message(&mut store, &later).unwrap();
+
+        let middle =
+            history_before(&store, &conversation, 10, &message_id("alpha", "c"), 10).unwrap();
+        assert_eq!(
+            middle
+                .iter()
+                .map(|message| message.id().value())
+                .collect::<Vec<_>>(),
+            vec!["z", "a", "b"]
+        );
+        let middle_limited =
+            history_before(&store, &conversation, 10, &message_id("alpha", "c"), 2).unwrap();
+        assert_eq!(
+            middle_limited
+                .iter()
+                .map(|message| message.id().value())
+                .collect::<Vec<_>>(),
+            vec!["a", "b"]
+        );
+
+        let mut cursor_at = 21;
+        let mut cursor_id = message_id("alpha", "zzz");
+        let mut pages = Vec::new();
+        // Bound the loop: a cursor that repeats a page must fail the coverage
+        // assertion instead of looping forever.
+        for _ in 0..8 {
+            let page = history_before(&store, &conversation, cursor_at, &cursor_id, 2).unwrap();
+            let Some(oldest) = page.first() else {
+                break;
+            };
+            cursor_at = oldest.created_at;
+            cursor_id = oldest.id().clone();
+            pages.push(page);
+        }
+        pages.reverse();
+        let ids: Vec<_> = pages
+            .iter()
+            .flatten()
+            .map(|message| message.id().value())
+            .collect();
+        assert_eq!(ids, vec!["z", "a", "b", "c", "d", "e", "y"]);
+    }
+
+    #[test]
+    fn history_before_remaps_alias_across_page_boundary() {
+        let (_temp, mut store, conversation) = setup();
+        let alias = ConversationId::new(TransportId::new("alpha").unwrap(), "legacy").unwrap();
+        super::super::conversations::upsert_conversation(
+            &mut store,
+            &Conversation {
+                id: alias.clone(),
+                remote_id: "legacy".into(),
+                kind: ConversationKind::Direct,
+                title: None,
+                participants: Vec::new(),
+                created_at: 0,
+                last_message_at: None,
+                aliases: Vec::new(),
+                preview: None,
+            },
+        )
+        .unwrap();
+        super::super::conversations::upsert_conversation(
+            &mut store,
+            &Conversation {
+                id: conversation.clone(),
+                remote_id: "room".into(),
+                kind: ConversationKind::Direct,
+                title: None,
+                participants: Vec::new(),
+                created_at: 0,
+                last_message_at: None,
+                aliases: vec![alias.clone()],
+                preview: None,
+            },
+        )
+        .unwrap();
+
+        let messages = [
+            fixture_message("alpha", "c1", "room", 1, "body", DeliveryState::Sent),
+            fixture_message("alpha", "a1", "legacy", 2, "body", DeliveryState::Sent),
+            fixture_message("alpha", "c2", "room", 3, "body", DeliveryState::Sent),
+            fixture_message("alpha", "a2", "legacy", 4, "body", DeliveryState::Sent),
+        ];
+        for message in &messages {
+            upsert_message(&mut store, message).unwrap();
+        }
+
+        let newest =
+            history_before(&store, &conversation, 5, &message_id("alpha", "zzz"), 2).unwrap();
+        assert_eq!(
+            newest
+                .iter()
+                .map(|message| message.id().value())
+                .collect::<Vec<_>>(),
+            vec!["c2", "a2"]
+        );
+        let oldest_loaded = newest.first().unwrap();
+        let older = history_before(
+            &store,
+            &conversation,
+            oldest_loaded.created_at,
+            oldest_loaded.id(),
+            2,
+        )
+        .unwrap();
+        assert_eq!(
+            older
+                .iter()
+                .map(|message| message.id().value())
+                .collect::<Vec<_>>(),
+            vec!["c1", "a1"]
+        );
+        for message in older.iter().chain(newest.iter()) {
+            assert_eq!(message.conversation_id(), &conversation);
+        }
+    }
+
+    #[test]
+    fn history_before_empty_cursor_and_zero_limit() {
+        let (_temp, mut store, conversation) = setup();
+        let message = fixture_message("alpha", "m1", "room", 10, "body", DeliveryState::Sent);
+        upsert_message(&mut store, &message).unwrap();
+        assert!(history_before(&store, &conversation, 0, message.id(), 5)
+            .unwrap()
+            .is_empty());
+        assert!(history_before(&store, &conversation, 20, message.id(), 0)
+            .unwrap()
+            .is_empty());
     }
 
     #[test]

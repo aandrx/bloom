@@ -19,7 +19,7 @@ import sys
 import threading
 import time
 
-PROTOCOL_VERSION = 1
+PROTOCOL_VERSION = 2
 SESSION_STATE = os.environ.get("BLOOM_FAKE_SESSION_STATE", "active")
 LONG_TITLE = os.environ.get("BLOOM_FAKE_LONG_TITLE") == "1"
 SUBSCRIBERS: set[socket.socket] = set()
@@ -128,6 +128,11 @@ def message(
     }
 
 
+def history_key(item: dict) -> tuple[int, str]:
+    """Match the store ordering (created_at, id) with the id's stable JSON form."""
+    return item["created_at"], json.dumps(item["id"], separators=(",", ":"), ensure_ascii=False)
+
+
 HISTORY = {
     "weekend@example.invalid": [
         message("weekend@example.invalid", "m1", 1_700_000_100_000, "Saturday looks perfect for the coast. Should we take the early train?", False),
@@ -201,7 +206,21 @@ def serve_client(conn: socket.socket) -> None:
             conn.sendall(frame({"request_id": request_id, "response": {"result": "conversations", "conversations": CONVERSATIONS}}))
         elif op == "history":
             key = kind.get("conversation_id", {}).get("value", "")
-            conn.sendall(frame({"request_id": request_id, "response": {"result": "history", "messages": HISTORY.get(key, [])}}))
+            messages = HISTORY.get(key, [])
+            limit = kind.get("limit")
+            cursor = kind.get("before")
+            if limit == 0:
+                messages = []
+            elif cursor is not None:
+                bound = history_key(cursor)
+                older = [item for item in messages if history_key(item) < bound]
+                older.sort(key=history_key)
+                if isinstance(limit, int):
+                    older = older[-limit:]
+                messages = older
+            elif isinstance(limit, int):
+                messages = messages[-limit:]
+            conn.sendall(frame({"request_id": request_id, "response": {"result": "history", "messages": messages}}))
         elif op == "send" or op == "start_conversation":
             conn.sendall(frame({"request_id": request_id, "response": {"result": "send", "message_id": cid("sent-1")}}))
             push(conn, {

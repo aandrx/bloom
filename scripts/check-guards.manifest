@@ -18,3 +18,5 @@ frame-bound|apps/bloomd/src/engine.rs|if bytes.len().saturating_add(take) > MAX_
 filter-q|apps/bloom-tui/src/app.rs|if self.edit_filter(key) {|if false {|bloom-tui|interaction|q_is_text_and_ctrl_c_clears_before_quitting
 composer-band|apps/bloom-tui/src/ui.rs|let pad_bottom = pads.saturating_sub(pad_top).min(1);|let pad_bottom = 0;|bloom-tui|ui_render|composer_band_shades_one_row_above_and_below_the_input
 sidebar-marker|apps/bloom-tui/src/ui.rs|.highlight_symbol("▎ ")|.highlight_symbol("  ")|bloom-tui|ui_render|sidebar_entries_show_a_clipped_preview_and_highlight_both_rows
+history-keyset-tie|apps/bloomd/src/store/messages.rs|(created_at = ?2 AND id < ?3)|(created_at = ?2 AND id > ?3)|bloomd|lib|store::messages::tests::history_before_splits_created_at_ties_by_id
+history-store-order|apps/bloomd/src/store/messages.rs|keyed[*left].0.cmp(&keyed[*right].0)|keyed[*right].0.cmp(&keyed[*left].0)|bloomd|lib|store::messages::tests::history_order_matches_the_keyset_order_for_escaped_ids

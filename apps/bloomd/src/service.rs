@@ -13,7 +13,7 @@ use bloom_domain::{
     Conversation, ConversationId, ConversationKind, DeliveryState, Handle, HandleKind, Message,
     MessageId, OutgoingBody, Participant,
 };
-use bloom_ipc::{Event, EventKind, ProtocolError};
+use bloom_ipc::{Event, EventKind, HistoryCursor, ProtocolError};
 use bloom_transport::{TransportError, TransportEvent};
 use std::{
     sync::{Arc, Mutex},
@@ -285,6 +285,25 @@ impl RequestHandler for Service {
         Box::pin(async move {
             let store = self.store.lock().unwrap();
             store::history(&store, &conversation_id, limit).map_err(|_| ProtocolError::Internal)
+        })
+    }
+
+    fn history_before(
+        &self,
+        conversation_id: ConversationId,
+        limit: u16,
+        before: HistoryCursor,
+    ) -> HandlerFuture<'_, Vec<Message>> {
+        Box::pin(async move {
+            let store = self.store.lock().unwrap();
+            store::history_before(
+                &store,
+                &conversation_id,
+                before.created_at,
+                &before.id,
+                limit,
+            )
+            .map_err(|_| ProtocolError::Internal)
         })
     }
 

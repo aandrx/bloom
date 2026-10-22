@@ -18,7 +18,7 @@
 
 | Area | Boundary |
 | --- | --- |
-| History | Only Bloom's stored messages; TUI latest-200 limit; no local pagination or remote/app historical import |
+| History | Only Bloom's stored messages; TUI shows the latest 200; keyset paging exists in the daemon/IPC but no in-app older-page load yet; no remote/app historical import |
 | Live service | Synthetic sidecar/IPC/PTY coverage; current real-engine changes not live-revalidated; no automatic engine-generation recovery |
 | Groups | Existing group text conditional on recipient-list capability; no group-management workflow |
 | Rich messaging | Unsupported inbound parts are placeholders; no attachment send/open/download, reactions, edits or unsend UI |
@@ -45,6 +45,6 @@ Independent source review for the current UI pass found a canonical-alias readin
 
 ## Release blockers and next work
 
-The user-directed priority remains UI/UX; this bounded reading/navigation pass is accepted, not permission to resume integrations or access a live account. [The roadmap](implementation-plan.md) keeps backend work queued: generation-scoped engine recovery, verified historical ingestion semantics/implementation, local pagination/search/unread navigation, then standalone runtime packaging. Keep the existing registration exclusively owned and do not automatically replay uncertain sends. [IDS validation](ids-validation-gate.md) remains separate and blocked.
+The user-directed priority remains UI/UX; this bounded reading/navigation pass is accepted, not permission to resume integrations or access a live account. [The roadmap](implementation-plan.md) keeps backend work queued: generation-scoped engine recovery, verified historical ingestion semantics/implementation, the in-app older-page load plus message search and unread navigation, then standalone runtime packaging. Keep the existing registration exclusively owned and do not automatically replay uncertain sends. [IDS validation](ids-validation-gate.md) remains separate and blocked.
 
 Optional mutation guards in `scripts/check-guards` require clean files and restore their mutations; they are not CI evidence or permission to reset working changes. Inspect the manifest and current tests before running them.

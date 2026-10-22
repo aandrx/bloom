@@ -1,6 +1,6 @@
 use crate::{
-    read_event, read_response, write_request, CodecError, ConversationSyncStatus, Event, Request,
-    RequestKind, ResponseKind,
+    read_event, read_response, write_request, CodecError, ConversationSyncStatus, Event,
+    HistoryCursor, Request, RequestKind, ResponseKind,
 };
 use bloom_domain::{Conversation, ConversationId, Message, MessageId, OutgoingBody};
 use std::{
@@ -159,6 +159,27 @@ impl BloomClient {
             .request(RequestKind::History {
                 conversation_id,
                 limit,
+                before: None,
+            })
+            .await?
+        {
+            ResponseKind::History { messages } => Ok(messages),
+            _ => Err(ClientError::UnexpectedResponse),
+        }
+    }
+
+    /// Page history strictly older than `before`, oldest-first, as with [`Self::history`].
+    pub async fn history_before(
+        &self,
+        conversation_id: ConversationId,
+        limit: u32,
+        before: HistoryCursor,
+    ) -> Result<Vec<Message>, ClientError> {
+        match self
+            .request(RequestKind::History {
+                conversation_id,
+                limit,
+                before: Some(before),
             })
             .await?
         {
@@ -253,12 +274,77 @@ impl EventStream {
 mod tests {
     use super::*;
     use crate::{write_event, write_response, EventKind, Response};
+    use bloom_domain::TransportId;
     use tokio::net::UnixListener;
 
     #[test]
     fn peer_uid_policy() {
         assert!(check_peer_uid(1000, 1000).is_ok());
         assert!(check_peer_uid(1001, 1000).is_err());
+    }
+
+    #[tokio::test]
+    async fn history_before_puts_the_cursor_on_the_wire() {
+        let d = tempfile::tempdir().unwrap();
+        let p = d.path().join("request");
+        let listener = UnixListener::bind(&p).unwrap();
+        type Seen = std::sync::Arc<std::sync::Mutex<Vec<(u32, Option<HistoryCursor>)>>>;
+        let seen: Seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let server_seen = seen.clone();
+        let server = tokio::spawn(async move {
+            // Each client request opens its own connection.
+            for _ in 0..2 {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let request = crate::read_request(&mut stream).await.unwrap();
+                let Some((_, limit, before)) = (match request.request {
+                    RequestKind::History {
+                        conversation_id,
+                        limit,
+                        before,
+                    } => Some((conversation_id, limit, before)),
+                    _ => None,
+                }) else {
+                    unreachable!("both calls are history reads");
+                };
+                server_seen.lock().unwrap().push((limit, before));
+                crate::write_response(
+                    &mut stream,
+                    &crate::Response {
+                        request_id: request.request_id,
+                        response: ResponseKind::History { messages: vec![] },
+                    },
+                )
+                .await
+                .unwrap();
+            }
+        });
+
+        let client = BloomClient::new(&p);
+        let conversation = ConversationId::new(TransportId::new("fake").unwrap(), "c").unwrap();
+        client
+            .history(conversation.clone(), 5)
+            .await
+            .expect("newest page");
+        let (plain_limit, plain_before) = seen.lock().unwrap()[0].clone();
+        assert_eq!(plain_limit, 5);
+        assert_eq!(plain_before, None, "a plain read carries no cursor");
+
+        let cursor = HistoryCursor {
+            created_at: 1_700_000_000_000,
+            id: MessageId::new(TransportId::new("fake").unwrap(), "m").unwrap(),
+        };
+        client
+            .history_before(conversation, 7, cursor.clone())
+            .await
+            .expect("older page");
+        let (paged_limit, paged_before) = seen.lock().unwrap()[1].clone();
+        assert_eq!(paged_limit, 7);
+        assert_eq!(
+            paged_before,
+            Some(cursor),
+            "the cursor reaches the daemon unchanged"
+        );
+        server.await.unwrap();
     }
 
     #[tokio::test]
@@ -401,7 +487,9 @@ mod tests {
             let (mut s, _) = l.accept().await.unwrap();
             let _ = crate::read_request(&mut s).await;
             use tokio::io::AsyncWriteExt;
-            s.write_all(&[1, 0, 0]).await.unwrap();
+            s.write_all(&[crate::PROTOCOL_VERSION as u8, 0, 0])
+                .await
+                .unwrap();
         });
         let result = BloomClient::new(p).list_conversations().await;
         assert!(matches!(

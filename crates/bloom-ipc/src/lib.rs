@@ -18,7 +18,7 @@ use serde::{Deserialize, Serialize};
 use std::{fmt, io};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
-pub const PROTOCOL_VERSION: u16 = 1;
+pub const PROTOCOL_VERSION: u16 = 2;
 /// Default daemon socket, shared by the daemon and its clients so both sides
 /// agree without configuration.
 pub fn default_socket_path() -> std::path::PathBuf {
@@ -47,6 +47,13 @@ pub struct Request {
     pub request_id: u64,
     pub request: RequestKind,
 }
+/// Keyset position for history pagination. Messages older than this cursor are
+/// returned under the store ordering `(created_at DESC, id DESC)`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HistoryCursor {
+    pub created_at: i64,
+    pub id: MessageId,
+}
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "op", rename_all = "snake_case")]
 pub enum RequestKind {
@@ -56,6 +63,11 @@ pub enum RequestKind {
     History {
         conversation_id: ConversationId,
         limit: u32,
+        /// Absent from a version 2 request that wants the newest page; a version 1
+        /// peer is rejected when the frame version byte is read, so it never sees
+        /// this field.
+        #[serde(default)]
+        before: Option<HistoryCursor>,
     },
     Send {
         conversation_id: ConversationId,
@@ -329,6 +341,48 @@ mod tests {
         .unwrap();
         assert!(without_sequence.get("push_sequence").is_none());
     }
+    #[tokio::test]
+    async fn history_before_cursor_round_trips_with_and_without_cursor() {
+        let transport = bloom_domain::TransportId::new("test").unwrap();
+        let conversation_id = ConversationId::new(transport.clone(), "conversation").unwrap();
+        for before in [
+            None,
+            Some(HistoryCursor {
+                created_at: 1_700_000_000_000,
+                id: MessageId::new(transport.clone(), "message").unwrap(),
+            }),
+        ] {
+            let expected = Request {
+                request_id: 9,
+                request: RequestKind::History {
+                    conversation_id: conversation_id.clone(),
+                    limit: 50,
+                    before: before.clone(),
+                },
+            };
+            let bytes = serde_json::to_vec(&expected).unwrap();
+            let decoded: Request = serde_json::from_slice(&bytes).unwrap();
+            assert_eq!(decoded.request_id, expected.request_id);
+            assert!(decoded.request == expected.request);
+        }
+
+        let without_field = serde_json::json!({
+            "request_id": 9,
+            "request": {
+                "op": "history",
+                "conversation_id": conversation_id,
+                "limit": 50,
+            },
+        });
+        match serde_json::from_value::<Request>(without_field)
+            .unwrap()
+            .request
+        {
+            RequestKind::History { before, .. } => assert_eq!(before, None),
+            _ => panic!("expected a history request"),
+        }
+    }
+
     #[tokio::test]
     async fn round_trip_and_fragmented_frame() {
         let (mut a, mut b) = duplex(2);
