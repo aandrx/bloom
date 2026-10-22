@@ -1647,3 +1647,252 @@ fn opening_another_thread_returns_to_its_newest_message() {
         "Ctrl+Home in one thread must not carry over to the next"
     );
 }
+
+#[test]
+fn composer_undo_removes_a_typed_run_and_a_deletion_is_separate() {
+    let mut app = app_with(&["Jules Lee"]);
+    for character in "hello".chars() {
+        app.handle_key(key(KeyCode::Char(character)));
+    }
+    assert_eq!(app.draft, "hello");
+
+    app.handle_key(key(KeyCode::Backspace));
+    assert_eq!(app.draft, "hell");
+    assert_eq!(app.undo_depths(), (2, 0));
+
+    app.handle_key(ctrl(KeyCode::Char('z')));
+    assert_eq!(app.draft, "hello", "undo restores the deleted character");
+    app.handle_key(ctrl(KeyCode::Char('z')));
+    assert_eq!(app.draft, "", "undo removes the whole typed run");
+    app.handle_key(ctrl(KeyCode::Char('z')));
+    assert_eq!(app.draft, "", "undo is a no-op at the oldest snapshot");
+}
+
+#[test]
+fn composer_undo_and_redo_restore_cursor_and_literal_paste_provenance() {
+    let mut app = app_with(&["Jules Lee"]);
+    for character in "ab".chars() {
+        app.handle_key(key(KeyCode::Char(character)));
+    }
+    app.handle_key(key(KeyCode::Left));
+    app.handle_key(key(KeyCode::Char('X')));
+    assert_eq!(app.draft, "aXb");
+    assert_eq!(app.draft_cursor, 2);
+
+    app.handle_key(ctrl(KeyCode::Char('z')));
+    assert_eq!(app.draft, "ab");
+    assert_eq!(app.draft_cursor, 1, "undo restores the insertion cursor");
+    app.handle_key(KeyEvent::new(
+        KeyCode::Char('z'),
+        KeyModifiers::CONTROL | KeyModifiers::SHIFT,
+    ));
+    assert_eq!(app.draft, "aXb");
+    assert_eq!(app.draft_cursor, 2, "redo reapplies the insertion cursor");
+
+    let mut pasted = app_with(&["Jules Lee"]);
+    pasted.paste(" /literal body");
+    assert_eq!(pasted.draft, " /literal body");
+    assert!(pasted.pasted_body);
+    let cursor = pasted.draft_cursor;
+    pasted.handle_key(ctrl(KeyCode::Char('z')));
+    assert_eq!(pasted.draft, "");
+    assert!(!pasted.pasted_body);
+    pasted.handle_key(ctrl(KeyCode::Char('y')));
+    assert_eq!(pasted.draft, " /literal body");
+    assert!(pasted.pasted_body, "redo restores literal-paste provenance");
+    assert_eq!(pasted.draft_cursor, cursor);
+}
+
+#[test]
+fn cancelling_composition_cannot_be_undone_back_to_life() {
+    let mut app = app_with(&["Jules Lee"]);
+    for character in "hello".chars() {
+        app.handle_key(key(KeyCode::Char(character)));
+    }
+    app.handle_key(ctrl(KeyCode::Char('z')));
+    assert_eq!(app.draft, "", "the typed run undoes");
+    app.handle_key(key(KeyCode::Esc));
+    assert_eq!(app.draft, "");
+
+    app.handle_key(ctrl(KeyCode::Char('z')));
+    app.handle_key(ctrl(KeyCode::Char('y')));
+
+    assert_eq!(
+        app.draft, "",
+        "an explicit cancellation is final; neither undo nor redo resurrects it"
+    );
+    assert_eq!(app.undo_depths(), (0, 0));
+}
+
+#[test]
+fn undo_works_while_the_command_menu_is_open_and_an_empty_redo_clears_literal_mode() {
+    let mut app = app_with(&["Jules Lee"]);
+    for character in "/he".chars() {
+        app.handle_key(key(KeyCode::Char(character)));
+    }
+    assert!(app.command_menu);
+    app.handle_key(ctrl(KeyCode::Char('z')));
+    assert_eq!(app.draft, "", "undo is not swallowed by the command menu");
+
+    let mut pasted = app_with(&["Jules Lee"]);
+    pasted.paste("/new");
+    pasted.handle_key(ctrl(KeyCode::Char('c')));
+    pasted.handle_key(ctrl(KeyCode::Char('z')));
+    pasted.handle_key(ctrl(KeyCode::Char('y')));
+    assert_eq!(pasted.draft, "");
+    assert!(
+        !pasted.pasted_body,
+        "an empty restored draft leaves literal-paste mode"
+    );
+}
+
+#[test]
+fn a_rejected_deletion_neither_adds_a_step_nor_drops_redo() {
+    let mut app = app_with(&["Jules Lee"]);
+    for character in "ab".chars() {
+        app.handle_key(key(KeyCode::Char(character)));
+    }
+    app.handle_key(ctrl(KeyCode::Char('z')));
+    assert_eq!(app.draft, "");
+    let before = app.undo_depths();
+
+    app.handle_key(key(KeyCode::Backspace));
+
+    assert_eq!(
+        app.undo_depths(),
+        (before.0, before.1),
+        "a deletion at the start of the draft changes nothing"
+    );
+    app.handle_key(ctrl(KeyCode::Char('y')));
+    assert_eq!(app.draft, "ab", "the redo stack survived the no-op");
+}
+
+#[test]
+fn typing_runs_split_when_the_caret_moves_or_input_is_cleared() {
+    let mut app = app_with(&["Jules Lee"]);
+    for character in "ab".chars() {
+        app.handle_key(key(KeyCode::Char(character)));
+    }
+    app.handle_key(key(KeyCode::Left));
+    app.handle_key(key(KeyCode::Char('X')));
+    app.handle_key(ctrl(KeyCode::Char('z')));
+    assert_eq!(app.draft, "ab", "the second run undoes on its own");
+
+    let mut cleared = app_with(&["Jules Lee"]);
+    for character in "hello".chars() {
+        cleared.handle_key(key(KeyCode::Char(character)));
+    }
+    cleared.handle_key(ctrl(KeyCode::Char('c')));
+    assert_eq!(cleared.draft, "");
+    cleared.handle_key(ctrl(KeyCode::Char('z')));
+    assert_eq!(
+        cleared.draft, "hello",
+        "clearing the input is itself an undoable step"
+    );
+}
+
+#[test]
+fn a_pasted_address_is_an_undoable_step() {
+    let mut app = app_with(&["Jules Lee"]);
+    app.begin_new_conversation();
+    app.paste("friend@example.test");
+
+    assert_eq!(app.draft, "friend@example.test");
+    app.handle_key(ctrl(KeyCode::Char('z')));
+    assert_eq!(app.draft, "", "a pasted recipient address can be undone");
+}
+
+#[test]
+fn composer_redo_is_dropped_after_a_new_edit_and_history_is_bounded() {
+    let mut app = app_with(&["Jules Lee"]);
+    for character in "one".chars() {
+        app.handle_key(key(KeyCode::Char(character)));
+    }
+    app.handle_key(ctrl(KeyCode::Char('z')));
+    assert_eq!(app.draft, "");
+    for character in "two".chars() {
+        app.handle_key(key(KeyCode::Char(character)));
+    }
+    app.handle_key(ctrl(KeyCode::Char('y')));
+    assert_eq!(app.draft, "two", "a new edit discards the redo stack");
+    assert_eq!(app.undo_depths(), (1, 0));
+
+    let mut bounded = app_with(&["Jules Lee"]);
+    for _ in 0..60 {
+        bounded.paste("x");
+        bounded.handle_key(key(KeyCode::Left));
+    }
+    assert_eq!(bounded.undo_depths(), (50, 0));
+    for _ in 0..50 {
+        bounded.handle_key(ctrl(KeyCode::Char('z')));
+    }
+    assert_eq!(bounded.draft, "x".repeat(10));
+    assert_eq!(bounded.undo_depths(), (0, 50));
+}
+
+#[test]
+fn switching_recipient_clears_composer_history_so_undo_cannot_follow() {
+    let mut app = app_with(&["Weekend crew", "Jules Lee"]);
+    let first = app.selected.clone().expect("selected chat");
+    for character in "secret".chars() {
+        app.handle_key(key(KeyCode::Char(character)));
+    }
+    assert_eq!(app.draft, "secret");
+
+    app.handle_key(ctrl(KeyCode::Char('b')));
+    app.handle_key(key(KeyCode::Char('n')));
+    assert_ne!(app.selected, Some(first.clone()));
+    assert_eq!(app.draft, "");
+    app.handle_key(ctrl(KeyCode::Char('z')));
+    assert_eq!(
+        app.draft, "",
+        "undo must not resurrect the previous chat's text"
+    );
+
+    app.handle_key(ctrl(KeyCode::Char('b')));
+    app.handle_key(key(KeyCode::Char('h')));
+    assert_eq!(app.selected, Some(first));
+    assert_eq!(app.draft, "secret");
+    app.handle_key(ctrl(KeyCode::Char('z')));
+    assert_eq!(
+        app.draft, "secret",
+        "returning to a chat clears its old history"
+    );
+}
+
+#[test]
+fn composer_undo_is_ignored_while_search_or_help_owns_input() {
+    let mut app = app_with(&["Jules Lee"]);
+    for character in "hello".chars() {
+        app.handle_key(key(KeyCode::Char(character)));
+    }
+
+    app.help_open = true;
+    app.handle_key(ctrl(KeyCode::Char('z')));
+    assert_eq!(app.draft, "hello", "help owns the keyboard");
+    assert_eq!(app.undo_depths(), (1, 0));
+
+    app.help_open = false;
+    app.search = Some(Default::default());
+    app.handle_key(ctrl(KeyCode::Char('z')));
+    assert_eq!(app.draft, "hello", "search owns the keyboard");
+    assert_eq!(app.undo_depths(), (1, 0));
+}
+
+#[test]
+fn a_successful_send_clears_composer_history() {
+    let mut app = app_with(&["Jules Lee"]);
+    for character in "hello".chars() {
+        app.handle_key(key(KeyCode::Char(character)));
+    }
+    assert_eq!(app.undo_depths(), (1, 0));
+    let (attempt, target) = submit_pending(&mut app);
+    app.finish_send(attempt, target, Ok(()));
+    assert_eq!(app.undo_depths(), (0, 0));
+    assert_eq!(app.draft, "");
+    app.handle_key(ctrl(KeyCode::Char('z')));
+    assert_eq!(
+        app.draft, "",
+        "sent text cannot be undone back into a draft"
+    );
+}

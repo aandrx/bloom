@@ -10,7 +10,7 @@ use bloom_domain::{
 };
 use bloom_ipc::MessageSearchHit;
 use bloom_tui::{
-    app::{App, Focus, SendFeedback, SendPhase, Theme, OLDER_PAGE_LIMIT},
+    app::{App, Focus, SendFeedback, SendPhase, Theme, OLDER_PAGE_LIMIT, SEARCH_RESULT_LIMIT},
     daemon::ConnectionState,
     ui,
 };
@@ -3956,6 +3956,68 @@ fn search_overlay_renders_empty_and_error_states() {
     app.fail_search(request, "Message search failed.".into());
     let failed = rendered(&app);
     assert!(failed.contains("Message search failed."), "{failed}");
+}
+
+#[test]
+fn search_overlay_shows_the_number_of_completed_hits() {
+    let selected = conversation("Weekend crew", 3, 40);
+    let mut app = App {
+        selected: Some(selected.id.clone()),
+        ..Default::default()
+    };
+    app.set_conversations(vec![selected.clone()]);
+    let request = start_search(&mut app, "needle");
+    app.finish_search(
+        request,
+        vec![
+            search_hit(&selected, "one", "first needle"),
+            search_hit(&selected, "two", "second needle"),
+        ],
+    );
+
+    let text = rendered(&app);
+    assert!(text.contains("2 results"), "{text}");
+    assert!(!text.contains("No messages found."), "{text}");
+}
+
+#[test]
+fn search_overlay_marks_a_hit_list_at_the_result_limit() {
+    let selected = conversation("Weekend crew", 3, 40);
+    let mut app = App {
+        selected: Some(selected.id.clone()),
+        ..Default::default()
+    };
+    app.set_conversations(vec![selected.clone()]);
+    let request = start_search(&mut app, "needle");
+    let hits = (0..SEARCH_RESULT_LIMIT)
+        .map(|index| search_hit(&selected, &format!("hit-{index}"), "needle"))
+        .collect();
+    app.finish_search(request, hits);
+
+    let text = rendered(&app);
+    assert!(
+        text.contains(&format!("{SEARCH_RESULT_LIMIT} results (may be more)")),
+        "{text}"
+    );
+}
+
+#[test]
+fn search_overlay_never_shows_a_result_count_while_loading_or_after_an_error() {
+    let selected = conversation("Weekend crew", 3, 40);
+    let mut app = App {
+        selected: Some(selected.id.clone()),
+        ..Default::default()
+    };
+    app.set_conversations(vec![selected.clone()]);
+    let request = start_search(&mut app, "needle");
+    let loading = rendered(&app);
+    assert!(loading.contains("Searching…"), "{loading}");
+    assert!(!loading.contains(" results"), "{loading}");
+
+    app.fail_search(request, "Message search failed.".into());
+    let failed = rendered(&app);
+    assert!(failed.contains("Message search failed."), "{failed}");
+    assert!(!failed.contains(" results"), "{failed}");
 }
 
 #[test]

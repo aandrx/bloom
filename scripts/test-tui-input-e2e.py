@@ -61,6 +61,13 @@ class InputFlows(unittest.TestCase):
         self.assertEqual(messages[0]['parts'], [{'type': 'text', 'value': body}])
         self.assertEqual(len(self.fixture.persisted()['conversations']), 2)
 
+    def test_ctrl_z_undoes_the_typed_run_without_touching_the_transcript(self):
+        baseline = self.capture([])
+        text = self.capture([b'Undo this draft', b'\x1a'])
+        self.assertNotIn('Undo this draft', text, 'Ctrl+Z must empty the composer')
+        self.assertEqual(text, baseline, 'undo must not redraw or alter the transcript')
+        self.assertEqual(self.fixture.persisted()['messages'], [], 'undo must never send')
+
     def test_ctrl_j_is_newline_not_send(self):
         self.capture([b'First line', b'\n', b'Second line', b'\r'])
         messages = self.fixture.persisted()['messages']

@@ -6,7 +6,7 @@
 
 - Rust daemon serving authenticated local Unix-socket IPC, external Dart engine adapter, encrypted SQLite storage/keychain integration, idempotent message ingestion and persistence before inbound fanout.
 - TUI conversation list, local stored transcript, sender grouping, text composition/sending, existing/new-chat correlation, event-driven delivery labels, uncertain-outcome warnings and explicit failed-draft recovery.
-- Recipient-owned session drafts and modal suspension, literal bracketed paste, grapheme editing/wrapping, exact multiline whitespace and responsive resize.
+- Recipient-owned session drafts and modal suspension, literal bracketed paste, grapheme editing/wrapping, exact multiline whitespace, responsive resize, and session-only composer undo/redo that clears when the draft changes owner.
 - On-demand older-page loading from local storage: reaching the oldest loaded row fetches the previous keyset page, keeps it across reconciliation for chats you paged back, and bounds retained paged history. Chats you never paged still replace wholesale, and no remote history is fetched.
 - Message-owned reading anchors across arrivals/reconciliation/edits/reflow and canonical identities; measured mouse/End Latest action and painted-overlay wheel ownership.
 - Below 70 columns, full-width conversations with a searchable Chats navigator. Query/candidate stay separate from actual recipient and parked composition until explicit open.
@@ -25,7 +25,7 @@
 | Rich messaging | Unsupported inbound parts are placeholders; no attachment send/open/download, reactions, edits or unsend UI |
 | Delivery | Labels reflect mapped transport events; presence of a Read enum is not proof of remote read-receipt support |
 | Accounts | Reuses an existing registration; no Bloom sign-in/activation/recovery; renewal unconfirmed |
-| Composition/reading | Session-only drafts, no undo, no unread count, no attachment search and no reviewed encrypted durable drafts |
+| Composition/reading | Session-only drafts and undo, no unread count, no attachment search and no reviewed encrypted durable drafts |
 | Packaging/platforms | Linux/OpenBubbles Flatpak is the documented setup; not a standalone Cargo-only or Windows distribution |
 | Accessibility | Keyboard/grapheme/monochrome/light-theme coverage, not broad terminal/font/screen-reader validation |
 | Future GUI/transport | GPUI not started; independent registration blocked at Gate 0; Matrix remains an excluded proof |

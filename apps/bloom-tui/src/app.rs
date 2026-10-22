@@ -16,7 +16,7 @@ use unicode_segmentation::UnicodeSegmentation;
 /// Rows a single PageUp or PageDown moves through the transcript.
 const SCROLL_PAGE: usize = 10;
 
-pub const HELP_ROW_COUNT: usize = 17;
+pub const HELP_ROW_COUNT: usize = 18;
 
 /// Messages requested per older-history page.
 pub const OLDER_PAGE_LIMIT: u32 = 200;
@@ -25,6 +25,8 @@ pub const SEARCH_RESULT_LIMIT: u32 = 50;
 /// Maximum number of paged-back messages retained per conversation, in addition
 /// to the newest window loaded by a snapshot.
 pub const OLDER_HISTORY_BUDGET: usize = 1000;
+/// Maximum number of composer undo steps kept for the active draft owner.
+const COMPOSER_UNDO_LIMIT: usize = 50;
 
 /// What a key press wants the shell to do.
 ///
@@ -195,6 +197,27 @@ pub struct SavedDraft {
     pasted_body: bool,
 }
 
+/// A composer snapshot captured before an edit. Restoring it keeps text, cursor
+/// and literal-paste provenance together.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[doc(hidden)]
+pub struct ComposerSnapshot {
+    pub text: String,
+    pub cursor: usize,
+    pub pasted_body: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[doc(hidden)]
+pub enum EditKind {
+    Insert,
+    Delete,
+    Paste,
+    Multiline,
+    Clear,
+    Complete,
+}
+
 #[derive(Debug, Clone)]
 pub struct SuspendedComposition {
     saved: SavedDraft,
@@ -288,6 +311,14 @@ pub struct App {
     pub active_draft_owner: Option<DraftOwner>,
     #[doc(hidden)]
     pub suspended_composition: Option<SuspendedComposition>,
+    /// Composer undo snapshots for the active draft owner, oldest first.
+    #[doc(hidden)]
+    pub undo_history: VecDeque<ComposerSnapshot>,
+    /// Composer redo snapshots, discarded on the next new edit.
+    #[doc(hidden)]
+    pub redo_history: VecDeque<ComposerSnapshot>,
+    #[doc(hidden)]
+    pub last_edit_kind: Option<EditKind>,
     /// Display rows scrolled back from the newest message. Zero pins the transcript
     /// to the newest content, which is what a chat client should do by default.
     pub scroll: usize,
@@ -444,6 +475,9 @@ impl Default for App {
             drafts: HashMap::new(),
             active_draft_owner: None,
             suspended_composition: None,
+            undo_history: VecDeque::new(),
+            redo_history: VecDeque::new(),
+            last_edit_kind: None,
             scroll: 0,
             reading_anchor: None,
             transcript_viewport: None,
@@ -844,6 +878,7 @@ impl App {
         if next == self.active_draft_owner {
             return;
         }
+        self.clear_undo_history();
         if let Some(owner) = self.active_draft_owner.take() {
             if self.draft.is_empty() {
                 self.drafts.remove(&owner);
@@ -872,6 +907,7 @@ impl App {
 
     /// Retire the active buffer and its saved copy, e.g. after a message is sent.
     fn retire_active_draft(&mut self) {
+        self.clear_undo_history();
         if let Some(owner) = self.active_draft_owner.clone() {
             self.drafts.remove(&owner);
         }
@@ -921,6 +957,7 @@ impl App {
             .composer_owner()
             .or_else(|| self.active_draft_owner.take());
         self.active_draft_owner = None;
+        self.clear_undo_history();
         self.suspended_composition = Some(SuspendedComposition {
             owner,
             saved: SavedDraft {
@@ -1260,12 +1297,14 @@ impl App {
         let Some(suggestion) = self.emoji_suggestions().get(self.emoji_selection).cloned() else {
             return false;
         };
+        let before = self.begin_edit();
         self.draft.replace_range(start..end, &suggestion.emoji);
         self.draft_cursor = self.draft[..start + suggestion.emoji.len()]
             .graphemes(true)
             .count();
         self.emoji_selection = 0;
         self.update_command_menu();
+        self.record_step(EditKind::Complete, before);
         true
     }
 
@@ -1658,6 +1697,8 @@ impl App {
     /// Abandon a draft or the new-conversation flow. The composer stays active,
     /// because it is always active; `Esc` should not take typing away.
     pub fn cancel_composition(&mut self) {
+        // An explicit discard is final for this draft: undo must not bring it back.
+        self.clear_undo_history();
         self.command_menu = false;
         self.theme_panel_open = false;
         self.new_conversation = false;
@@ -2064,6 +2105,87 @@ impl App {
         self.cursor_byte()
     }
 
+    fn composer_snapshot(&self) -> ComposerSnapshot {
+        ComposerSnapshot {
+            text: self.draft.clone(),
+            cursor: self.draft_cursor,
+            pasted_body: self.pasted_body,
+        }
+    }
+
+    fn clear_undo_history(&mut self) {
+        self.undo_history.clear();
+        self.redo_history.clear();
+        self.last_edit_kind = None;
+    }
+
+    /// Record the state a completed gesture started from. Called after the draft
+    /// changed, so a rejected edit cannot add a step or discard the redo history.
+    /// Consecutive edits of the same kind coalesce; a paste is always its own step.
+    fn record_step(&mut self, kind: EditKind, before: ComposerSnapshot) {
+        let after = self.composer_snapshot();
+        if before == after {
+            return;
+        }
+        let standalone = matches!(kind, EditKind::Paste | EditKind::Complete);
+        if !standalone && self.last_edit_kind == Some(kind) {
+            return;
+        }
+        if self.undo_history.len() == COMPOSER_UNDO_LIMIT {
+            self.undo_history.pop_front();
+        }
+        self.undo_history.push_back(before);
+        self.redo_history.clear();
+        self.last_edit_kind = Some(kind);
+    }
+
+    /// Capture the state before an edit, for `record_step`.
+    fn begin_edit(&mut self) -> ComposerSnapshot {
+        self.composer_snapshot()
+    }
+
+    fn restore_composer_snapshot(&mut self, snapshot: ComposerSnapshot) {
+        self.draft = snapshot.text;
+        self.draft_cursor = snapshot.cursor.min(self.draft.graphemes(true).count());
+        self.pasted_body = snapshot.pasted_body;
+        self.draft_vertical_column = None;
+        // Normalise last: an empty draft must leave literal-paste mode, or a later
+        // `/command` would be sent as text.
+        self.update_command_menu();
+    }
+
+    fn undo_composer(&mut self) -> bool {
+        let Some(previous) = self.undo_history.pop_back() else {
+            return false;
+        };
+        if self.redo_history.len() == COMPOSER_UNDO_LIMIT {
+            self.redo_history.pop_front();
+        }
+        self.redo_history.push_back(self.composer_snapshot());
+        self.restore_composer_snapshot(previous);
+        self.last_edit_kind = None;
+        true
+    }
+
+    fn redo_composer(&mut self) -> bool {
+        let Some(next) = self.redo_history.pop_back() else {
+            return false;
+        };
+        if self.undo_history.len() == COMPOSER_UNDO_LIMIT {
+            self.undo_history.pop_front();
+        }
+        self.undo_history.push_back(self.composer_snapshot());
+        self.restore_composer_snapshot(next);
+        self.last_edit_kind = None;
+        true
+    }
+
+    /// The number of available undo and redo steps. Exposed for the key-path tests.
+    #[doc(hidden)]
+    pub fn undo_depths(&self) -> (usize, usize) {
+        (self.undo_history.len(), self.redo_history.len())
+    }
+
     fn insert_draft(&mut self, character: char) {
         let byte = self.cursor_byte();
         self.draft.insert(byte, character);
@@ -2224,22 +2346,68 @@ impl App {
         self.draft_vertical_column = None;
         let control = key.modifiers.contains(KeyModifiers::CONTROL);
         let alt = key.modifiers.contains(KeyModifiers::ALT);
+        let before = self.begin_edit();
         match key.code {
-            KeyCode::Backspace if control || alt => self.delete_word_before_cursor(),
-            KeyCode::Backspace => self.delete_before_cursor(),
-            KeyCode::Delete => self.delete_at_cursor(),
-            KeyCode::Left if control || alt => self.move_word(false),
-            KeyCode::Right if control || alt => self.move_word(true),
-            KeyCode::Left => self.move_draft_cursor(-1),
-            KeyCode::Right => self.move_draft_cursor(1),
-            KeyCode::Home => self.draft_cursor = 0,
-            KeyCode::End => self.draft_cursor = self.draft.graphemes(true).count(),
-            KeyCode::Char('a') if control => self.draft_cursor = 0,
-            KeyCode::Char('e') if control => self.draft_cursor = self.draft.graphemes(true).count(),
-            KeyCode::Char('w') if control || alt => self.delete_word_before_cursor(),
-            KeyCode::Char('u') if control => self.clear_before_cursor(),
-            KeyCode::Char('k') if control => self.kill_to_end(),
-            KeyCode::Char(character) if !control && !alt => self.insert_draft(character),
+            KeyCode::Backspace if control || alt => {
+                self.delete_word_before_cursor();
+                self.record_step(EditKind::Delete, before);
+            }
+            KeyCode::Backspace => {
+                self.delete_before_cursor();
+                self.record_step(EditKind::Delete, before);
+            }
+            KeyCode::Delete => {
+                self.delete_at_cursor();
+                self.record_step(EditKind::Delete, before);
+            }
+            KeyCode::Left if control || alt => {
+                self.last_edit_kind = None;
+                self.move_word(false);
+            }
+            KeyCode::Right if control || alt => {
+                self.last_edit_kind = None;
+                self.move_word(true);
+            }
+            KeyCode::Left => {
+                self.last_edit_kind = None;
+                self.move_draft_cursor(-1);
+            }
+            KeyCode::Right => {
+                self.last_edit_kind = None;
+                self.move_draft_cursor(1);
+            }
+            KeyCode::Home => {
+                self.last_edit_kind = None;
+                self.draft_cursor = 0;
+            }
+            KeyCode::End => {
+                self.last_edit_kind = None;
+                self.draft_cursor = self.draft.graphemes(true).count();
+            }
+            KeyCode::Char('a') if control => {
+                self.last_edit_kind = None;
+                self.draft_cursor = 0;
+            }
+            KeyCode::Char('e') if control => {
+                self.last_edit_kind = None;
+                self.draft_cursor = self.draft.graphemes(true).count();
+            }
+            KeyCode::Char('w') if control || alt => {
+                self.delete_word_before_cursor();
+                self.record_step(EditKind::Delete, before);
+            }
+            KeyCode::Char('u') if control => {
+                self.clear_before_cursor();
+                self.record_step(EditKind::Delete, before);
+            }
+            KeyCode::Char('k') if control => {
+                self.kill_to_end();
+                self.record_step(EditKind::Delete, before);
+            }
+            KeyCode::Char(character) if !control && !alt => {
+                self.insert_draft(character);
+                self.record_step(EditKind::Insert, before);
+            }
             _ => return false,
         }
         let draft_changed = matches!(
@@ -2625,6 +2793,7 @@ impl App {
     }
 
     fn restore_send_draft(&mut self, recovery: RecoveryDraft) {
+        self.clear_undo_history();
         self.draft = recovery.body;
         // A recovered body is always message data, even if it begins with '/'.
         self.pasted_body = true;
@@ -2781,17 +2950,24 @@ impl App {
             || self.contacts_editing.is_some()
             || (self.new_conversation && self.pending_address.is_none());
         if single {
-            self.insert_paste(&clean.replace('\n', " "), false);
+            // A pasted address is still an edit of this draft and must be undoable.
+            let kind = if self.renaming.is_some() || self.contacts_editing.is_some() {
+                None
+            } else {
+                Some(EditKind::Paste)
+            };
+            self.insert_paste(&clean.replace('\n', " "), false, kind);
         } else {
             self.focus = Focus::Composer;
-            self.insert_paste(&clean, true);
+            self.insert_paste(&clean, true, Some(EditKind::Paste));
         }
     }
 
-    fn insert_paste(&mut self, text: &str, body: bool) {
+    fn insert_paste(&mut self, text: &str, body: bool, kind: Option<EditKind>) {
         if text.is_empty() {
             return;
         }
+        let before = self.begin_edit();
         let byte = self
             .draft
             .grapheme_indices(true)
@@ -2808,6 +2984,9 @@ impl App {
         self.pasted_body |= body;
         self.composing = true;
         self.update_command_menu();
+        if let Some(kind) = kind {
+            self.record_step(kind, before);
+        }
     }
 
     pub fn handle_key(&mut self, key: KeyEvent) -> Action {
@@ -2844,7 +3023,7 @@ impl App {
                 && !self.leader_pending
                 && (!self.new_conversation || self.pending_address.is_some());
             if body_editor {
-                self.insert_paste("\n", true);
+                self.insert_paste("\n", true, Some(EditKind::Multiline));
             }
             return Action::None;
         }
@@ -2890,9 +3069,11 @@ impl App {
                     || self.help_open)
                 && !self.draft.is_empty()
             {
+                let before = self.begin_edit();
                 self.draft.clear();
                 self.draft_cursor = 0;
                 self.command_menu = false;
+                self.record_step(EditKind::Clear, before);
                 return Action::None;
             }
             return Action::Quit;
@@ -3143,6 +3324,17 @@ impl App {
                         };
                     }
                 }
+                KeyCode::Char('z' | 'Z')
+                    if key.modifiers.contains(KeyModifiers::CONTROL)
+                        && !key.modifiers.contains(KeyModifiers::SHIFT) =>
+                {
+                    self.undo_composer();
+                    return Action::None;
+                }
+                KeyCode::Char('y' | 'Y') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    self.redo_composer();
+                    return Action::None;
+                }
                 KeyCode::Down => {
                     let count = self.command_suggestions().len();
                     if count > 0 {
@@ -3222,7 +3414,20 @@ impl App {
         }
 
         if self.composing {
+            let control = key.modifiers.contains(KeyModifiers::CONTROL);
             match key.code {
+                KeyCode::Char('z' | 'Z') if control => {
+                    if key.modifiers.contains(KeyModifiers::SHIFT) {
+                        self.redo_composer();
+                    } else {
+                        self.undo_composer();
+                    }
+                    return Action::None;
+                }
+                KeyCode::Char('y' | 'Y') if control => {
+                    self.redo_composer();
+                    return Action::None;
+                }
                 KeyCode::Esc => {
                     self.cancel_composition();
                     return Action::None;
@@ -3567,6 +3772,7 @@ impl App {
                         if let Some(index) = hits.composer_cursor_at(column, row) {
                             self.draft_cursor = index.min(self.draft.graphemes(true).count());
                             self.draft_vertical_column = None;
+                            self.last_edit_kind = None;
                         }
                     }
                 }

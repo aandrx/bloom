@@ -1,6 +1,6 @@
 use crate::app::{
     conversation_subtitle, message_text, status_text, status_tone, timestamp, App, ComposerPrompt,
-    Focus, StatusTone, Theme,
+    Focus, SearchState, StatusTone, Theme, SEARCH_RESULT_LIMIT,
 };
 
 use bloom_domain::{Conversation, ConversationId, DeliveryState, Message, MessageId};
@@ -1511,6 +1511,25 @@ fn search_conversation_name(app: &App, id: &bloom_domain::ConversationId) -> Str
         )
 }
 
+/// The one-line status above the search hits, with the count when results are ready.
+fn search_status_text(state: &SearchState) -> Option<String> {
+    if state.loading {
+        Some("Searching…".to_owned())
+    } else if let Some(error) = state.error.as_ref() {
+        Some(error.clone())
+    } else if state.completed && state.hits.is_empty() && !state.query.trim().is_empty() {
+        Some("No messages found.".to_owned())
+    } else if state.completed && !state.hits.is_empty() {
+        Some(if state.hits.len() as u32 >= SEARCH_RESULT_LIMIT {
+            format!("{} results (may be more)", state.hits.len())
+        } else {
+            format!("{} results", state.hits.len())
+        })
+    } else {
+        None
+    }
+}
+
 fn render_search(
     frame: &mut Frame<'_>,
     area: Rect,
@@ -1545,18 +1564,14 @@ fn render_search(
 
     let mut row = area.y.saturating_add(1);
     let bottom = area.y.saturating_add(area.height);
-    let status = if state.loading {
-        Some(("Searching…".to_owned(), Style::default().fg(palette.muted)))
-    } else if let Some(error) = state.error.as_ref() {
-        Some((error.clone(), Style::default().fg(palette.red)))
-    } else if state.completed && state.hits.is_empty() && !state.query.trim().is_empty() {
-        Some((
-            "No messages found.".to_owned(),
-            Style::default().fg(palette.muted),
-        ))
-    } else {
-        None
-    };
+    let status = search_status_text(state).map(|message| {
+        let style = if state.error.is_some() {
+            Style::default().fg(palette.red)
+        } else {
+            Style::default().fg(palette.muted)
+        };
+        (message, style)
+    });
     if let Some((message, style)) = status {
         if row < bottom {
             frame.render_widget(
@@ -3017,11 +3032,7 @@ fn render_cached_with_mode(
         });
         let search_layout = search_open.then(|| {
             let state = app.search.as_ref().expect("search state was checked");
-            let status = u16::from(
-                state.loading
-                    || state.error.is_some()
-                    || (state.completed && state.hits.is_empty() && !state.query.trim().is_empty()),
-            );
+            let status = u16::from(search_status_text(state).is_some());
             let results = if state.loading || state.error.is_some() {
                 0
             } else {
@@ -3479,6 +3490,7 @@ fn render_help(frame: &mut Frame<'_>, app: &App, content: Rect, palette: Palette
             "recover failed draft",
         ),
         ("Ctrl+F", "search stored messages", "search messages"),
+        ("Ctrl+Z / Ctrl+Y", "undo / redo the draft", "undo / redo"),
         ("/new", "start a new conversation", "new chat"),
         (
             "/sync",
