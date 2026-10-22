@@ -2,11 +2,15 @@
 
 **Status: active next-work plan, not completed features.** Replaces the obsolete foundation/direct-transport wave list. Read [handoff](handoff.md), [current design](system-design.md), [status](status.md) and [completed iteration](iteration-review.md) first.
 
+**Current user priority: UI/UX quality for the existing chat client.** The [reading/navigation pass](ux-polish-review.md) records its accepted bounded scope. The current [switching-latency follow-up](tui-switching-performance.md) records the user's subsequent lag report, fresh synthetic PTY measurements and acceptance. Backend recovery/history work below remains queued, not part of this bounded UI iteration.
+
+Multi-service integration and workspace/server navigation are deferred. Preserve [multi-service-research.md](multi-service-research.md) as research, not an active implementation instruction.
+
 ## Completed foundation
 
 Rust daemon/domain/IPC/secret-store boundary, encrypted persistence, external Dart engine integration, local conversation/message storage, TUI text sends and safe new-chat correlation, known-participant contacts/local preferences, exact direct identity reconciliation, literal multiline paste, recipient-bound session drafts/modal suspension, metadata sync request tracking, neutral responsive UI and installed launcher lifecycle have synthetic regression coverage. Cargo installs commands but not the complete runtime. Current live engine, historical import and renewal remain separate unverified gates.
 
-## Work order and acceptance
+## Queued backend/product work and acceptance
 
 ### 1. Generation-scoped engine recovery
 
@@ -28,9 +32,12 @@ Acceptance: synthetic pages cover duplicates, out-of-order live overlap, tombsto
 
 ### 3. Daily reading/composition loop
 
+The current bounded UI pass implements stable message-owned reading anchors, a measured Latest/End action, overlay wheel ownership and full-width narrow conversations with a searchable Chats navigator. Its acceptance evidence is in [the UI review](ux-polish-review.md); do not redispatch these as unimplemented features.
+
+Remaining:
+
 - Cursor-based local pagination beyond 200 stored messages, with stable viewport and bounded memory.
-- Local message search and explicit unread/jump-to-latest affordances without stealing a deliberate reading position.
-- A deliberate narrow-screen chat drawer rather than shrinking identities indefinitely.
+- Local message-content search and authoritative unread navigation. Chats searches conversation names/addresses only, not message content.
 - Undo and, only after privacy/retention review, encrypted durable drafts.
 - Consider typed interaction modes to reduce independent flag combinations, but only behind regression coverage for modal transitions, recipient changes, aliases, filters and asynchronous results.
 
@@ -50,7 +57,7 @@ Attachments, replies/reactions, edits/unsend, typing/read receipts and group man
 
 - Workspace all-target tests, timezone TUI tests, strict Clippy, formatting and source guard pass.
 - Owned Dart format/analyze/test gates pass after `dart pub get`; generated bridge is not manually edited.
-- Synthetic fixture, actual TUI PTY input/messaging and actual launcher suites pass against rebuilt binaries.
+- Synthetic fixture, actual TUI PTY input/messaging/reading-navigation and actual launcher suites pass against rebuilt binaries.
 - Normal daemon dependency graph contains no `rustpush`; engine library is not vendored; staged files contain no credentials or personal content.
 - User-facing bugs reproduced before fixes; regressions fail for the original defect and pass afterward. Inspect actual UI output and mouse hitboxes, not just snapshots or test counts.
 - Current-account operations require explicit authorization. Synthetic results cannot pass live delivery/history/renewal gates.

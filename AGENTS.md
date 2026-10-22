@@ -39,10 +39,11 @@ Use a Python virtual environment with `pyte==0.8.2` for all Python suites:
 python scripts/test-stateful-fake-daemon.py
 python scripts/test-tui-input-e2e.py
 python scripts/test-tui-messaging-e2e.py
+python scripts/test-tui-reading-e2e.py
 python scripts/test-launcher-e2e.py
 ```
 
-Dart owned-source checks and visual capture instructions are in `docs/handoff.md`.
+Dart owned-source checks and visual capture instructions are in `docs/handoff.md`. The optional `python scripts/benchmark-tui-switching.py` probe measures synthetic actual-PTY switching latency after rebuilding; it reports timings, not a CI wall-clock pass/fail gate. See `docs/tui-switching-performance.md`.
 The mutation guard script refuses dirty files; never reset working changes to run it.
 
 ## Change discipline

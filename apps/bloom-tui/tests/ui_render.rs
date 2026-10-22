@@ -577,6 +577,12 @@ fn long_disconnected_header_keeps_identity_and_status_at_narrow_widths() {
             rows.iter().take(2).any(|row| row.contains("Offline")),
             "failure status at {width}: {rows:?}"
         );
+        if width == 44 {
+            assert!(
+                !rows[0].contains("Offline") && rows[1].contains("Offline"),
+                "short header must move failure status to its own row: {rows:?}"
+            );
+        }
     }
 }
 
@@ -1767,12 +1773,13 @@ fn short_terminal_keeps_compact_footer_hints() {
         row_text(&compact, compact_prompt + 2).contains("↵ send"),
         "compact footer remains below the boundary:\n{compact_text}"
     );
-    let sidebar_divider = (1..compact.area.width - 1)
-        .find(|x| compact[(*x, 3)].symbol() == "│")
-        .expect("compact sidebar divider");
     assert!(
-        sidebar_divider < 14,
-        "compact sidebar preserves transcript width: {sidebar_divider}"
+        row_text(&compact, 0).contains("‹ Chats"),
+        "compact layout exposes navigation"
+    );
+    assert!(
+        !(0..compact.area.width).any(|x| compact[(x, 3)].symbol() == "│"),
+        "narrow conversation owns the full width instead of a clipped rail"
     );
 
     let composing = App {
@@ -1987,7 +1994,7 @@ fn composer_cursor_tracks_wide_graphemes_and_long_drafts() {
         (prefix_column + expected_prefix_width as u16, row)
     );
 
-    app.draft = "abcdefghijklmnopqrstuvwxyz".into();
+    app.draft = "abcdefghijklmnopqrstuvwxyz".repeat(2);
     app.draft_cursor = app.draft.chars().count();
     let backend = TestBackend::new(40, 8);
     let mut terminal = Terminal::new(backend).unwrap();
@@ -2687,7 +2694,7 @@ fn narrow_header_prioritizes_identity_over_optional_theme() {
         .collect::<Vec<_>>()
         .join("\n");
     assert!(
-        footer.contains("↵ send") && footer.contains("? help"),
+        (footer.contains("↵ send") || footer.contains("Enter send")) && footer.contains("? help"),
         "the narrow hints retain submission and discovery, got:\n{footer}"
     );
 }
@@ -3182,6 +3189,484 @@ fn the_command_popup_aligns_with_the_chat_not_the_center() {
             || (0..12).any(|y| row_text(&narrow, y).contains("/help")),
         "menu survives narrow short layout"
     );
+}
+
+fn tracked_frame(app: &mut App, width: u16, height: u16) -> (ratatui::buffer::Buffer, ui::HitMap) {
+    let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+    let mut hits = ui::HitMap::default();
+    terminal
+        .draw(|frame| hits = ui::render(frame, app))
+        .unwrap();
+    app.record_transcript(hits.transcript_view.clone());
+    (terminal.backend().buffer().clone(), hits)
+}
+
+fn reading_fixture() -> (App, Conversation) {
+    let only = conversation("Reading", 2, 1);
+    let mut app = App::default();
+    app.set_conversations(vec![only.clone()]);
+    for index in 0..60 {
+        app.upsert(
+            only.id.clone(),
+            message(
+                &only,
+                &format!("m{index:03}"),
+                1_700_000_000_000 + index,
+                &format!("reading message {index:03}"),
+                false,
+            ),
+        );
+    }
+    tracked_frame(&mut app, 100, 24);
+    app.scroll_back(10);
+    tracked_frame(&mut app, 100, 24);
+    (app, only)
+}
+
+#[test]
+fn reading_anchor_survives_appends_edits_duplicates_snapshots_and_reflow() {
+    use bloom_ipc::EventKind;
+    let (mut app, only) = reading_fixture();
+    let anchor = app.reading_anchor.clone().unwrap();
+    let original_back = app.scroll;
+    let arrival = message(
+        &only,
+        "arrival",
+        1_700_000_001_000,
+        &"new wrapped content ".repeat(50),
+        false,
+    );
+    for _ in 0..2 {
+        app.apply_event(EventKind::Message {
+            conversation_id: only.id.clone(),
+            message: arrival.clone(),
+            push_sequence: None,
+        });
+        tracked_frame(&mut app, 100, 24);
+        assert_eq!(app.reading_anchor.as_ref().unwrap().message, anchor.message);
+        assert_eq!(app.reading_anchor.as_ref().unwrap().row, anchor.row);
+    }
+    assert!(
+        app.scroll > original_back,
+        "bottom-relative distance must grow, not the reading position"
+    );
+    app.apply_event(EventKind::Update {
+        conversation_id: only.id.clone(),
+        message: message(
+            &only,
+            "m000",
+            1_700_000_000_000,
+            &"edited earlier text ".repeat(50),
+            false,
+        ),
+    });
+    tracked_frame(&mut app, 100, 24);
+    assert_eq!(app.reading_anchor.as_ref().unwrap().message, anchor.message);
+    app.apply_snapshot(bloom_tui::daemon::Snapshot {
+        revision: 10,
+        conversations: vec![only.clone()],
+        visible: Some(only.id.clone()),
+        history: app.messages[&only.id].clone(),
+    });
+    tracked_frame(&mut app, 66, 18);
+    assert_eq!(app.reading_anchor.as_ref().unwrap().message, anchor.message);
+    assert_eq!(app.reading_anchor.as_ref().unwrap().row, anchor.row);
+    tracked_frame(&mut app, 20, 3); // Tiny fallback must not discard the anchor.
+    tracked_frame(&mut app, 100, 24);
+    assert_eq!(app.reading_anchor.as_ref().unwrap().message, anchor.message);
+    app.scroll_to_newest();
+    tracked_frame(&mut app, 100, 24);
+    assert!(!app.is_scrolled_back());
+    app.apply_event(EventKind::Message {
+        conversation_id: only.id.clone(),
+        message: message(
+            &only,
+            "following",
+            1_700_000_002_000,
+            "follow this new arrival",
+            false,
+        ),
+        push_sequence: None,
+    });
+    let (buffer, hits) = tracked_frame(&mut app, 100, 24);
+    assert!((0..24).any(|y| row_text(&buffer, y).contains("follow this new arrival")));
+    assert!(hits.latest.is_none());
+}
+
+#[test]
+fn latest_has_a_measured_target_keeps_errors_and_preserves_literal_composition() {
+    let (mut app, _) = reading_fixture();
+    app.draft = "/new literal draft".into();
+    app.pasted_body = true;
+    app.draft_cursor = 4;
+    app.error = Some("A visible send error".into());
+    let (buffer, hits) = tracked_frame(&mut app, 100, 24);
+    let latest = hits
+        .latest
+        .expect("visible return control even with an error");
+    assert_eq!(hits.at(latest.x, latest.y), Some(ui::Hit::Latest));
+    assert!((0..24).any(|y| row_text(&buffer, y).contains("A visible send error")));
+    app.handle_mouse(
+        MouseEventKind::Down(MouseButton::Left),
+        latest.x,
+        latest.y,
+        &hits,
+    );
+    assert!(!app.is_scrolled_back());
+    assert_eq!(app.draft, "/new literal draft");
+    assert_eq!(app.draft_cursor, 4);
+    assert!(app.pasted_body);
+}
+
+#[test]
+fn painted_overlays_own_wheel_and_uncovered_transcript_still_scrolls() {
+    for panel in 0..5 {
+        let (mut app, _) = reading_fixture();
+        app.scroll_to_newest();
+        match panel {
+            0 => app.open_settings(),
+            1 => app.theme_panel_open = true,
+            2 => {
+                app.draft = "/".into();
+                app.command_menu = true;
+            }
+            3 => app.begin_contacts(),
+            _ => {
+                let id = app.selected.clone().unwrap();
+                app.open_context_menu(id);
+            }
+        }
+        let (_, hits) = tracked_frame(&mut app, 100, 30);
+        let area = hits
+            .menu
+            .or(hits.context_menu)
+            .or(hits.popup)
+            .expect("painted panel");
+        assert!(hits.latest.is_none());
+        app.handle_mouse(MouseEventKind::ScrollUp, area.x + 1, area.y + 1, &hits);
+        assert_eq!(app.scroll, 0, "panel {panel} must consume its own wheel");
+        let point = (hits.transcript.x, hits.transcript.y);
+        if !hits.overlay_contains(point.0, point.1) {
+            app.handle_mouse(MouseEventKind::ScrollUp, point.0, point.1, &hits);
+            assert!(
+                app.is_scrolled_back(),
+                "uncovered transcript remains scrollable"
+            );
+        }
+    }
+}
+
+#[test]
+fn alias_reconciliation_is_the_same_reading_context_even_before_history_arrives() {
+    let (mut app, original) = reading_fixture();
+    let anchor = app.reading_anchor.clone().unwrap();
+    let mut canonical = conversation("Canonical Reading", 2, 1);
+    canonical.aliases.push(original.id.clone());
+    app.set_conversations(vec![canonical.clone()]);
+    tracked_frame(&mut app, 100, 24); // The new identity has no history response yet.
+    assert!(
+        app.is_scrolled_back(),
+        "a metadata alias must not reset the reading context"
+    );
+    assert_eq!(app.reading_anchor.as_ref().unwrap().message, anchor.message);
+    let history = app.messages[&original.id]
+        .iter()
+        .map(|old| {
+            message(
+                &canonical,
+                old.id().value(),
+                old.created_at,
+                &format!(
+                    "reading message {}",
+                    old.id().value().trim_start_matches('m')
+                ),
+                false,
+            )
+        })
+        .collect();
+    app.apply_snapshot(bloom_tui::daemon::Snapshot {
+        revision: 20,
+        visible: Some(canonical.id.clone()),
+        conversations: vec![canonical.clone()],
+        history,
+    });
+    tracked_frame(&mut app, 100, 24);
+    assert_eq!(app.reading_anchor.as_ref().unwrap().message, anchor.message);
+    assert_eq!(
+        app.reading_anchor.as_ref().unwrap().conversation,
+        canonical.id
+    );
+    assert_eq!(app.reading_anchor.as_ref().unwrap().row, anchor.row);
+}
+
+#[test]
+fn narrow_drawer_owns_input_without_retargeting_until_explicit_open() {
+    let (mut app, alice) = reading_fixture();
+    let bob = conversation("Bob with a useful full identity", 2, 0);
+    app.set_conversations(vec![alice.clone(), bob.clone()]);
+    app.draft = "/new literal private Alice body".into();
+    app.pasted_body = true;
+    app.draft_cursor = 7;
+    let anchor = app.reading_anchor.clone().unwrap();
+    app.set_terminal_width(44);
+    let (_, narrow) = tracked_frame(&mut app, 44, 12);
+    assert_eq!(
+        narrow.composer.width as usize,
+        ui::composer_columns(44, false)
+    );
+    assert!(narrow.sidebar_rows.is_empty());
+    let chats = narrow.header_chats.expect("visible Chats navigation");
+    app.handle_mouse(
+        MouseEventKind::Down(MouseButton::Left),
+        chats.x,
+        chats.y,
+        &narrow,
+    );
+    app.paste("Bob");
+    let (buffer, hits) = tracked_frame(&mut app, 44, 12);
+    assert!((0..12).any(|y| row_text(&buffer, y).contains("Bob with a useful full identity")));
+    assert_eq!(
+        app.selected.as_ref(),
+        Some(&alice.id),
+        "highlight/search must not select a recipient"
+    );
+    assert_eq!(app.draft, "/new literal private Alice body");
+    assert_eq!(app.draft_cursor, 7);
+    assert!(app.pasted_body);
+    assert_eq!(hits.at(chats.x, chats.y), Some(ui::Hit::Drawer));
+    assert!(hits.latest.is_none());
+    app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+    assert_eq!(app.reading_anchor.as_ref().unwrap().message, anchor.message);
+    assert_eq!(app.selected.as_ref(), Some(&alice.id));
+    app.handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+    app.paste("Bob");
+    app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+    assert_eq!(app.selected.as_ref(), Some(&bob.id));
+    assert!(
+        app.draft.is_empty(),
+        "Alice's literal body must not appear in Bob"
+    );
+    app.handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+    app.paste("Reading");
+    app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+    assert_eq!(app.selected.as_ref(), Some(&alice.id));
+    assert_eq!(app.draft, "/new literal private Alice body");
+    assert_eq!(app.draft_cursor, 7);
+    assert!(app.pasted_body);
+}
+
+#[test]
+fn stale_drawer_click_cannot_open_a_different_current_chat() {
+    let (mut app, alice) = reading_fixture();
+    let bob = conversation("Bob", 2, 0);
+    let charlie = conversation("Charlie", 2, -1);
+    app.set_conversations(vec![alice.clone(), bob.clone(), charlie.clone()]);
+    app.set_terminal_width(44);
+    app.open_chat_drawer();
+    let (_, hits) = tracked_frame(&mut app, 44, 12);
+    let bob_row = hits
+        .drawer_rows
+        .iter()
+        .find(|(_, id)| id == &bob.id)
+        .unwrap()
+        .0;
+
+    let mut promoted_charlie = charlie;
+    promoted_charlie.last_message_at = Some(100);
+    app.set_conversations(vec![alice.clone(), promoted_charlie]);
+    app.handle_mouse(
+        MouseEventKind::Down(MouseButton::Left),
+        bob_row.x,
+        bob_row.y,
+        &hits,
+    );
+
+    assert_eq!(app.selected, Some(alice.id));
+    assert!(
+        app.chat_drawer.is_some(),
+        "stale hit must leave navigation open"
+    );
+}
+
+#[test]
+fn drawer_search_trims_paste_and_matches_participant_display_names() {
+    let (mut app, alice) = reading_fixture();
+    let mut project = conversation("Project room", 3, 0);
+    project.participants[1].display_name = Some("Robert Jones".into());
+    project.participants[1].handle =
+        Handle::new(HandleKind::Email, "robert@example.invalid").unwrap();
+    app.set_conversations(vec![alice, project.clone()]);
+    app.set_terminal_width(44);
+    app.open_chat_drawer();
+
+    app.paste("robert@example.invalid\n");
+    assert_eq!(app.drawer_selection(), Some(project.id.clone()));
+    app.handle_key(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL));
+    app.paste("Robert Jones\n");
+    assert_eq!(app.drawer_selection(), Some(project.id.clone()));
+    app.handle_key(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL));
+    app.titles.insert(
+        bloom_tui::app::conversation_key(&project.id),
+        "Zebra hideout".into(),
+    );
+    app.paste("Zebra hideout\n");
+    assert_eq!(app.drawer_selection(), Some(project.id));
+}
+
+#[test]
+fn opening_and_closing_drawer_clears_pending_leader_input() {
+    let (mut app, _) = reading_fixture();
+    app.set_terminal_width(44);
+    let (_, hits) = tracked_frame(&mut app, 44, 12);
+    let chats = hits.header_chats.unwrap();
+    app.handle_key(KeyEvent::new(KeyCode::Char('b'), KeyModifiers::CONTROL));
+    assert!(app.leader_pending);
+    app.handle_mouse(
+        MouseEventKind::Down(MouseButton::Left),
+        chats.x,
+        chats.y,
+        &hits,
+    );
+    assert!(app.chat_drawer.is_some());
+    assert!(!app.leader_pending);
+    app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+    app.handle_key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE));
+    assert_eq!(app.draft, "x");
+}
+
+#[test]
+fn drawer_list_scrolls_to_a_deep_candidate_and_renders_at_tiny_sizes() {
+    let mut app = App::default();
+    app.set_conversations(
+        (0..60)
+            .map(|index| conversation(&format!("Chat {index:02}"), 2, index))
+            .collect(),
+    );
+    app.set_terminal_width(44);
+    app.open_chat_drawer();
+    app.handle_key(KeyEvent::new(KeyCode::End, KeyModifiers::NONE));
+    let chosen = app.drawer_selection().unwrap();
+    for (width, height) in [(66, 18), (44, 12), (24, 6), (20, 4), (8, 2), (1, 1)] {
+        let (_, hits) = tracked_frame(&mut app, width, height);
+        assert!(hits.drawer.is_some());
+        if height >= 6 {
+            assert!(
+                hits.drawer_rows.iter().any(|(_, id)| id == &chosen),
+                "deep candidate must stay visible at {width}x{height}"
+            );
+        }
+        assert!(
+            hits.composer_positions.is_empty(),
+            "drawer must not leave composer cursor targets behind"
+        );
+    }
+    app.handle_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL));
+    assert!(
+        app.chat_drawer.is_none(),
+        "Ctrl+C cancels navigation instead of clearing or sending the draft"
+    );
+}
+
+#[test]
+fn drawer_cancel_preserves_suspended_new_chat_and_empty_search_cannot_open() {
+    let (mut app, _) = reading_fixture();
+    app.begin_new_conversation();
+    app.paste("carol@example.invalid");
+    app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+    app.paste("/new literal Carol body");
+    app.open_settings();
+    app.set_terminal_width(44);
+    app.open_chat_drawer();
+    app.paste("no matching conversation");
+    app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+    assert!(
+        app.chat_drawer.is_some(),
+        "empty search must remain correctable"
+    );
+    app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+    assert!(
+        app.settings_open,
+        "cancel must return to the exact underlying panel"
+    );
+    app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+    assert_eq!(
+        app.pending_address.as_deref(),
+        Some("carol@example.invalid")
+    );
+    assert_eq!(app.draft, "/new literal Carol body");
+    assert!(app.pasted_body);
+    app.open_chat_drawer();
+    app.paste("Reading");
+    app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+    assert!(!app.new_conversation);
+    assert!(
+        app.draft.is_empty(),
+        "new-chat body cannot leak into an existing chat"
+    );
+    app.begin_new_conversation();
+    app.paste("carol@example.invalid");
+    app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+    assert_eq!(
+        app.draft, "/new literal Carol body",
+        "navigation parks rather than discards the new-chat body"
+    );
+    assert!(app.pasted_body);
+}
+
+#[test]
+fn drawer_candidate_survives_background_identity_alias_reconciliation() {
+    let (mut app, alice) = reading_fixture();
+    let bob = conversation("Bob original identity", 2, 0);
+    app.set_conversations(vec![alice.clone(), bob.clone()]);
+    app.set_terminal_width(44);
+    app.open_chat_drawer();
+    app.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+    tracked_frame(&mut app, 44, 12);
+    assert_eq!(app.drawer_selection(), Some(bob.id.clone()));
+    let mut canonical = conversation("Bob canonical identity", 2, 0);
+    canonical.aliases.push(bob.id);
+    app.set_conversations(vec![alice.clone(), canonical.clone()]);
+    let (buffer, _) = tracked_frame(&mut app, 44, 12);
+    assert!(
+        (0..12).any(|y| row_text(&buffer, y).contains("› Bob canonical identity")),
+        "background identity metadata must not change the highlighted logical chat"
+    );
+    let mut final_identity = conversation("Bob final identity", 2, 0);
+    final_identity.aliases.push(canonical.id);
+    app.set_conversations(vec![alice, final_identity.clone()]);
+    let (buffer, _) = tracked_frame(&mut app, 44, 12);
+    assert!(
+        (0..12).any(|y| row_text(&buffer, y).contains("› Bob final identity")),
+        "successive alias transitions must retain the same logical candidate"
+    );
+    app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+    assert_eq!(app.selected, Some(final_identity.id));
+}
+
+#[test]
+fn delivery_icon_and_label_wrap_as_one_visual_unit() {
+    let (mut app, selected) = reading_fixture();
+    let mut sent = message(
+        &selected,
+        "delivered-wrap",
+        1_800_000_000_000,
+        "Yes, morning works best for me.",
+        true,
+    );
+    sent.delivery = DeliveryState::Delivered;
+    app.upsert(selected.id, sent);
+    app.scroll_to_newest();
+    for width in [24, 44, 66] {
+        let grid = buffer(&app, width, 30);
+        let delivered = (0..30)
+            .map(|y| row_text(&grid, y))
+            .find(|row| row.contains("delivered"))
+            .expect("delivery status must remain visible");
+        assert!(
+            delivered.contains('✓'),
+            "delivery icon must not be stranded on another row at {width}: {delivered:?}"
+        );
+    }
 }
 
 #[test]

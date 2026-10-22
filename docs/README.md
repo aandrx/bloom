@@ -13,13 +13,16 @@ Start with [fresh-session handoff](handoff.md). The root [AGENTS.md](../AGENTS.m
 | [Implementation roadmap](implementation-plan.md) | Active ordered work and acceptance gates, not completed features |
 | [TUI user guide](tui.md) | Controls, preferences, screen behavior, setup and troubleshooting |
 | [TUI internals](tui-internals.md) | Redraw, state/ownership, geometry, palettes, terminal lifecycle and test tooling |
-| [Latest iteration review](iteration-review.md) | Accepted fixes, reproduced defects, synthetic verification, parent critique and remaining limits |
+| [Reading/navigation UI iteration](ux-polish-review.md) | Accepted current-chat interaction/design scope, reproductions and evidence; integrations deferred |
+| [Switching latency follow-up](tui-switching-performance.md) | Measured local switching lag, bounded rendering correction and repeatable synthetic PTY probe |
+| [Previous completed iteration](iteration-review.md) | Accepted reliability/UI fixes, synthetic verification, parent critique and remaining limits |
 | [Sidecar package guide](../ext/bloom-engine-sidecar/README.md) | Runtime prerequisites, version/licensing boundary and current child protocol |
 
 ## Research, history and deferred work
 
 | Document | Status / how to use |
 | --- | --- |
+| [Multi-service research and proposed plan](multi-service-research.md) | Deferred Slack/Discord feasibility, policy/access limits, service-native navigation and staged acceptance gates; not implemented connectors |
 | [Engine-sidecar evidence](engine-sidecar.md) | Historical research/authorized live experiments plus updated integration boundaries; not current-checkout live proof |
 | [IDS validation gate](ids-validation-gate.md) | Independent registration remains blocked; existing-engine reuse does not open this gate |
 | [GPUI bookmark](gpui-surface.md) | Deferred surface exploration; no working GUI implementation or scheduled port |

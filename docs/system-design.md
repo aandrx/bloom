@@ -80,7 +80,7 @@ There is no automatic engine-generation recovery after child failure. IPC reconn
 
 `App` owns interaction state, draft ownership and recovery. Session-only drafts preserve text, cursor and literal-paste provenance; new-chat keys include recipient context. Transient panels suspend composition and restore only the correct owner. Preferences store display settings/labels, not plaintext drafts.
 
-`composer.rs` wraps extended graphemes and maps cursor geometry. `ui.rs` returns hitboxes from the same frame it draws. `main.rs` routes input and asynchronous events/results through a coalescing `RedrawScheduler` capped at 120 FPS; animation ticks are 33 ms. See [rendering internals](tui-internals.md).
+`composer.rs` wraps extended graphemes and maps cursor geometry. `ui.rs` returns hitboxes from the same frame it draws. The terminal loop owns a bounded session-only transcript layout cache; unchanged layouts reuse exact ratatui geometry and paint only visible logical lines, without mutating App. `main.rs` routes input and asynchronous events/results through a coalescing `RedrawScheduler` capped at 120 FPS; animation ticks are 33 ms. See [rendering internals](tui-internals.md).
 
 ## Security and capability boundaries
 

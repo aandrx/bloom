@@ -283,6 +283,7 @@ async fn main() -> Result<()> {
     let mut last_visible = app.selected.clone();
     let mut redraw = RedrawScheduler::default();
     let mut hits = ui::HitMap::default();
+    let mut render_cache = ui::RenderCache::default();
     let mut inbound_redraws = VecDeque::<(u64, std::time::Instant)>::new();
     // The daemon has no explicit catch-up completion frame, so treat a burst of
     // inbound events as syncing until the stream has been quiet for a moment.
@@ -291,11 +292,13 @@ async fn main() -> Result<()> {
     let mut next_animation = tokio::time::Instant::now();
     loop {
         if redraw.take_due(std::time::Instant::now()) {
+            app.set_terminal_width(terminal.size()?.width);
             // Rendering returns the hitboxes it drew, so mouse input is resolved
             // against the frame the user is actually looking at.
             terminal.draw(|frame| {
-                hits = ui::render(frame, &app);
+                hits = ui::render_with_cache(frame, &app, &mut render_cache);
             })?;
+            app.record_transcript(hits.transcript_view.take());
             let drawn_at = std::time::Instant::now();
             while let Some((sequence, received_at)) = inbound_redraws.pop_front() {
                 diagnostics::inbound_timing(
@@ -399,6 +402,7 @@ async fn main() -> Result<()> {
                 // Keep vertical cursor motion and mouse placement aligned with the
                 // responsive composer width currently on screen.
                 let size = terminal.size()?;
+                app.set_terminal_width(size.width);
                 app.composer_columns = ui::composer_columns(size.width, app.compact_sidebar);
                 app.composer_prefix_columns =
                     ui::composer_prefix_columns(&app, app.composer_columns);

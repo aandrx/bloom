@@ -52,6 +52,7 @@ jobs:
           "$RUNNER_TEMP/bloom-e2e/bin/python" scripts/test-stateful-fake-daemon.py
           "$RUNNER_TEMP/bloom-e2e/bin/python" scripts/test-tui-input-e2e.py
           "$RUNNER_TEMP/bloom-e2e/bin/python" scripts/test-tui-messaging-e2e.py
+          "$RUNNER_TEMP/bloom-e2e/bin/python" scripts/test-tui-reading-e2e.py
         env:
           TZ: UTC
       - name: TUI tests under a second timezone

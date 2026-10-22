@@ -180,6 +180,8 @@ pub struct App {
     /// None means follow the terminal theme; Some pins a user preference.
     pub theme_override: Option<Theme>,
     pub compact_sidebar: bool,
+    pub terminal_width: u16,
+    pub chat_drawer: Option<ChatDrawer>,
     pub wrap_composer: bool,
     /// Current composer text and prompt widths, refreshed by the terminal loop.
     pub composer_columns: usize,
@@ -232,6 +234,10 @@ pub struct App {
     /// Display rows scrolled back from the newest message. Zero pins the transcript
     /// to the newest content, which is what a chat client should do by default.
     pub scroll: usize,
+    #[doc(hidden)]
+    pub reading_anchor: Option<crate::transcript::ReadingAnchor>,
+    #[doc(hidden)]
+    pub transcript_viewport: Option<crate::transcript::TranscriptViewport>,
     /// Set when the daemon reports a conversation listing change; the caller then
     /// re-reads the conversation list without disturbing the open thread.
     pub resync_conversations: bool,
@@ -276,6 +282,14 @@ pub struct App {
     pub renaming: Option<ConversationId>,
 }
 
+/// Navigation is a separate input owner. Highlighting never retargets a draft;
+/// only an explicit open commits the candidate conversation.
+#[derive(Clone, Debug)]
+pub struct ChatDrawer {
+    pub query: String,
+    pub selected: Option<ConversationId>,
+}
+
 /// A small right-click menu over a conversation.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ContextMenu {
@@ -315,6 +329,8 @@ impl Default for App {
             system_theme: Theme::default(),
             theme_override: None,
             compact_sidebar: false,
+            terminal_width: 100,
+            chat_drawer: None,
             wrap_composer: true,
             composer_columns: 72,
             composer_prefix_columns: 3,
@@ -353,6 +369,8 @@ impl Default for App {
             active_draft_owner: None,
             suspended_composition: None,
             scroll: 0,
+            reading_anchor: None,
+            transcript_viewport: None,
             resync_conversations: false,
             filter: None,
             composing: true,
@@ -446,7 +464,26 @@ impl App {
                 // under the retired row.
                 let canonical_id = canonical.id.clone();
                 self.migrate_draft_owner(&selected, &canonical_id);
-                self.select(Some(canonical_id));
+                // An alias is not navigation. Keep the semantic reading context
+                // through the gap before the canonical identity's history loads.
+                self.selected = Some(canonical_id.clone());
+                if let Some(anchor) = self.reading_anchor.as_mut() {
+                    anchor.conversation = canonical_id.clone();
+                }
+                if let Some(view) = self.transcript_viewport.as_mut() {
+                    view.conversation = canonical_id;
+                }
+            }
+        }
+        if let Some(drawer) = self.chat_drawer.as_mut() {
+            if let Some(canonical) = drawer.selected.as_ref().and_then(|candidate| {
+                conversations
+                    .iter()
+                    .find(|conversation| conversation.aliases.contains(candidate))
+            }) {
+                // Carry the candidate forward without committing navigation,
+                // including successive snapshots that expose only the last alias.
+                drawer.selected = Some(canonical.id.clone());
             }
         }
         conversations.sort_by_key(|c| std::cmp::Reverse(c.last_message_at));
@@ -472,7 +509,8 @@ impl App {
     /// so opening a different thread returns to that thread's newest message.
     pub fn select(&mut self, id: Option<ConversationId>) {
         if self.selected != id {
-            self.scroll = 0;
+            self.scroll_to_newest();
+            self.transcript_viewport = None;
             self.send_feedback = None;
             if self.suspended_composition.is_none() {
                 let next = if self.new_conversation {
@@ -606,24 +644,67 @@ impl App {
         self.resume_composer_draft();
     }
 
+    /// Capture gestures against the displayed geometry, even when an event arrives
+    /// before the next coalesced redraw.
+    fn anchor_scroll(&mut self) {
+        self.reading_anchor = None;
+        if self.scroll > 0 {
+            if let Some(view) = self.transcript_viewport.as_ref() {
+                if self.selected.as_ref() == Some(&view.conversation) && !self.new_conversation {
+                    self.scroll = self.scroll.min(view.max_scroll());
+                    if self.scroll > 0 {
+                        self.reading_anchor = view.anchor_at(view.max_scroll() - self.scroll);
+                    }
+                }
+            }
+        }
+    }
+
+    /// Resolve using geometry from this frame's actual transcript formatter.
+    pub fn transcript_top(&self, view: &crate::transcript::TranscriptViewport) -> usize {
+        view.top_for(self.scroll, self.reading_anchor.as_ref())
+    }
+
+    /// Record only a successfully displayed frame. Rendering remains immutable.
+    pub fn record_transcript(&mut self, view: Option<crate::transcript::TranscriptViewport>) {
+        if let Some(view) = view {
+            self.scroll = view.back();
+            self.reading_anchor = if self.scroll > 0 {
+                view.anchor_at(view.top)
+            } else {
+                None
+            };
+            self.transcript_viewport = Some(view);
+        } else if self.new_conversation || self.selected.is_none() {
+            self.scroll_to_newest();
+            self.transcript_viewport = None;
+        }
+        // A tiny fallback frame has no transcript; retain its last reading anchor
+        // so restoring a usable terminal size does not silently jump to latest.
+    }
+
     /// Scroll the transcript back through older messages, in display rows.
     pub fn scroll_back(&mut self, rows: usize) {
         self.scroll = self.scroll.saturating_add(rows);
+        self.anchor_scroll();
     }
 
     /// Scroll forward towards the newest message. Zero means pinned to the newest.
     pub fn scroll_forward(&mut self, rows: usize) {
         self.scroll = self.scroll.saturating_sub(rows);
+        self.anchor_scroll();
     }
 
     /// Request the oldest content. The renderer clamps this to what exists.
     pub fn scroll_to_oldest(&mut self) {
         self.scroll = usize::MAX;
+        self.anchor_scroll();
     }
 
-    /// Return to the newest message.
+    /// Return to the newest message without changing composition.
     pub fn scroll_to_newest(&mut self) {
         self.scroll = 0;
+        self.reading_anchor = None;
     }
 
     /// True while the transcript is showing something other than the newest message.
@@ -1144,6 +1225,170 @@ impl App {
     pub fn filter_has_no_matches(&self) -> bool {
         matches!(self.filter_query(), Some(query) if !query.trim().is_empty() || self.filter_category != 0)
             && self.visible_conversations().is_empty()
+    }
+
+    pub fn set_terminal_width(&mut self, width: u16) {
+        self.terminal_width = width;
+        let uses_drawer = crate::ui::uses_chat_drawer(width);
+        if uses_drawer && self.context_menu.is_some() {
+            self.close_context_menu();
+            self.focus = Focus::Composer;
+        }
+        if uses_drawer
+            && self.focus == Focus::Sidebar
+            && self.context_menu.is_none()
+            && self.renaming.is_none()
+            && self.filter.is_none()
+            && !self.settings_open
+            && !self.theme_panel_open
+            && !self.contacts_open
+            && !self.help_open
+            && !self.command_menu
+        {
+            self.focus = Focus::Composer;
+            self.open_chat_drawer();
+        }
+    }
+
+    pub fn open_chat_drawer(&mut self) {
+        self.leader_pending = false;
+        if self.chat_drawer.is_none() {
+            self.chat_drawer = Some(ChatDrawer {
+                query: String::new(),
+                selected: self.selected.clone(),
+            });
+        }
+    }
+
+    pub fn drawer_conversations(&self) -> Vec<&Conversation> {
+        let query = self
+            .chat_drawer
+            .as_ref()
+            .map_or("", |drawer| drawer.query.trim());
+        let needle = query.to_lowercase();
+        self.conversations
+            .iter()
+            .filter(|conversation| {
+                !self.conversation_is_hidden(conversation)
+                    && (self
+                        .conversation_name(conversation)
+                        .to_lowercase()
+                        .contains(&needle)
+                        || conversation_matches(conversation, query))
+            })
+            .collect()
+    }
+
+    pub fn drawer_selection(&self) -> Option<ConversationId> {
+        let rows = self.drawer_conversations();
+        self.chat_drawer
+            .as_ref()
+            .and_then(|drawer| drawer.selected.as_ref())
+            .filter(|selected| rows.iter().any(|row| &row.id == *selected))
+            .cloned()
+            .or_else(|| rows.first().map(|row| row.id.clone()))
+    }
+
+    fn drawer_step(&mut self, step: isize) {
+        let rows = self.drawer_conversations();
+        let selected = self.drawer_selection();
+        let index = rows
+            .iter()
+            .position(|row| Some(&row.id) == selected.as_ref())
+            .unwrap_or(0);
+        let next = rows
+            .get(
+                index
+                    .saturating_add_signed(step)
+                    .min(rows.len().saturating_sub(1)),
+            )
+            .map(|row| row.id.clone());
+        if let Some(drawer) = self.chat_drawer.as_mut() {
+            drawer.selected = next;
+        }
+    }
+
+    fn confirm_chat_drawer(&mut self) {
+        let selected = self.drawer_selection();
+        self.confirm_chat_drawer_id(selected);
+    }
+
+    fn confirm_chat_drawer_id(&mut self, requested: Option<ConversationId>) {
+        // A click belongs to the last painted frame. Resolve it against the
+        // current filtered rows, including a canonical alias, or ignore it.
+        let Some(id) = requested.and_then(|requested| {
+            self.drawer_conversations()
+                .into_iter()
+                .find(|conversation| {
+                    conversation.id == requested || conversation.aliases.contains(&requested)
+                })
+                .map(|conversation| conversation.id.clone())
+        }) else {
+            return;
+        };
+        self.chat_drawer = None;
+        self.close_preferences();
+        if self.contacts_open {
+            self.close_contacts();
+        }
+        if self.renaming.is_some() {
+            self.cancel_rename();
+        }
+        self.cancel_filter();
+        // Park even an unfinished new-chat body under its own owner. Choosing
+        // an existing chat must neither discard it nor send it elsewhere.
+        self.retarget_draft(None);
+        self.new_conversation = false;
+        self.pending_address = None;
+        self.command_menu = false;
+        self.help_open = false;
+        self.context_menu = None;
+        self.select(Some(id));
+        self.resume_composer_draft();
+        self.focus = Focus::Composer;
+        self.composing = true;
+    }
+
+    fn drawer_key(&mut self, key: KeyEvent) {
+        match key.code {
+            KeyCode::Esc | KeyCode::Tab | KeyCode::BackTab => self.chat_drawer = None,
+            KeyCode::Enter => self.confirm_chat_drawer(),
+            KeyCode::Up => self.drawer_step(-1),
+            KeyCode::Down => self.drawer_step(1),
+            KeyCode::PageUp => self.drawer_step(-10),
+            KeyCode::PageDown => self.drawer_step(10),
+            KeyCode::Home => self.drawer_step(isize::MIN),
+            KeyCode::End => self.drawer_step(isize::MAX),
+            KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                self.chat_drawer = None
+            }
+            KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                if let Some(drawer) = self.chat_drawer.as_mut() {
+                    drawer.query.clear();
+                    drawer.selected = None;
+                }
+            }
+            KeyCode::Backspace => {
+                if let Some(drawer) = self.chat_drawer.as_mut() {
+                    if let Some((index, _)) = drawer.query.grapheme_indices(true).next_back() {
+                        drawer.query.truncate(index);
+                    }
+                    drawer.selected = None;
+                }
+            }
+            KeyCode::Char(character)
+                if !character.is_control()
+                    && !key.modifiers.intersects(
+                        KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SUPER,
+                    ) =>
+            {
+                if let Some(drawer) = self.chat_drawer.as_mut() {
+                    drawer.query.push(character);
+                    drawer.selected = None;
+                }
+            }
+            _ => {}
+        }
     }
 
     /// Open the filter without touching an in-progress draft, so `/` cannot lose
@@ -1869,6 +2114,13 @@ impl App {
 
     /// Paste is data, never keystrokes or a command. Non-editable overlays own input.
     pub fn paste(&mut self, input: &str) {
+        if let Some(drawer) = self.chat_drawer.as_mut() {
+            drawer
+                .query
+                .push_str(&sanitize_paste(input).replace('\n', " "));
+            drawer.selected = None;
+            return;
+        }
         if self.context_menu.is_some()
             || self.help_open
             || self.settings_open
@@ -1924,6 +2176,10 @@ impl App {
     }
 
     pub fn handle_key(&mut self, key: KeyEvent) -> Action {
+        if self.chat_drawer.is_some() {
+            self.drawer_key(key);
+            return Action::None;
+        }
         if self.draft.is_empty() {
             self.pasted_body = false;
         }
@@ -2033,6 +2289,10 @@ impl App {
         }
 
         if !self.leader_pending && matches!(key.code, KeyCode::Tab | KeyCode::BackTab) {
+            if crate::ui::uses_chat_drawer(self.terminal_width) {
+                self.open_chat_drawer();
+                return Action::None;
+            }
             self.focus = match self.focus {
                 Focus::Composer => Focus::Sidebar,
                 Focus::Sidebar => Focus::Composer,
@@ -2455,6 +2715,21 @@ impl App {
     ) -> Action {
         // A wheel notch moves a few rows, the way a terminal usually scrolls.
         const WHEEL_ROWS: usize = 3;
+        if self.chat_drawer.is_some() {
+            match kind {
+                MouseEventKind::ScrollUp => self.drawer_step(-(WHEEL_ROWS as isize)),
+                MouseEventKind::ScrollDown => self.drawer_step(WHEEL_ROWS as isize),
+                MouseEventKind::Down(MouseButton::Left) => match hits.at(column, row) {
+                    Some(Hit::DrawerChat(id)) => {
+                        self.confirm_chat_drawer_id(Some(id));
+                    }
+                    Some(Hit::CloseDrawer) => self.chat_drawer = None,
+                    _ => {}
+                },
+                _ => {}
+            }
+            return Action::None;
+        }
         if self.help_open {
             match kind {
                 MouseEventKind::ScrollUp => {
@@ -2472,28 +2747,58 @@ impl App {
             }
             return Action::None;
         }
+        // Wheel ownership is resolved from the same painted layers as clicks.
+        // Background panels must not receive a gesture through a popup.
+        if matches!(kind, MouseEventKind::ScrollUp | MouseEventKind::ScrollDown)
+            && hits.overlay_contains(column, row)
+        {
+            let step = if kind == MouseEventKind::ScrollUp {
+                -1
+            } else {
+                1
+            };
+            if hits
+                .context_menu
+                .is_some_and(|area| area.contains((column, row).into()))
+            {
+                self.context_step(step);
+            } else if hits
+                .menu
+                .is_some_and(|area| area.contains((column, row).into()))
+            {
+                self.command_selection = self
+                    .command_selection
+                    .saturating_add_signed(step)
+                    .min(self.command_suggestions().len().saturating_sub(1));
+            } else if self.contacts_open {
+                self.contacts_step(step * WHEEL_ROWS as isize);
+            } else if self.new_conversation && self.pending_address.is_none() {
+                self.new_contact_step(step * WHEEL_ROWS as isize);
+            } else if self.filter_query().is_some() {
+                self.select_step(step * WHEEL_ROWS as isize);
+            } else if self.theme_panel_open {
+                self.theme_panel_selection = self
+                    .theme_panel_selection
+                    .saturating_add_signed(step)
+                    .min(2);
+            } else if !self.emoji_suggestions().is_empty() {
+                self.emoji_selection = self
+                    .emoji_selection
+                    .saturating_add_signed(step)
+                    .min(self.emoji_suggestions().len().saturating_sub(1));
+            }
+            return Action::None;
+        }
         match kind {
             MouseEventKind::ScrollUp => {
-                if self.contacts_open {
-                    self.contacts_step(-(WHEEL_ROWS as isize));
-                } else if self.new_conversation && self.pending_address.is_none() {
-                    self.new_contact_step(-(WHEEL_ROWS as isize));
-                } else if self.filter_query().is_some() {
-                    self.select_step(-(WHEEL_ROWS as isize));
-                } else if matches!(hits.at(column, row), Some(Hit::SidebarChat(_))) {
+                if hits.sidebar.contains((column, row).into()) {
                     self.select_step(-1);
                 } else {
                     self.scroll_back(WHEEL_ROWS);
                 }
             }
             MouseEventKind::ScrollDown => {
-                if self.contacts_open {
-                    self.contacts_step(WHEEL_ROWS as isize);
-                } else if self.new_conversation && self.pending_address.is_none() {
-                    self.new_contact_step(WHEEL_ROWS as isize);
-                } else if self.filter_query().is_some() {
-                    self.select_step(WHEEL_ROWS as isize);
-                } else if matches!(hits.at(column, row), Some(Hit::SidebarChat(_))) {
+                if hits.sidebar.contains((column, row).into()) {
                     self.select_step(1);
                 } else {
                     self.scroll_forward(WHEEL_ROWS);
@@ -2578,6 +2883,8 @@ impl App {
                     });
                     self.close_preferences();
                 }
+                Some(Hit::HeaderChats) => self.open_chat_drawer(),
+                Some(Hit::Latest) => self.scroll_to_newest(),
                 Some(Hit::HeaderSettings) => self.open_settings(),
                 Some(Hit::HeaderHelp) => {
                     if self.contacts_open {
@@ -2894,11 +3201,8 @@ impl App {
                 conversation_id,
                 message,
             } => {
-                // Reading back through a thread should not be interrupted by a new
-                // message arriving in it; the user is pinned back to the newest.
-                if self.selected.as_ref() == Some(&conversation_id) {
-                    self.scroll = 0;
-                }
+                // Keep a deliberate reading anchor. Zero alone follows the tail;
+                // delivery updates and new arrivals must not steal reading focus.
                 // A message for a conversation we do not know about means our list is
                 // stale: ask for a refresh rather than caching it invisibly.
                 if !self

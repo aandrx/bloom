@@ -1,4 +1,16 @@
 # name|file|old text|replacement text|package|test target|test
+stale-drawer-click|apps/bloom-tui/src/app.rs|self.confirm_chat_drawer_id(Some(id));|self.confirm_chat_drawer();|bloom-tui|ui_render|stale_drawer_click_cannot_open_a_different_current_chat
+drawer-search-trim|apps/bloom-tui/src/app.rs|drawer.query.trim()|drawer.query.as_str()|bloom-tui|ui_render|drawer_search_trims_paste_and_matches_participant_display_names
+resize-overlay-owner|apps/bloom-tui/src/app.rs|let uses_drawer = crate::ui::uses_chat_drawer(width);|let uses_drawer = false;|bloom-tui|interaction|narrow_resize_does_not_replace_an_open_overlay_with_chats
+transcript-cache|apps/bloom-tui/src/ui.rs|entry.key.matches(app, width, palette, new_message)|false|bloom-tui|lib|ui::cache_tests::cache_reuses_layout_across_local_ui_changes_and_unchanged_snapshots
+cache-width|apps/bloom-tui/src/ui.rs|self.width == width|true|bloom-tui|lib|ui::cache_tests::cache_invalidates_for_render_dependencies_and_reuses_prior_width
+viewport-work|apps/bloom-tui/src/ui.rs|layout.lines[first..end].to_vec()|layout.lines.clone()|bloom-tui|lib|ui::cache_tests::windowed_paragraph_matches_full_history_reflow
+delivery-wrap|apps/bloom-tui/src/ui.rs|"✓\u{00a0}delivered"|"✓ delivered"|bloom-tui|ui_render|delivery_icon_and_label_wrap_as_one_visual_unit
+drawer-identity|apps/bloom-tui/src/app.rs|drawer.selected = Some(canonical.id.clone());|drawer.selected = None;|bloom-tui|ui_render|drawer_candidate_survives_background_identity_alias_reconciliation
+reading-anchor|apps/bloom-tui/src/ui.rs|max_scroll.saturating_sub(app.transcript_top(view))|app.scroll.min(max_scroll)|bloom-tui|ui_render|reading_anchor_survives_appends_edits_duplicates_snapshots_and_reflow
+overlay-wheel|apps/bloom-tui/src/app.rs|&& hits.overlay_contains(column, row)|&& false|bloom-tui|ui_render|painted_overlays_own_wheel_and_uncovered_transcript_still_scrolls
+drawer-input-owner|apps/bloom-tui/src/app.rs|self.drawer_key(key);|self.select_step(1);|bloom-tui|ui_render|narrow_drawer_owns_input_without_retargeting_until_explicit_open
+narrow-rail|apps/bloom-tui/src/ui.rs|if uses_chat_drawer(width) {|if false {|bloom-tui|ui_render|narrow_drawer_owns_input_without_retargeting_until_explicit_open
 byline|apps/bloom-tui/src/ui.rs|if header_lines.contains(&line) && line_starts.get(line) == Some(&last_row) {|if false {|bloom-tui|ui_render|no_scroll_position_ends_the_transcript_on_a_bare_byline
 theme-padding|apps/bloom-tui/src/ui.rs|let width = unicode_width::UnicodeWidthStr::width(label) as u16 + 2;|let width = unicode_width::UnicodeWidthStr::width(label) as u16;|bloom-tui|ui_render|the_theme_control_sits_one_column_inside_the_frame
 header-identity|apps/bloom-tui/src/ui.rs|let compact = available < 48 && pane.height > 1;|let compact = false;|bloom-tui|ui_render|long_disconnected_header_keeps_identity_and_status_at_narrow_widths

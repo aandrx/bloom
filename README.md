@@ -8,7 +8,7 @@ The offline, illustrative prototype is at [`design/mockup/index.html`](design/mo
 
 **New maintainer or fresh agent:** read [AGENTS.md](AGENTS.md), then the [handoff](docs/handoff.md). The [documentation map](docs/README.md) distinguishes current guides from historical research/plans.
 
-For keyboard controls and troubleshooting, see the [terminal client guide](docs/tui.md). For implemented/partial/missing features and verification boundaries, see [status](docs/status.md). The [system design](docs/system-design.md), [active roadmap](docs/implementation-plan.md), and [latest review](docs/iteration-review.md) explain architecture, next decisions and accepted work.
+For keyboard controls and troubleshooting, see the [terminal client guide](docs/tui.md). For implemented/partial/missing features and verification boundaries, see [status](docs/status.md). The [system design](docs/system-design.md), [active roadmap](docs/implementation-plan.md), and [switching-latency follow-up](docs/tui-switching-performance.md) explain the architecture, next decisions, and latest accepted work.
 
 ## Staged direction
 
@@ -16,7 +16,7 @@ For keyboard controls and troubleshooting, see the [terminal client guide](docs/
 2. Validate engine recovery and historical ingestion before broadening features.
 3. Keep independent registration and desktop mockups separate from working-product claims.
 
-See the [current review and iteration plan](docs/iteration-review.md) for scope and verification.
+See the [reading/navigation review](docs/ux-polish-review.md) and [switching-latency follow-up](docs/tui-switching-performance.md) for the current scope and verification.
 
 ## Running it
 

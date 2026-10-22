@@ -109,6 +109,11 @@ capture theme-66x18 66 18 'text:/theme enter'
 capture theme-44x12 44 12 'text:/theme enter'
 capture default-66x18 66 18 ''
 capture default-44x12 44 12 ''
+capture chats-44x12 44 12 'tab'
+capture chats-search-66x18 66 18 'tab text:jules'
+capture chats-empty-44x12 44 12 'tab text:unmatched'
+NO_COLOR=1 capture chats-monochrome-44x12 44 12 'tab'
+capture reading-back-100x12 100 12 'pageup'
 capture new-recipient 100 30 'text:/new enter'
 capture new-body 66 18 'text:/new enter text:carol@example.invalid enter text:Hello space text:Carol'
 capture multiline 66 18 'text:First space text:line ctrl-j text:Second space text:line'
@@ -120,13 +125,14 @@ mkdir -p "$light_config/bloom"
 printf '%s\n' '{"version":1,"theme":"light"}' >"$light_config/bloom/tui.json"
 XDG_CONFIG_HOME="$light_config" capture light 100 30 ''
 XDG_CONFIG_HOME="$light_config" capture light-settings 66 18 'text:, right'
+XDG_CONFIG_HOME="$light_config" capture light-chats-66x18 66 18 'tab'
 
 export REVIEW_OUT="$out" REVIEW_REFERENCE="$reference" REVIEW_NOTE="$ref_note"
 python3 - <<'PY'
 import html, os
 from pathlib import Path
 out=Path(os.environ['REVIEW_OUT'])
-states=['default','settings-appearance','settings-layout','contacts','filter','filter-no-match','slash-menu','theme','help','settings-appearance-66x18','settings-layout-66x18','contacts-66x18','help-80x4','filter-66x18','filter-44x12','filter-44x12-long-title','contacts-44x12-nickname','contacts-search','contacts-search-no-match','theme-66x18','theme-44x12','default-66x18','default-44x12','new-recipient','new-body','multiline','session-failed-44x12','long-title-44x12','no-color-picker','light','light-settings']
+states=['default','settings-appearance','settings-layout','contacts','filter','filter-no-match','slash-menu','theme','help','settings-appearance-66x18','settings-layout-66x18','contacts-66x18','help-80x4','filter-66x18','filter-44x12','filter-44x12-long-title','contacts-44x12-nickname','contacts-search','contacts-search-no-match','theme-66x18','theme-44x12','default-66x18','default-44x12','chats-44x12','chats-search-66x18','chats-empty-44x12','chats-monochrome-44x12','reading-back-100x12','new-recipient','new-body','multiline','session-failed-44x12','long-title-44x12','no-color-picker','light','light-settings','light-chats-66x18']
 ref=os.environ['REVIEW_REFERENCE']
 note=os.environ['REVIEW_NOTE']
 def card(label, path):

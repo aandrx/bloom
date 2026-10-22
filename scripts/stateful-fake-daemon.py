@@ -159,7 +159,31 @@ def serve(client, args, state):
                     )
                 continue
             try:
-                if op in ("send", "start_conversation"):
+                if op == "fixture_append_message":
+                    # Test-only persistence without fanout. This proves that the
+                    # real TUI's periodic history reconciliation ran.
+                    cid = body.get("conversation_id", {})
+                    text = body.get("text")
+                    if (cid.get("transport") != "openbubbles"
+                            or not isinstance(text, str) or not text):
+                        raise LookupError
+                    with LOCK:
+                        candidate = next((x for x in state["conversations"] if x["id"] == cid), None)
+                        if candidate is None:
+                            raise LookupError
+                        now = int(time.time() * 1000)
+                        sender = next(p["handle"] for p in candidate["participants"] if not p.get("is_me"))
+                        message = {"id": {"transport": "openbubbles", "value": uuid.uuid4().hex},
+                                   "conversation_id": candidate["id"], "remote_id": None, "sender": sender,
+                                   "parts": [{"type": "text", "value": text}], "created_at": now,
+                                   "sent_at": None, "delivery": "delivered", "from_me": False,
+                                   "edited_at": None, "reactions": [], "unsent_at": None}
+                        state["messages"].append(message)
+                        candidate["preview"] = text
+                        candidate["last_message_at"] = now
+                        save(state, args.store)
+                    response = {"result": "fixture_append_message", "message_id": message["id"]}
+                elif op in ("send", "start_conversation"):
                     is_start = op == "start_conversation"
                     parts = body.get("body", {}).get("parts", [])
                     if (not isinstance(parts, list) or not parts

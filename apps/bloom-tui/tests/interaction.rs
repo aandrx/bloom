@@ -1394,6 +1394,34 @@ fn a_snapshot_that_removes_the_selected_conversation_recovers() {
 }
 
 #[test]
+fn narrow_resize_does_not_replace_an_open_overlay_with_chats() {
+    let alice = conversation("Alice", 2);
+    let mut app = App::default();
+    app.set_conversations(vec![alice.clone()]);
+    app.set_terminal_width(100);
+    app.focus = bloom_tui::app::Focus::Sidebar;
+    app.handle_key(key(KeyCode::Char('?')));
+
+    app.set_terminal_width(44);
+
+    assert!(app.help_open);
+    assert!(
+        app.chat_drawer.is_none(),
+        "resizing must preserve the current overlay input owner"
+    );
+
+    app.help_open = false;
+    app.set_terminal_width(100);
+    app.open_context_menu(alice.id);
+    app.set_terminal_width(44);
+    assert!(
+        app.context_menu.is_none(),
+        "a sidebar-owned menu that cannot render narrowly must close"
+    );
+    assert!(app.chat_drawer.is_none());
+}
+
+#[test]
 fn the_two_step_composer_keeps_the_draft_between_the_steps() {
     let mut app = app_with(&["Jules Lee"]);
 
@@ -1523,7 +1551,7 @@ fn page_keys_move_the_reading_position_and_clamp_at_the_newest() {
     app.handle_key(ctrl(KeyCode::Char('e')));
     assert_eq!(app.draft_cursor, "a draft".chars().count());
 
-    // A new message in the open thread pins the view back to the newest.
+    // A new message never cancels deliberate reading back.
     app.handle_key(key(KeyCode::PageUp));
     assert!(app.is_scrolled_back());
     app.apply_event(EventKind::Message {
@@ -1532,8 +1560,8 @@ fn page_keys_move_the_reading_position_and_clamp_at_the_newest() {
         push_sequence: None,
     });
     assert!(
-        !app.is_scrolled_back(),
-        "a new message must not leave the reader stranded in the past"
+        app.is_scrolled_back(),
+        "a new message must not pull the reader away from older content"
     );
 }
 

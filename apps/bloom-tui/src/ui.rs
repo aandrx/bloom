@@ -3,10 +3,14 @@ use crate::app::{
     Focus, StatusTone, Theme,
 };
 
-use bloom_domain::DeliveryState;
+use bloom_domain::{Conversation, ConversationId, DeliveryState, Message, MessageId};
 use ratatui::{prelude::*, widgets::*};
 use std::sync::OnceLock;
 use unicode_segmentation::UnicodeSegmentation;
+
+#[cfg(test)]
+#[path = "ui_cache_tests.rs"]
+mod cache_tests;
 
 fn monochrome_from(value: Option<std::ffi::OsString>) -> bool {
     value.is_some_and(|value| !value.is_empty())
@@ -17,7 +21,7 @@ fn monochrome() -> bool {
     *NO_COLOR.get_or_init(|| monochrome_from(std::env::var_os("NO_COLOR")))
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 struct Palette {
     bg: Color,
     surface: Color,
@@ -65,19 +69,17 @@ const LIGHT: Palette = Palette {
 
 const COMFORTABLE_RAIL_MIN_WIDTH: u16 = 70;
 
+pub fn uses_chat_drawer(width: u16) -> bool {
+    width < COMFORTABLE_RAIL_MIN_WIDTH
+}
+
 fn sidebar_width_for(width: u16, compact_sidebar: bool) -> u16 {
-    let compact = compact_sidebar || width < COMFORTABLE_RAIL_MIN_WIDTH;
-    let rail_percent = if compact { 15 } else { 25 };
+    if uses_chat_drawer(width) {
+        return 0;
+    }
+    let rail_percent = if compact_sidebar { 15 } else { 25 };
     let desired = (u32::from(width) * rail_percent + 50) / 100;
-    let sidebar_min = if width < 45 {
-        10
-    } else {
-        // A compact rail still needs enough room for a useful chat identity.
-        16
-    };
-    desired
-        .clamp(sidebar_min, 34)
-        .min(width.saturating_sub(3) as u32) as u16
+    desired.clamp(16, 34).min(width.saturating_sub(3) as u32) as u16
 }
 
 /// Usable composer columns after the responsive chat rail and text gutters.
@@ -87,7 +89,9 @@ pub fn composer_columns(width: u16, compact_sidebar: bool) -> usize {
     }
     usize::from(
         width
-            .saturating_sub(sidebar_width_for(width, compact_sidebar) + 1 + 4)
+            .saturating_sub(
+                sidebar_width_for(width, compact_sidebar) + u16::from(!uses_chat_drawer(width)) + 4,
+            )
             .max(1),
     )
 }
@@ -1588,46 +1592,6 @@ fn render_filter_panel(
     hits
 }
 
-/// Wrap text into display rows the way the transcript paragraph does, breaking at
-/// whitespace and splitting a word only when it cannot fit on a row by itself.
-/// The count is what the paragraph will actually occupy, so the tail can be
-/// chosen without clipping the oldest visible line.
-fn wrap_text(text: &str, width: usize) -> Vec<String> {
-    let width = width.max(1);
-    let mut rows: Vec<String> = Vec::new();
-    let mut row = String::new();
-    let mut used = 0usize;
-    for word in text
-        .split_inclusive(char::is_whitespace)
-        .filter(|word| !word.is_empty())
-    {
-        let word_width = unicode_width::UnicodeWidthStr::width(word);
-        if used > 0 && used + word_width > width {
-            rows.push(std::mem::take(&mut row));
-            used = 0;
-        }
-        if word_width > width {
-            for character in word.chars() {
-                let character_width =
-                    unicode_width::UnicodeWidthChar::width(character).unwrap_or(0);
-                if used + character_width > width {
-                    rows.push(std::mem::take(&mut row));
-                    used = 0;
-                }
-                row.push(character);
-                used += character_width;
-            }
-            continue;
-        }
-        row.push_str(word);
-        used += word_width;
-    }
-    if !row.is_empty() || rows.is_empty() {
-        rows.push(row);
-    }
-    rows
-}
-
 fn display_truncate(value: &str, width: usize) -> String {
     let mut result = String::new();
     let mut used = 0;
@@ -1689,6 +1653,11 @@ pub enum Hit {
     ContextMenuRow(usize),
     HeaderSettings,
     HeaderHelp,
+    HeaderChats,
+    DrawerChat(bloom_domain::ConversationId),
+    Drawer,
+    CloseDrawer,
+    Latest,
     CloseOverlay,
 }
 
@@ -1696,6 +1665,8 @@ pub enum Hit {
 pub struct HitMap {
     pub sidebar: Rect,
     pub transcript: Rect,
+    pub transcript_view: Option<crate::transcript::TranscriptViewport>,
+    pub latest: Option<Rect>,
     pub composer: Rect,
     pub composer_positions: Vec<(u16, u16, usize)>,
     pub sidebar_rows: Vec<(Rect, bloom_domain::ConversationId)>,
@@ -1719,6 +1690,10 @@ pub struct HitMap {
     pub help: Option<Rect>,
     pub header_settings: Option<Rect>,
     pub header_help: Option<Rect>,
+    pub header_chats: Option<Rect>,
+    pub drawer: Option<Rect>,
+    pub close_drawer: Option<Rect>,
+    pub drawer_rows: Vec<(Rect, bloom_domain::ConversationId)>,
 }
 
 impl HitMap {
@@ -1744,9 +1719,32 @@ impl HitMap {
             .map(|(_, _, index)| *index)
     }
 
+    pub fn overlay_contains(&self, column: u16, row: u16) -> bool {
+        self.drawer.is_some()
+            || self.help.is_some()
+            || [self.menu, self.context_menu, self.popup]
+                .into_iter()
+                .flatten()
+                .any(|area| Self::contains(area, column, row))
+    }
+
     /// Resolve a pointer position. Overlays take priority over the panes below
     /// them, which is what makes the command popup own the mouse while it is up.
     pub fn at(&self, column: u16, row: u16) -> Option<Hit> {
+        if self.drawer.is_some() {
+            if self
+                .close_drawer
+                .is_some_and(|area| Self::contains(area, column, row))
+            {
+                return Some(Hit::CloseDrawer);
+            }
+            return self
+                .drawer_rows
+                .iter()
+                .find(|(area, _)| Self::contains(*area, column, row))
+                .map(|(_, id)| Hit::DrawerChat(id.clone()))
+                .or(Some(Hit::Drawer));
+        }
         if self.help.is_some() {
             // Help is modal: clicks anywhere dismiss it without reaching panes
             // rendered underneath, even when the pointer is outside the sheet.
@@ -1834,6 +1832,12 @@ impl HitMap {
             return Some(Hit::ThemeRow(index));
         }
         if self
+            .header_chats
+            .is_some_and(|area| Self::contains(area, column, row))
+        {
+            return Some(Hit::HeaderChats);
+        }
+        if self
             .header_settings
             .is_some_and(|area| Self::contains(area, column, row))
         {
@@ -1844,6 +1848,12 @@ impl HitMap {
             .is_some_and(|area| Self::contains(area, column, row))
         {
             return Some(Hit::HeaderHelp);
+        }
+        if self
+            .latest
+            .is_some_and(|area| Self::contains(area, column, row))
+        {
+            return Some(Hit::Latest);
         }
         if let Some((_, id)) = self
             .sidebar_rows
@@ -1862,11 +1872,166 @@ impl HitMap {
     }
 }
 
+// Keep only a few loaded-history variants, never a persistent plaintext cache.
+const TRANSCRIPT_CACHE_CAPACITY: usize = 4;
+
+struct TranscriptLayout {
+    lines: Vec<Line<'static>>,
+    header_lines: Vec<usize>,
+    message_lines: Vec<(MessageId, usize)>,
+    line_starts: Vec<usize>,
+    rows: usize,
+}
+
+struct TranscriptKey {
+    selected: Option<ConversationId>,
+    conversation: Option<Conversation>,
+    messages: Vec<Message>,
+    nicknames: std::collections::HashMap<String, String>,
+    palette: Palette,
+    width: u16,
+    new_message: bool,
+}
+
+impl TranscriptKey {
+    fn messages(app: &App, new_message: bool) -> &[Message] {
+        if new_message {
+            return &[];
+        }
+        app.selected
+            .as_ref()
+            .and_then(|id| app.messages.get(id))
+            .map(Vec::as_slice)
+            .unwrap_or_default()
+    }
+
+    fn matches(&self, app: &App, width: u16, palette: Palette, new_message: bool) -> bool {
+        self.width == width
+            && self.palette == palette
+            && self.new_message == new_message
+            && self.selected == app.selected
+            && self.conversation.as_ref() == app.selected_conversation()
+            && self.nicknames == app.nicknames
+            && self.messages.as_slice() == Self::messages(app, new_message)
+    }
+
+    fn new(app: &App, width: u16, palette: Palette, new_message: bool) -> Self {
+        Self {
+            selected: app.selected.clone(),
+            conversation: app.selected_conversation().cloned(),
+            messages: Self::messages(app, new_message).to_vec(),
+            nicknames: app.nicknames.clone(),
+            palette,
+            width,
+            new_message,
+        }
+    }
+}
+
+struct CachedTranscript {
+    key: TranscriptKey,
+    layout: TranscriptLayout,
+}
+
+/// Renderer-owned, bounded LRU of loaded transcript layouts. App remains immutable.
+#[derive(Default)]
+pub struct RenderCache {
+    transcripts: Vec<CachedTranscript>,
+    builds: usize,
+}
+
+impl RenderCache {
+    /// A deterministic work counter for regression tests, not content diagnostics.
+    pub fn transcript_layout_builds(&self) -> usize {
+        self.builds
+    }
+
+    fn layout(
+        &mut self,
+        app: &App,
+        width: u16,
+        palette: Palette,
+        new_message: bool,
+        build: impl FnOnce() -> TranscriptLayout,
+    ) -> &TranscriptLayout {
+        if let Some(index) = self
+            .transcripts
+            .iter()
+            .position(|entry| entry.key.matches(app, width, palette, new_message))
+        {
+            if index + 1 != self.transcripts.len() {
+                let entry = self.transcripts.remove(index);
+                self.transcripts.push(entry);
+            }
+        } else {
+            if !new_message {
+                // Keep width/theme variants, not obsolete copies of edited or
+                // removed history. New-chat empty states do not evict the parked thread.
+                let messages = TranscriptKey::messages(app, false);
+                self.transcripts.retain(|entry| {
+                    entry.key.selected != app.selected || entry.key.messages.as_slice() == messages
+                });
+            }
+            let layout = build();
+            let key = TranscriptKey::new(app, width, palette, new_message);
+            if self.transcripts.len() == TRANSCRIPT_CACHE_CAPACITY {
+                self.transcripts.remove(0);
+            }
+            self.transcripts.push(CachedTranscript { key, layout });
+            self.builds += 1;
+        }
+        &self.transcripts.last().expect("layout was inserted").layout
+    }
+}
+
+fn transcript_window(
+    layout: &TranscriptLayout,
+    scroll: u16,
+    height: u16,
+    muted: bool,
+    palette: Palette,
+) -> (Vec<Line<'static>>, u16) {
+    let top = usize::from(scroll);
+    let first = layout
+        .line_starts
+        .partition_point(|start| *start <= top)
+        .saturating_sub(1);
+    let end = layout
+        .line_starts
+        .partition_point(|start| *start < top + usize::from(height))
+        .max(first + 1)
+        .min(layout.lines.len());
+    let relative_scroll =
+        top.saturating_sub(layout.line_starts.get(first).copied().unwrap_or_default());
+    let mut lines = layout.lines[first..end].to_vec();
+    if muted {
+        for line in &mut lines {
+            for span in &mut line.spans {
+                span.style = Style::default().fg(palette.muted).bg(palette.surface);
+            }
+        }
+    }
+    (lines, relative_scroll as u16)
+}
+
 pub fn render(frame: &mut Frame<'_>, app: &App) -> HitMap {
     render_with_mode(frame, app, monochrome())
 }
 
+pub fn render_with_cache(frame: &mut Frame<'_>, app: &App, cache: &mut RenderCache) -> HitMap {
+    render_cached_with_mode(frame, app, monochrome(), cache)
+}
+
 fn render_with_mode(frame: &mut Frame<'_>, app: &App, monochrome: bool) -> HitMap {
+    render_cached_with_mode(frame, app, monochrome, &mut RenderCache::default())
+}
+
+fn render_cached_with_mode(
+    frame: &mut Frame<'_>,
+    app: &App,
+    monochrome: bool,
+    cache: &mut RenderCache,
+) -> HitMap {
     let mut palette = match app.theme {
         Theme::Dark => DARK,
         Theme::Light => LIGHT,
@@ -1893,6 +2058,9 @@ fn render_with_mode(frame: &mut Frame<'_>, app: &App, monochrome: bool) -> HitMa
         area,
     );
     let inner = area;
+    if app.chat_drawer.is_some() {
+        return render_chat_drawer(frame, app, inner, palette);
+    }
     // A terminal can be arbitrarily small. Below the size where the layout is
     // meaningful, show a compact fallback instead of asking ratatui for regions
     // outside the buffer, which panics.
@@ -1931,7 +2099,7 @@ fn render_with_mode(frame: &mut Frame<'_>, app: &App, monochrome: bool) -> HitMa
     let sidebar_width = sidebar_width_for(inner.width, app.compact_sidebar);
     let body = Layout::horizontal([
         Constraint::Length(sidebar_width),
-        Constraint::Length(1),
+        Constraint::Length(u16::from(sidebar_width > 0)),
         Constraint::Min(1),
     ])
     .split(inner);
@@ -2024,7 +2192,7 @@ fn render_with_mode(frame: &mut Frame<'_>, app: &App, monochrome: bool) -> HitMa
         .enumerate()
         .filter_map(|(index, conversation)| {
             let row = (index.checked_sub(offset)? as u16).checked_mul(entry_height)?;
-            (row + entry_height <= list_area.height).then(|| {
+            (body[0].width > 0 && row + entry_height <= list_area.height).then(|| {
                 (
                     Rect::new(
                         list_area.x,
@@ -2136,8 +2304,17 @@ fn render_with_mode(frame: &mut Frame<'_>, app: &App, monochrome: bool) -> HitMa
     }
     let pane = right[0];
     let gutter = 2u16.min(pane.width / 4);
-    let left = pane.x.saturating_add(gutter);
+    let mut left = pane.x.saturating_add(gutter);
     let right_edge = pane.x.saturating_add(pane.width).saturating_sub(gutter);
+    if uses_chat_drawer(inner.width) && right_edge.saturating_sub(left) >= 18 {
+        let area = Rect::new(left, pane.y, 7, 1);
+        frame.render_widget(
+            Paragraph::new("‹ Chats").style(Style::default().fg(palette.cyan)),
+            area,
+        );
+        hits.header_chats = Some(area);
+        left = left.saturating_add(8);
+    }
     let available = right_edge.saturating_sub(left);
     let compact = available < 48 && pane.height > 1;
     let title_row = pane.y;
@@ -2180,7 +2357,8 @@ fn render_with_mode(frame: &mut Frame<'_>, app: &App, monochrome: bool) -> HitMa
     let budget = available
         .saturating_sub(title_min)
         .saturating_sub(reserve_status);
-    if !compact {
+    if !compact && !uses_chat_drawer(inner.width) {
+        // Narrow screens spend their budget on Chats, identity and status.
         // Drop optional branding first; identity and status always get their budget.
         if controls_width + 2 <= budget {
             help = true;
@@ -2316,182 +2494,212 @@ fn render_with_mode(frame: &mut Frame<'_>, app: &App, monochrome: bool) -> HitMa
             Rect::new(left, context_row, available, 1),
         );
     }
-    let transcript_width = content.width.max(1) as usize;
-    let mut lines = Vec::new();
-    let mut header_lines: Vec<usize> = Vec::new();
-    if let Some(messages) = app
-        .selected
-        .as_ref()
-        .filter(|_| !new_message)
-        .and_then(|id| app.messages.get(id))
-    {
-        // Pad speaker names to a common column so timestamps line up, the way the
-        // mockup's transcript does. Capped so one long name cannot push the times
-        // off the visible line.
-        const SPEAKER_COLUMN_CAP: usize = 12;
-        let speaker_column = messages
-            .iter()
-            .map(|message| {
-                let label = app.speaker_label_for(message, app.selected_conversation());
-                unicode_width::UnicodeWidthStr::width(label.as_str())
-            })
-            .max()
-            .unwrap_or(0)
-            .clamp(1, SPEAKER_COLUMN_CAP);
+    let layout = cache.layout(app, content.width.max(1), palette, new_message, || {
+        let transcript_width = content.width.max(1) as usize;
+        let mut lines = Vec::new();
+        let mut header_lines: Vec<usize> = Vec::new();
+        let mut message_lines = Vec::new();
+        if let Some(messages) = app
+            .selected
+            .as_ref()
+            .filter(|_| !new_message)
+            .and_then(|id| app.messages.get(id))
+        {
+            // Pad speaker names to a common column so timestamps line up, the way the
+            // mockup's transcript does. Capped so one long name cannot push the times
+            // off the visible line.
+            const SPEAKER_COLUMN_CAP: usize = 12;
+            let speaker_column = messages
+                .iter()
+                .map(|message| {
+                    let label = app.speaker_label_for(message, app.selected_conversation());
+                    unicode_width::UnicodeWidthStr::width(label.as_str())
+                })
+                .max()
+                .unwrap_or(0)
+                .clamp(1, SPEAKER_COLUMN_CAP);
 
-        // Group consecutive messages from one sender the way Slack does: the name
-        // and time appear once per run, a day divider marks each new day, and a
-        // blank row separates runs. The boundary is the name, not just whitespace.
-        const GROUP_GAP_MS: i64 = 5 * 60 * 1000;
-        let mut previous: Option<(String, bool, i64, (i32, i32))> = None;
-        for message in messages {
-            let speaker = app.speaker_label_for(message, app.selected_conversation());
-            let (year, yday, day_text) = crate::app::day_label(message.created_at);
-            let new_day = previous
-                .as_ref()
-                .is_none_or(|(_, _, _, day)| *day != (year, yday));
-            let new_group = new_day
-                || previous.as_ref().is_some_and(|(name, mine, at, _)| {
-                    *name != speaker
-                        || *mine != message.from_me
-                        || message.created_at - at > GROUP_GAP_MS
-                });
-            if new_day && !day_text.is_empty() {
-                if previous.is_some() {
+            // Group consecutive messages from one sender the way Slack does: the name
+            // and time appear once per run, a day divider marks each new day, and a
+            // blank row separates runs. The boundary is the name, not just whitespace.
+            const GROUP_GAP_MS: i64 = 5 * 60 * 1000;
+            let mut previous: Option<(String, bool, i64, (i32, i32))> = None;
+            for message in messages {
+                message_lines.push((message.id().clone(), lines.len()));
+                let speaker = app.speaker_label_for(message, app.selected_conversation());
+                let (year, yday, day_text) = crate::app::day_label(message.created_at);
+                let new_day = previous
+                    .as_ref()
+                    .is_none_or(|(_, _, _, day)| *day != (year, yday));
+                let new_group = new_day
+                    || previous.as_ref().is_some_and(|(name, mine, at, _)| {
+                        *name != speaker
+                            || *mine != message.from_me
+                            || message.created_at - at > GROUP_GAP_MS
+                    });
+                if new_day && !day_text.is_empty() {
+                    if previous.is_some() {
+                        lines.push(Line::raw(""));
+                    }
+                    let label = format!(" {day_text} ");
+                    let label_width = unicode_width::UnicodeWidthStr::width(label.as_str());
+                    let side = transcript_width.saturating_sub(label_width) / 2;
+                    let rule = "─".repeat(side.min(6));
+                    let pad = " ".repeat(side.saturating_sub(side.min(6)));
+                    lines.push(Line::from(vec![
+                        Span::raw(pad),
+                        Span::styled(rule.clone(), Style::default().fg(palette.rule)),
+                        Span::styled(label, Style::default().fg(palette.muted)),
+                        Span::styled(rule, Style::default().fg(palette.rule)),
+                    ]));
+                } else if new_group {
                     lines.push(Line::raw(""));
                 }
-                let label = format!(" {day_text} ");
-                let label_width = unicode_width::UnicodeWidthStr::width(label.as_str());
-                let side = transcript_width.saturating_sub(label_width) / 2;
-                let rule = "─".repeat(side.min(6));
-                let pad = " ".repeat(side.saturating_sub(side.min(6)));
-                lines.push(Line::from(vec![
-                    Span::raw(pad),
-                    Span::styled(rule.clone(), Style::default().fg(palette.rule)),
-                    Span::styled(label, Style::default().fg(palette.muted)),
-                    Span::styled(rule, Style::default().fg(palette.rule)),
-                ]));
-            } else if new_group {
-                lines.push(Line::raw(""));
-            }
-            previous = Some((
-                speaker.clone(),
-                message.from_me,
-                message.created_at,
-                (year, yday),
-            ));
-            let padded = display_pad(&speaker, speaker_column);
-            let timestamp = timestamp(message.created_at);
-            let message_surface = if message.from_me {
-                palette.input_surface
-            } else {
-                palette.surface
-            };
-            let mut header = vec![
-                Span::styled(
-                    padded.clone(),
-                    Style::default()
-                        .fg(speaker_color(&speaker, message.from_me, &palette))
-                        .bg(message_surface)
-                        .add_modifier(Modifier::BOLD),
-                ),
-                Span::styled("  ", Style::default().bg(message_surface)),
-                Span::styled(
-                    timestamp.clone(),
-                    Style::default().fg(palette.muted).bg(message_surface),
-                ),
-            ];
-            let header_width = unicode_width::UnicodeWidthStr::width(padded.as_str())
-                + 2
-                + unicode_width::UnicodeWidthStr::width(timestamp.as_str());
-            if message.from_me && header_width < transcript_width {
-                header.push(Span::styled(
-                    " ".repeat(transcript_width - header_width),
-                    Style::default().bg(message_surface),
+                previous = Some((
+                    speaker.clone(),
+                    message.from_me,
+                    message.created_at,
+                    (year, yday),
                 ));
-            }
-            // Remember where each byline lands, so the viewport can avoid ending on one
-            // with its body below the fold. A continuing run has no byline at all.
-            if new_group {
-                header_lines.push(lines.len());
-                lines.push(Line::from(header));
-            }
-
-            let text = message_text(message);
-            let mut body_style = Style::default().fg(palette.text);
-            if message.from_me {
-                body_style = body_style.bg(message_surface);
-            }
-            let mut body_width = unicode_width::UnicodeWidthStr::width(text.as_str());
-            let mut body = vec![Span::styled(text, body_style)];
-            if message.from_me {
-                let state = match message.delivery {
-                    DeliveryState::Queued => "⠋ queued",
-                    DeliveryState::Sent => "✓ sent",
-                    DeliveryState::Delivered => "✓ delivered",
-                    DeliveryState::Read => "✓ read",
-                    DeliveryState::Failed => "failed",
-                };
-                let state_style = match message.delivery {
-                    DeliveryState::Queued => Style::default().add_modifier(Modifier::DIM),
-                    DeliveryState::Sent => Style::default().add_modifier(Modifier::DIM),
-                    DeliveryState::Delivered | DeliveryState::Read => {
-                        Style::default().add_modifier(Modifier::BOLD)
-                    }
-                    DeliveryState::Failed => {
-                        Style::default().add_modifier(Modifier::BOLD | Modifier::UNDERLINED)
-                    }
-                }
-                .fg(if state.starts_with('✓') {
-                    palette.green
+                let padded = display_pad(&speaker, speaker_column);
+                let timestamp = timestamp(message.created_at);
+                let message_surface = if message.from_me {
+                    palette.input_surface
                 } else {
-                    palette.muted
-                })
-                .bg(message_surface);
-                let state_width = unicode_width::UnicodeWidthStr::width(state);
-                body.extend([
+                    palette.surface
+                };
+                let mut header = vec![
+                    Span::styled(
+                        padded.clone(),
+                        Style::default()
+                            .fg(speaker_color(&speaker, message.from_me, &palette))
+                            .bg(message_surface)
+                            .add_modifier(Modifier::BOLD),
+                    ),
                     Span::styled("  ", Style::default().bg(message_surface)),
-                    Span::styled(state, state_style),
-                ]);
-                body_width += 2 + state_width;
-                if body_width < transcript_width {
-                    body.push(Span::styled(
-                        " ".repeat(transcript_width - body_width),
+                    Span::styled(
+                        timestamp.clone(),
+                        Style::default().fg(palette.muted).bg(message_surface),
+                    ),
+                ];
+                let header_width = unicode_width::UnicodeWidthStr::width(padded.as_str())
+                    + 2
+                    + unicode_width::UnicodeWidthStr::width(timestamp.as_str());
+                if message.from_me && header_width < transcript_width {
+                    header.push(Span::styled(
+                        " ".repeat(transcript_width - header_width),
                         Style::default().bg(message_surface),
                     ));
                 }
+                // Remember where each byline lands, so the viewport can avoid ending on one
+                // with its body below the fold. A continuing run has no byline at all.
+                if new_group {
+                    header_lines.push(lines.len());
+                    lines.push(Line::from(header));
+                }
+
+                let text = message_text(message);
+                let mut body_style = Style::default().fg(palette.text);
+                if message.from_me {
+                    body_style = body_style.bg(message_surface);
+                }
+                let mut body_width = unicode_width::UnicodeWidthStr::width(text.as_str());
+                let mut body = vec![Span::styled(text, body_style)];
+                if message.from_me {
+                    let state = match message.delivery {
+                        // Keep the status icon attached to its word when wrapping.
+                        DeliveryState::Queued => "⠋\u{00a0}queued",
+                        DeliveryState::Sent => "✓\u{00a0}sent",
+                        DeliveryState::Delivered => "✓\u{00a0}delivered",
+                        DeliveryState::Read => "✓\u{00a0}read",
+                        DeliveryState::Failed => "failed",
+                    };
+                    let state_style = match message.delivery {
+                        DeliveryState::Queued => Style::default().add_modifier(Modifier::DIM),
+                        DeliveryState::Sent => Style::default().add_modifier(Modifier::DIM),
+                        DeliveryState::Delivered | DeliveryState::Read => {
+                            Style::default().add_modifier(Modifier::BOLD)
+                        }
+                        DeliveryState::Failed => {
+                            Style::default().add_modifier(Modifier::BOLD | Modifier::UNDERLINED)
+                        }
+                    }
+                    .fg(if state.starts_with('✓') {
+                        palette.green
+                    } else {
+                        palette.muted
+                    })
+                    .bg(message_surface);
+                    let state_width = unicode_width::UnicodeWidthStr::width(state);
+                    body.extend([
+                        Span::styled("  ", Style::default().bg(message_surface)),
+                        Span::styled(state, state_style),
+                    ]);
+                    body_width += 2 + state_width;
+                    if body_width < transcript_width {
+                        body.push(Span::styled(
+                            " ".repeat(transcript_width - body_width),
+                            Style::default().bg(message_surface),
+                        ));
+                    }
+                }
+                lines.push(Line::from(body));
             }
-            lines.push(Line::from(body));
         }
-    }
-    // Show the newest messages by default and let the user scroll back. Rows are
-    // counted with the same wrap the paragraph performs, so the offset lands on
-    // the row the renderer will actually use; scroll 0 pins to the newest content
-    // and an over-height message therefore shows its tail rather than vanishing.
-    if app.command_menu {
-        for line in &mut lines {
-            for span in &mut line.spans {
-                span.style = Style::default().fg(palette.muted).bg(palette.surface);
-            }
+        // Show the newest messages by default and let the user scroll back. Rows are
+        // counted with the same wrap the paragraph performs, so the offset lands on
+        // the row the renderer will actually use; scroll 0 pins to the newest content
+        // and an over-height message therefore shows its tail rather than vanishing.
+        let mut line_starts: Vec<usize> = Vec::with_capacity(lines.len());
+        let mut rows = 0usize;
+        for line in &lines {
+            let count = Paragraph::new(line.clone())
+                .wrap(Wrap { trim: false })
+                .line_count(content.width.max(1))
+                .max(1);
+            line_starts.push(rows);
+            rows += count;
         }
-    }
-    let width = transcript_width;
-    let mut line_starts: Vec<usize> = Vec::with_capacity(lines.len());
-    let mut rows = 0usize;
-    for line in &lines {
-        let text: String = line
-            .spans
-            .iter()
-            .map(|span| span.content.as_ref())
-            .collect();
-        let count = wrap_text(&text, width).len().max(1);
-        line_starts.push(rows);
-        rows += count;
-    }
+        TranscriptLayout {
+            lines,
+            header_lines,
+            message_lines,
+            line_starts,
+            rows,
+        }
+    });
+    let lines = &layout.lines;
+    let header_lines = &layout.header_lines;
+    let message_lines = &layout.message_lines;
+    let line_starts = &layout.line_starts;
+    let rows = layout.rows;
+    let mut viewport = app
+        .selected
+        .as_ref()
+        .filter(|id| !new_message && app.messages.contains_key(*id))
+        .map(|id| crate::transcript::TranscriptViewport {
+            conversation: id.clone(),
+            messages: message_lines
+                .iter()
+                .enumerate()
+                .map(|(index, (id, line))| crate::transcript::MessageRows {
+                    id: id.clone(),
+                    start: line_starts[*line],
+                    end: message_lines
+                        .get(index + 1)
+                        .map_or(rows, |(_, next)| line_starts[*next]),
+                })
+                .collect(),
+            rows,
+            height: content.height as usize,
+            top: 0,
+        });
     let max_scroll = rows.saturating_sub(content.height as usize);
-    // `Paragraph::scroll` offsets from the top, so a reading position of zero rows
-    // back from the newest message is the bottom of the transcript.
-    let mut back = app.scroll.min(max_scroll);
+    let mut back = viewport
+        .as_ref()
+        .map_or(app.scroll.min(max_scroll), |view| {
+            max_scroll.saturating_sub(app.transcript_top(view))
+        });
     // A byline on the last visible row reads as a fault: the header is shown but its
     // message is not. Step one row so the row above it ends the view; at the very top
     // of the transcript there is nothing older to show, so step towards the newer
@@ -2510,6 +2718,44 @@ fn render_with_mode(frame: &mut Frame<'_>, app: &App, monochrome: bool) -> HitMa
         }
     }
     let scroll = max_scroll.saturating_sub(back).min(u16::MAX as usize) as u16;
+    if let Some(view) = viewport.as_mut() {
+        view.top = usize::from(scroll);
+    }
+    hits.transcript_view = viewport;
+    // Use the existing breathing row, not the feedback/error footer or a message
+    // row. Panels and tiny layouts never acquire a hidden latest hitbox.
+    let panel_open = app.help_open
+        || app.settings_open
+        || app.theme_panel_open
+        || app.contacts_open
+        || app.command_menu
+        || app.filter_query().is_some()
+        || (app.new_conversation && app.pending_address.is_none())
+        || !app.emoji_suggestions().is_empty()
+        || app.context_menu.is_some();
+    if back > 0 && spacer_rows > 0 && !panel_open && content.width >= 8 {
+        let label = if content.width >= 14 {
+            "↓ Latest · End"
+        } else {
+            "↓ Latest"
+        };
+        let width = unicode_width::UnicodeWidthStr::width(label) as u16;
+        let area = Rect::new(
+            content.right().saturating_sub(width),
+            content.bottom(),
+            width,
+            1,
+        );
+        frame.render_widget(
+            Paragraph::new(label).style(
+                Style::default()
+                    .fg(palette.cyan)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            area,
+        );
+        hits.latest = Some(area);
+    }
     if lines.is_empty() && app.filter_query().is_none() {
         let (title, key, description) = if new_message {
             if app.pending_address.is_some() {
@@ -2566,10 +2812,14 @@ fn render_with_mode(frame: &mut Frame<'_>, app: &App, monochrome: bool) -> HitMa
             Rect::new(content.x, y, content.width, height),
         );
     } else {
+        // Start at the logical line containing the visible row. Reflowing every
+        // preceding message just to discard it made ordinary panel switches slow.
+        let (visible_lines, relative_scroll) =
+            transcript_window(layout, scroll, content.height, app.command_menu, palette);
         frame.render_widget(
-            Paragraph::new(lines)
+            Paragraph::new(visible_lines)
                 .wrap(Wrap { trim: false })
-                .scroll((scroll, 0))
+                .scroll((relative_scroll, 0))
                 .style(Style::default().bg(palette.surface)),
             content,
         );
@@ -2878,8 +3128,145 @@ fn render_with_mode(frame: &mut Frame<'_>, app: &App, monochrome: bool) -> HitMa
     hits
 }
 
-/// The `?` shortcut sheet, mirroring Codex's grouped key list. Returns its panel
-/// so a click anywhere on it dismisses.
+/// Full-screen navigation owns both keyboard and mouse, including at tiny sizes.
+fn render_chat_drawer(frame: &mut Frame<'_>, app: &App, area: Rect, palette: Palette) -> HitMap {
+    let mut hits = HitMap {
+        drawer: Some(area),
+        ..Default::default()
+    };
+    if area.width == 0 || area.height == 0 {
+        return hits;
+    }
+    let gutter = if area.width >= 6 { 2 } else { 0 };
+    let width = area.width.saturating_sub(gutter * 2).min(66);
+    let pane = Rect::new(
+        area.x + (area.width - width) / 2,
+        area.y,
+        width,
+        area.height,
+    );
+    let rows = app.drawer_conversations();
+    let selected = app.drawer_selection();
+    let close_width = if pane.width >= 18 { 9 } else { 0 };
+    frame.render_widget(
+        Paragraph::new(truncate_with_ellipsis(
+            &format!("Chats · {}", rows.len()),
+            pane.width.saturating_sub(close_width) as usize,
+        ))
+        .style(
+            Style::default()
+                .fg(palette.text)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Rect::new(pane.x, pane.y, pane.width.saturating_sub(close_width), 1),
+    );
+    if close_width > 0 {
+        let close = Rect::new(pane.right() - 8, pane.y, 8, 1);
+        frame.render_widget(
+            Paragraph::new("Esc back").style(Style::default().fg(palette.muted)),
+            close,
+        );
+        hits.close_drawer = Some(close);
+    }
+    let header = if area.height >= 6 { 4 } else { 1 };
+    if header == 4 {
+        frame.render_widget(
+            Paragraph::new("─".repeat(pane.width as usize))
+                .style(Style::default().fg(palette.rule)),
+            Rect::new(pane.x, pane.y + 1, pane.width, 1),
+        );
+        let query = app
+            .chat_drawer
+            .as_ref()
+            .map_or("", |drawer| drawer.query.as_str());
+        let input = Rect::new(pane.x, pane.y + 2, pane.width, 1);
+        let layout = ComposerLayout::new(input, "Find: ", query, query.len(), true, false);
+        render_composer_layout(frame, &layout, false, palette, palette.input_surface);
+    }
+    let footer = u16::from(area.height >= 2);
+    let list_area = Rect::new(
+        pane.x,
+        pane.y + header,
+        pane.width,
+        pane.height.saturating_sub(header + footer),
+    );
+    let entry_height = if pane.height >= 12 && pane.width >= 35 {
+        2
+    } else {
+        1
+    };
+    let entry_width = usize::from(pane.width.saturating_sub(2));
+    let entries: Vec<_> = rows
+        .iter()
+        .map(|conversation| {
+            let mut lines = vec![sidebar_name_line(app, conversation, entry_width, palette)];
+            if entry_height == 2 {
+                lines.push(sidebar_preview_line(conversation, entry_width, palette));
+            }
+            ListItem::new(lines)
+        })
+        .collect();
+    let mut state = ListState::default();
+    state.select(
+        rows.iter()
+            .position(|row| Some(&row.id) == selected.as_ref()),
+    );
+    frame.render_stateful_widget(
+        List::new(entries)
+            .highlight_symbol("› ")
+            .highlight_style(Style::default().bg(palette.input_surface))
+            .repeat_highlight_symbol(false),
+        list_area,
+        &mut state,
+    );
+    hits.drawer_rows = rows
+        .iter()
+        .enumerate()
+        .filter_map(|(index, conversation)| {
+            let row = (index.checked_sub(state.offset())? as u16).checked_mul(entry_height)?;
+            (list_area.width > 0 && row + entry_height <= list_area.height).then(|| {
+                (
+                    Rect::new(
+                        list_area.x,
+                        list_area.y + row,
+                        list_area.width,
+                        entry_height,
+                    ),
+                    conversation.id.clone(),
+                )
+            })
+        })
+        .collect();
+    if rows.is_empty() && list_area.height > 0 {
+        let text = if app.conversations.is_empty() {
+            "No conversations yet"
+        } else {
+            "No matching chats"
+        };
+        frame.render_widget(
+            Paragraph::new(truncate_with_ellipsis(text, list_area.width as usize))
+                .style(Style::default().fg(palette.muted)),
+            list_area,
+        );
+    }
+    if footer > 0 {
+        let hint = if pane.width >= 37 {
+            "↑↓ choose · Enter open · Esc back"
+        } else if pane.width >= 27 {
+            "↑↓ choose · ↵ open · Esc back"
+        } else {
+            "↑↓ · ↵ open · Esc back"
+        };
+        frame.render_widget(
+            Paragraph::new(truncate_display_graphemes(hint, pane.width as usize))
+                .style(Style::default().fg(palette.muted)),
+            Rect::new(pane.x, pane.bottom() - 1, pane.width, 1),
+        );
+    }
+    hits
+}
+
+/// The shortcut sheet is modal; a click anywhere dismisses without click-through.
 fn render_help(frame: &mut Frame<'_>, app: &App, content: Rect, palette: Palette) -> Option<Rect> {
     if !app.help_open || content.height == 0 || content.width == 0 {
         return None;

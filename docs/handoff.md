@@ -13,6 +13,8 @@ The TUI is the current client. Desktop/mobile previews are illustrative. GPUI, d
 ## Working features and limits
 
 - Conversation listing, known-participant contacts, local nicknames/titles/hiding, filtering, sender-grouped transcript, scrolling, light/dark/automatic themes, monochrome cues, mouse hitboxes and command pickers.
+- Reading is anchored to conversation/message/row across arrivals, reconciliation, edits and resize. End/clickable Latest explicitly resumes following; painted overlays consume their own wheel input.
+- Below 70 columns, conversations use full width and Chats opens a dedicated searchable navigator. Query/candidate do not retarget a parked draft; Esc cancels and Enter/click commits.
 - Existing/new-chat text sends with accepted-ID correlation, event-driven delivery labels and explicit failure recovery. Uncertain sends are never automatically retried. Group text is conditional on the sidecar's recipient-list capability; no group management.
 - Bracketed paste is literal, multiline preserves body whitespace, editing uses grapheme positions, resize redraws promptly. Session drafts are bound to recipient; modal suspension preserves body/cursor/paste provenance. Explicit cancel may discard new-chat composition. Drafts are not durable or stored in plaintext preferences.
 - Local encrypted message storage, duplicate upserts, persistence before event fanout, reconnect snapshots and five-second visible-thread reconciliation. The TUI requests only the latest 200 stored messages. No pagination or message-content search.
@@ -27,6 +29,7 @@ Missing: remote historical import, automatic engine-generation restart, Bloom si
 | --- | --- |
 | `apps/bloom-tui/src/app.rs` | Interaction state, drafts, commands, recovery, identity-aware selection |
 | `apps/bloom-tui/src/composer.rs` | Grapheme wrapping and cursor geometry |
+| `apps/bloom-tui/src/transcript.rs` | Message/row reading anchors and renderer-measured viewport geometry |
 | `apps/bloom-tui/src/ui.rs` | Palettes, responsive geometry, transcript, pickers and hitboxes |
 | `apps/bloom-tui/src/main.rs` | Terminal lifecycle, asynchronous input/events/results, redraw scheduling |
 | `apps/bloom-tui/src/daemon.rs` | IPC reconnect, subscription/snapshot ordering and local reconciliation |
@@ -56,8 +59,11 @@ python3 -m venv /path/to/private/test-venv
 /path/to/private/test-venv/bin/python scripts/test-stateful-fake-daemon.py
 /path/to/private/test-venv/bin/python scripts/test-tui-input-e2e.py
 /path/to/private/test-venv/bin/python scripts/test-tui-messaging-e2e.py
+/path/to/private/test-venv/bin/python scripts/test-tui-reading-e2e.py
 /path/to/private/test-venv/bin/python scripts/test-launcher-e2e.py
 ```
+
+The optional `python scripts/benchmark-tui-switching.py` probe measures synthetic input-to-readable-state switching latency; `--body-repeat 100` stresses long messages, and `--columns 44` covers narrow navigation. It reports timings, not a CI wall-clock gate; deterministic cache/output tests guard regressions.
 
 The scripts use `target/debug/bloom-tui` and `target/debug/bloom`, so rebuild binaries after source changes; tests alone can leave the executable fixtures stale. Linux is the documented/tested runtime. PTY tests need Python with pyte; the launcher suite includes `/proc`-based fixture cleanup. Dependencies require network access on first setup.
 
@@ -72,7 +78,7 @@ dart format --output=none --set-exit-if-changed bin lib/payload_codec.dart lib/p
 
 Generated bindings are deliberately excluded. CI is `.github/workflows/check.yml`; it enforces these Rust/Dart gates, synthetic Python suites and the default transport dependency boundary.
 
-Visual review: `scripts/tui-review.sh OUTPUT_DIR` captures a 31-state synthetic matrix, isolates preferences/logs, and creates HTML/PNG review sheets. Tooling currently assumes the local Python helper at `~/.cache/bloom-tools` and Pi browser helper location; adapt these tooling paths for another machine, not product runtime. Review runs need Node/browser tools as well as Python. `scripts/tui-shot.sh` captures individual states. Stop/reap isolated helpers when finished. Do not edit scripts/renderers during a running matrix; rerun affected states after follow-up changes.
+Visual review: `scripts/tui-review.sh OUTPUT_DIR` captures a 37-state synthetic matrix, isolates preferences/logs, and creates HTML/PNG review sheets. Tooling currently assumes the local Python helper at `~/.cache/bloom-tools` and Pi browser helper location; adapt these tooling paths for another machine, not product runtime. Review runs need Node/browser tools as well as Python. `scripts/tui-shot.sh` captures individual states. Stop/reap isolated helpers when finished. Do not edit scripts/renderers during a running matrix; rerun affected states after follow-up changes.
 
 `check-guards` is an optional mutation proof tool for clean files only. Its manifest is not proof a guard was recently exercised; never discard dirty changes to satisfy it.
 
@@ -84,6 +90,12 @@ Never delete a database to work around a missing keychain entry. Never start a s
 
 ## Latest evidence and handoff state
 
+The current [switching-latency follow-up](tui-switching-performance.md) records fresh synthetic PTY reproduction, bounded layout caching/windowed painting and verification. Prior UI polish verification, independent source review, reference limits and parent visual critique are recorded in [the reading/navigation review](ux-polish-review.md). Use these records for the latest tree rather than treating the counts below as current.
+
+Phase 0 stabilization reran the complete Rust/Python gate, Tokyo-timezone TUI tests, strict Clippy, formatting, source guard, normal builds, 8 fixture tests, 11 input PTY tests, 4 messaging PTY tests, 7 reading/navigation PTY tests, 8 launcher tests, Dart 3.13.4 formatting/analysis/all 56 tests, the complete 37-state visual matrix, and final switching probes. Current TUI counts are 67 library and 88 render tests. Three new mutation guards prove stale-click, trimmed local-title search, and narrow-resize overlay ownership coverage. No live account or real engine was accessed.
+
+### Previous reliability/UI iteration
+
 `iteration-review.md` records the accepted changes, parent critique and synthetic verification. Workspace all-target tests, TUI timezone tests, strict Clippy/formatting, source guard, 56 Dart tests/analysis/formatting, 8 fixture tests, 11 input PTY tests, 4 messaging PTY tests and 8 actual-launcher tests passed in the iteration. Handoff preparation reran those gates successfully and proved all seven mutation guards against clean committed source, repairing a stale filter guard before rerunning normal tests. Counts are a historical checkpoint, not a substitute for rerunning tests after a new change.
 
 Temporary visual evidence: `/tmp/bloom-full-review-final/` (31 states plus focused recaptures). These files are disposable and not committed; absence in another session is expected. Reproduce using the scripts. Earlier visual jobs were stopped/failed during iteration and replaced; do not treat those partial outputs as verification. Independent audits informed the plan, but model usage limits interrupted implementations; the parent rejected partial work and finished/reviewed it directly. There was no fresh independent post-implementation reviewer pass.
@@ -92,4 +104,8 @@ The Git history and working tree are the source of truth, not a session summary.
 
 ## Next work
 
-Follow `implementation-plan.md`: generation-scoped engine recovery first, historical ingestion only after pinned-engine semantics are verified, then local pagination/search/unread navigation and standalone runtime packaging. Do not implement archives by assuming CloudKit/generated method names establish cursor/tombstone semantics. Do not turn unknown remote acceptance into an automatic resend. A visual score near 8/10 for reviewed states does not make overall product reliability 8/10.
+The user explicitly deferred multi-service integration to focus on current-chat UI/UX, with high interaction/design standards informed by Herdr, Pi, Codex and Claude Code. [The active UI iteration](ux-polish-review.md) records fresh E2E reproductions, selected changes and acceptance evidence. Preserve draft/routing safety and do not add workspace/server scaffolding or connector refactors in this iteration.
+
+[Multi-service research](multi-service-research.md) remains a deferred reference, not implemented functionality or permission to access accounts.
+
+Queued backend work in `implementation-plan.md` remains generation-scoped engine recovery, verified historical ingestion, local pagination/search/unread navigation and standalone runtime packaging. Do not implement archives by assuming CloudKit/generated method names establish cursor/tombstone semantics. Do not turn unknown remote acceptance into an automatic resend. Polished reviewed states do not establish overall product reliability.

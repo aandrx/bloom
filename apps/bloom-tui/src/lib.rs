@@ -5,6 +5,7 @@ pub mod daemon;
 pub mod diagnostics;
 #[cfg(unix)]
 pub mod launcher;
+pub mod transcript;
 pub mod ui;
 
 /// Re-exported so callers and integration tests can build key events without

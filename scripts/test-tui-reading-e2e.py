@@ -1,0 +1,249 @@
+#!/usr/bin/env python3
+"""Reading and overlay regressions against the real TUI and private synthetic IPC.
+
+Build bloom-tui first; use a Python interpreter with pyte. No real engine/account.
+"""
+import fcntl
+import json
+import os
+from pathlib import Path
+import pty
+import re
+import runpy
+import select
+import signal
+import struct
+import termios
+import time
+import unittest
+
+HERE = Path(__file__).resolve().parent
+H = runpy.run_path(str(HERE / 'test-tui-messaging-e2e.py'), run_name='helpers')
+R = runpy.run_path(str(HERE / 'test-stateful-fake-daemon.py'), run_name='helpers')
+CID = {'transport': 'openbubbles', 'value': 'alice@example.invalid'}
+
+
+class ReadingFlows(unittest.TestCase):
+    def setUp(self):
+        self.fixture = H['MessagingFlows']()
+        self.fixture.setUp()
+        self.addCleanup(self.fixture.tearDown)
+        self.fixture.start_daemon()
+        for index in range(60):
+            self.send_message(index)
+        with H['isolated_environment']({
+            'BLOOM_SOCKET_PATH': str(self.fixture.socket_path),
+            'XDG_CONFIG_HOME': str(self.fixture.root / 'config'),
+            'XDG_STATE_HOME': str(self.fixture.root / 'state'),
+            'XDG_DATA_HOME': str(self.fixture.root / 'data'),
+            'NO_COLOR': '1',
+        }):
+            self.pid, self.master = pty.fork()
+            if self.pid == 0:
+                os.execv(str(H['BINARY']), [str(H['BINARY'])])
+        self.addCleanup(self.stop_tui)
+        self.resize(100, 30)
+        self.wait_for(lambda: 'READ_MARKER_059' in self.text())
+
+    def stop_tui(self):
+        try:
+            os.kill(self.pid, signal.SIGTERM)
+        except ProcessLookupError:
+            pass
+        os.waitpid(self.pid, 0)
+        os.close(self.master)
+
+    def send_message(self, index):
+        R['request'](str(self.fixture.socket_path), 'send', conversation_id=CID,
+                     body={'parts': [{'type': 'text', 'value': f'READ_MARKER_{index:03d} synthetic context'}]})
+
+    def resize(self, width, height):
+        self.width, self.height = width, height
+        self.screen = H['SHOT']['pyte'].Screen(width, height)
+        self.stream = H['SHOT']['pyte'].ByteStream(self.screen)
+        fcntl.ioctl(self.master, termios.TIOCSWINSZ, struct.pack('HHHH', height, width, 0, 0))
+        os.kill(self.pid, signal.SIGWINCH)
+
+    def pump(self, seconds):
+        deadline = time.monotonic() + seconds
+        while time.monotonic() < deadline:
+            if select.select([self.master], [], [], min(.03, max(0, deadline - time.monotonic())))[0]:
+                self.stream.feed(os.read(self.master, 65536))
+
+    def wait_for(self, predicate, timeout=5):
+        deadline = time.monotonic() + timeout
+        while not predicate() and time.monotonic() < deadline:
+            self.pump(.05)
+        self.assertTrue(predicate(), self.text())
+
+    def text(self):
+        return '\n'.join(self.screen.display)
+
+    def markers(self):
+        # Exclude sidebar previews, header and composition. The divider is drawn
+        # at the actual sidebar boundary; a full-width narrow layout has none.
+        divider = self.screen.display[0].find('│')
+        left = divider + 3 if divider >= 0 else 2
+        return re.findall(r'READ_MARKER_\d+', '\n'.join(line[left:] for line in self.screen.display[2:-5]))
+
+    def key(self, value):
+        os.write(self.master, value)
+        self.pump(.2)
+
+    def artifact(self, name):
+        root = os.environ.get('BLOOM_E2E_ARTIFACTS')
+        if root:
+            destination = Path(root) / self._testMethodName
+            destination.mkdir(parents=True, exist_ok=True)
+            (destination / (name + '.txt')).write_text(self.text() + '\n')
+            (destination / (name + '.html')).write_text(H['SHOT']['to_html'](self.screen, self.width, self.height))
+
+    def test_arrivals_reconciliation_latest_and_literal_draft(self):
+        body = '/new\nPrivate literal Alice draft'
+        self.key(b'\x1b[200~' + body.encode() + b'\x1b[201~')
+        self.key(b'\x1b[5~')
+        self.assertTrue(self.markers())
+        anchor = self.markers()[0]
+        self.artifact('reading-before')
+        for index in range(60, 63):
+            self.send_message(index)
+        self.pump(.6)
+        self.artifact('reading-after-arrivals')
+        self.assertEqual(self.markers()[0], anchor, 'live arrivals must not abandon the reading anchor')
+        missed = 'READ_MARKER_063 stored without a live event'
+        R['request'](str(self.fixture.socket_path), 'fixture_append_message',
+                     conversation_id=CID, text=missed)
+        self.pump(.5)
+        self.assertNotIn('READ_MARKER_063', self.text(),
+                         'fixture message must not arrive through live fanout')
+        self.wait_for(lambda: 'READ_MARKER_063' in self.text(), timeout=15)
+        self.assertIn('READ_MARKER_063', self.text(),
+                      'periodic stored-history reconciliation must fetch the missed message')
+        self.assertEqual(self.markers()[0], anchor, 'stored-history reconciliation must preserve reading')
+        self.assertIn('Latest', self.text())
+        self.key(b'\x1b[F')
+        self.assertNotIn('↓ Latest', self.text())
+        self.assertIn('READ_MARKER_063', self.markers(),
+                      'End must render the reconciled message in the transcript')
+        self.key(b'\x1b[5~')
+        row, line = next((row, line) for row, line in enumerate(self.screen.display) if '↓ Latest' in line)
+        column = line.index('↓ Latest')
+        self.key(f'\x1b[<0;{column + 1};{row + 1}M'.encode())
+        self.assertNotIn('↓ Latest', self.text())
+        self.assertIn('READ_MARKER_063', self.markers(),
+                      'mouse Latest must render the reconciled message in the transcript')
+        self.artifact('latest-after-click')
+        self.assertEqual(len(self.fixture.persisted()['messages']), 64)
+        self.key(b'\r')
+        messages = self.fixture.persisted()['messages']
+        self.assertEqual(len(messages), 65)
+        self.assertEqual(messages[-1]['conversation_id'], CID)
+        self.assertEqual(messages[-1]['parts'], [{'type': 'text', 'value': body}])
+
+    def test_settings_wheel_cannot_scroll_hidden_history(self):
+        before = self.markers()
+        self.key(b',')
+        self.assertIn('Settings', self.text())
+        self.artifact('settings-before-wheel')
+        self.key(b'\x1b[<64;65;23M')
+        self.key(b'\x1b')
+        self.artifact('closed-after-wheel')
+        self.assertNotIn('reading back', self.text().lower())
+        self.assertNotIn('↓ Latest', self.text())
+        self.assertEqual(self.markers(), before)
+
+    def test_narrow_navigation_cancel_click_and_recipient_owned_literal_draft(self):
+        self.resize(44, 12)
+        self.wait_for(lambda: 'Alice' in self.text())
+        self.assertNotIn('│', self.screen.display[0], 'narrow chat should own the full width')
+        body = '/new\nPrivate Alice draft'
+        self.key(b'\x1b[200~' + body.encode() + b'\x1b[201~')
+        self.key(b'\t')
+        self.assertIn('Find:', self.text())
+        self.key(b'\x1b[200~Bob\n\x1b[201~')
+        self.assertIn('Bob', self.text())
+        self.artifact('narrow-chats-query')
+        self.key(b'\x1b')
+        self.assertIn('Alice', self.screen.display[0])
+        self.assertIn('Private Alice draft', self.text())
+        self.key(b'\t')
+        self.key(b'Bob')
+        row, line = next((row, line) for row, line in enumerate(self.screen.display) if '› Bob' in line)
+        self.key(f'\x1b[<0;{line.index("› Bob") + 1};{row + 1}M'.encode())
+        self.assertIn('Bob', self.screen.display[0])
+        self.assertNotIn('Private Alice draft', self.text())
+        self.key(b'\r')
+        self.assertEqual(len(self.fixture.persisted()['messages']), 60)
+        self.key(b'\t')
+        self.key(b'Alice')
+        self.resize(100, 30)
+        self.wait_for(lambda: 'Find:' in self.text())
+        self.key(b'\r')
+        self.assertIn('Alice', self.screen.display[0])
+        self.assertIn('Private Alice draft', self.text())
+        self.key(b'\r')
+        messages = self.fixture.persisted()['messages']
+        self.assertEqual(len(messages), 61)
+        self.assertEqual(messages[-1]['conversation_id'], CID)
+        self.assertEqual(messages[-1]['parts'], [{'type': 'text', 'value': body}])
+
+    def test_drawer_candidate_survives_identity_alias_on_reconnect(self):
+        self.resize(44, 12)
+        self.wait_for(lambda: 'Alice' in self.text())
+        self.key(b'\t')
+        self.key(b'\x1b[B')
+        self.assertIn('› Bob', self.text())
+        self.artifact('candidate-before-reconnect')
+        for suffix in ('canonical', 'final'):
+            self.fixture.stop_daemon()
+            state = self.fixture.persisted()
+            bob = next(chat for chat in state['conversations'] if chat['title'].startswith('Bob'))
+            bob['aliases'] = [bob['id']]
+            bob['id'] = {'transport': 'openbubbles', 'value': f'bob-{suffix}@example.invalid'}
+            bob['title'] = f'Bob {suffix} identity'
+            self.fixture.store_path.write_text(json.dumps(state))
+            self.fixture.start_daemon()
+            self.wait_for(lambda: bob['title'] in self.text(), timeout=10)
+            self.artifact(f'candidate-after-{suffix}-reconnect')
+            self.assertIn(f'› {bob["title"]}', self.text(),
+                          'successive identity reconciliation must preserve the logical candidate')
+        self.key(b'\r')
+        self.assertIn('Bob final identity', self.screen.display[0])
+        self.assertEqual(len(self.fixture.persisted()['messages']), 60)
+
+    def test_narrow_resize_preserves_overlay_owner(self):
+        self.key(b'\t')
+        self.key(b'?')
+        self.assertIn('Keyboard shortcuts', self.text())
+        self.resize(44, 12)
+        self.wait_for(lambda: 'Keyboard shortcuts' in self.text())
+        self.assertNotIn('Find:', self.text(),
+                         'resize must not replace the help overlay with Chats')
+
+    def test_narrow_mouse_drawer_clears_pending_leader(self):
+        self.resize(44, 12)
+        self.wait_for(lambda: 'Alice' in self.text())
+        self.key(b'\x02')
+        row, line = next((row, line) for row, line in enumerate(self.screen.display) if '‹ Chats' in line)
+        self.key(f'\x1b[<0;{line.index("‹ Chats") + 1};{row + 1}M'.encode())
+        self.assertIn('Find:', self.text())
+        self.key(b'\x1b')
+        self.key(b'x')
+        self.assertTrue(any('›' in line and line.rstrip().endswith('x')
+                            for line in self.screen.display),
+                        'drawer opening must clear the pending Ctrl+B leader')
+
+    def test_resize_retains_the_message_being_read(self):
+        self.key(b'\x1b[5~')
+        anchor = self.markers()[0]
+        self.resize(66, 18)
+        self.wait_for(lambda: bool(self.markers()))
+        self.assertEqual(self.markers()[0], anchor)
+        self.resize(100, 30)
+        self.wait_for(lambda: bool(self.markers()))
+        self.assertEqual(self.markers()[0], anchor)
+        self.artifact('restored-size')
+
+
+if __name__ == '__main__':
+    unittest.main(verbosity=2)
