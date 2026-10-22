@@ -7,7 +7,7 @@ use bloom_domain::{
     Conversation, ConversationId, ConversationKind, Handle, HandleKind, Message, MessageId,
     Participant,
 };
-use bloom_ipc::{ConversationSyncStatus, EventKind};
+use bloom_ipc::{ConversationSyncStatus, EventKind, MessageSearchHit};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEventKind};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::OnceLock;
@@ -16,10 +16,12 @@ use unicode_segmentation::UnicodeSegmentation;
 /// Rows a single PageUp or PageDown moves through the transcript.
 const SCROLL_PAGE: usize = 10;
 
-pub const HELP_ROW_COUNT: usize = 16;
+pub const HELP_ROW_COUNT: usize = 17;
 
 /// Messages requested per older-history page.
 pub const OLDER_PAGE_LIMIT: u32 = 200;
+/// Maximum number of message-search hits requested at once.
+pub const SEARCH_RESULT_LIMIT: u32 = 50;
 /// Maximum number of paged-back messages retained per conversation, in addition
 /// to the newest window loaded by a snapshot.
 pub const OLDER_HISTORY_BUDGET: usize = 1000;
@@ -43,6 +45,10 @@ pub enum Action {
         body: String,
     },
     SyncConversations,
+    Search {
+        request: u64,
+        query: String,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -195,6 +201,21 @@ pub struct SuspendedComposition {
     owner: Option<DraftOwner>,
 }
 
+/// Modal state for searching stored message text.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct SearchState {
+    pub query: String,
+    pub hits: Vec<MessageSearchHit>,
+    pub selected: usize,
+    pub loading: bool,
+    pub completed: bool,
+    pub error: Option<String>,
+    /// The in-flight request this state is waiting for, if any.
+    pub request: Option<u64>,
+    /// The query whose results are currently on display.
+    pub completed_query: Option<String>,
+}
+
 pub struct App {
     pub theme: Theme,
     /// Terminal-detected theme used when the preference is automatic.
@@ -316,6 +337,19 @@ pub struct App {
     pub context_menu: Option<ContextMenu>,
     /// The conversation whose local title the composer is editing.
     pub renaming: Option<ConversationId>,
+    /// The message-search modal, when open or reaching a hit.
+    pub search: Option<SearchState>,
+    /// Message the transcript is paging back to after a search hit was opened.
+    #[doc(hidden)]
+    pub search_jump: Option<(ConversationId, MessageId)>,
+    /// How many times a jump has waited for its conversation's history.
+    #[doc(hidden)]
+    pub search_jump_waits: u8,
+    /// A query a slash command asked the shell to run.
+    #[doc(hidden)]
+    pub pending_search: Option<(u64, String)>,
+    /// Monotonic id for message-search replies.
+    pub search_request: u64,
 }
 
 /// Navigation is a separate input owner. Highlighting never retargets a draft;
@@ -439,6 +473,11 @@ impl Default for App {
             hidden: HashSet::new(),
             context_menu: None,
             renaming: None,
+            search: None,
+            search_jump: None,
+            search_jump_waits: 0,
+            pending_search: None,
+            search_request: 0,
         }
     }
 }
@@ -755,6 +794,13 @@ impl App {
     /// so opening a different thread returns to that thread's newest message.
     pub fn select(&mut self, id: Option<ConversationId>) {
         if self.selected != id {
+            if self
+                .search_jump
+                .as_ref()
+                .is_some_and(|(conversation, _)| Some(conversation) != id.as_ref())
+            {
+                self.abandon_search_jump();
+            }
             self.older_requested = false;
             self.older_error = None;
             // A page still in flight belongs to the chat being left; its result is
@@ -945,6 +991,7 @@ impl App {
             || self.context_menu.is_some()
             || self.filter_query().is_some()
             || self.command_menu
+            || self.search.is_some()
     }
 
     /// True when the recorded viewport is the selected thread and pinned to its
@@ -1250,6 +1297,278 @@ impl App {
         self.draft_cursor = 0;
         self.resume_composer_draft();
         self.focus = self.contacts_return_focus;
+    }
+
+    /// Open the message-search modal. Only overlay state is cleared; the
+    /// recipient's draft is parked and restored unchanged on close. A new-message
+    /// flow owns the composer, so search refuses rather than opening invisibly.
+    pub fn open_search(&mut self) {
+        if self.new_conversation || self.pending_address.is_some() {
+            self.notice = Some("Finish or cancel the new message first.".into());
+            return;
+        }
+        if self.filter_query().is_some() {
+            self.cancel_filter();
+        }
+        self.suspend_composer_draft();
+        self.leader_pending = false;
+        self.help_open = false;
+        self.settings_open = false;
+        self.theme_panel_open = false;
+        self.contacts_open = false;
+        self.contacts_editing = None;
+        self.command_menu = false;
+        self.context_menu = None;
+        self.renaming = None;
+        self.chat_drawer = None;
+        self.search = Some(SearchState::default());
+        self.focus = Focus::Composer;
+        self.composing = false;
+        self.draft.clear();
+        self.draft_cursor = 0;
+        self.pasted_body = false;
+        self.error = None;
+    }
+
+    pub fn close_search(&mut self) {
+        self.search = None;
+        self.composing = true;
+        self.draft.clear();
+        self.draft_cursor = 0;
+        self.pasted_body = false;
+        self.resume_composer_draft();
+    }
+
+    pub fn search_input(&mut self, character: char) {
+        if let Some(state) = self.search.as_mut() {
+            state.query.push(character);
+        }
+        self.search_edited();
+    }
+
+    pub fn search_backspace(&mut self) {
+        if let Some(state) = self.search.as_mut() {
+            if let Some((start, _)) = state.query.grapheme_indices(true).next_back() {
+                state.query.truncate(start);
+            }
+        }
+        self.search_edited();
+    }
+
+    pub fn search_delete_word(&mut self) {
+        if let Some(state) = self.search.as_mut() {
+            let trimmed = state.query.trim_end();
+            let start = trimmed
+                .char_indices()
+                .rev()
+                .find(|(_, character)| character.is_whitespace())
+                .map_or(0, |(index, character)| index + character.len_utf8());
+            state.query.truncate(start);
+        }
+        self.search_edited();
+    }
+
+    pub fn search_clear(&mut self) {
+        if let Some(state) = self.search.as_mut() {
+            state.query.clear();
+        }
+        self.search_edited();
+    }
+
+    /// Editing the query invalidates every result the old query produced, so a
+    /// later Enter cannot jump an unrelated hit.
+    fn search_edited(&mut self) {
+        if let Some(state) = self.search.as_mut() {
+            state.request = None;
+            state.loading = false;
+            state.error = None;
+            state.hits.clear();
+            state.completed = false;
+            state.completed_query = None;
+            state.selected = 0;
+        }
+    }
+
+    /// Append pasted text to the query while search owns the input.
+    pub fn search_paste(&mut self, input: &str) {
+        let clean = sanitize_paste(input).replace('\n', " ");
+        if let Some(state) = self.search.as_mut() {
+            state.query.push_str(&clean);
+        }
+        self.search_edited();
+    }
+
+    pub fn search_step(&mut self, delta: isize) {
+        if let Some(state) = self.search.as_mut() {
+            let last = state.hits.len().saturating_sub(1);
+            state.selected = state.selected.saturating_add_signed(delta).min(last);
+        }
+    }
+
+    pub fn search_select(&mut self, index: usize) {
+        if let Some(state) = self.search.as_mut() {
+            state.selected = index.min(state.hits.len().saturating_sub(1));
+        }
+    }
+
+    pub fn search_editable(&self) -> bool {
+        self.search.is_some()
+    }
+
+    pub fn search_results_visible(&self) -> bool {
+        self.search.as_ref().is_some_and(|state| {
+            !state.hits.is_empty() && state.completed_query.as_deref() == Some(state.query.trim())
+        })
+    }
+
+    pub fn search_query(&self) -> Option<&str> {
+        self.search.as_ref().map(|state| state.query.as_str())
+    }
+
+    /// Start a search. An empty or whitespace-only query never enters loading.
+    /// The returned id must accompany the reply so stale results are dropped.
+    pub fn begin_search(&mut self) -> Option<(u64, String)> {
+        let request = self.search_request;
+        let state = self.search.as_mut()?;
+        let query = state.query.trim().to_owned();
+        if query.is_empty() {
+            return None;
+        }
+        self.search_request = self.search_request.wrapping_add(1);
+        state.request = Some(request);
+        state.loading = true;
+        state.completed = false;
+        state.completed_query = None;
+        state.error = None;
+        state.hits.clear();
+        state.selected = 0;
+        Some((request, query))
+    }
+
+    pub fn finish_search(&mut self, request: u64, hits: Vec<MessageSearchHit>) {
+        if let Some(state) = self.search.as_mut() {
+            if state.request != Some(request) {
+                return;
+            }
+            state.loading = false;
+            state.completed = true;
+            state.hits = hits;
+            state.selected = 0;
+            state.completed_query = Some(state.query.trim().to_owned());
+        }
+    }
+
+    pub fn fail_search(&mut self, request: u64, message: String) {
+        if let Some(state) = self.search.as_mut() {
+            if state.request != Some(request) {
+                return;
+            }
+            state.loading = false;
+            state.completed = true;
+            state.error = Some(message);
+        }
+    }
+
+    pub fn selected_search_hit(&self) -> Option<MessageSearchHit> {
+        self.search
+            .as_ref()
+            .and_then(|state| state.hits.get(state.selected).cloned())
+    }
+
+    /// Commit the selected hit: close the modal, open its conversation, and
+    /// remember the message that paging must reach.
+    pub fn begin_search_jump(&mut self) -> Option<(ConversationId, MessageId)> {
+        let hit = self.selected_search_hit()?;
+        let previous = self.selected.clone();
+        let conversation = hit.conversation_id;
+        let message = hit.message_id;
+        self.close_search();
+        if previous.as_ref() != Some(&conversation) {
+            self.select(Some(conversation.clone()));
+        }
+        // Paged history stays with its own chat, exactly as a normal switch does.
+        self.search_jump = Some((conversation.clone(), message.clone()));
+        self.search_jump_waits = 0;
+        Some((conversation, message))
+    }
+
+    pub fn search_jump_pending(&self) -> Option<(&ConversationId, &MessageId)> {
+        let (conversation, message) = self.search_jump.as_ref()?;
+        (self.selected.as_ref() == Some(conversation)).then_some((conversation, message))
+    }
+
+    /// Finish a pending jump once its message is loaded, anchoring the transcript
+    /// on it rather than on the tail.
+    pub fn reach_search_jump(&mut self) -> bool {
+        let Some((conversation, message)) = self.search_jump.clone() else {
+            return false;
+        };
+        if self.selected.as_ref() != Some(&conversation) {
+            return false;
+        }
+        let found = self
+            .messages
+            .get(&conversation)
+            .is_some_and(|messages| messages.iter().any(|row| row.id() == &message));
+        if !found {
+            return false;
+        }
+        self.search_jump = None;
+        self.reading_anchor = Some(crate::transcript::ReadingAnchor {
+            conversation,
+            message,
+            row: 0,
+        });
+        self.scroll = 1;
+        true
+    }
+
+    pub fn abandon_search_jump(&mut self) {
+        self.search_jump = None;
+        self.search_jump_waits = 0;
+    }
+
+    /// Continue a pending search jump: reach the message, page one more time, or
+    /// give up when the store has no further history to offer. A chat whose
+    /// window has not loaded yet waits instead of declaring the hit missing.
+    pub fn advance_search_jump(&mut self) {
+        let Some((conversation, _)) = self.search_jump.clone() else {
+            return;
+        };
+        if self.selected.as_ref() != Some(&conversation) {
+            self.abandon_search_jump();
+            return;
+        }
+        if self.reach_search_jump() {
+            return;
+        }
+        let loaded = self
+            .messages
+            .get(&conversation)
+            .is_some_and(|messages| !messages.is_empty());
+        if !loaded {
+            // A handful of snapshots is enough for a listed conversation to load.
+            // Without this bound, a hit whose conversation never loads would leave
+            // the jump pending forever with no explanation.
+            self.search_jump_waits = self.search_jump_waits.saturating_add(1);
+            if self.search_jump_waits > 3 {
+                self.abandon_search_jump();
+                self.notice =
+                    Some("That message is outside the history Bloom keeps loaded.".into());
+            }
+            return;
+        }
+        if self.older_loading.is_some() {
+            // Another page (for this chat or a different one) will report back;
+            // deciding now would abandon the jump on a false negative.
+            return;
+        }
+        if self.can_load_older() {
+            self.older_requested = true;
+            return;
+        }
+        self.abandon_search_jump();
+        self.notice = Some("That message is outside the history Bloom keeps loaded.".into());
     }
 
     fn contacts_step(&mut self, delta: isize) {
@@ -1959,6 +2278,7 @@ impl App {
             ("/settings", "Open local display settings"),
             ("/nickname", "Name this direct chat locally"),
             ("/contacts", "Browse known participants and nicknames"),
+            ("/search", "Search stored message text"),
             ("/new", "Start a new direct chat"),
             ("/filter", "Filter your conversations"),
             ("/compact", "Toggle sidebar density"),
@@ -1998,6 +2318,24 @@ impl App {
             self.draft_cursor = self.draft.graphemes(true).count();
         }
         self.command_menu = false;
+    }
+
+    fn execute_search_command(&mut self) {
+        let query = self
+            .draft
+            .strip_prefix("/search")
+            .unwrap_or_default()
+            .trim()
+            .to_owned();
+        self.error = None;
+        self.open_search();
+        if query.is_empty() {
+            return;
+        }
+        for character in query.chars() {
+            self.search_input(character);
+        }
+        self.pending_search = self.begin_search();
     }
 
     fn execute_nickname_command(&mut self) {
@@ -2092,6 +2430,7 @@ impl App {
                 self.begin_contacts();
             }
             ["/nickname", ..] => self.execute_nickname_command(),
+            ["/search", ..] => self.execute_search_command(),
             ["/new"] => {
                 self.error = None;
                 self.retire_active_draft();
@@ -2119,7 +2458,9 @@ impl App {
     }
 
     fn take_pending_action(&mut self) -> Action {
-        if std::mem::take(&mut self.sync_requested) && !self.sync_in_flight {
+        if let Some((request, query)) = self.pending_search.take() {
+            Action::Search { request, query }
+        } else if std::mem::take(&mut self.sync_requested) && !self.sync_in_flight {
             self.sync_in_flight = true;
             Action::SyncConversations
         } else {
@@ -2411,6 +2752,10 @@ impl App {
             drawer.selected = None;
             return;
         }
+        if self.search.is_some() {
+            self.search_paste(input);
+            return;
+        }
         if self.context_menu.is_some()
             || self.help_open
             || self.settings_open
@@ -2468,6 +2813,13 @@ impl App {
     pub fn handle_key(&mut self, key: KeyEvent) -> Action {
         if self.chat_drawer.is_some() {
             self.drawer_key(key);
+            return Action::None;
+        }
+        if self.search.is_some() {
+            return self.search_key(key);
+        }
+        if key.code == KeyCode::Char('f') && key.modifiers.contains(KeyModifiers::CONTROL) {
+            self.open_search();
             return Action::None;
         }
         if self.draft.is_empty() {
@@ -2998,6 +3350,38 @@ impl App {
         Action::None
     }
 
+    fn search_key(&mut self, key: KeyEvent) -> Action {
+        let control = key.modifiers.contains(KeyModifiers::CONTROL);
+        match key.code {
+            KeyCode::Esc => self.close_search(),
+            KeyCode::Char('c') if control => self.close_search(),
+            KeyCode::Enter if self.search_results_visible() => {
+                if self.begin_search_jump().is_some() {
+                    self.advance_search_jump();
+                }
+            }
+            KeyCode::Enter => {
+                if let Some((request, query)) = self.begin_search() {
+                    return Action::Search { request, query };
+                }
+            }
+            KeyCode::Up => self.search_step(-1),
+            KeyCode::Down => self.search_step(1),
+            KeyCode::Backspace => self.search_backspace(),
+            KeyCode::Char('w') if control => self.search_delete_word(),
+            KeyCode::Char('u') if control => self.search_clear(),
+            KeyCode::Char(character)
+                if !control
+                    && !key.modifiers.contains(KeyModifiers::ALT)
+                    && !character.is_control() =>
+            {
+                self.search_input(character);
+            }
+            _ => {}
+        }
+        Action::None
+    }
+
     /// Resolve a mouse event against the last frame's hitboxes. The hitboxes come
     /// from rendering, so a click can only land on something that was drawn.
     pub fn handle_mouse(
@@ -3041,6 +3425,35 @@ impl App {
             }
             return Action::None;
         }
+        if self.search.is_some() {
+            // Search is modal for the pointer too: only its own rows and wheel
+            // reach it, so a header or pane click cannot stack an overlay on top.
+            match kind {
+                MouseEventKind::ScrollUp | MouseEventKind::ScrollDown => {
+                    if hits
+                        .popup
+                        .is_some_and(|area| area.contains((column, row).into()))
+                    {
+                        let step = if kind == MouseEventKind::ScrollUp {
+                            -1
+                        } else {
+                            1
+                        };
+                        self.search_step(step);
+                    }
+                }
+                MouseEventKind::Down(MouseButton::Left) => {
+                    if let Some(Hit::SearchRow(index)) = hits.at(column, row) {
+                        self.search_select(index);
+                        if self.begin_search_jump().is_some() {
+                            self.advance_search_jump();
+                        }
+                    }
+                }
+                _ => {}
+            }
+            return Action::None;
+        }
         // Wheel ownership is resolved from the same painted layers as clicks.
         // Background panels must not receive a gesture through a popup.
         if matches!(kind, MouseEventKind::ScrollUp | MouseEventKind::ScrollDown)
@@ -3068,6 +3481,8 @@ impl App {
                 self.contacts_step(step * WHEEL_ROWS as isize);
             } else if self.new_conversation && self.pending_address.is_none() {
                 self.new_contact_step(step * WHEEL_ROWS as isize);
+            } else if self.search.is_some() {
+                self.search_step(step);
             } else if self.filter_query().is_some() {
                 self.select_step(step * WHEEL_ROWS as isize);
             } else if self.theme_panel_open {
@@ -3393,14 +3808,20 @@ impl App {
     /// Commands that take an argument autofill into the composer; commands that
     /// open a mode run the moment they are chosen.
     fn command_needs_argument(name: &str) -> bool {
-        matches!(name, "/nickname" | "/theme")
+        matches!(name, "/nickname" | "/theme" | "/search")
     }
 
     /// Run (or autofill) the highlighted command from the popup.
     fn activate_selected_command(&mut self) {
         let suggestions = self.command_suggestions();
         match suggestions.get(self.command_selection).copied() {
-            Some((name, _)) if Self::command_needs_argument(name) => self.complete_command(),
+            Some((name, _)) if Self::command_needs_argument(name) => {
+                if name == "/search" && self.draft.trim() == "/search" {
+                    self.execute_command();
+                } else {
+                    self.complete_command();
+                }
+            }
             Some((name, _)) => {
                 self.draft = name.to_owned();
                 self.draft_cursor = name.graphemes(true).count();
@@ -5441,5 +5862,457 @@ mod tests {
         app.older_exhausted.remove(&canonical.id);
         assert!(app.can_load_older());
         assert!(app.begin_load_older().is_some());
+    }
+
+    fn search_hit(conversation: &Conversation, id: &str, snippet: &str) -> MessageSearchHit {
+        MessageSearchHit {
+            conversation_id: conversation.id.clone(),
+            message_id: MessageId::new(conversation.id.transport().clone(), id).unwrap(),
+            created_at: 1,
+            snippet: snippet.into(),
+        }
+    }
+
+    #[test]
+    fn search_modal_parks_and_restores_the_recipient_draft() {
+        let mut app = App::default();
+        let chat = conversation("search-draft@example.test", Some(10));
+        app.set_conversations(vec![chat.clone()]);
+        app.select(Some(chat.id.clone()));
+        app.draft = "unfinished literal /body".into();
+        app.draft_cursor = app.draft.graphemes(true).count();
+        app.pasted_body = true;
+        let cursor = app.draft_cursor;
+        let selected = app.selected.clone();
+
+        app.open_search();
+
+        assert!(app.search.is_some());
+        assert!(app.draft.is_empty());
+        assert_eq!(app.selected, selected);
+        assert!(matches!(
+            app.suspended_composition
+                .as_ref()
+                .and_then(|composition| composition.owner.as_ref()),
+            Some(DraftOwner::Conversation(id)) if id == &chat.id
+        ));
+
+        app.close_search();
+
+        assert!(app.search.is_none());
+        assert_eq!(app.selected, selected);
+        assert_eq!(app.draft, "unfinished literal /body");
+        assert_eq!(app.draft_cursor, cursor);
+        assert!(app.pasted_body);
+    }
+
+    #[test]
+    fn empty_or_whitespace_search_query_does_not_load() {
+        let mut app = App::default();
+        app.open_search();
+
+        assert_eq!(app.begin_search(), None);
+        assert!(!app.search.as_ref().expect("search state").loading);
+
+        app.search_input(' ');
+        app.search_input('\t');
+
+        assert_eq!(app.begin_search(), None);
+        assert!(!app.search.as_ref().expect("search state").loading);
+    }
+
+    #[test]
+    fn completed_search_selects_the_first_hit_and_navigation_clamps() {
+        let mut app = App::default();
+        let chat = conversation("search-hits@example.test", Some(10));
+        let first = search_hit(&chat, "m1", "first needle");
+        let second = search_hit(&chat, "m2", "second needle");
+        app.open_search();
+        for character in "needle".chars() {
+            app.search_input(character);
+        }
+
+        let (request, query) = app.begin_search().expect("search starts");
+        assert_eq!(query, "needle");
+        assert!(app.search.as_ref().expect("search state").loading);
+        app.finish_search(request, vec![first, second]);
+
+        assert!(!app.search.as_ref().expect("search state").loading);
+        assert_eq!(app.search.as_ref().expect("search state").selected, 0);
+        assert_eq!(app.search.as_ref().expect("search state").hits.len(), 2);
+        assert!(app.search_results_visible());
+        assert_eq!(
+            app.selected_search_hit()
+                .map(|hit| hit.message_id.value().to_owned()),
+            Some("m1".into())
+        );
+
+        app.search_step(-1);
+        assert_eq!(app.search.as_ref().expect("search state").selected, 0);
+        app.search_step(1);
+        assert_eq!(app.search.as_ref().expect("search state").selected, 1);
+        app.search_step(1);
+        assert_eq!(app.search.as_ref().expect("search state").selected, 1);
+        app.search_step(-1);
+        assert_eq!(app.search.as_ref().expect("search state").selected, 0);
+        app.search_select(99);
+        assert_eq!(app.search.as_ref().expect("search state").selected, 1);
+    }
+
+    #[test]
+    fn search_jump_selects_the_hit_conversation_and_reaches_the_message() {
+        let mut app = App::default();
+        let source = conversation("search-source@example.test", Some(20));
+        let target = conversation("search-target@example.test", Some(10));
+        app.set_conversations(vec![source.clone(), target.clone()]);
+        app.select(Some(source.id.clone()));
+        let hit = search_hit(&target, "needle", "a needle in history");
+        let expected = (target.id.clone(), hit.message_id.clone());
+        app.open_search();
+        for character in "needle".chars() {
+            app.search_input(character);
+        }
+        let (request, _) = app.begin_search().expect("search starts");
+        app.finish_search(request, vec![hit]);
+
+        assert_eq!(app.begin_search_jump(), Some(expected.clone()));
+        assert_eq!(app.selected, Some(target.id.clone()));
+        assert_eq!(app.search_jump_pending(), Some((&expected.0, &expected.1)));
+        assert!(!app.search_editable());
+        assert!(!app.reach_search_jump());
+
+        app.upsert(
+            target.id.clone(),
+            message(&target, "needle", 1, "a needle in history"),
+        );
+
+        assert!(app.reach_search_jump());
+        assert!(app.search_jump_pending().is_none());
+        let anchor = app.reading_anchor.as_ref().expect("reading anchor");
+        assert_eq!(anchor.conversation, target.id);
+        assert_eq!(anchor.message, expected.1);
+        assert_eq!(anchor.row, 0);
+        assert!(app.scroll > 0);
+    }
+
+    #[test]
+    fn search_jump_within_the_selected_chat_keeps_drafts_and_paging() {
+        let mut app = App::default();
+        let chat = conversation("search-same@example.test", Some(10));
+        app.set_conversations(vec![chat.clone()]);
+        app.select(Some(chat.id.clone()));
+        app.draft = "keep this draft".into();
+        app.draft_cursor = app.draft.graphemes(true).count();
+        app.pasted_body = true;
+        let cursor = app.draft_cursor;
+        app.older_loaded.insert(chat.id.clone());
+        let hit = search_hit(&chat, "m1", "same chat needle");
+        app.open_search();
+        for character in "needle".chars() {
+            app.search_input(character);
+        }
+        let (request, _) = app.begin_search().expect("search starts");
+        app.finish_search(request, vec![hit]);
+
+        let jumped = app.begin_search_jump().expect("jump");
+
+        assert_eq!(jumped.0, chat.id);
+        assert_eq!(app.selected, Some(chat.id.clone()));
+        assert_eq!(app.draft, "keep this draft");
+        assert_eq!(app.draft_cursor, cursor);
+        assert!(app.pasted_body);
+        assert!(app.older_loaded.contains(&chat.id));
+    }
+
+    #[test]
+    fn abandoning_a_search_jump_clears_pending_navigation() {
+        let mut app = App::default();
+        let source = conversation("search-abandon-source@example.test", Some(20));
+        let target = conversation("search-abandon-target@example.test", Some(10));
+        app.set_conversations(vec![source.clone(), target.clone()]);
+        app.select(Some(source.id.clone()));
+        let hit = search_hit(&target, "needle", "needle");
+        app.open_search();
+        for character in "needle".chars() {
+            app.search_input(character);
+        }
+        let (request, _) = app.begin_search().expect("search starts");
+        app.finish_search(request, vec![hit]);
+        app.begin_search_jump().expect("jump");
+
+        app.abandon_search_jump();
+
+        assert!(app.search_jump_pending().is_none());
+        app.upsert(target.id.clone(), message(&target, "needle", 1, "needle"));
+        assert!(!app.reach_search_jump());
+        assert!(app.reading_anchor.is_none());
+    }
+
+    #[test]
+    fn search_refuses_to_open_during_a_new_message() {
+        let mut app = App::default();
+        app.begin_new_conversation();
+        app.draft = "an unsent new message".into();
+        app.draft_cursor = app.draft.graphemes(true).count();
+
+        app.open_search();
+
+        assert!(app.search.is_none());
+        assert!(app.new_conversation);
+        assert_eq!(app.draft, "an unsent new message");
+        assert!(
+            app.notice.is_some(),
+            "the refusal explains itself instead of failing silently"
+        );
+    }
+
+    #[test]
+    fn opening_search_dismisses_an_open_filter() {
+        let mut app = App::default();
+        app.set_conversations(vec![conversation("filtered@example.test", Some(10))]);
+        app.begin_filter();
+        assert!(app.filter.is_some());
+
+        app.open_search();
+
+        assert!(app.search.is_some());
+        assert!(app.filter.is_none(), "the filter must not hide search");
+    }
+
+    #[test]
+    fn a_stale_search_reply_is_ignored() {
+        let mut app = App::default();
+        let chat = conversation("stale-search@example.test", Some(10));
+        app.open_search();
+        for character in "first".chars() {
+            app.search_input(character);
+        }
+        let (stale, _) = app.begin_search().expect("first search");
+        for character in "second".chars() {
+            app.search_input(character);
+        }
+        let (current, _) = app.begin_search().expect("second search");
+        assert_ne!(stale, current);
+
+        app.finish_search(stale, vec![search_hit(&chat, "old", "stale hit")]);
+        assert!(app.search.as_ref().expect("search").hits.is_empty());
+        assert!(!app.search_results_visible());
+
+        app.finish_search(current, vec![search_hit(&chat, "new", "current hit")]);
+        assert_eq!(
+            app.search.as_ref().expect("search").hits[0].snippet,
+            "current hit"
+        );
+        assert!(app.search_results_visible());
+
+        app.fail_search(stale, "old failure".into());
+        assert!(app.search.as_ref().expect("search").error.is_none());
+    }
+
+    #[test]
+    fn editing_the_query_clears_previous_hits_and_enter_searches_again() {
+        let mut app = App::default();
+        let chat = conversation("edit-search@example.test", Some(10));
+        app.open_search();
+        for character in "needle".chars() {
+            app.search_input(character);
+        }
+        let (request, _) = app.begin_search().expect("search");
+        app.finish_search(request, vec![search_hit(&chat, "hit", "a needle")]);
+        assert!(app.search_results_visible());
+
+        app.search_input('x');
+
+        assert!(!app.search_results_visible(), "old hits no longer apply");
+        assert!(app.search.as_ref().expect("search").hits.is_empty());
+        assert!(
+            matches!(
+                app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+                Action::Search { .. }
+            ),
+            "Enter searches the edited query instead of opening the stale hit"
+        );
+    }
+
+    #[test]
+    fn a_jump_waits_for_history_before_declaring_the_hit_missing() {
+        let mut app = App::default();
+        let source = conversation("wait-source@example.test", Some(20));
+        let target = conversation("wait-target@example.test", Some(10));
+        app.set_conversations(vec![source.clone(), target.clone()]);
+        app.select(Some(source.id.clone()));
+        let hit = search_hit(&target, "needle", "needle");
+        app.open_search();
+        for character in "needle".chars() {
+            app.search_input(character);
+        }
+        let (request, _) = app.begin_search().expect("search");
+        app.finish_search(request, vec![hit]);
+        app.begin_search_jump().expect("jump");
+
+        // No history for the target yet: the jump must wait, not give up.
+        app.advance_search_jump();
+        assert!(app.search_jump_pending().is_some());
+        assert_eq!(app.notice, None);
+
+        // History arrived but the message is not in it, and nothing older exists.
+        app.upsert(
+            target.id.clone(),
+            message(&target, "other", 50, "unrelated"),
+        );
+        app.older_exhausted.insert(target.id.clone());
+        app.advance_search_jump();
+
+        assert!(app.search_jump_pending().is_none());
+        assert!(
+            app.notice
+                .as_deref()
+                .is_some_and(|notice| notice.contains("outside the history")),
+            "the abandoned jump explains itself"
+        );
+    }
+
+    #[test]
+    fn search_paste_edits_the_query_without_touching_the_composer() {
+        let mut app = App::default();
+        let chat = conversation("paste-search@example.test", Some(10));
+        app.set_conversations(vec![chat.clone()]);
+        app.select(Some(chat.id.clone()));
+        app.draft = "recipient draft".into();
+        app.draft_cursor = app.draft.graphemes(true).count();
+        app.open_search();
+
+        app.paste("two words");
+
+        assert_eq!(app.search_query(), Some("two words"));
+        assert!(
+            app.draft.is_empty(),
+            "the recipient draft stays parked while searching"
+        );
+        app.close_search();
+        assert_eq!(
+            app.draft, "recipient draft",
+            "closing search restores the recipient draft untouched"
+        );
+    }
+
+    #[test]
+    fn a_jump_for_a_conversation_that_never_loads_gives_up_with_a_notice() {
+        let mut app = App::default();
+        let source = conversation("never-source@example.test", Some(20));
+        let gone = conversation("never-target@example.test", Some(10));
+        app.set_conversations(vec![source.clone(), gone.clone()]);
+        app.select(Some(source.id.clone()));
+        let hit = search_hit(&gone, "needle", "needle");
+        app.open_search();
+        for character in "needle".chars() {
+            app.search_input(character);
+        }
+        let (request, _) = app.begin_search().expect("search");
+        app.finish_search(request, vec![hit]);
+        app.begin_search_jump().expect("jump");
+
+        // The conversation never produces history; the jump must still resolve.
+        for _ in 0..6 {
+            app.advance_search_jump();
+            if app.search_jump_pending().is_none() {
+                break;
+            }
+        }
+        assert!(app.search_jump_pending().is_none());
+        assert!(
+            app.notice
+                .as_deref()
+                .is_some_and(|notice| notice.contains("outside the history")),
+            "an unreachable jump explains itself instead of hanging"
+        );
+    }
+
+    #[test]
+    fn opening_search_closes_other_overlays() {
+        let mut app = App::default();
+        let chat = conversation("search-overlay@example.test", Some(10));
+        app.set_conversations(vec![chat]);
+
+        app.help_open = true;
+        app.open_search();
+        assert!(!app.help_open);
+
+        app.open_settings();
+        assert!(app.settings_open);
+        app.open_search();
+        assert!(!app.settings_open);
+
+        app.begin_contacts();
+        assert!(app.contacts_open);
+        app.open_search();
+        assert!(!app.contacts_open);
+        assert!(!app.help_open);
+        assert!(!app.settings_open);
+        assert!(!app.theme_panel_open);
+    }
+    #[test]
+    fn ctrl_f_opens_search_and_its_keys_stay_out_of_the_composer() {
+        let mut app = App::default();
+        let chat = conversation("search-keys@example.test", Some(10));
+        app.set_conversations(vec![chat.clone()]);
+        app.select(Some(chat.id.clone()));
+        app.draft = "parked draft".into();
+        app.draft_cursor = app.draft.graphemes(true).count();
+
+        assert_eq!(
+            app.handle_key(KeyEvent::new(KeyCode::Char('f'), KeyModifiers::CONTROL,)),
+            Action::None
+        );
+        assert!(app.search_editable());
+        assert!(app.draft.is_empty());
+
+        for character in "alpha beta".chars() {
+            app.handle_key(KeyEvent::new(KeyCode::Char(character), KeyModifiers::NONE));
+        }
+        assert_eq!(app.search_query(), Some("alpha beta"));
+        app.handle_key(KeyEvent::new(KeyCode::Char('w'), KeyModifiers::CONTROL));
+        assert_eq!(app.search_query(), Some("alpha "));
+        app.handle_key(KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE));
+        app.handle_key(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL));
+        assert_eq!(app.search_query(), Some(""));
+
+        assert_eq!(
+            app.handle_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL,)),
+            Action::None,
+            "Ctrl+C closes search instead of quitting"
+        );
+        assert!(!app.search_editable());
+        assert_eq!(app.draft, "parked draft");
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('f'), KeyModifiers::CONTROL));
+        app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(!app.search_editable());
+        assert_eq!(app.draft, "parked draft");
+    }
+    #[test]
+    fn slash_search_opens_empty_or_runs_the_argument_query() {
+        let mut app = App::default();
+        for character in "/search".chars() {
+            app.handle_key(KeyEvent::new(KeyCode::Char(character), KeyModifiers::NONE));
+        }
+        assert!(app.command_menu);
+        assert_eq!(
+            app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+            Action::None
+        );
+        assert!(app.search_editable());
+        assert_eq!(app.search_query(), Some(""));
+        app.close_search();
+
+        app.draft = "/search needle".into();
+        app.draft_cursor = app.draft.graphemes(true).count();
+        let action = app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(
+            matches!(action, Action::Search { ref query, .. } if query == "needle"),
+            "an argument runs the query straight away"
+        );
+        assert_eq!(app.search_query(), Some("needle"));
+        assert!(app.search.as_ref().expect("search state").loading);
     }
 }

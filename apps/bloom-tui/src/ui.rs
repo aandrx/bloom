@@ -1501,6 +1501,136 @@ fn render_emoji_suggestions(
     hits
 }
 
+fn search_conversation_name(app: &App, id: &bloom_domain::ConversationId) -> String {
+    app.conversations
+        .iter()
+        .find(|conversation| &conversation.id == id || conversation.aliases.contains(id))
+        .map_or_else(
+            || id.value().to_owned(),
+            |conversation| app.conversation_name(conversation),
+        )
+}
+
+fn render_search(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    app: &App,
+    palette: Palette,
+) -> Vec<(Rect, usize)> {
+    if area.width == 0 || area.height == 0 {
+        return Vec::new();
+    }
+    let Some(state) = app.search.as_ref() else {
+        return Vec::new();
+    };
+    let inset = 2u16.min(area.width / 2);
+    let text_x = area.x.saturating_add(inset);
+    let text_width = area.width.saturating_sub(inset.saturating_mul(2)).max(1) as usize;
+    let prefix = "Search: ";
+    let cursor = "▏";
+    let query_width = text_width
+        .saturating_sub(unicode_width::UnicodeWidthStr::width(prefix))
+        .saturating_sub(unicode_width::UnicodeWidthStr::width(cursor));
+    frame.render_widget(
+        Paragraph::new(Line::from(vec![
+            Span::styled(prefix, Style::default().fg(palette.muted)),
+            Span::styled(
+                truncate_display_graphemes(&state.query, query_width),
+                Style::default().fg(palette.text),
+            ),
+            Span::styled(cursor, Style::default().fg(palette.cyan)),
+        ])),
+        Rect::new(text_x, area.y, text_width as u16, 1),
+    );
+
+    let mut row = area.y.saturating_add(1);
+    let bottom = area.y.saturating_add(area.height);
+    let status = if state.loading {
+        Some(("Searching…".to_owned(), Style::default().fg(palette.muted)))
+    } else if let Some(error) = state.error.as_ref() {
+        Some((error.clone(), Style::default().fg(palette.red)))
+    } else if state.completed && state.hits.is_empty() && !state.query.trim().is_empty() {
+        Some((
+            "No messages found.".to_owned(),
+            Style::default().fg(palette.muted),
+        ))
+    } else {
+        None
+    };
+    if let Some((message, style)) = status {
+        if row < bottom {
+            frame.render_widget(
+                Paragraph::new(truncate_display_graphemes(&message, text_width)).style(style),
+                Rect::new(text_x, row, text_width as u16, 1),
+            );
+        }
+        row = row.saturating_add(1);
+    }
+    let mut hits = Vec::new();
+    if state.loading || state.error.is_some() || state.hits.is_empty() || row >= bottom {
+        return hits;
+    }
+    let visible = (bottom - row).min(state.hits.len() as u16).min(8) as usize;
+    if visible == 0 {
+        return hits;
+    }
+    let selected = state.selected.min(state.hits.len().saturating_sub(1));
+    let first = selected
+        .saturating_sub(visible.saturating_sub(1))
+        .min(state.hits.len().saturating_sub(visible));
+    for (index, hit) in state.hits.iter().enumerate().skip(first).take(visible) {
+        let row_area = Rect::new(area.x, row, area.width, 1);
+        let active = index == selected;
+        let background = if active {
+            palette.selection
+        } else {
+            palette.input_surface
+        };
+        frame.render_widget(
+            Block::default().style(Style::default().bg(background)),
+            row_area,
+        );
+        let marker_width = 2usize;
+        let body_width = text_width.saturating_sub(marker_width);
+        let name = search_conversation_name(app, &hit.conversation_id);
+        let name_width = body_width.min(20);
+        let shown_name = truncate_display_graphemes(&name, name_width);
+        let shown_name_width = unicode_width::UnicodeWidthStr::width(shown_name.as_str());
+        let snippet_width = body_width.saturating_sub(shown_name_width + 2);
+        let shown_snippet =
+            truncate_display_graphemes(&sanitize_snippet(&hit.snippet), snippet_width);
+        frame.render_widget(
+            Paragraph::new(Line::from(vec![
+                Span::styled(
+                    if active { "› " } else { "  " },
+                    Style::default()
+                        .fg(palette.cyan)
+                        .bg(background)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(
+                    shown_name,
+                    Style::default()
+                        .fg(palette.text)
+                        .bg(background)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::styled("  ", Style::default().bg(background)),
+                Span::styled(
+                    shown_snippet,
+                    Style::default()
+                        .fg(if active { palette.text } else { palette.muted })
+                        .bg(background),
+                ),
+            ])),
+            Rect::new(text_x, row, text_width as u16, 1),
+        );
+        hits.push((row_area, index));
+        row = row.saturating_add(1);
+    }
+    hits
+}
+
 fn render_filter_panel(
     frame: &mut Frame<'_>,
     area: Rect,
@@ -1606,6 +1736,35 @@ fn display_truncate(value: &str, width: usize) -> String {
     result
 }
 
+/// Remove C0/C1 control characters so stored text can never emit an escape
+/// sequence, then let the caller truncate the safe result.
+/// Stored text may contain anything. Drop control and bidirectional-format
+/// characters so a snippet can never emit an escape sequence or reorder the line,
+/// and keep tabs as a single space so words do not run together.
+fn sanitize_snippet(value: &str) -> String {
+    value
+        .chars()
+        .filter_map(|character| {
+            if character == '\t' {
+                return Some(' ');
+            }
+            if character.is_control() || is_bidi_format(character) {
+                return None;
+            }
+            Some(character)
+        })
+        .collect()
+}
+
+fn is_bidi_format(character: char) -> bool {
+    matches!(
+        character,
+        '\u{200e}' | '\u{200f}'
+            | '\u{202a}'..='\u{202e}'
+            | '\u{2066}'..='\u{2069}'
+    )
+}
+
 fn truncate_display_graphemes(value: &str, width: usize) -> String {
     let mut result = String::new();
     let mut used = 0;
@@ -1648,6 +1807,7 @@ pub enum Hit {
     NewContactTab(usize),
     FilterRow(usize),
     FilterTab(usize),
+    SearchRow(usize),
     EmojiRow(usize),
     ThemeRow(usize),
     ContextMenuRow(usize),
@@ -1682,6 +1842,7 @@ pub struct HitMap {
     pub new_contact_tabs: Vec<(Rect, usize)>,
     pub filter_rows: Vec<(Rect, usize)>,
     pub filter_tabs: Vec<(Rect, usize)>,
+    pub search_rows: Vec<(Rect, usize)>,
     pub emoji_rows: Vec<(Rect, usize)>,
     pub theme_rows: Vec<(Rect, usize)>,
     /// The conversation context menu and its items.
@@ -1792,6 +1953,9 @@ impl HitMap {
             }
             if let Some(index) = Self::row_at(&self.filter_tabs, column, row) {
                 return Some(Hit::FilterTab(index));
+            }
+            if let Some(index) = Self::row_at(&self.search_rows, column, row) {
+                return Some(Hit::SearchRow(index));
             }
             if let Some(index) = Self::row_at(&self.emoji_rows, column, row) {
                 return Some(Hit::EmojiRow(index));
@@ -2730,6 +2894,7 @@ fn render_cached_with_mode(
         || app.contacts_open
         || app.command_menu
         || app.filter_query().is_some()
+        || app.search.is_some()
         || (app.new_conversation && app.pending_address.is_none())
         || !app.emoji_suggestions().is_empty()
         || app.context_menu.is_some();
@@ -2826,12 +2991,14 @@ fn render_cached_with_mode(
     }
     let new_recipient_open = app.new_conversation && app.pending_address.is_none();
     let filter_open = app.filter_query().is_some();
+    let search_open = app.search.is_some();
     let emoji_open = !app.emoji_suggestions().is_empty();
     if app.contacts_open
         || app.settings_open
         || app.theme_panel_open
         || new_recipient_open
         || filter_open
+        || search_open
         || emoji_open
     {
         let picker_bounds = Rect::new(body[2].x, content.y, body[2].width, content.height);
@@ -2848,6 +3015,26 @@ fn render_cached_with_mode(
             let body_rows = 2 + handles.len().max(1);
             titled_picker_geometry(picker_bounds, geometry.band.y, 2, body_rows, 0)
         });
+        let search_layout = search_open.then(|| {
+            let state = app.search.as_ref().expect("search state was checked");
+            let status = u16::from(
+                state.loading
+                    || state.error.is_some()
+                    || (state.completed && state.hits.is_empty() && !state.query.trim().is_empty()),
+            );
+            let results = if state.loading || state.error.is_some() {
+                0
+            } else {
+                state.hits.len().min(8) as u16
+            };
+            titled_picker_geometry(
+                picker_bounds,
+                geometry.band.y,
+                0,
+                usize::from(1 + status + results),
+                0,
+            )
+        });
         let theme_layout = app
             .theme_panel_open
             .then(|| titled_picker_geometry(picker_bounds, geometry.band.y, 0, 3, 0));
@@ -2857,11 +3044,13 @@ fn render_cached_with_mode(
             contacts.panel
         } else if let Some(filter) = filter_layout {
             filter.panel
+        } else if let Some(search) = search_layout {
+            search.panel
         } else if let Some(theme) = theme_layout {
             theme.panel
         } else {
             let available_height = content.height;
-            let panel_height = if new_recipient_open || filter_open {
+            let panel_height = if new_recipient_open || filter_open || search_open {
                 available_height.min(9)
             } else if emoji_open {
                 available_height.min(8)
@@ -2907,6 +3096,8 @@ fn render_cached_with_mode(
                 "New conversation"
             } else if filter_open {
                 "Filter conversations"
+            } else if search_open {
+                "Search"
             } else if emoji_open {
                 "Emoji suggestions"
             } else {
@@ -2915,6 +3106,7 @@ fn render_cached_with_mode(
             let title_area = settings_layout
                 .or(contacts_layout)
                 .or(filter_layout)
+                .or(search_layout)
                 .or(theme_layout)
                 .map_or_else(
                     || {
@@ -2993,6 +3185,9 @@ fn render_cached_with_mode(
                         palette,
                     );
                     hits.filter_rows = render_filter_panel(frame, filter.rows, app, palette);
+                } else if search_open {
+                    let search = search_layout.expect("search geometry was measured");
+                    hits.search_rows = render_search(frame, search.rows, app, palette);
                 } else if emoji_open {
                     hits.emoji_rows = render_emoji_suggestions(frame, rows_area, app, palette);
                 } else {
@@ -3283,6 +3478,7 @@ fn render_help(frame: &mut Frame<'_>, app: &App, content: Rect, palette: Palette
             "recover a saved failed draft",
             "recover failed draft",
         ),
+        ("Ctrl+F", "search stored messages", "search messages"),
         ("/new", "start a new conversation", "new chat"),
         (
             "/sync",

@@ -8,6 +8,7 @@ use bloom_domain::{
     Conversation, ConversationId, ConversationKind, DeliveryState, Handle, HandleKind, Message,
     MessageId, MessagePart, Participant, TransportId,
 };
+use bloom_ipc::MessageSearchHit;
 use bloom_tui::{
     app::{App, Focus, SendFeedback, SendPhase, Theme, OLDER_PAGE_LIMIT},
     daemon::ConnectionState,
@@ -3865,5 +3866,202 @@ fn consecutive_messages_from_one_sender_share_a_byline_under_a_day_divider() {
     assert!(
         text.contains(&day),
         "the day divider names the day:\n{text}"
+    );
+}
+fn search_hit(conversation: &Conversation, id: &str, snippet: &str) -> MessageSearchHit {
+    MessageSearchHit {
+        conversation_id: conversation.id.clone(),
+        message_id: MessageId::new(transport(), id).unwrap(),
+        created_at: 1_700_000_000_000,
+        snippet: snippet.to_owned(),
+    }
+}
+
+/// Opens the search overlay, types a query and returns the request id the daemon
+/// reply must carry.
+fn start_search(app: &mut App, query: &str) -> u64 {
+    app.open_search();
+    for character in query.chars() {
+        app.search_input(character);
+    }
+    app.begin_search().expect("search starts").0
+}
+
+#[test]
+fn search_overlay_renders_the_query_snippets_and_other_chat_names() {
+    let selected = conversation("Weekend crew", 3, 40);
+    let other = conversation("Jules Lee", 2, 20);
+    let mut app = App {
+        selected: Some(selected.id.clone()),
+        ..Default::default()
+    };
+    app.set_conversations(vec![selected.clone(), other.clone()]);
+    let request = start_search(&mut app, "needle");
+    app.finish_search(
+        request,
+        vec![search_hit(&other, "hit", "found a needle in this chat")],
+    );
+
+    let text = rendered(&app);
+    assert!(text.contains("Search: needle"), "{text}");
+    assert!(text.contains("Jules Lee"), "{text}");
+    assert!(text.contains("found a needle"), "{text}");
+    assert!(!text.contains("No messages found."), "{text}");
+}
+
+#[test]
+fn search_overlay_truncates_long_snippets_to_the_popup_width() {
+    let selected = conversation("Weekend crew", 3, 40);
+    let mut app = App {
+        selected: Some(selected.id.clone()),
+        ..Default::default()
+    };
+    app.set_conversations(vec![selected.clone()]);
+    let request = start_search(&mut app, "needle");
+    let tail = "UNRENDERED_TAIL";
+    app.finish_search(
+        request,
+        vec![search_hit(
+            &selected,
+            "hit",
+            &format!("{}{tail}", "wide snippet ".repeat(40)),
+        )],
+    );
+
+    let (grid, hits) = tracked_frame(&mut app, 66, 18);
+    let popup = hits.popup.expect("search popup");
+    let (row, _) = hits.search_rows.first().copied().expect("search hit row");
+    assert_eq!(row.x, popup.x);
+    assert_eq!(row.width, popup.width);
+    let line = row_text(&grid, row.y);
+    assert!(
+        !line.contains(tail),
+        "snippet must stop at the popup: {line:?}"
+    );
+}
+
+#[test]
+fn search_overlay_renders_empty_and_error_states() {
+    let selected = conversation("Weekend crew", 3, 40);
+    let mut app = App {
+        selected: Some(selected.id.clone()),
+        ..Default::default()
+    };
+    app.set_conversations(vec![selected.clone()]);
+    let request = start_search(&mut app, "missing");
+    app.finish_search(request, Vec::new());
+    let empty = rendered(&app);
+    assert!(empty.contains("No messages found."), "{empty}");
+
+    app.fail_search(request, "Message search failed.".into());
+    let failed = rendered(&app);
+    assert!(failed.contains("Message search failed."), "{failed}");
+}
+
+#[test]
+fn search_snippets_cannot_emit_terminal_escape_sequences() {
+    let selected = conversation("Weekend crew", 3, 40);
+    let mut app = App {
+        selected: Some(selected.id.clone()),
+        ..Default::default()
+    };
+    app.set_conversations(vec![selected.clone()]);
+    let request = start_search(&mut app, "needle");
+    app.finish_search(
+        request,
+        vec![search_hit(
+            &selected,
+            "hit",
+            "before \u{1b}[31mneedle\u{1b}[0m after",
+        )],
+    );
+
+    let (grid, _) = tracked_frame(&mut app, 100, 24);
+    let painted: String = (0..24).map(|y| row_text(&grid, y)).collect();
+    assert!(
+        !painted.contains('\u{1b}'),
+        "stored text must never reach the frame as an escape sequence"
+    );
+    assert!(painted.contains("needle"), "{painted}");
+
+    // Formatting and bidi controls are stripped, and tabs keep words apart.
+    let request = start_search(&mut app, "tabbed");
+    app.finish_search(
+        request,
+        vec![search_hit(&selected, "tab", "one\ttwo\u{202e}three")],
+    );
+    let (grid, _) = tracked_frame(&mut app, 100, 24);
+    let painted: String = (0..24).map(|y| row_text(&grid, y)).collect();
+    assert!(painted.contains("one two"), "{painted}");
+    assert!(!painted.contains('\u{202e}'), "{painted}");
+}
+
+#[test]
+fn clicking_a_search_result_opens_it_and_other_clicks_do_nothing() {
+    let selected = conversation("Weekend crew", 3, 40);
+    let other = conversation("Jules Lee", 2, 20);
+    let mut app = App {
+        selected: Some(selected.id.clone()),
+        ..Default::default()
+    };
+    app.set_conversations(vec![selected.clone(), other.clone()]);
+    let request = start_search(&mut app, "needle");
+    app.finish_search(request, vec![search_hit(&other, "hit", "found a needle")]);
+
+    let (_, hits) = tracked_frame(&mut app, 100, 24);
+    let (row, _) = hits.search_rows.first().copied().expect("search row");
+    app.handle_mouse(
+        MouseEventKind::Down(MouseButton::Left),
+        row.x + 1,
+        row.y,
+        &hits,
+    );
+    assert_eq!(
+        app.selected,
+        Some(other.id.clone()),
+        "a click opens the hit's conversation"
+    );
+    assert!(app.search.is_none(), "opening a hit closes the overlay");
+
+    // A click outside the popup must not reach the transcript or sidebar.
+    app.open_search();
+    let (_, hits) = tracked_frame(&mut app, 100, 24);
+    let before = app.selected.clone();
+    app.handle_mouse(MouseEventKind::Down(MouseButton::Left), 2, 3, &hits);
+    assert_eq!(app.selected, before);
+    assert!(app.search.is_some(), "the overlay stays open");
+}
+
+#[test]
+fn search_overlay_paints_over_the_transcript_and_owns_the_wheel() {
+    let (mut app, selected) = reading_fixture();
+    let mut hits = vec![
+        search_hit(&selected, "search-0", "first needle"),
+        search_hit(&selected, "search-1", "second needle"),
+    ];
+    hits.push(search_hit(&selected, "search-2", "third needle"));
+    let request = start_search(&mut app, "needle");
+    app.finish_search(request, hits);
+    app.scroll_to_newest();
+
+    let (grid, frame_hits) = tracked_frame(&mut app, 100, 24);
+    let popup = frame_hits.popup.expect("search popup");
+    assert!(frame_hits.latest.is_none());
+    assert!(popup.y > frame_hits.transcript.y);
+    let covered =
+        (frame_hits.transcript.y..popup.y).any(|y| row_text(&grid, y).contains("reading message"));
+    assert!(covered, "the transcript remains painted behind the popup");
+    let before = app.scroll;
+    app.handle_mouse(
+        MouseEventKind::ScrollDown,
+        popup.x + 1,
+        popup.y + popup.height.saturating_sub(1),
+        &frame_hits,
+    );
+    assert_eq!(app.scroll, before, "search must consume its own wheel");
+    assert_eq!(
+        app.search.as_ref().expect("search state").selected,
+        1,
+        "the wheel moves the hit selection"
     );
 }

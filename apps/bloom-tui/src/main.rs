@@ -6,7 +6,7 @@ use bloom_ipc::{
     client::{BloomClient, ClientError},
     EventKind, ProtocolError,
 };
-use bloom_tui::app::{App, SendFailure, Theme, OLDER_PAGE_LIMIT};
+use bloom_tui::app::{App, SendFailure, Theme, OLDER_PAGE_LIMIT, SEARCH_RESULT_LIMIT};
 use bloom_tui::config::Config;
 use bloom_tui::daemon::{self, ConnectionState, Snapshot};
 use bloom_tui::diagnostics::{self, Stage};
@@ -227,7 +227,12 @@ async fn main() -> Result<()> {
     let (conversation_tx, mut conversation_rx) =
         mpsc::unbounded_channel::<Vec<bloom_domain::Conversation>>();
     let (sync_tx, mut sync_rx) = mpsc::unbounded_channel();
-    let (older_tx, mut older_rx) = mpsc::unbounded_channel();
+    let (older_tx, mut older_rx) = mpsc::unbounded_channel::<(
+        bloom_domain::ConversationId,
+        Result<Vec<bloom_domain::Message>, ClientError>,
+    )>();
+    let (search_tx, mut search_rx) =
+        mpsc::unbounded_channel::<(u64, Result<Vec<bloom_ipc::MessageSearchHit>, ClientError>)>();
     let (visible_tx, visible_rx) = watch::channel::<Option<bloom_domain::ConversationId>>(None);
 
     {
@@ -322,6 +327,7 @@ async fn main() -> Result<()> {
             Some(snapshot) = snapshot_rx.recv() => {
                 app.thread_loading = false;
                 app.apply_snapshot(snapshot);
+                app.advance_search_jump();
                 redraw.request();
                 if app.selected != last_visible {
                     last_visible = app.selected.clone();
@@ -386,11 +392,38 @@ async fn main() -> Result<()> {
             },
             Some((conversation, result)) = older_rx.recv() => {
                 match result {
-                    Ok(page) => app.finish_load_older(conversation, page, OLDER_PAGE_LIMIT),
-                    Err(_) => app.fail_load_older(
-                        conversation,
-                        "Older messages could not be loaded.".into(),
-                    ),
+                    Ok(page) => {
+                        app.finish_load_older(conversation.clone(), page, OLDER_PAGE_LIMIT);
+                        if app
+                            .search_jump
+                            .as_ref()
+                            .is_some_and(|(id, _)| id == &conversation)
+                        {
+                            app.advance_search_jump();
+                        }
+                    }
+                    Err(_) => {
+                        let jump_here = app
+                            .search_jump
+                            .as_ref()
+                            .is_some_and(|(id, _)| id == &conversation);
+                        app.fail_load_older(
+                            conversation,
+                            "Older messages could not be loaded.".into(),
+                        );
+                        if jump_here {
+                            app.abandon_search_jump();
+                            app.notice =
+                                Some("Older messages could not be loaded.".into());
+                        }
+                    }
+                }
+                redraw.request();
+            },
+            Some((request, result)) = search_rx.recv() => {
+                match result {
+                    Ok(hits) => app.finish_search(request, hits),
+                    Err(_) => app.fail_search(request, "Message search failed.".into()),
                 }
                 redraw.request();
             },
@@ -461,6 +494,14 @@ async fn main() -> Result<()> {
                             let _ = send_tx.send((attempt, target, result));
                         });
                     }
+                    bloom_tui::app::Action::Search { request, query } => {
+                        let client = client.clone();
+                        let tx = search_tx.clone();
+                        tokio::spawn(async move {
+                            let result = client.search_messages(&query, SEARCH_RESULT_LIMIT).await;
+                            let _ = tx.send((request, result));
+                        });
+                    }
                     bloom_tui::app::Action::SyncConversations => {
                         app.sync_in_flight = true;
                         app.notice = Some("Syncing conversation-list metadata...".into());
@@ -502,27 +543,6 @@ async fn main() -> Result<()> {
                         }
                     }
                 }
-                if app.older_requested {
-                    // Keep the request pending while another page is in flight, so a
-                    // gesture is not silently dropped by the single-request rule.
-                    if let Some((conversation, cursor)) = app.begin_load_older() {
-                        app.older_requested = false;
-                        let client = client.clone();
-                        let tx = older_tx.clone();
-                        tokio::spawn(async move {
-                            let result = client
-                                .history_before(conversation.clone(), OLDER_PAGE_LIMIT, cursor)
-                                .await;
-                            let _ = tx.send((conversation, result));
-                        });
-                        redraw.request();
-                    } else if !app.can_load_older() {
-                        // Nothing is loading and no page can be fetched, so the request
-                        // is fully satisfied; clearing it stops a later input from
-                        // firing a page the user did not ask for.
-                        app.older_requested = false;
-                    }
-                }
                 // A selection change is a request for a fresh read, not an event.
                 if app.selected != last_visible {
                     last_visible = app.selected.clone();
@@ -552,6 +572,27 @@ async fn main() -> Result<()> {
             last_visible = app.selected.clone();
             app.thread_loading = last_visible.is_some();
             let _ = visible_tx.send(last_visible.clone());
+        }
+        if app.older_requested {
+            // Keep the request pending while another page is in flight, so a
+            // gesture is not silently dropped by the single-request rule.
+            if let Some((conversation, cursor)) = app.begin_load_older() {
+                app.older_requested = false;
+                let client = client.clone();
+                let tx = older_tx.clone();
+                tokio::spawn(async move {
+                    let result = client
+                        .history_before(conversation.clone(), OLDER_PAGE_LIMIT, cursor)
+                        .await;
+                    let _ = tx.send((conversation, result));
+                });
+                redraw.request();
+            } else if !app.can_load_older() {
+                // Nothing is loading and no page can be fetched, so the request
+                // is fully satisfied; clearing it stops a later input from
+                // firing a page the user did not ask for.
+                app.older_requested = false;
+            }
         }
     }
 

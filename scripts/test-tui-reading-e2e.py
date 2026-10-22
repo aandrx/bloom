@@ -313,5 +313,66 @@ class ReadingFlows(unittest.TestCase):
         self.artifact('restored-size')
 
 
+
+    def test_search_finds_and_jumps_to_paged_history_and_esc_restores_draft(self):
+        # Seed an older page whose oldest message has a marker no other message
+        # contains, so a hit can only resolve by paging back through the store.
+        self.stop_tui()
+        self.fixture.stop_daemon()
+        state = self.fixture.persisted()
+        chat = next(item for item in state['conversations'] if item['id'] == CID)
+        sender = next(participant['handle'] for participant in chat['participants']
+                      if not participant['is_me'])
+        baseline = min(item['created_at'] for item in state['messages'])
+        marker = 'OLDER_MARKER_999'
+        seeded = []
+        for index in range(220):
+            text = (f'{marker} only in the oldest stored message' if index == 0
+                    else f'OLDER_SEARCH_CONTEXT_{index:03d} synthetic context')
+            seeded.append({
+                'id': {'transport': 'openbubbles', 'value': f'search-older-{index:03d}'},
+                'conversation_id': CID,
+                'remote_id': None,
+                'sender': sender,
+                'parts': [{'type': 'text', 'value': text}],
+                'created_at': baseline - (220 - index) * 10,
+                'sent_at': None,
+                'delivery': 'delivered',
+                'from_me': False,
+                'edited_at': None,
+                'reactions': [],
+                'unsent_at': None,
+            })
+        state['messages'] = seeded + state['messages']
+        self.fixture.store_path.write_text(json.dumps(state))
+        self.fixture.start_daemon()
+        self.start_tui()
+        self.resize(100, 30)
+        self.wait_for(lambda: 'READ_MARKER_059' in self.text())
+        self.assertNotIn(marker, self.text(),
+                         'the oldest stored message must start outside the loaded history')
+
+        draft = 'Private Alice search draft'
+        self.key(b'\x1b[200~' + draft.encode() + b'\x1b[201~')
+        self.key(b'\x06')  # Ctrl+F
+        self.wait_for(lambda: 'Search:' in self.text())
+        self.key(b'\x1b')
+        self.wait_for(lambda: draft in self.text())
+        self.assertIn(draft, self.text(), 'Esc must restore the parked composer draft')
+
+        self.key(b'\x06')
+        self.wait_for(lambda: 'Search:' in self.text())
+        self.key(marker.encode())
+        self.key(b'\r')
+        # The query line and the hit snippet both name the marker.
+        self.wait_for(lambda: self.text().count(marker) >= 2, timeout=10)
+        self.artifact('search-results')
+        self.key(b'\r')
+        self.wait_for(lambda: marker in self.markers(), timeout=15)
+        self.assertEqual(self.markers()[0], marker,
+                         'the jump must page back and land on the matched message')
+        self.assertIn(draft, self.text(), 'closing search restores the draft')
+        self.artifact('search-jumped')
+
 if __name__ == '__main__':
     unittest.main(verbosity=2)

@@ -34,12 +34,18 @@ Acceptance: synthetic pages cover duplicates, out-of-order live overlap, tombsto
 
 The current bounded UI pass implements stable message-owned reading anchors, a measured Latest/End action, overlay wheel ownership and full-width narrow conversations with a searchable Chats navigator. Its acceptance evidence is in [the UI review](ux-polish-review.md); do not redispatch these as unimplemented features.
 
-Remaining:
+Shipped in this loop so far:
 
-- Cursor-based local pagination is implemented: keyset paging in the store and IPC (protocol version 3), and the transcript loads the previous page when the reader reaches the oldest loaded row, keeps paged history across reconciliation for that chat, and bounds retained pages. Remaining work is paging affordances for very deep histories and the message-content search surface; the search backend exists in the store and IPC.
-- Local message-content search and authoritative unread navigation. Chats searches conversation names/addresses only, not message content.
+- Keyset local pagination end to end. The store and IPC page backwards from a known message (protocol version 3), and the transcript loads the previous page when the reader reaches the oldest loaded row, keeps paged history across reconciliation for that chat, and stops at a bounded retained budget instead of repeating a discarded request.
+- Local message search end to end. `search_messages` matches stored text parts case-insensitively, newest first, with char-boundary-safe snippets and canonical conversation ids. Ctrl+F or `/search` opens a modal that lists hits with chat identity and snippet, and opening a hit pages back until that message is loaded and anchors the transcript on it.
+- Failure and identity handling around paging: page failures stay readable until the next interaction, alias reconciliation carries paged history and unions caches, and leaving a chat releases the in-flight page slot.
+
+Remaining in this section:
+
+- Search polish: attachment and participant-context search, and a result list that stays usable for very deep hits beyond the retained paging budget.
+- Authoritative unread navigation. There is no read-state authority yet, so this needs a storage and transport decision before UI work. Chats searches conversation names and addresses only.
 - Undo and, only after privacy/retention review, encrypted durable drafts.
-- Consider typed interaction modes to reduce independent flag combinations, but only behind regression coverage for modal transitions, recipient changes, aliases, filters and asynchronous results.
+- Typed interaction modes to reduce independent flag combinations, but only behind regression coverage for modal transitions, recipient changes, aliases, filters and asynchronous results.
 
 Acceptance: actual PTY tests for long local histories, new arrivals while reading back, search navigation, drawer/focus/mouse paths, unicode cursor behavior and cancel/recovery ownership. Preserve exact body whitespace and uncertain-send policy.
 
@@ -49,7 +55,13 @@ Current install requires retained sidecar checkout, resolved Dart packages, Dart
 
 Acceptance: install into an isolated prefix, hide the source checkout, run from unrelated directories with synthetic engine/registration fixtures, test missing dependencies/version mismatch and safe failure. Verify executable/file permissions, reused-daemon lifecycle and terminal restoration. Bloom-owned sign-in is not part of this packaging step.
 
-### 5. Rich messaging and future GUI
+### 5. Launcher build profile (open decision)
+
+The isolated first-render probe measured about 31 ms (medium bodies) and 213 ms (long bodies) in the debug profile `scripts/bloom` builds, against 4 ms and 22 ms for the same code in release. Switching the launcher to a release build would cut first-visit render cost roughly eight to ten times, at the cost of slower first builds and more disk. The launcher still builds debug because that trade-off belongs to the user, not to a silent change.
+
+Acceptance if adopted: an isolated install builds and runs both profiles, terminal restoration and reused-daemon behavior are unchanged, startup cost is documented, and no test suite depends on a fixed profile path.
+
+### 6. Rich messaging and future GUI
 
 Attachments, replies/reactions, edits/unsend, typing/read receipts and group management require transport mapping, persistence, IPC and interaction together. Capability declarations are not enough. GPUI remains deferred; [bookmark](gpui-surface.md) records exploration without scheduling it. Independent registration stays blocked by [Gate 0](ids-validation-gate.md).
 

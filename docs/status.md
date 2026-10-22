@@ -19,13 +19,13 @@
 
 | Area | Boundary |
 | --- | --- |
-| History | Only Bloom's stored messages; the transcript opens the newest 200 and loads earlier pages from local storage on demand (bounded paged budget, session only); no remote/app historical import |
+| History | Only Bloom's stored messages; the transcript opens the newest 200, loads earlier pages on demand (bounded session budget) and searches stored message text locally, paging back to a hit when needed; no remote/app historical import |
 | Live service | Synthetic sidecar/IPC/PTY coverage; current real-engine changes not live-revalidated; no automatic engine-generation recovery |
 | Groups | Existing group text conditional on recipient-list capability; no group-management workflow |
 | Rich messaging | Unsupported inbound parts are placeholders; no attachment send/open/download, reactions, edits or unsend UI |
 | Delivery | Labels reflect mapped transport events; presence of a Read enum is not proof of remote read-receipt support |
 | Accounts | Reuses an existing registration; no Bloom sign-in/activation/recovery; renewal unconfirmed |
-| Composition/reading | Session-only drafts, no undo, unread count, message-content search or reviewed encrypted durable drafts |
+| Composition/reading | Session-only drafts, no undo, no unread count, no attachment search and no reviewed encrypted durable drafts |
 | Packaging/platforms | Linux/OpenBubbles Flatpak is the documented setup; not a standalone Cargo-only or Windows distribution |
 | Accessibility | Keyboard/grapheme/monochrome/light-theme coverage, not broad terminal/font/screen-reader validation |
 | Future GUI/transport | GPUI not started; independent registration blocked at Gate 0; Matrix remains an excluded proof |
