@@ -231,7 +231,7 @@ pub struct SuspendedComposition {
     owner: Option<DraftOwner>,
 }
 
-/// Modal state for searching stored message text.
+/// Modal state for searching stored text and reported attachment filenames.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct SearchState {
     pub query: String,
@@ -3028,7 +3028,7 @@ impl App {
             ("/settings", "Open local display settings"),
             ("/nickname", "Name this direct chat locally"),
             ("/contacts", "Browse known participants and nicknames"),
-            ("/search", "Search stored message text"),
+            ("/search", "Search stored text and filenames"),
             ("/new", "Start a new direct chat"),
             ("/filter", "Filter your conversations"),
             ("/compact", "Toggle sidebar density"),
@@ -5336,7 +5336,11 @@ pub fn message_text(message: &Message) -> String {
         .iter()
         .map(|part| match part {
             bloom_domain::MessagePart::Text(s) => s.clone(),
-            bloom_domain::MessagePart::Attachment(_) => "[attachment]".into(),
+            bloom_domain::MessagePart::Attachment(attachment) => attachment
+                .file_name()
+                .filter(|name| !name.is_empty())
+                .map(|name| format!("[attachment: {}]", name.escape_debug()))
+                .unwrap_or_else(|| "[attachment]".into()),
             bloom_domain::MessagePart::Unsupported { .. } => "[attachment]".into(),
         })
         .collect::<Vec<_>>()

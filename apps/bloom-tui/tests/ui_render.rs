@@ -5,12 +5,15 @@
 //! terminal, a daemon, or the engine.
 
 use bloom_domain::{
-    Conversation, ConversationId, ConversationKind, DeliveryState, Handle, HandleKind, Message,
-    MessageId, MessagePart, Participant, TransportId,
+    AttachmentRef, Conversation, ConversationId, ConversationKind, DeliveryState, Handle,
+    HandleKind, Message, MessageId, MessagePart, Participant, TransportId,
 };
 use bloom_ipc::{MessageSearchHit, ParticipantFilter};
 use bloom_tui::{
-    app::{App, Focus, SendFeedback, SendPhase, Theme, OLDER_PAGE_LIMIT, SEARCH_RESULT_LIMIT},
+    app::{
+        message_text, App, Focus, SendFeedback, SendPhase, Theme, OLDER_PAGE_LIMIT,
+        SEARCH_RESULT_LIMIT,
+    },
     daemon::{ConnectionState, HISTORY_LIMIT},
     ui,
 };
@@ -86,6 +89,82 @@ fn message(conversation: &Conversation, id: &str, at: i64, text: &str, mine: boo
         None,
     )
     .unwrap()
+}
+
+fn message_with_parts(
+    conversation: &Conversation,
+    id: &str,
+    at: i64,
+    parts: Vec<MessagePart>,
+    mine: bool,
+) -> Message {
+    Message::new(
+        MessageId::new(transport(), id).unwrap(),
+        conversation.id.clone(),
+        None,
+        if mine {
+            conversation
+                .participants
+                .iter()
+                .find(|p| p.is_me)
+                .unwrap()
+                .handle
+                .clone()
+        } else {
+            Handle::new(HandleKind::Opaque, "Maya").unwrap()
+        },
+        parts,
+        at,
+        None,
+        if mine {
+            DeliveryState::Delivered
+        } else {
+            DeliveryState::Read
+        },
+        mine,
+        None,
+        Vec::new(),
+        None,
+    )
+    .unwrap()
+}
+
+/// A reported attachment name, or an unnamed attachment when `name` is `None`.
+fn attachment(name: Option<&str>) -> MessagePart {
+    MessagePart::Attachment(
+        AttachmentRef::new("attachment-id", None, name.map(str::to_owned), None).unwrap(),
+    )
+}
+
+/// Draw through the public cache entry point so a reuse regression is observable.
+fn cached_frame(
+    app: &App,
+    width: u16,
+    height: u16,
+    cache: &mut ui::RenderCache,
+) -> (ratatui::buffer::Buffer, ui::HitMap) {
+    let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+    let mut hits = ui::HitMap::default();
+    terminal
+        .draw(|frame| hits = ui::render_with_cache(frame, app, cache))
+        .unwrap();
+    (terminal.backend().buffer().clone(), hits)
+}
+
+/// Only the transcript rectangle, with row padding removed. This excludes the
+/// sidebar preview so a stale or mismatched sidebar cannot mask the transcript.
+fn transcript_flat(buffer: &ratatui::buffer::Buffer, hits: &ui::HitMap) -> String {
+    let area = hits.transcript;
+    (area.y..area.y + area.height)
+        .map(|y| {
+            (area.x..area.x + area.width)
+                .map(|x| buffer[(x, y)].symbol())
+                .collect::<String>()
+                .trim_end()
+                .to_owned()
+        })
+        .collect::<Vec<_>>()
+        .join("")
 }
 
 fn rendered(app: &App) -> String {
@@ -4699,5 +4778,293 @@ fn header_drops_unread_count_before_identity_at_tight_widths() {
     assert!(
         !tight_header.contains("· 2"),
         "the optional unread count goes first: {tight_header:?}"
+    );
+}
+
+#[test]
+fn mixed_attachment_parts_keep_order_exact_whitespace_and_reported_unicode_name() {
+    let chat = conversation("Parts", 2, 1);
+    let with_parts = message_with_parts(
+        &chat,
+        "mixed",
+        10,
+        vec![
+            MessagePart::Text("before  two spaces".into()),
+            attachment(Some("résumé final.pdf")),
+            MessagePart::Unsupported {
+                kind: "image/heic".into(),
+            },
+            MessagePart::Text("after".into()),
+        ],
+        false,
+    );
+
+    assert_eq!(
+        message_text(&with_parts),
+        "before  two spaces [attachment: résumé final.pdf] [attachment] after"
+    );
+}
+
+#[test]
+fn attachment_projection_uses_the_name_only_when_the_transport_reported_one() {
+    let unnamed = MessagePart::Attachment(
+        AttachmentRef::new("invoice.pdf", Some("image/png".into()), None, Some(1_024)).unwrap(),
+    );
+    let empty = attachment(Some(""));
+    let unsupported = MessagePart::Unsupported {
+        kind: "application/pdf".into(),
+    };
+    let named = attachment(Some("statement.pdf"));
+    let chat = conversation("Fallback", 2, 1);
+    let with_parts = message_with_parts(
+        &chat,
+        "fallback",
+        10,
+        vec![
+            unnamed,
+            empty,
+            unsupported,
+            named,
+            MessagePart::Text("tail".into()),
+        ],
+        false,
+    );
+
+    assert_eq!(
+        message_text(&with_parts),
+        "[attachment] [attachment] [attachment] [attachment: statement.pdf] tail",
+        "a name-like id or MIME type is not display metadata"
+    );
+}
+
+#[test]
+fn loaded_attachment_preview_matches_the_transcript_projection() {
+    let chat = conversation("Preview", 2, 1);
+    let with_parts = message_with_parts(
+        &chat,
+        "preview",
+        10,
+        vec![
+            MessagePart::Text("see".into()),
+            attachment(Some("plan v2.pdf")),
+        ],
+        true,
+    );
+    let expected = message_text(&with_parts);
+    let mut app = App {
+        selected: Some(chat.id.clone()),
+        ..Default::default()
+    };
+    app.set_conversations(vec![chat.clone()]);
+    app.upsert(chat.id.clone(), with_parts);
+
+    assert_eq!(app.preview(&chat.id), expected);
+    assert_eq!(app.preview(&chat.id), "see [attachment: plan v2.pdf]");
+}
+
+#[test]
+fn attachment_name_projection_escapes_controls_bidi_quotes_backslash_and_zwj() {
+    let name = "a\u{0}b\u{7}c\u{1b}d\u{7f}e\u{9f}f\u{61c}g\u{202e}h\u{2066}i\"j\\k\u{200d}l's.pdf";
+    let chat = conversation("Escapes", 2, 1);
+    let with_parts = message_with_parts(
+        &chat,
+        "escapes",
+        10,
+        vec![attachment(Some(name)), MessagePart::Text("tail".into())],
+        false,
+    );
+    let expected_name =
+        r#"a\0b\u{7}c\u{1b}d\u{7f}e\u{9f}f\u{61c}g\u{202e}h\u{2066}i\"j\\k\u{200d}l\'s.pdf"#;
+    let projected = message_text(&with_parts);
+
+    assert_eq!(
+        projected,
+        format!("[attachment: {expected_name}] tail"),
+        "the projection must use Rust's debug escaping"
+    );
+    for raw in [
+        '\u{0}', '\u{7}', '\u{1b}', '\u{7f}', '\u{9f}', '\u{61c}', '\u{202e}', '\u{2066}',
+        '\u{200d}',
+    ] {
+        assert!(
+            !projected.contains(raw),
+            "raw {raw:?} leaked into the filename projection: {projected:?}"
+        );
+    }
+    assert!(
+        projected.contains("\\\""),
+        "a quote must be escaped with a backslash: {projected:?}"
+    );
+    assert!(
+        projected.contains("\\\\"),
+        "a backslash must be escaped: {projected:?}"
+    );
+}
+
+#[test]
+fn raw_message_attachment_parts_survive_serde_and_rendering_unchanged() {
+    let name = "raw\u{202e}name\u{200d}.pdf";
+    let chat = conversation("Raw", 2, 1);
+    let with_parts = message_with_parts(
+        &chat,
+        "raw",
+        10,
+        vec![
+            MessagePart::Text("body".into()),
+            attachment(Some(name)),
+            MessagePart::Unsupported {
+                kind: "image/heic".into(),
+            },
+        ],
+        false,
+    );
+    let original_parts = with_parts.parts.to_vec();
+    let encoded = serde_json::to_string(&original_parts).unwrap();
+    let decoded: Vec<MessagePart> = serde_json::from_str(&encoded).unwrap();
+    assert_eq!(decoded, original_parts, "serde round-trip changed parts");
+
+    let mut app = App {
+        selected: Some(chat.id.clone()),
+        ..Default::default()
+    };
+    app.set_conversations(vec![chat.clone()]);
+    app.upsert(chat.id.clone(), with_parts);
+    let _ = rendered(&app);
+    assert_eq!(
+        app.messages[&chat.id][0].parts, original_parts,
+        "rendering must not rewrite stored message parts"
+    );
+    assert_eq!(
+        app.messages[&chat.id][0].parts,
+        serde_json::from_str::<Vec<MessagePart>>(&encoded).unwrap(),
+        "the stored parts must still equal the serialized raw parts"
+    );
+}
+
+#[test]
+fn attachment_filename_renders_in_the_transcript_at_24_44_and_100_columns_both_themes() {
+    let chat = conversation("Wrap", 2, 1);
+    let filename = "very-long-résumé-Ünïcode-ﬁle.pdf";
+    let sentinel = "ATTACHMENT_SENTINEL";
+    for width in [24u16, 44, 100] {
+        for theme in [Theme::Dark, Theme::Light] {
+            let mut app = App {
+                selected: Some(chat.id.clone()),
+                theme,
+                ..Default::default()
+            };
+            app.set_conversations(vec![chat.clone()]);
+            app.upsert(
+                chat.id.clone(),
+                message_with_parts(
+                    &chat,
+                    "wrap",
+                    10,
+                    vec![
+                        MessagePart::Text(sentinel.into()),
+                        attachment(Some(filename)),
+                    ],
+                    false,
+                ),
+            );
+            let (buffer, hits) = tracked_frame(&mut app, width, 20);
+            let transcript = transcript_flat(&buffer, &hits);
+
+            assert!(
+                transcript.contains(sentinel),
+                "body missing at {width} {theme:?}: {transcript:?}"
+            );
+            assert!(
+                transcript.contains(filename),
+                "filename missing from the transcript at {width} {theme:?}: {transcript:?}"
+            );
+            if width >= 70 {
+                assert!(
+                    hits.sidebar.width > 0 && hits.transcript.x > 0,
+                    "the sidebar is visible at {width}, so only the transcript rect is asserted"
+                );
+            } else {
+                assert_eq!(
+                    hits.sidebar.width, 0,
+                    "narrow layouts hide the sidebar, leaving no preview to mask a stale transcript"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn unsupported_part_renders_the_generic_placeholder_without_inferring_its_kind() {
+    let chat = conversation("Unsupported", 2, 1);
+    let with_parts = message_with_parts(
+        &chat,
+        "unsupported",
+        10,
+        vec![MessagePart::Unsupported {
+            kind: "image/heic".into(),
+        }],
+        false,
+    );
+    let mut app = App {
+        selected: Some(chat.id.clone()),
+        ..Default::default()
+    };
+    app.set_conversations(vec![chat.clone()]);
+    app.upsert(chat.id.clone(), with_parts);
+    let (buffer, hits) = tracked_frame(&mut app, 44, 12);
+    let transcript = transcript_flat(&buffer, &hits);
+
+    assert!(transcript.contains("[attachment]"), "{transcript:?}");
+    assert!(!transcript.contains("heic"), "{transcript:?}");
+    assert!(!transcript.contains("image/"), "{transcript:?}");
+}
+
+#[test]
+fn same_message_id_filename_update_repaints_a_reused_transcript_cache() {
+    let chat = conversation("Cache update", 2, 1);
+    let mut app = App {
+        selected: Some(chat.id.clone()),
+        ..Default::default()
+    };
+    app.set_conversations(vec![chat.clone()]);
+    app.upsert(
+        chat.id.clone(),
+        message_with_parts(
+            &chat,
+            "m1",
+            10,
+            vec![attachment(Some("old-report.pdf"))],
+            false,
+        ),
+    );
+    let mut cache = ui::RenderCache::default();
+    let (first, first_hits) = cached_frame(&app, 44, 12, &mut cache);
+    let first_text = transcript_flat(&first, &first_hits);
+    assert!(first_text.contains("old-report.pdf"), "{first_text:?}");
+    assert!(!first_text.contains("new-report.pdf"), "{first_text:?}");
+
+    app.upsert(
+        chat.id.clone(),
+        message_with_parts(
+            &chat,
+            "m1",
+            10,
+            vec![attachment(Some("new-report.pdf"))],
+            false,
+        ),
+    );
+    let (second, second_hits) = cached_frame(&app, 44, 12, &mut cache);
+    let second_text = transcript_flat(&second, &second_hits);
+    assert!(
+        second_text.contains("new-report.pdf"),
+        "the same message id must repaint its new filename: {second_text:?}"
+    );
+    assert!(
+        !second_text.contains("old-report.pdf"),
+        "a reused cache must not serve the stale transcript: {second_text:?}"
+    );
+    assert!(
+        cache.transcript_layout_builds() >= 2,
+        "the second frame must rebuild the layout after the message changed"
     );
 }

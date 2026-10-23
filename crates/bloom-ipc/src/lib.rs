@@ -19,7 +19,9 @@ use serde::{Deserialize, Serialize};
 use std::{fmt, io};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
-pub const PROTOCOL_VERSION: u16 = 5;
+/// Bumped to 6 because local search now covers both the stored message body
+/// and the reported filename. Searches never read file contents from disk.
+pub const PROTOCOL_VERSION: u16 = 6;
 /// Largest accepted `message_context` limit. Dispatch rejects larger limits
 /// instead of clamping them.
 pub const MAX_MESSAGE_CONTEXT_LIMIT: u32 = 200;
@@ -59,7 +61,9 @@ pub struct HistoryCursor {
     pub id: MessageId,
 }
 /// One message matched by a local content search. The snippet is a short window
-/// around the matched run, with ellipses when it was truncated.
+/// around the matched run, with ellipses when it was truncated. Snippets of the
+/// stored body are plain presentation text; filename excerpts are escaped and
+/// are not a raw match-offset map into either the body or the filename.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MessageSearchHit {
     pub conversation_id: ConversationId,
@@ -100,8 +104,8 @@ pub enum RequestKind {
         address: String,
         body: OutgoingBody,
     },
-    /// Local content search over stored message text. `limit == 0` and limits
-    /// above `u16::MAX` are invalid.
+    /// Local content search over stored message text and reported filenames.
+    /// `limit == 0` and limits above `u16::MAX` are invalid.
     SearchMessages {
         query: String,
         limit: u32,
@@ -508,7 +512,7 @@ mod tests {
             ResponseKind::MessageContext { messages } => assert_eq!(messages, vec![message]),
             _ => panic!("expected message context"),
         }
-        assert_eq!(PROTOCOL_VERSION, 5);
+        assert_eq!(PROTOCOL_VERSION, 6);
     }
 
     #[tokio::test]
@@ -545,6 +549,21 @@ mod tests {
         let mut input = old_frame.as_slice();
         assert_eq!(
             read_request(&mut input).await.err().unwrap(),
+            CodecError::WrongVersion
+        );
+    }
+
+    #[tokio::test]
+    async fn rejects_v5_request_and_response_before_header_or_payload() {
+        let old = [5u8];
+        let mut request_input = old.as_slice();
+        assert_eq!(
+            read_request(&mut request_input).await.err().unwrap(),
+            CodecError::WrongVersion
+        );
+        let mut response_input = old.as_slice();
+        assert_eq!(
+            read_response(&mut response_input).await.err().unwrap(),
             CodecError::WrongVersion
         );
     }

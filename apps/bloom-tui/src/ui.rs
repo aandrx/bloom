@@ -627,7 +627,7 @@ fn footer_hints(width: usize, palette: Palette, app: &App, wrapped_input: bool) 
     const RENAME_FULL: [(&str, &str); 2] = [("Enter", " save"), ("Esc", " cancel")];
     const RENAME_TIGHT: [(&str, &str); 1] = [("Esc", " cancel")];
     const SEARCH_FULL: [(&str, &str); 4] = [
-        ("Enter", " search text"),
+        ("Enter", " search text/filenames"),
         ("Ctrl+P", " chats with"),
         ("↑↓", " choose"),
         ("Esc", " close"),
@@ -3897,7 +3897,11 @@ fn render_help(frame: &mut Frame<'_>, app: &App, content: Rect, palette: Palette
             "recover a saved failed draft",
             "recover failed draft",
         ),
-        ("Ctrl+F", "search stored messages", "search messages"),
+        (
+            "Ctrl+F",
+            "search stored text and filenames",
+            "search messages",
+        ),
         ("Ctrl+Z / Ctrl+Y", "undo / redo the draft", "undo / redo"),
         ("/new", "start a new conversation", "new chat"),
         (

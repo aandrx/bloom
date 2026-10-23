@@ -39,7 +39,7 @@ def oversized_response(limit):
 
 def send(client, obj):
     payload = json.dumps(obj).encode()
-    client.sendall(b"\x05" + struct.pack(">I", len(payload)) + payload)
+    client.sendall(b"\x06" + struct.pack(">I", len(payload)) + payload)
 
 
 def recv_exact(client, size):
@@ -55,7 +55,7 @@ def recv_exact(client, size):
 def recv(client):
     header = recv_exact(client, 5)
     version, size = struct.unpack(">BI", header)
-    if version != 5 or not 0 < size <= 1048576:
+    if version != 6 or not 0 < size <= 1048576:
         raise AssertionError("invalid response frame")
     return json.loads(recv_exact(client, size))
 
@@ -433,6 +433,24 @@ class Tests(unittest.TestCase):
             {"result": "error", "error": "invalid_request"},
         )
 
+    def test_search_messages_matches_typed_filename_parts_over_rpc(self):
+        self.stop()
+        conversation = identity("alice@example.invalid")
+        with open(self.store, encoding="utf-8") as stream:
+            state = json.load(stream)
+        state["messages"].append(synthetic_message(
+            conversation, "typed-filename", 1000,
+            [synthetic_text("quiet body"), synthetic_attachment("r\u00e9sum\u00e9-needle.pdf")]))
+        with open(self.store, "w", encoding="utf-8") as stream:
+            json.dump(state, stream, ensure_ascii=False)
+        self.start()
+        response = request(self.sock, "search_messages", query="NEEDLE", limit=5)
+        self.assertEqual(response["result"], "search_results")
+        self.assertEqual([hit["message_id"]["value"] for hit in response["hits"]],
+                         ["typed-filename"])
+        self.assertEqual(response["hits"][0]["snippet"],
+                         "Filename: r\u00e9sum\u00e9-needle.pdf")
+
 
 def context_state():
     """Same-timestamp, escaped-id rows split across a canonical id and an alias."""
@@ -639,6 +657,342 @@ class FakeParticipantSearch(ParticipantSearchMixin, unittest.TestCase):
         return self.module["search_messages"](query, limit, participant)
 
 
+# Expected windows from the Rust `str::escape_debug` oracle; embedded so the tests
+# do not depend on /tmp artifacts or a Rust build.
+RUST_ESCAPE_VECTORS = [
+    ("accents", "r\u00e9sum\u00e9-needle.pdf", "r\u00e9sum\u00e9-needle.pdf",
+     "r\u00e9sum\u00e9-needle.pdf"),
+    ("controls", "x\0\t\x1b\x85needle.pdf", "x\0\t\x1b\x85needle.pdf",
+     "x\\0\\t\\u{1b}\\u{85}needle.pdf"),
+    ("bidi", "\u061c\u200e\u200f\u202e\u2066needle.pdf",
+     "\u061c\u200e\u200f\u202e\u2066needle.pdf",
+     "\\u{61c}\\u{200e}\\u{200f}\\u{202e}\\u{2066}needle.pdf"),
+    ("quotes", 'say "needle"\\file.txt', 'say "needle"\\file.txt',
+     'say \\"needle\\"\\\\file.txt'),
+    ("apostrophe", "director's-needle.pdf", "director's-needle.pdf", r"director\'s-needle.pdf"),
+    ("leading-mark", "\u0301needle.pdf", "\u0301needle.pdf", "\\u{301}needle.pdf"),
+    ("following-mark", "a\u0301needle.pdf", "a\u0301needle.pdf", "a\u0301needle.pdf"),
+    ("spacing-mark", "\u093eneedle.pdf", "\u093eneedle.pdf", "\u093eneedle.pdf"),
+    ("joiner", "\U0001f468\u200d\U0001f469needle.pdf",
+     "\U0001f468\u200d\U0001f469needle.pdf",
+     "\U0001f468\\u{200d}\U0001f469needle.pdf"),
+    ("nbsp", "needle\xa0.pdf", "needle\xa0.pdf", "needle\\u{a0}.pdf"),
+    ("crlf", "first\r\nneedle.pdf", "first needle.pdf", "first needle.pdf"),
+]
+
+
+# Additional leading-Mc outputs captured from the pinned Rust escape oracle.
+RUST_LEADING_MC_ESCAPES = (
+    0x09BE, 0x09D7, 0x0B3E, 0x0B57, 0x0BBE, 0x0BD7, 0x0CC0, 0x0CC2,
+    0x0CC7, 0x0CC8, 0x0CCA, 0x0CCB, 0x0CD5, 0x0CD6, 0x0D3E, 0x0D57,
+    0x0DCF, 0x0DDF, 0x1715, 0x1734, 0x1B35, 0x1B3B, 0x1B3D, 0x1B43,
+    0x1B44, 0x1BAA, 0x1BF2, 0x1BF3, 0xA953, 0xA9C0, 0x111C0, 0x11235,
+    0x1133E, 0x1134D, 0x11357, 0x113B8, 0x113C2, 0x113C5, 0x113C7,
+    0x113C8, 0x113C9, 0x113CF, 0x114B0, 0x114BD, 0x115AF, 0x116B6,
+    0x11930, 0x1193D, 0x11F41, 0x16FF0, 0x16FF1, 0x1D166, 0x1D16D,
+)
+RUST_ESCAPE_VECTORS += [
+    (f"leading-mc-{cp:x}", chr(cp) + "needle.pdf", chr(cp) + "needle.pdf",
+     f"\\u{{{cp:x}}}needle.pdf")
+    for cp in RUST_LEADING_MC_ESCAPES
+]
+
+
+def synthetic_text(value):
+    return {"type": "text", "value": value}
+
+
+def synthetic_attachment(name, ident="synthetic-att", mime="application/octet-stream"):
+    return {"type": "attachment", "value": {
+        "id": ident, "mime_type": mime, "file_name": name, "byte_len": 0}}
+
+
+def synthetic_message(conversation_id, ident, at, parts):
+    return {
+        "id": identity(ident, transport=conversation_id["transport"]),
+        "conversation_id": copy.deepcopy(conversation_id),
+        "remote_id": None,
+        "sender": {"kind": "email", "value": "synthetic@example.invalid"},
+        "parts": copy.deepcopy(parts),
+        "created_at": at,
+        "sent_at": None,
+        "delivery": "delivered",
+        "from_me": False,
+        "edited_at": None,
+        "reactions": [],
+        "unsent_at": None,
+    }
+
+
+def filename_scope_scenario():
+    """Filename hits across direct, group, alias, and exact transport scopes."""
+    direct = identity("direct@example.invalid")
+    group = identity("group@example.invalid")
+    parallel = identity("parallel@example.invalid", transport="other")
+    phone = identity("phone@example.invalid")
+    archive = identity("archive@example.invalid")
+    archive_old = identity("archive-legacy")
+    ghost = identity("ghost@example.invalid")
+    me = {"kind": "email", "value": "me@example.invalid"}
+
+    def person(kind, value):
+        return {"handle": {"kind": kind, "value": value}, "display_name": None, "is_me": False}
+
+    conversations = [
+        {"id": direct, "kind": "direct", "aliases": [],
+         "participants": [{"handle": me, "is_me": True}, person("email", "alice@example.invalid")]},
+        {"id": group, "kind": "group", "aliases": [],
+         "participants": [{"handle": me, "is_me": True}, person("email", "bob@example.invalid"),
+                           person("email", "carol@example.invalid")]},
+        {"id": parallel, "kind": "direct", "aliases": [],
+         "participants": [{"handle": me, "is_me": True}, person("email", "alice@example.invalid")]},
+        {"id": phone, "kind": "direct", "aliases": [],
+         "participants": [{"handle": me, "is_me": True}, person("tel", "alice@example.invalid")]},
+        {"id": archive, "kind": "direct", "aliases": [archive_old],
+         "participants": [{"handle": me, "is_me": True}, person("email", "erin@example.invalid")]},
+    ]
+    conversations.append({
+        "id": ghost, "kind": "direct", "aliases": [],
+        "participants": [{"handle": me, "is_me": True}, person("email", "bob@example.invalid")],
+    })
+    rows = [
+        synthetic_message(direct, "direct-name", 90,
+                          [synthetic_text("quiet"), synthetic_attachment("report-needle.pdf")]),
+        synthetic_message(direct, "direct-body", 100, [synthetic_text("Needle direct")]),
+        synthetic_message(group, "group-name", 110, [synthetic_attachment("group-needle.pdf")]),
+        synthetic_message(parallel, "parallel-name", 120, [synthetic_attachment("parallel-needle.pdf")]),
+        synthetic_message(phone, "phone-name", 130, [synthetic_attachment("phone-needle.pdf")]),
+        synthetic_message(archive_old, "archive-name", 140, [synthetic_attachment("alias-needle.pdf")]),
+    ]
+    # These 60 newer rows are outside Alice's direct-chat membership.
+    for index in range(60):
+        rows.append(synthetic_message(
+            ghost, f"ghost-{index:02d}", 1000 + index,
+            [synthetic_text("report-needle newer out of scope")]))
+    return conversations, rows, archive
+
+
+class FixtureFilenameParityMixin:
+    def add(self, ident, at, parts):
+        message = synthetic_message(self.conversation, ident, at, parts)
+        self.add_message(message)
+        return message
+
+    def ids(self, hits):
+        return [hit["message_id"]["value"] for hit in hits]
+
+    def test_filename_only_prefix_and_body_first_priority(self):
+        self.add("filename-only", 100, [synthetic_text("quiet body"),
+                                        synthetic_attachment("r\u00e9sum\u00e9-needle.pdf")])
+        hits = self.search("NEEDLE", 10)
+        self.assertEqual(self.ids(hits), ["filename-only"])
+        self.assertEqual(hits[0]["snippet"], "Filename: r\u00e9sum\u00e9-needle.pdf")
+
+        self.add("body-wins", 90, [synthetic_attachment("earlier-needle.pdf"),
+                                   synthetic_text("needle body")])
+        hits = self.search("needle", 10)
+        self.assertEqual(self.ids(hits), ["filename-only", "body-wins"])
+        self.assertEqual(hits[1]["snippet"], "needle body")
+
+    def test_first_matching_filename_yields_one_hit(self):
+        self.add("multi", 100, [synthetic_attachment("first-needle.pdf", "att-1"),
+                                synthetic_attachment("second-needle.pdf", "att-2")])
+        hits = self.search("needle", 10)
+        self.assertEqual(self.ids(hits), ["multi"])
+        self.assertEqual(hits[0]["snippet"], "Filename: first-needle.pdf")
+
+    def test_punctuation_query_is_literal(self):
+        body = "from: bob? [needle]\\d+"
+        self.add("literal", 100, [synthetic_text(body)])
+        self.assertEqual(self.search("from: bob?", 10)[0]["snippet"], body)
+        self.assertEqual(self.search("needle]\\d+", 10)[0]["snippet"], body)
+
+    def test_no_cross_part_joining(self):
+        self.add("split-text", 100, [synthetic_text("nee"), synthetic_text("dle")])
+        self.add("split-attachment", 90, [synthetic_text("nee"),
+                                          synthetic_attachment("dle.pdf")])
+        self.assertEqual(self.search("needle", 10), [])
+
+    def test_missing_names_and_metadata_never_infer_a_filename(self):
+        self.add("empty-name", 100, [synthetic_attachment("", "needle-id", "needle/mime"),
+                                     synthetic_attachment(None, "needle-id-2", "needle/mime")])
+        self.add("absent-name", 90, [{"type": "attachment", "value": {
+            "id": "needle-id-3", "mime_type": "needle/mime", "byte_len": 0}}])
+        self.add("unsupported", 80, [{"type": "unsupported", "value": {
+            "kind": "needle", "file_name": "needle.pdf"}}])
+        self.add("clean-name", 70, [synthetic_attachment("clean.pdf", "needle-id-4", "needle/mime")])
+        self.assertEqual(self.search("needle", 10), [])
+
+    def test_escape_debug_oracle_vectors_and_snippets(self):
+        for index, (case, name, window, escaped) in enumerate(RUST_ESCAPE_VECTORS):
+            self.assertEqual(self.module["escape_debug"](window), escaped, case)
+            self.add("unicode-" + case, 1000 + index,
+                     [synthetic_text("quiet"), synthetic_attachment(name)])
+        snippets = {hit["message_id"]["value"]: hit["snippet"]
+                    for hit in self.search("needle", len(RUST_ESCAPE_VECTORS))}
+        for case, _, _, escaped in RUST_ESCAPE_VECTORS:
+            self.assertEqual(snippets["unicode-" + case], "Filename: " + escaped, case)
+
+    def test_dotless_and_dotted_i_use_original_spans(self):
+        # The old regex fixture falsely matched the dotless body and missed this name.
+        self.add("dotless-body", 100, [synthetic_text("d\u0131r\u0131m"),
+                                       synthetic_attachment("i.pdf")])
+        hits = self.search("i", 10)
+        self.assertEqual(self.ids(hits), ["dotless-body"])
+        self.assertEqual(hits[0]["snippet"], "Filename: i.pdf")
+
+        self.add("dotted-name", 200, [synthetic_text("quiet"),
+                                      synthetic_attachment("\u0130stanbul-needle.pdf")])
+        hits = self.search("i\u0307", 10)
+        self.assertEqual(self.ids(hits), ["dotted-name"])
+        self.assertEqual(hits[0]["snippet"], "Filename: \u0130stanbul-needle.pdf")
+
+    def test_filename_snippets_are_safe_and_preserve_literal_ellipses(self):
+        self.add("escaped", 100, [synthetic_text("quiet"),
+                                  synthetic_attachment("line\nneedle\u202e\\end")])
+        self.add("literal-ellipsis", 90, [synthetic_attachment("\u2026needle\u2026")])
+        self.add("truncated", 80, [synthetic_attachment("p" * 40 + "needle" + "s" * 40)])
+        snippets = {hit["message_id"]["value"]: hit["snippet"]
+                    for hit in self.search("needle", 10)}
+        self.assertEqual(snippets["escaped"], "Filename: line needle\\u{202e}\\\\end")
+        self.assertEqual(snippets["literal-ellipsis"], "Filename: \u2026needle\u2026")
+        self.assertEqual(snippets["truncated"],
+                         "Filename: \u2026" + "p" * 30 + "needle" + "s" * 30 + "\u2026")
+
+    def test_mixed_chronology_at_restrictive_limit(self):
+        self.add("old-body", 100, [synthetic_text("needle old")])
+        self.add("mid-name", 200, [synthetic_text("quiet"),
+                                   synthetic_attachment("middle-needle.pdf")])
+        self.add("new-body", 300, [synthetic_text("needle new")])
+        hits = self.search("needle", 2)
+        self.assertEqual(self.ids(hits), ["new-body", "mid-name"])
+        self.assertEqual(hits[0]["snippet"], "needle new")
+        self.assertEqual(hits[1]["snippet"], "Filename: middle-needle.pdf")
+
+    def test_global_scan_keeps_only_the_newest_twenty_thousand_rows(self):
+        for index in range(20001):
+            if index == 0:
+                value = "outside-only-marker"
+            elif index == 1:
+                value = "inside-boundary-needle"
+            else:
+                value = f"quiet {index}"
+            parts = [synthetic_text(value)]
+            if index <= 1:
+                parts.append(synthetic_attachment(value + "-filename"))
+            self.add(f"scan-{index:05d}", 1000 + index, parts)
+        self.assertEqual(self.search("outside-only-marker", 10), [])
+        self.assertEqual(self.ids(self.search("inside-boundary-needle", 10)), ["scan-00001"])
+        self.assertEqual(self.search("outside-only-marker-filename", 10), [])
+        named = self.search("inside-boundary-needle-filename", 10)
+        self.assertEqual(self.ids(named), ["scan-00001"])
+        self.assertEqual(named[0]["snippet"], "Filename: inside-boundary-needle-filename")
+
+
+class StatefulFilenameParity(FixtureFilenameParityMixin, unittest.TestCase):
+    def setUp(self):
+        self.module = runpy.run_path(DAEMON)
+        self.conversation = identity("alice@example.invalid")
+        self.state = {"conversations": [{
+            "id": self.conversation, "aliases": [], "participants": []}], "messages": []}
+
+    def add_message(self, message):
+        self.state["messages"].append(message)
+
+    def search(self, query, limit, participant=None):
+        return self.module["search_messages"](self.state, query, limit, participant)
+
+
+class FakeFilenameParity(FixtureFilenameParityMixin, unittest.TestCase):
+    def setUp(self):
+        self.module = runpy.run_path(FAKE)
+        self.conversation = identity("alice@example.invalid")
+        self.module["CONVERSATIONS"][:] = [{
+            "id": self.conversation, "aliases": [], "participants": []}]
+        self.module["HISTORY"].clear()
+
+    def add_message(self, message):
+        self.module["HISTORY"].setdefault(
+            message["conversation_id"]["value"], []).append(message)
+
+    def search(self, query, limit, participant=None):
+        return self.module["search_messages"](query, limit, participant)
+
+
+class FilenameScopeSearchMixin:
+    def search(self, query, limit, participant=None):
+        raise NotImplementedError
+
+    def ids(self, hits):
+        return [hit["message_id"]["value"] for hit in hits]
+
+    def test_synthetic_message_ids_keep_the_owning_transport(self):
+        _, rows, _ = filename_scope_scenario()
+        for row in rows:
+            self.assertEqual(row["id"]["transport"], row["conversation_id"]["transport"],
+                             row["id"]["value"])
+
+    def test_scoped_older_filename_behind_newer_out_of_scope_rows(self):
+        hits = self.search("report-needle", 1,
+                           scope("openbubbles", "email", "alice@example.invalid"))
+        self.assertEqual(self.ids(hits), ["direct-name"])
+        self.assertEqual(hits[0]["snippet"], "Filename: report-needle.pdf")
+
+    def test_alias_filename_hit_remaps_to_canonical_conversation(self):
+        hits = self.search("alias-needle", 1,
+                           scope("openbubbles", "email", "erin@example.invalid"))
+        self.assertEqual(self.ids(hits), ["archive-name"])
+        self.assertEqual(hits[0]["conversation_id"], self.archive)
+        self.assertEqual(hits[0]["snippet"], "Filename: alias-needle.pdf")
+
+    def test_group_filename_membership(self):
+        hits = self.search("group-needle", 1,
+                           scope("openbubbles", "email", "bob@example.invalid"))
+        self.assertEqual(self.ids(hits), ["group-name"])
+
+    def test_filename_transport_and_handle_kind_are_exact(self):
+        self.assertEqual(
+            self.ids(self.search("parallel-needle", 1,
+                                 scope("other", "email", "alice@example.invalid"))),
+            ["parallel-name"],
+        )
+        self.assertEqual(
+            self.ids(self.search("phone-needle", 1,
+                                 scope("openbubbles", "tel", "alice@example.invalid"))),
+            ["phone-name"],
+        )
+        self.assertEqual(
+            self.search("phone-needle", 10,
+                        scope("openbubbles", "opaque", "alice@example.invalid")),
+            [],
+        )
+
+
+class StatefulFilenameScopeSearch(FilenameScopeSearchMixin, unittest.TestCase):
+    def setUp(self):
+        self.module = runpy.run_path(DAEMON)
+        conversations, rows, self.archive = filename_scope_scenario()
+        self.state = {"conversations": copy.deepcopy(conversations),
+                      "messages": copy.deepcopy(rows)}
+
+    def search(self, query, limit, participant=None):
+        return self.module["search_messages"](self.state, query, limit, participant)
+
+
+class FakeFilenameScopeSearch(FilenameScopeSearchMixin, unittest.TestCase):
+    def setUp(self):
+        self.module = runpy.run_path(FAKE)
+        conversations, rows, self.archive = filename_scope_scenario()
+        self.module["CONVERSATIONS"][:] = copy.deepcopy(conversations)
+        self.module["HISTORY"].clear()
+        for row in rows:
+            self.module["HISTORY"].setdefault(
+                row["conversation_id"]["value"], []).append(copy.deepcopy(row))
+
+    def search(self, query, limit, participant=None):
+        return self.module["search_messages"](query, limit, participant)
+
+
 class FakeTypedPartsRPC(unittest.TestCase):
     def setUp(self):
         self.module = runpy.run_path(FAKE)
@@ -707,10 +1061,10 @@ class FrameSerialization(unittest.TestCase):
             module["frame"](event)
 
     def test_fake_daemon_frames_stay_within_limit(self):
-        self.check_fixture(FAKE, 5)
+        self.check_fixture(FAKE, 6)
 
     def test_stateful_fake_daemon_frames_stay_within_limit(self):
-        self.check_fixture(DAEMON, 5)
+        self.check_fixture(DAEMON, 6)
 
 
 if __name__ == "__main__":

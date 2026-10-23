@@ -52,6 +52,14 @@ All scope changes use `commit_search_participant`, which validates a known ident
 
 `HitMap.search_participant_rows` carries the exact painted optional filter, not a later candidate-list index. Mouse commit uses the same state helper; removed identities are ignored, not converted to All chats. Wheel selection changes only within the painted popup. Below 70 columns the picker owns a full-width frame with no underlying composer, sidebar, or transcript hitboxes. Identity rows wrap, using the same Paragraph width and Wrap settings for height measurement and painting. Selection windows account for row heights rather than candidate counts. A partially inspectable oversized identity shows a resize warning and gets no mouse hitbox. Render and actual-PTY regressions cover these boundaries.
 
+## Reported filenames
+
+`message_text` formats a nonempty `AttachmentRef::file_name()` as `[attachment: NAME]` with Rust `str::escape_debug()`. The transcript and loaded-message preview use that projection. Text parts remain unchanged; unnamed and unsupported parts keep `[attachment]`. Rendering never mutates the stored parts or turns a name into a file action. Cached/unloaded conversation summaries are not backfilled.
+
+The cache key already compares message values. A same-ID filename update invalidates the cached layout without a new cache mechanism. Headless tests check this through a reused `RenderCache`, and clip assertions to the transcript so sidebar previews cannot hide a stale layout.
+
+IPC v6 search matches text first across all parts, then the first matching reported filename. Query matching uses raw metadata before display escaping. Filename snippets are escaped presentation excerpts, not raw offsets or structured attachment references. The UI never parses their prefix to infer identity or an action. Escaping applies to filenames; this feature does not establish global body-text sanitization.
+
 ## Exact search context
 
 `SearchContext` holds one generation-correlated preview of at most 200 rows, separate from `App.messages` and normal older-page state. Unloaded search hits use the v4 exact `message_context` request; no intermediate pages are accumulated. `displayed_messages` supplies the formatter and cache key, while `displayed_transcript_conversation` supplies matching viewport identity.

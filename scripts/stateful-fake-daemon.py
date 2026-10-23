@@ -9,11 +9,28 @@ import socket
 import struct
 import threading
 import time
+import unicodedata
 import uuid
 
-VERSION = 5
+VERSION = 6
 MAX_FRAME = 1024 * 1024
 SEARCH_SCAN_LIMIT = 20_000
+SNIPPET_CONTEXT_CHARS = 30
+ELLIPSIS = "\u2026"
+_NONPRINTABLE_CATEGORIES = frozenset(("Cc", "Cf", "Cs", "Co", "Cn", "Zl", "Zp", "Zs"))
+# Mn/Me covers most Grapheme_Extend characters; add common non-mark extenders.
+_OTHER_GRAPHEME_EXTEND = frozenset({0x200C, 0x200D, 0x302E, 0x302F, 0xFF9E, 0xFF9F,
+                                    0x1D165, *range(0x1D16E, 0x1D173)})
+# Additional Mc leading escapes verified against the pinned Rust standard library.
+_OTHER_GRAPHEME_EXTEND |= frozenset({
+    0x09BE, 0x09D7, 0x0B3E, 0x0B57, 0x0BBE, 0x0BD7, 0x0CC0, 0x0CC2,
+    0x0CC7, 0x0CC8, 0x0CCA, 0x0CCB, 0x0CD5, 0x0CD6, 0x0D3E, 0x0D57,
+    0x0DCF, 0x0DDF, 0x1715, 0x1734, 0x1B35, 0x1B3B, 0x1B3D, 0x1B43,
+    0x1B44, 0x1BAA, 0x1BF2, 0x1BF3, 0xA953, 0xA9C0, 0x111C0, 0x11235,
+    0x1133E, 0x1134D, 0x11357, 0x113B8, 0x113C2, 0x113C5, 0x113C7,
+    0x113C8, 0x113C9, 0x113CF, 0x114B0, 0x114BD, 0x115AF, 0x116B6,
+    0x11930, 0x1193D, 0x11F41, 0x16FF0, 0x16FF1, 0x1D166, 0x1D16D,
+})
 LOCK = threading.RLock()
 SUBS = set()
 WRITE_LOCKS = {}
@@ -121,19 +138,95 @@ def message_context(state, conversation_id, message_id, limit):
     return [remap(message) for message in older] + [remap(target)] + [remap(message) for message in newer]
 
 
-def search_snippet(text, query):
-    """Return a 30-character context window around the match, or None.
+def _is_grapheme_extended(character):
+    """Approximate Unicode Grapheme_Extend for leading-character escaping."""
+    return (unicodedata.category(character) in ("Mn", "Me")
+            or ord(character) in _OTHER_GRAPHEME_EXTEND)
 
-    The match is located with a case-insensitive regex so the offsets index the
-    original text: lowercasing can change length, which would slice the wrong run.
+
+def _is_printable(character):
+    if character == " ":
+        return True
+    return unicodedata.category(character) not in _NONPRINTABLE_CATEGORIES
+
+
+def escape_debug(text):
+    """Rust-style escaping with tested vectors, not exhaustive Unicode parity.
+
+    Leading Grapheme_Extend and Unicode table versions are approximated here.
     """
-    match = re.search(re.escape(query), text, re.IGNORECASE)
-    if match is None:
+    pieces = []
+    for index, character in enumerate(text):
+        if character == "\0":
+            piece = "\\0"
+        elif character == "\t":
+            piece = "\\t"
+        elif character == "\r":
+            piece = "\\r"
+        elif character == "\n":
+            piece = "\\n"
+        elif character == "\\":
+            piece = "\\\\"
+        elif character in ("'", '"'):
+            piece = "\\" + character
+        elif index == 0 and _is_grapheme_extended(character):
+            piece = f"\\u{{{ord(character):x}}}"
+        elif _is_printable(character):
+            piece = character
+        else:
+            piece = f"\\u{{{ord(character):x}}}"
+        pieces.append(piece)
+    return "".join(pieces)
+
+
+def lowercase_with_boundaries(text):
+    """Lower each character separately, mapping lowered chars to original spans."""
+    lowered = []
+    boundaries = []
+    for index, character in enumerate(text):
+        part = character.lower()
+        lowered.append(part)
+        boundaries.extend((index, index + 1) for _ in part)
+    return "".join(lowered), boundaries
+
+
+def field_snippet(text, query_lower):
+    """Return a contextual window around the first literal lowered match."""
+    if not query_lower:
         return None
-    start = max(0, match.start() - 30)
-    stop = min(len(text), match.end() + 30)
-    body = text[start:stop].replace("\r\n", " ").replace("\r", " ").replace("\n", " ")
-    return ("\u2026" if start > 0 else "") + body + ("\u2026" if stop < len(text) else "")
+    lower, boundaries = lowercase_with_boundaries(text)
+    start_lower = lower.find(query_lower)
+    if start_lower < 0:
+        return None
+    end_lower = start_lower + len(query_lower)
+    start = boundaries[start_lower][0]
+    end = boundaries[end_lower - 1][1]
+    context_start = max(0, start - SNIPPET_CONTEXT_CHARS)
+    context_end = min(len(text), end + SNIPPET_CONTEXT_CHARS)
+    body = text[context_start:context_end].replace("\r\n", " ").replace("\r", " ").replace("\n", " ")
+    return (ELLIPSIS if context_start > 0 else "") + body + (ELLIPSIS if context_end < len(text) else "")
+
+
+def search_snippet(item, query_lower):
+    """Scan all text parts first, then report the first matching stored name."""
+    for part in item.get("parts", []):
+        if isinstance(part, dict) and part.get("type") == "text" and isinstance(part.get("value"), str):
+            snippet = field_snippet(part["value"], query_lower)
+            if snippet is not None:
+                return snippet
+    for part in item.get("parts", []):
+        if not isinstance(part, dict) or part.get("type") != "attachment":
+            continue
+        value = part.get("value")
+        if not isinstance(value, dict):
+            continue
+        name = value.get("file_name")
+        if not isinstance(name, str) or not name:
+            continue
+        window = field_snippet(name, query_lower)
+        if window is not None:
+            return "Filename: " + escape_debug(window)
+    return None
 
 
 def canonical_conversation(state, conversation_id):
@@ -182,16 +275,12 @@ def search_messages(state, query, limit, participant=None):
     if (not isinstance(query, str) or not query.strip()
             or not isinstance(limit, int) or isinstance(limit, bool) or limit <= 0):
         return hits
+    query_lower = query.strip().lower()
     for message in sorted(state["messages"], key=history_key, reverse=True)[:SEARCH_SCAN_LIMIT]:
         canonical = canonical_conversation(state, message["conversation_id"])
         if memberships is not None and json.dumps(canonical, separators=(",", ":"), ensure_ascii=False) not in memberships:
             continue
-        snippet = None
-        for part in message.get("parts", []):
-            if part.get("type") == "text" and isinstance(part.get("value"), str):
-                snippet = search_snippet(part["value"], query.strip())
-                if snippet is not None:
-                    break
+        snippet = search_snippet(message, query_lower)
         if snippet is None:
             continue
         hits.append({"conversation_id": canonical,

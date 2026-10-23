@@ -13,6 +13,8 @@ Start with [fresh-session handoff](handoff.md). The root [AGENTS.md](../AGENTS.m
 | [Implementation roadmap](implementation-plan.md) | Active ordered work and acceptance gates, not completed features |
 | [TUI user guide](tui.md) | Controls, preferences, screen behavior, setup and troubleshooting |
 | [TUI internals](tui-internals.md) | Redraw, state/ownership, geometry, palettes, terminal lifecycle and test tooling |
+| [Local filename search](filename-search.md) | Body-first filename search, display rules, v6 compatibility, verification status, and limits |
+| [Attachment metadata](attachment-metadata.md) | Allowlisted ingestion and local metadata tokens, not file content or download identity |
 | [Reading/navigation UI iteration](ux-polish-review.md) | Accepted current-chat interaction/design scope, reproductions and evidence; integrations deferred |
 | [Switching latency follow-up](tui-switching-performance.md) | Measured local switching lag, bounded rendering correction and repeatable synthetic PTY probe |
 | [Previous completed iteration](iteration-review.md) | Accepted reliability/UI fixes, synthetic verification, parent critique and remaining limits |
@@ -22,6 +24,7 @@ Start with [fresh-session handoff](handoff.md). The root [AGENTS.md](../AGENTS.m
 
 | Document | Status / how to use |
 | --- | --- |
+| [Attachment filename baseline](attachment-search-gap.md) | Historical ingestion gap, accepted prerequisites, and limits of old unsupported records |
 | [Multi-service research and proposed plan](multi-service-research.md) | Deferred Slack/Discord feasibility, policy/access limits, service-native navigation and staged acceptance gates; not implemented connectors |
 | [Engine-sidecar evidence](engine-sidecar.md) | Historical research/authorized live experiments plus updated integration boundaries; not current-checkout live proof |
 | [IDS validation gate](ids-validation-gate.md) | Independent registration remains blocked; existing-engine reuse does not open this gate |

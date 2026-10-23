@@ -14,7 +14,7 @@ Rust daemon/domain/IPC/secret-store boundary, encrypted persistence, external Da
 
 The section numbers below group work by area; they are not execution order.
 
-1. The [one-file metadata-preservation prerequisite](attachment-metadata.md) is accepted under shipp: 107 daemon unit tests, 13 fake-sidecar tests, the full rebuilt gate, and scoped independent final review pass. It preserves descriptive scalars with bounded local tokens, not engine/download identity. The separate borrowed filename accessor is also accepted: 10 domain tests, strict workspace Clippy, formatting/source checks, and scoped independent source review pass, with no serialization or UI behavior changes. Direct fixture preflight and a parent probe show supplied typed parts already survive context/framing and stateful persistence. The test-only fixture RPC/save/restart proof is also accepted: 30 tests, source/diff checks, and scoped independent source review pass, without a daemon rewrite. Next is bounded read-only protocol-policy preflight, then native search/display contracts addressing compatibility and matching parity. No matching/UI writer starts before that contract. Never search placeholders or infer filenames. [The baseline gap](attachment-search-gap.md) remains relevant to old records.
+1. Native filename search is implemented on IPC v6 in the working tree and is recorded in the [filename-search contract](filename-search.md). Matcher units pass 118 parent-run daemon tests and static checks; the fixture component passes 61 parent-run tests with 64 golden cases and 468 checked Mc scalars matching pinned Rust; the UI passes parent TUI/Tokyo/static checks, 119 render tests, and rebuilt named-context PTY probes at 100/44/24 columns; the persistent owner/cursor/send case passes the full 15-case reading suite. Parent completed the Rust/static/build checks and the runtime rerun passes all suites. One earlier legacy unread RPC timeout remains unresolved. Final cross-component source review found no confirmed new defect. The filename feature is accepted at the documented synthetic store/IPC/real-TUI boundary, with its limits explicit. Nothing is committed or deployed. The accepted [metadata-preservation prerequisite](attachment-metadata.md) and [baseline gap](attachment-search-gap.md) remain historical records; do not redispatch them. Never search placeholders or infer filenames.
 2. Participant-context search and deep-hit navigation are accepted with the evidence below. Attachment sending, download/open, content extraction, and remote history remain outside these metadata/search units.
 3. Start generation-scoped engine recovery only when resuming backend work. Historical ingestion, packaging, and rich messaging remain queued.
 
@@ -48,7 +48,7 @@ This section covers reading and composition. Reading anchors, the measured Lates
 
 Shipped in this loop so far:
 
-- Keyset local pagination end to end. The store and IPC page backwards from a known message (currently protocol version 5), and the transcript loads the previous page when the reader reaches the oldest loaded row, keeps paged history across reconciliation for that chat, and stops at a bounded retained budget instead of repeating a discarded request.
+- Keyset local pagination end to end. The store and IPC page backwards from a known message (currently protocol version 6), and the transcript loads the previous page when the reader reaches the oldest loaded row, keeps paged history across reconciliation for that chat, and stops at a bounded retained budget instead of repeating a discarded request.
 - Local message search end to end. `search_messages` matches stored text parts case-insensitively, newest first, with char-boundary-safe snippets and canonical conversation ids. Ctrl+F or `/search` opens a modal that lists hits with chat identity and snippet, and opening a loaded hit anchors directly. Unloaded hits use the exact-context view described below.
 - Failure and identity handling around paging: page failures stay readable until the next interaction, alias reconciliation carries paged history and unions caches, and leaving a chat releases the in-flight page slot.
 - Session-only composer undo/redo and completed-search result counts, committed in `f85ce33`. Undo is bounded and recipient-owned; durable drafts are not implemented. A search at its result cap says "may be more" rather than claiming completeness.
@@ -68,17 +68,17 @@ Deep-hit navigation, accepted under shipp with synthetic coverage:
 
 Participant-context search, accepted under shipp with synthetic coverage:
 
-- [Its design and acceptance record](participant-search.md) defines current local chat membership, not sender filtering or historical group membership. IPC v5 carries transport plus exact handle. Filtering happens before the result limit within the existing global newest-20,000-row scan bound; plain queries stay literal.
+- [Its design and acceptance record](participant-search.md) defines current local chat membership, not sender filtering or historical group membership. Participant scope was introduced in IPC v5 and carries transport plus exact handle; the current protocol is v6. Filtering happens before the result limit within the existing global newest-20,000-row scan bound; plain queries stay literal.
 - Ctrl+P inside Search opens **Chats with**. Exact identity-bearing rows, All chats, nested cancel, and request invalidation preserve the body query and recipient-owned draft. Narrow pickers own the full frame and wrap identities instead of silently hiding distinguishing text.
 - Final workspace and timezone tests, strict Clippy, formatting, source guard, and rebuilt runtime suites pass: 28 fixture, 14 reading/navigation, 12 input, 4 messaging, and 8 launcher tests. Scoped independent source reviews and parent runtime/capture inspection informed acceptance. The final presentation rereview found no remaining confirmed defects in its scope. No live account or engine was accessed.
 
 Next in this section:
 
-- Resolve the [attachment ingestion prerequisite](attachment-search-gap.md) before filename search. Verify part identity and privacy boundaries, then scope metadata preservation and encrypted round-trip tests separately from search or download. Do not copy raw attachment envelopes, infer names, or claim recovery of old placeholders.
+- Native filename search is implemented in the working tree on IPC v6; see the [filename-search contract](filename-search.md) for the matching, snippet, display and v6 rules. Component checks pass. The rebuilt Rust/static checks and completed runtime rerun pass. Final cross-component source review found no confirmed new defect; the filename feature is accepted with the recorded limits. Do not redispatch the accepted metadata prerequisite. Old unsupported placeholders have no name to recover.
 
 Later in this section:
 
-- Attachment search is blocked on verified metadata preservation. Participant-context search is implemented.
+- Filename search over stored text plus reported names is implemented and awaits the final rebuilt workspace/runtime gate. Attachment content search, file send/open/download, and old-placeholder recovery remain out of scope. Participant-context search is implemented.
 - Durable encrypted drafts still need a privacy and retention review; undo stays session-only until then.
 - Typed interaction modes to reduce independent flag combinations, but only behind regression coverage for modal transitions, recipient changes, aliases, filters and asynchronous results.
 

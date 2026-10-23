@@ -81,8 +81,9 @@ pub fn get_message(store: &EncryptedStore, id: &MessageId) -> Result<Option<Mess
         .transpose()
 }
 
-/// Search text parts of stored messages, newest first. The scan is bounded to the
-/// newest [`SEARCH_SCAN_LIMIT`] rows so one query cannot walk an unbounded store,
+/// Search stored text parts and reported attachment file names of stored
+/// messages, newest first. The scan is bounded to the newest
+/// [`SEARCH_SCAN_LIMIT`] rows so one query cannot walk an unbounded store,
 /// and it stops as soon as `limit` hits have been collected.
 pub fn search_messages(
     store: &EncryptedStore,
@@ -92,10 +93,11 @@ pub fn search_messages(
     search_messages_with_participant(store, query, limit, None)
 }
 
-/// Search text parts of stored messages, optionally scoped to canonical
-/// conversations whose current participants include the exact filter handle.
-/// Membership is checked before hits are counted, so a limit never hides a
-/// matching older message behind newer out-of-scope hits.
+/// Search stored text parts and reported attachment file names of stored
+/// messages, optionally scoped to canonical conversations whose current
+/// participants include the exact filter handle. Membership is checked before
+/// hits are counted, so a limit never hides a matching older message behind
+/// newer out-of-scope hits.
 pub fn search_messages_with_participant(
     store: &EncryptedStore,
     query: &str,
@@ -177,21 +179,47 @@ pub fn search_messages_with_participant(
     Ok(hits)
 }
 
+/// Select one snippet per message. All text parts are scanned first, in stored
+/// order, so a matching body always wins over a filename. Only when no body
+/// part matches are reported, nonempty attachment file names scanned in stored
+/// order. Missing or empty names contribute nothing: names are never inferred
+/// from IDs, MIME types, or part kinds. One message still yields one hit.
 fn search_snippet(message: &Message, query_lower: &str) -> Option<String> {
     for part in message.parts() {
         let MessagePart::Text(text) = part else {
             continue;
         };
-        let (lower, boundaries) = lowercase_with_boundaries(text);
-        let Some(start_lower) = lower.find(query_lower) else {
+        if let Some(snippet) = field_snippet(text, query_lower) {
+            return Some(snippet);
+        }
+    }
+    for part in message.parts() {
+        let MessagePart::Attachment(attachment) = part else {
             continue;
         };
-        let end_lower = start_lower + query_lower.len();
-        let start = boundaries[start_lower].0;
-        let end = boundaries[end_lower - 1].1;
-        return Some(snippet_window(text, start, end));
+        let Some(name) = attachment.file_name() else {
+            continue;
+        };
+        if name.is_empty() {
+            continue;
+        }
+        if let Some(window) = field_snippet(name, query_lower) {
+            // The stored name is matched raw, then escaped for presentation.
+            return Some(format!("Filename: {}", window.escape_debug()));
+        }
     }
     None
+}
+
+/// Build a contextual snippet around the first literal match in one field, reusing
+/// the original-span mapping when lowercasing changes byte lengths.
+fn field_snippet(text: &str, query_lower: &str) -> Option<String> {
+    let (lower, boundaries) = lowercase_with_boundaries(text);
+    let start_lower = lower.find(query_lower)?;
+    let end_lower = start_lower + query_lower.len();
+    let start = boundaries[start_lower].0;
+    let end = boundaries[end_lower - 1].1;
+    Some(snippet_window(text, start, end))
 }
 
 /// Lowercase a string and record the original character span of every lowered
@@ -516,8 +544,8 @@ mod tests {
     use super::*;
     use crate::store::KEY_BYTES;
     use bloom_domain::{
-        Conversation, ConversationKind, DeliveryState, Handle, HandleKind, MessagePart,
-        Participant, TransportId,
+        AttachmentRef, Conversation, ConversationKind, DeliveryState, Handle, HandleKind,
+        MessagePart, Participant, TransportId,
     };
     use std::fs;
 
@@ -587,7 +615,29 @@ mod tests {
         at: i64,
         parts: Vec<MessagePart>,
     ) -> Message {
-        let transport = TransportId::new("alpha").unwrap();
+        fixture_message_parts_on("alpha", message, conversation, at, parts)
+    }
+
+    fn fixture_attachment(id: &str, name: Option<&str>) -> MessagePart {
+        MessagePart::Attachment(
+            bloom_domain::AttachmentRef::new(
+                id,
+                Some("text/plain".to_owned()),
+                name.map(str::to_owned),
+                Some(11),
+            )
+            .unwrap(),
+        )
+    }
+
+    fn fixture_message_parts_on(
+        transport: &str,
+        message: &str,
+        conversation: &str,
+        at: i64,
+        parts: Vec<MessagePart>,
+    ) -> Message {
+        let transport = TransportId::new(transport).unwrap();
         Message::new(
             MessageId::new(transport.clone(), message).unwrap(),
             ConversationId::new(transport, conversation).unwrap(),
@@ -634,6 +684,467 @@ mod tests {
         assert_eq!(hits[0].message_id.value(), "m1");
         assert_eq!(hits[0].conversation_id, conversation);
         assert_eq!(hits[0].snippet, "HeLLo NeEdLe");
+    }
+
+    #[test]
+    fn search_finds_filename_only_attachment() {
+        let (_temp, mut store, conversation) = setup();
+        upsert_message(
+            &mut store,
+            &fixture_message_parts(
+                "named",
+                "room",
+                1,
+                vec![fixture_attachment("a1", Some("quarterly-needle.pdf"))],
+            ),
+        )
+        .unwrap();
+
+        let hits = search_messages(&store, "needle", 10).unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].message_id.value(), "named");
+        assert_eq!(hits[0].conversation_id, conversation);
+        assert_eq!(hits[0].snippet, "Filename: quarterly-needle.pdf");
+    }
+
+    #[test]
+    fn search_prefers_matching_body_over_earlier_matching_attachment() {
+        let (_temp, mut store, _conversation) = setup();
+        upsert_message(
+            &mut store,
+            &fixture_message_parts(
+                "body-wins",
+                "room",
+                1,
+                vec![
+                    fixture_attachment("a1", Some("needle-attachment.txt")),
+                    MessagePart::Text("body needle".into()),
+                ],
+            ),
+        )
+        .unwrap();
+
+        let hits = search_messages(&store, "needle", 10).unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].snippet, "body needle");
+    }
+
+    #[test]
+    fn search_returns_one_hit_and_the_first_matching_filename() {
+        let (_temp, mut store, _conversation) = setup();
+        upsert_message(
+            &mut store,
+            &fixture_message_parts(
+                "multi-name",
+                "room",
+                1,
+                vec![
+                    fixture_attachment("a1", Some("first-needle.txt")),
+                    fixture_attachment("a2", Some("second-needle.txt")),
+                ],
+            ),
+        )
+        .unwrap();
+
+        let hits = search_messages(&store, "needle", 10).unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].message_id.value(), "multi-name");
+        assert_eq!(hits[0].snippet, "Filename: first-needle.txt");
+    }
+
+    #[test]
+    fn search_treats_filename_punctuation_and_prefixes_literally() {
+        let (_temp, mut store, _conversation) = setup();
+        upsert_message(
+            &mut store,
+            &fixture_message_parts(
+                "literal",
+                "room",
+                1,
+                vec![fixture_attachment("a1", Some("from: bob?.txt"))],
+            ),
+        )
+        .unwrap();
+
+        let hits = search_messages(&store, "from: bob?", 10).unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].snippet, "Filename: from: bob?.txt");
+    }
+
+    #[test]
+    fn filename_snippet_uses_original_offsets_when_lowercasing_expands() {
+        let (_temp, mut store, _conversation) = setup();
+        let name = format!("{}needle{}", "\u{0130}".repeat(40), "\u{e9}".repeat(40));
+        upsert_message(
+            &mut store,
+            &fixture_message_parts(
+                "expand-name",
+                "room",
+                1,
+                vec![fixture_attachment("a1", Some(name.as_str()))],
+            ),
+        )
+        .unwrap();
+
+        let hits = search_messages(&store, "NEEDLE", 10).unwrap();
+        assert_eq!(hits.len(), 1);
+        let snippet = &hits[0].snippet;
+        assert!(snippet.starts_with("Filename: \u{2026}"), "{snippet}");
+        assert!(snippet.ends_with('\u{2026}'), "{snippet}");
+        assert!(snippet.contains("needle"), "{snippet}");
+        assert_eq!(
+            snippet
+                .chars()
+                .filter(|character| *character == '\u{e9}')
+                .count(),
+            30,
+            "30 original multibyte context characters after the match"
+        );
+    }
+
+    #[test]
+    fn filename_search_ignores_missing_names_ids_mime_types_and_unsupported_parts() {
+        let (_temp, mut store, _conversation) = setup();
+        upsert_message(
+            &mut store,
+            &fixture_message_parts(
+                "anonymous",
+                "room",
+                1,
+                vec![
+                    MessagePart::Attachment(
+                        AttachmentRef::new(
+                            "needle-id",
+                            Some("needle/mime".into()),
+                            None,
+                            Some(2048),
+                        )
+                        .unwrap(),
+                    ),
+                    MessagePart::Attachment(
+                        AttachmentRef::new(
+                            "empty-name",
+                            Some("text/plain".into()),
+                            Some(String::new()),
+                            Some(5),
+                        )
+                        .unwrap(),
+                    ),
+                    MessagePart::Unsupported {
+                        kind: "needle".into(),
+                    },
+                ],
+            ),
+        )
+        .unwrap();
+
+        for query in ["needle", "needle-id", "needle/mime", "text/plain"] {
+            assert!(
+                search_messages(&store, query, 10).unwrap().is_empty(),
+                "{query} must not match inferred metadata"
+            );
+        }
+    }
+
+    #[test]
+    fn filename_snippet_escapes_controls_bidi_quotes_and_backslashes() {
+        let (_temp, mut store, _conversation) = setup();
+        upsert_message(
+            &mut store,
+            &fixture_message_parts(
+                "unsafe-name",
+                "room",
+                1,
+                vec![fixture_attachment(
+                    "a1",
+                    Some("evil\\\"needle\u{202e}\u{1b}.txt"),
+                )],
+            ),
+        )
+        .unwrap();
+
+        let hits = search_messages(&store, "needle", 10).unwrap();
+        assert_eq!(hits.len(), 1);
+        let snippet = &hits[0].snippet;
+        assert!(snippet.starts_with("Filename: evil"), "{snippet}");
+        assert!(snippet.contains(r"\\"), "{snippet}");
+        assert!(snippet.contains(r#"\""#), "{snippet}");
+        assert!(snippet.contains(r"\u{202e}"), "{snippet}");
+        assert!(snippet.contains(r"\u{1b}"), "{snippet}");
+        assert!(!snippet.contains('\u{202e}'), "{snippet}");
+        assert!(!snippet.contains('\u{1b}'), "{snippet}");
+
+        // The snippet crosses the unchanged DTO: escaping must survive transport,
+        // not appear as raw control or bidi characters after a round trip.
+        let encoded = serde_json::to_string(&hits[0]).unwrap();
+        let restored: MessageSearchHit = serde_json::from_str(&encoded).unwrap();
+        assert_eq!(restored, hits[0]);
+        assert!(restored.snippet.contains(r"\u{202e}"), "{encoded}");
+        assert!(restored.snippet.contains(r"\u{1b}"), "{encoded}");
+        assert!(!restored
+            .snippet
+            .chars()
+            .any(|character| character == '\u{202e}' || character.is_control()));
+        assert!(encoded.contains(r"\\u{202e}"), "{encoded}");
+        assert!(encoded.contains(r"\\u{1b}"), "{encoded}");
+    }
+
+    #[test]
+    fn truncated_filename_snippet_keeps_a_literal_ellipsis() {
+        let (_temp, mut store, _conversation) = setup();
+        let name = format!("needle{}", "a".repeat(40));
+        upsert_message(
+            &mut store,
+            &fixture_message_parts(
+                "truncated-name",
+                "room",
+                1,
+                vec![fixture_attachment("a1", Some(name.as_str()))],
+            ),
+        )
+        .unwrap();
+
+        let hits = search_messages(&store, "needle", 10).unwrap();
+        assert_eq!(hits.len(), 1);
+        let snippet = &hits[0].snippet;
+        assert_eq!(
+            *snippet,
+            format!("Filename: needle{}\u{2026}", "a".repeat(30))
+        );
+        assert!(!snippet.contains(r"\u{2026}"), "{snippet}");
+    }
+
+    #[test]
+    fn newer_filename_hits_displace_older_body_hits_at_the_limit() {
+        let (_temp, mut store, _conversation) = setup();
+        upsert_message(
+            &mut store,
+            &fixture_message(
+                "alpha",
+                "body",
+                "room",
+                1,
+                "needle body",
+                DeliveryState::Sent,
+            ),
+        )
+        .unwrap();
+        upsert_message(
+            &mut store,
+            &fixture_message_parts(
+                "file",
+                "room",
+                2,
+                vec![fixture_attachment("a1", Some("needle-newer.bin"))],
+            ),
+        )
+        .unwrap();
+
+        let limited = search_messages(&store, "needle", 1).unwrap();
+        assert_eq!(limited.len(), 1);
+        assert_eq!(limited[0].message_id.value(), "file");
+        assert_eq!(limited[0].snippet, "Filename: needle-newer.bin");
+
+        let both = search_messages(&store, "needle", 2).unwrap();
+        assert_eq!(
+            both.iter()
+                .map(|hit| hit.message_id.value())
+                .collect::<Vec<_>>(),
+            vec!["file", "body"]
+        );
+    }
+
+    #[test]
+    fn filtered_search_finds_an_older_filename_behind_more_than_fifty_newer_hits() {
+        let (_temp, mut store, conversation) = setup();
+        let friend = participant(HandleKind::Email, "friend@example.invalid", Some("Friend"));
+        super::super::conversations::upsert_conversation(
+            &mut store,
+            &scoped_conversation(
+                "alpha",
+                "room",
+                ConversationKind::Direct,
+                vec![friend.clone()],
+                Vec::new(),
+            ),
+        )
+        .unwrap();
+        super::super::conversations::upsert_conversation(
+            &mut store,
+            &scoped_conversation(
+                "alpha",
+                "elsewhere",
+                ConversationKind::Direct,
+                Vec::new(),
+                Vec::new(),
+            ),
+        )
+        .unwrap();
+        for at in 10..=64 {
+            upsert_message(
+                &mut store,
+                &fixture_message(
+                    "alpha",
+                    &format!("newer-{at}"),
+                    "elsewhere",
+                    at,
+                    "needle elsewhere",
+                    DeliveryState::Sent,
+                ),
+            )
+            .unwrap();
+        }
+        upsert_message(
+            &mut store,
+            &fixture_message_parts(
+                "hidden",
+                "room",
+                1,
+                vec![fixture_attachment("hidden-att", Some("hidden-needle.pdf"))],
+            ),
+        )
+        .unwrap();
+
+        let unfiltered = search_messages(&store, "needle", 50).unwrap();
+        assert_eq!(unfiltered.len(), 50);
+        assert!(unfiltered
+            .iter()
+            .all(|hit| hit.message_id.value() != "hidden"));
+
+        let filter = ParticipantFilter {
+            transport: TransportId::new("alpha").unwrap(),
+            handle: friend.handle,
+        };
+        for limit in [1, 50] {
+            let hits =
+                search_messages_with_participant(&store, "needle", limit, Some(&filter)).unwrap();
+            assert_eq!(hits.len(), 1, "limit {limit} counts only in-scope hits");
+            assert_eq!(hits[0].message_id.value(), "hidden");
+            assert_eq!(hits[0].conversation_id, conversation);
+            assert_eq!(hits[0].snippet, "Filename: hidden-needle.pdf");
+        }
+    }
+
+    #[test]
+    fn filename_search_uses_alias_group_and_exact_transport_membership() {
+        let (_temp, mut store, _conversation) = setup();
+        let friend = participant(HandleKind::Email, "member@example.invalid", Some("Member"));
+        let alias = ConversationId::new(TransportId::new("alpha").unwrap(), "legacy").unwrap();
+        super::super::conversations::upsert_conversation(
+            &mut store,
+            &scoped_conversation(
+                "alpha",
+                "canonical",
+                ConversationKind::Direct,
+                vec![friend.clone()],
+                vec![alias],
+            ),
+        )
+        .unwrap();
+        super::super::conversations::upsert_conversation(
+            &mut store,
+            &scoped_conversation(
+                "alpha",
+                "legacy",
+                ConversationKind::Direct,
+                Vec::new(),
+                Vec::new(),
+            ),
+        )
+        .unwrap();
+        let group_member = participant(HandleKind::Tel, "group-member", None);
+        super::super::conversations::upsert_conversation(
+            &mut store,
+            &scoped_conversation(
+                "alpha",
+                "group",
+                ConversationKind::Group,
+                vec![group_member.clone()],
+                Vec::new(),
+            ),
+        )
+        .unwrap();
+        let same = Handle::new(HandleKind::Email, "same@example.invalid").unwrap();
+        for transport in ["alpha", "beta"] {
+            super::super::conversations::upsert_conversation(
+                &mut store,
+                &scoped_conversation(
+                    transport,
+                    &format!("{transport}-same"),
+                    ConversationKind::Direct,
+                    vec![Participant {
+                        handle: same.clone(),
+                        display_name: None,
+                        is_me: false,
+                    }],
+                    Vec::new(),
+                ),
+            )
+            .unwrap();
+        }
+        for message in [
+            fixture_message_parts(
+                "via-alias",
+                "legacy",
+                1,
+                vec![fixture_attachment("a1", Some("needle-alias.txt"))],
+            ),
+            fixture_message_parts(
+                "group-file",
+                "group",
+                2,
+                vec![fixture_attachment("a2", Some("needle-group.txt"))],
+            ),
+            fixture_message_parts(
+                "alpha-file",
+                "alpha-same",
+                3,
+                vec![fixture_attachment("a3", Some("needle-alpha.txt"))],
+            ),
+            fixture_message_parts_on(
+                "beta",
+                "beta-file",
+                "beta-same",
+                4,
+                vec![fixture_attachment("a4", Some("needle-beta.txt"))],
+            ),
+        ] {
+            upsert_message(&mut store, &message).unwrap();
+        }
+
+        let member = ParticipantFilter {
+            transport: TransportId::new("alpha").unwrap(),
+            handle: friend.handle,
+        };
+        let hits = search_messages_with_participant(&store, "needle", 10, Some(&member)).unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].conversation_id.value(), "canonical");
+        assert_eq!(hits[0].snippet, "Filename: needle-alias.txt");
+
+        let group = ParticipantFilter {
+            transport: TransportId::new("alpha").unwrap(),
+            handle: group_member.handle,
+        };
+        let hits = search_messages_with_participant(&store, "needle", 10, Some(&group)).unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].conversation_id.value(), "group");
+        assert_eq!(hits[0].snippet, "Filename: needle-group.txt");
+
+        for (transport, expected) in [("alpha", "alpha-same"), ("beta", "beta-same")] {
+            let filter = ParticipantFilter {
+                transport: TransportId::new(transport).unwrap(),
+                handle: same.clone(),
+            };
+            let hits =
+                search_messages_with_participant(&store, "needle", 10, Some(&filter)).unwrap();
+            assert_eq!(
+                hits.len(),
+                1,
+                "{transport} must match exactly one conversation"
+            );
+            assert_eq!(hits[0].conversation_id.value(), expected);
+            assert_eq!(hits[0].snippet, format!("Filename: needle-{transport}.txt"));
+        }
     }
 
     #[test]
@@ -955,7 +1466,15 @@ mod tests {
         for (id, at) in [("outside-bound", 0), ("at-bound", 1)] {
             upsert_message(
                 &mut store,
-                &fixture_message("alpha", id, "room", at, "needle", DeliveryState::Sent),
+                &fixture_message_parts(
+                    id,
+                    "room",
+                    at,
+                    vec![
+                        MessagePart::Text("needle".into()),
+                        fixture_attachment(&format!("att-{id}"), Some("needlefile")),
+                    ],
+                ),
             )
             .unwrap();
         }
@@ -985,6 +1504,15 @@ mod tests {
                 "membership must not move the global scan boundary"
             );
             assert_eq!(hits[0].message_id.value(), "at-bound");
+
+            let hits = search_messages_with_participant(&store, "needlefile", 50, scope).unwrap();
+            assert_eq!(
+                hits.len(),
+                1,
+                "filename matching must use the same global scan boundary"
+            );
+            assert_eq!(hits[0].message_id.value(), "at-bound");
+            assert_eq!(hits[0].snippet, "Filename: needlefile");
         }
     }
 

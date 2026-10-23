@@ -611,5 +611,155 @@ class ReadingFlows(unittest.TestCase):
         self.assertEqual(restored_sends()[0]['conversation_id'], CID,
                          'Latest must preserve literal-paste provenance and recipient')
 
+    def test_filename_hit_outside_window_opens_full_metadata_and_restores_alice_draft(self):
+        filename = "FILE_ONLY_NEEDLE界'\u202e\u001b\u0085report.bin"
+        escaped = "FILE_ONLY_NEEDLE界\\'\\u{202e}\\u{1b}\\u{85}report.bin"
+        anchor = 'FILE_TARGET_CONTEXT anchored body has no query'
+
+        # Rebuild Bob with 220 older rows. Only the oldest row carries the reported
+        # filename, so it falls outside the newest 200 rows that a chat switch loads.
+        self.stop_tui()
+        self.fixture.stop_daemon()
+        state = self.fixture.persisted()
+        chat = next(item for item in state['conversations'] if item['id'] == BOB)
+        sender = next(participant['handle'] for participant in chat['participants']
+                      if not participant['is_me'])
+        baseline = min(item['created_at'] for item in state['messages'])
+        seeded = []
+        for index in range(220):
+            parts = [{'type': 'text',
+                      'value': f'BOB_OLDER_CONTEXT_{index:03d} synthetic context'}]
+            if index == 0:
+                parts = [
+                    {'type': 'text', 'value': anchor},
+                    {'type': 'attachment', 'value': {
+                        'id': 'synthetic-filename-only-target',
+                        'mime_type': None,
+                        'file_name': filename,
+                        'byte_len': 0,
+                    }},
+                ]
+            seeded.append({
+                'id': {'transport': BOB['transport'],
+                       'value': f'bob-filename-older-{index:03d}'},
+                'conversation_id': dict(BOB),
+                'remote_id': None,
+                'sender': sender,
+                'parts': parts,
+                'created_at': baseline - (220 - index) * 10,
+                'sent_at': None,
+                'delivery': 'delivered',
+                'from_me': False,
+                'edited_at': None,
+                'reactions': [],
+                'unsent_at': None,
+            })
+        state['messages'] = seeded + state['messages']
+        self.fixture.store_path.write_text(json.dumps(state))
+        self.fixture.start_daemon()
+        self.start_tui()
+        self.resize(100, 30)
+        self.wait_for(lambda: 'READ_MARKER_059' in self.text())
+        self.assertNotIn('FILE_ONLY_NEEDLE', self.text(),
+                         'the filename hit must start outside the loaded newest rows')
+
+        def transcript_text():
+            divider = self.screen.display[0].find('│')
+            left = divider + 3 if divider >= 0 else 2
+            return '\n'.join(line[left:] for line in self.screen.display[2:-5])
+
+        def projected():
+            return re.sub(r'\s+', ' ', transcript_text())
+
+        def compact():
+            return re.sub(r'\s+', '', transcript_text())
+
+        outgoing_before = {
+            (message['id']['transport'], message['id']['value'])
+            for message in state['messages'] if message.get('from_me')
+        }
+        draft = '/new\nPrivate Alice filename draft'
+        self.key(b'\x1b[200~' + draft.encode() + b'\x1b[201~')
+        for _ in range(5):
+            self.key(b'\x1b[D')
+        parked_cursor = (self.screen.cursor.x, self.screen.cursor.y)
+        self.artifact('filename-parked-draft')
+
+        self.key(b'\x06')
+        self.wait_for(lambda: 'Search:' in self.text())
+        self.key(b'FILE_ONLY_NEEDLE')
+        self.key(b'\r')
+        self.wait_for(lambda: re.search(r'\b1 results\b', self.text()) is not None,
+                      timeout=10)
+        self.assertIn('Filename: ' + escaped, self.text(),
+                      'the single hit must show the escaped filename excerpt')
+        self.artifact('filename-search-result')
+        self.key(b'\r')
+        self.wait_for(lambda: anchor in projected() and escaped in compact(), timeout=15)
+        self.assertIn('Bob', self.screen.display[0])
+        self.assertIn('Search context', self.text(), 'the old target must use exact context')
+        self.assertNotIn('PrivateAlicefilenamedraft', re.sub(r'\s+', '', self.text()),
+                         "Alice's parked body must not appear in Bob's composer")
+        self.assertIn(anchor, projected())
+        self.assertIn(escaped, compact(),
+                      'the exact context must show the full escaped filename')
+        self.assertNotIn('\u202e', transcript_text(), 'raw RLO must never reach the screen')
+        self.artifact('filename-context-100')
+
+        # Keep enough transcript height to inspect the entire wrapped metadata.
+        # A 12-row terminal cannot show the anchor and long filename together.
+        for width, height in ((44, 30), (24, 30)):
+            self.resize(width, height)
+            self.wait_for(lambda: anchor in projected() and escaped in compact(),
+                          timeout=10)
+            self.assertIn(anchor, projected())
+            self.assertIn(escaped, compact())
+            self.assertNotIn('\u202e', transcript_text())
+            if width == 24:
+                self.assertIn('↓ Latest', self.text(),
+                              'the narrow search context must keep its Latest exit visible')
+            self.artifact(f'filename-context-{width}')
+
+        self.resize(100, 30)
+        self.wait_for(lambda: anchor in projected() and escaped in compact(), timeout=10)
+        self.assertIn(anchor, projected())
+        self.assertIn(escaped, compact())
+        self.assertNotIn('\u202e', transcript_text())
+        self.assertIn('Search context', self.text(), 'resizing must retain the exact context')
+        self.artifact('filename-context-restored-100')
+
+        self.key(b'\x02p')  # Alice remains first; Bob is second in the stable chat order.
+        self.wait_for(lambda: 'Alice' in self.screen.display[0])
+        self.wait_for(lambda: all(line in self.text() for line in draft.splitlines()))
+        self.wait_for(lambda: (self.screen.cursor.x, self.screen.cursor.y) == parked_cursor)
+        self.assertEqual((self.screen.cursor.x, self.screen.cursor.y), parked_cursor)
+        self.artifact('filename-alice-draft-restored')
+
+        self.key(b'X')
+        expected = draft[:-5] + 'X' + draft[-5:]
+        self.wait_for(lambda: 'Private Alice filename Xdraft' in self.text())
+        self.key(b'\r')
+
+        def sent_rows():
+            return [message for message in self.fixture.persisted()['messages']
+                    if message.get('from_me')
+                    and message['parts'] == [{'type': 'text', 'value': expected}]]
+
+        self.wait_for(lambda: bool(sent_rows()), timeout=10)
+        self.assertEqual(len(sent_rows()), 1)
+        self.assertEqual(sent_rows()[0]['conversation_id'], CID,
+                         'the restored cursor, literal draft and recipient must send to Alice')
+        self.assertNotEqual(sent_rows()[0]['conversation_id'], BOB)
+        self.assertEqual(sent_rows()[0]['parts'], [{'type': 'text', 'value': expected}])
+        new_outgoing = [
+            message for message in self.fixture.persisted()['messages']
+            if message.get('from_me')
+            and (message['id']['transport'], message['id']['value']) not in outgoing_before
+        ]
+        self.assertEqual(new_outgoing, sent_rows(),
+                         'metadata navigation must not create any additional outbound message')
+        self.artifact('filename-alice-sent')
+
+
 if __name__ == '__main__':
     unittest.main(verbosity=2)

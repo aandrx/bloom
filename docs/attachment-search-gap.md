@@ -1,28 +1,35 @@
-# Attachment search prerequisite
+# Attachment filenames: baseline and limits
 
-Status: the baseline ingestion gap is documented, and the one-file metadata-preservation prerequisite is accepted under shipp with synthetic evidence. The filename-access bridge is accepted separately; search matching and display remain unimplemented units. No filename-search feature is accepted.
+This record explains the ingestion gap that preceded [local filename search](filename-search.md). Metadata, matching, display, and persistent PTY components now pass their scoped checks and reviews. Coordinated IPC v6 integration, rebuilt Rust/static checks, and the completed runtime rerun pass; final source review found no confirmed new defect. One earlier legacy unread RPC timeout remains an unresolved observation. The filename feature is accepted under shipp at its documented synthetic boundary, with that timeout and other limits retained.
 
-## Observed data flow
+## Historical baseline
 
-- `crates/bloom-domain/src/lib.rs` defines `MessagePart::Attachment(AttachmentRef)`. The reference can hold an ID, MIME type, optional filename, and optional byte length. Its existence does not prove real ingestion.
-- `ext/bloom-engine-sidecar/dart/lib/payload_codec.dart` emits attachment `name`, `mime`, `uti_type`, `part`, and attachment-type metadata. Inline metadata includes `byte_length`; MMCS metadata includes `size` and remote-access fields.
-- At the research baseline, `apps/bloomd/src/engine.rs::map_inbound` preserved text parts but mapped every other part type to `MessagePart::Unsupported { kind }`. It did not construct the attachment reference or preserve the filename.
-- `apps/bloomd/src/store/messages.rs::upsert_message` serializes the mapped Message into encrypted storage. It cannot recover fields discarded before storage. Search currently matches text parts only.
-- `apps/bloom-tui/src/app.rs::message_text` displays attachments and unsupported parts as placeholders. A generic `[attachment]` is not filename evidence.
+`bloom-domain` already defined `MessagePart::Attachment(AttachmentRef)` with an optional filename. That type did not establish that ingestion preserved names.
 
-Before the prerequisite implementation, parent ran `cargo test -p bloomd --lib attachment_only_messages_are_kept_as_unsupported_parts`. The test passed and explicitly asserts that a named attachment becomes an unsupported attachment marker. This is synthetic runtime proof of the baseline mapper behavior, not inspection of a live account or every historical database.
+The owned Dart codec emitted attachment descriptions and remote-access fields. At the research baseline, `apps/bloomd/src/engine.rs::map_inbound` kept text but converted other parts to `Unsupported`. The encrypted store could not recover a discarded filename. Search read text parts, and the TUI showed `[attachment]`.
 
-## Boundary before any writer
+Parent ran `cargo test -p bloomd --lib attachment_only_messages_are_kept_as_unsupported_parts` before the mapper change. It passed and asserted that a named attachment became an unsupported marker. This was synthetic proof, not a live-account inspection.
 
-Filename search cannot be advertised until separate filename-access, search, and display units pass verification. Messages entering through the baseline mapper have no preserved filename evidence. Do not infer filenames from URLs, IDs, MIME types, or placeholders. Old stored placeholders cannot be backfilled without a separately verified source; no remote history or account access is authorized.
+## Metadata prerequisite
 
-The owned codec also emits MMCS object, URL, signature, and key fields. Raw attachment JSON must not be copied into domain metadata, search text, logs, or plaintext preferences. Any future metadata mapping needs a small scalar allowlist, not an envelope dump.
+The [metadata contract](attachment-metadata.md) permits reported filename, MIME type, and byte length. The mapper excludes MMCS object, URL, signature, key, UTI, and raw attachment envelopes. Tokens describe the current local revision and have a 256-byte limit. They are not download identifiers or stored-vector indexes.
 
-Baseline research questions (resolved or explicitly left unverified in the accepted contract):
+Research did not establish stable or remote meanings for the outer `idx` or nested part number. Their stability is unknown, not proven absent. The local token does not depend on those fields.
 
-1. What `part` and outer `idx` mean in owned tests, including any limits on identity stability across edits.
-2. Whether an explicitly local metadata reference is appropriate. It must not be presented as a remote-download identifier or a guessed engine identity.
-3. A safe filename, MIME, and byte-length mapping with explicit missing/malformed-field behavior. Preserve surrounding text and honest unsupported placeholders when metadata is insufficient.
-4. Synthetic mapping and encrypted round-trip regressions proving allowlisted metadata survives while remote-access fields do not.
+The mapper prerequisite passed 107 daemon unit tests, 13 fake-sidecar tests, the rebuilt synthetic gate, and source review. The borrowed filename getter passed 10 domain tests and review without changing serialization. Supplied typed parts already survived both fake daemons. A test-only RPC/save/restart addition proved that behavior without a producer rewrite.
 
-This prerequisite is metadata preservation only. Search matching, attachment rendering, sending, opening, downloading, and content extraction remain separate units. The four-file follow-up found no evidence that either engine numbering field is stable or a download identity. Those properties are unknown, not proven unstable. The [accepted metadata-only contract](attachment-metadata.md) instead defines an explicitly local current-revision metadata token, a three-field metadata allowlist, and a one-file mapper/test boundary. Independent design review found no blocker after clarifying the nested numbering field, unknown-kind size handling, and replacement regression. The `engine.rs` implementation and parent hardening pass 107 daemon unit and 13 fake-sidecar tests, the full rebuilt gate, and scoped final source review. No confirmed new defects remain in that scope. The borrowed filename accessor is accepted with focused API verification and source review. Parent fixture preflight found supplied parts are retained, so the accepted test-only RPC/save/restart coverage passes 30 tests and scoped source review, with no producer rewrite. Protocol preflight and matching/display contracts follow; old unsupported placeholders remain without filename evidence.
+## Filename search components
+
+The store now matches body text before explicit filenames within each message. It keeps the global newest-20,000-row bound, canonical membership, ordering, and hit limits. Missing names, MIME types, IDs, and unsupported markers do not supply filenames.
+
+The fixture component passes 61 tests. Its 64 escaped-name cases include quotes, controls, bidi marks, and confirmed leading combining marks. Both fixtures matched pinned Rust for all 468 `Mc` scalars checked. Other Unicode classes and versions are not exhaustively equivalent.
+
+The TUI displays escaped reported names in the transcript and loaded-message preview. Parent checked normal and Tokyo-timezone TUI suites, 119 render tests, static checks, and rebuilt PTY output at 100, 44, and 24 columns. The full 15-case reading suite proves an older filename-only hit, exact context, restored cursor, literal multiline input, and one text send to the original recipient. Scoped source reviews found no blockers after the documented test corrections.
+
+The [filename-search record](filename-search.md) contains the contract and final integration evidence. These component results do not establish current live-engine reliability.
+
+## Remaining limits
+
+Old unsupported placeholders contain no filename to search. The implementation does not infer names from IDs, URLs, MIME types, or placeholders, and does not backfill missing metadata.
+
+A reported name is descriptive metadata. It does not establish a local path, available content, completed transfer, or permission to open a file. Attachment sending, opening, downloading, content extraction, and remote history remain outside this work.
