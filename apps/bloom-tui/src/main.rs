@@ -169,6 +169,52 @@ impl Drop for TerminalGuard {
     }
 }
 
+/// Tracks a failed settings save so the loop neither retries an unchanged
+/// config forever nor hides the error until an unrelated redraw.
+#[derive(Default)]
+struct SettingsSaveState {
+    failed: Option<(Config, String)>,
+}
+
+impl SettingsSaveState {
+    /// A config is attempted unless the same value already failed.
+    fn should_attempt(&self, desired: &Config) -> bool {
+        self.failed
+            .as_ref()
+            .is_none_or(|(failed, _)| failed != desired)
+    }
+
+    /// Remembers the value that failed and its exact message so the same value
+    /// is not attempted again until the desired config changes.
+    fn record_failure(&mut self, desired: &Config, message: String) {
+        self.failed = Some((desired.clone(), message));
+    }
+
+    /// Reports whether the guard's message is now stale because the desired
+    /// config matches the saved one. A pending change keeps both the guard and
+    /// its error, so a failed change is not cleared and retried on the next
+    /// iteration. Returns false unless `error` is exactly the message this guard
+    /// set, so an unrelated newer error is never cleared.
+    fn settled_message(
+        &mut self,
+        desired: &Config,
+        saved: &Config,
+        error: &Option<String>,
+    ) -> bool {
+        if desired != saved {
+            return false;
+        }
+        self.take_own_message(error)
+    }
+
+    /// Forgets the guard after a successful save and reports whether the visible
+    /// error is the one this guard set.
+    fn take_own_message(&mut self, error: &Option<String>) -> bool {
+        let message = self.failed.take().map(|(_, message)| message);
+        message.is_some_and(|message| error.as_deref() == Some(message.as_str()))
+    }
+}
+
 /// The same resolution the daemon uses, so an override (including one from .env)
 /// cannot put the UI on a different socket than the daemon.
 fn socket_path() -> PathBuf {
@@ -296,6 +342,7 @@ async fn main() -> Result<()> {
 
     let mut last_visible = app.selected.clone();
     let mut redraw = RedrawScheduler::default();
+    let mut settings_save = SettingsSaveState::default();
     let mut hits = ui::HitMap::default();
     let mut render_cache = ui::RenderCache::default();
     let mut inbound_redraws = VecDeque::<(u64, std::time::Instant)>::new();
@@ -347,13 +394,30 @@ async fn main() -> Result<()> {
             },
             read_positions: app.read_positions_for_config(),
         };
-        if updated_config != config {
+        let settings_pending = updated_config != config;
+        if settings_pending && settings_save.should_attempt(&updated_config) {
             match updated_config.save(&config_path) {
-                Ok(()) => config = updated_config,
+                Ok(()) => {
+                    config = updated_config;
+                    if settings_save.take_own_message(&app.error) {
+                        app.error = None;
+                        redraw.request();
+                    }
+                }
                 Err(error) => {
-                    app.error = Some(format!("Could not save local settings: {error}"));
+                    let message = format!("Could not save local settings: {error}");
+                    app.error = Some(message.clone());
+                    settings_save.record_failure(&updated_config, message);
+                    // The error was set after this frame was drawn, so paint it
+                    // without waiting for an unrelated event.
+                    redraw.request();
                 }
             }
+        } else if settings_save.settled_message(&updated_config, &config, &app.error) {
+            // Nothing is pending, so an earlier failure no longer describes
+            // outstanding work. A still-pending failed change keeps its error.
+            app.error = None;
+            redraw.request();
         }
 
         let redraw_delay = redraw.wake_after(std::time::Instant::now());
@@ -664,5 +728,106 @@ mod accessibility_tests {
     fn initial_theme_uses_background_luminance() {
         assert_eq!(theme_for_rgb((250, 250, 250)), bloom_tui::app::Theme::Light);
         assert_eq!(theme_for_rgb((10, 10, 10)), bloom_tui::app::Theme::Dark);
+    }
+}
+
+#[cfg(test)]
+mod settings_save_tests {
+    use super::*;
+
+    fn desired(theme: Option<&str>) -> Config {
+        Config {
+            version: 1,
+            theme: theme.map(str::to_owned),
+            ..Config::default()
+        }
+    }
+
+    #[test]
+    fn repeated_identical_config_attempts_once_then_is_suppressed() {
+        let mut state = SettingsSaveState::default();
+        let config = desired(Some("dark"));
+        assert!(state.should_attempt(&config));
+        state.record_failure(&config, "Could not save local settings: denied".into());
+        assert!(!state.should_attempt(&config));
+    }
+
+    #[test]
+    fn changed_config_after_failure_is_attempted_again() {
+        let mut state = SettingsSaveState::default();
+        let failed = desired(Some("dark"));
+        state.record_failure(&failed, "Could not save local settings: denied".into());
+        assert!(state.should_attempt(&desired(Some("light"))));
+    }
+
+    #[test]
+    fn success_adopts_config_and_clears_its_own_message() {
+        let mut state = SettingsSaveState::default();
+        let config = desired(Some("dark"));
+        let message = "Could not save local settings: denied".to_owned();
+        state.record_failure(&config, message.clone());
+        let mut error = Some(message);
+        if state.take_own_message(&error) {
+            error = None;
+        }
+        assert_eq!(error, None);
+        assert!(state.should_attempt(&desired(Some("light"))));
+    }
+
+    #[test]
+    fn success_leaves_a_different_error_untouched() {
+        let mut state = SettingsSaveState::default();
+        let config = desired(Some("dark"));
+        state.record_failure(&config, "Could not save local settings: denied".into());
+        let error = Some("Conversation-list sync failed.".to_owned());
+        let saved = desired(None);
+        assert!(!state.settled_message(&saved, &saved, &error));
+        assert_eq!(error.as_deref(), Some("Conversation-list sync failed."));
+    }
+
+    #[test]
+    fn reverting_to_the_saved_config_clears_the_stale_message() {
+        let mut state = SettingsSaveState::default();
+        let failed = desired(Some("dark"));
+        let message = "Could not save local settings: denied".to_owned();
+        state.record_failure(&failed, message.clone());
+        // Reverting makes the desired config equal the saved one, so nothing is
+        // pending and the guard's stale message is cleared.
+        let saved = desired(None);
+        let mut error = Some(message);
+        if state.settled_message(&saved, &saved, &error) {
+            error = None;
+        }
+        assert_eq!(error, None);
+        assert!(state.failed.is_none());
+    }
+
+    #[test]
+    fn pending_failed_change_keeps_its_error_and_stays_suppressed() {
+        let mut state = SettingsSaveState::default();
+        let failed = desired(Some("dark"));
+        let message = "Could not save local settings: denied".to_owned();
+        state.record_failure(&failed, message.clone());
+        let error = Some(message);
+        // The change is still pending, so the message is not stale.
+        assert!(!state.settled_message(&failed, &desired(None), &error));
+        assert_eq!(
+            error.as_deref(),
+            Some("Could not save local settings: denied")
+        );
+        // The guard must survive, otherwise the next iteration retries the write.
+        assert!(!state.should_attempt(&failed));
+    }
+
+    #[test]
+    fn failure_is_recorded_so_the_same_value_is_not_retried() {
+        let mut state = SettingsSaveState::default();
+        let config = desired(Some("dark"));
+        state.record_failure(&config, "Could not save local settings: denied".into());
+        assert_eq!(
+            state.failed.as_ref().map(|(failed, _)| failed),
+            Some(&config)
+        );
+        assert!(!state.should_attempt(&config));
     }
 }

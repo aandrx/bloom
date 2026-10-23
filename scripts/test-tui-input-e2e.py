@@ -158,6 +158,99 @@ class InputFlows(unittest.TestCase):
             os.waitpid(pid, 0)
             os.close(master)
 
+    def test_failed_settings_save_is_painted_without_another_key(self):
+        fixture = self.fixture
+        config_root = fixture.root / 'config'
+        config_root.mkdir(parents=True)
+        os.chmod(config_root, 0o700)
+        tui_json = config_root / 'bloom' / 'tui.json'
+
+        raw = bytearray()
+        environment = {
+            'BLOOM_SOCKET_PATH': str(fixture.socket_path),
+            'XDG_CONFIG_HOME': str(config_root),
+            'XDG_STATE_HOME': str(fixture.root / 'state'),
+            'XDG_DATA_HOME': str(fixture.root / 'data'),
+            'NO_COLOR': '1',
+        }
+        with HELPERS['isolated_environment'](environment):
+            pid, master = pty.fork()
+            if pid == 0:
+                os.execv(str(HELPERS['BINARY']), [str(HELPERS['BINARY'])])
+
+        def current_text():
+            screen = SHOT['render'](bytes(raw), 100, 30)
+            return '\n'.join(screen.display)
+
+        def pump_until(predicate, timeout):
+            deadline = time.monotonic() + timeout
+            while time.monotonic() < deadline:
+                if select.select([master], [], [], .05)[0]:
+                    try:
+                        raw.extend(os.read(master, 65536))
+                    except OSError:
+                        break
+                if predicate(current_text()):
+                    return True
+            return False
+
+        try:
+            fcntl.ioctl(master, termios.TIOCSWINSZ, struct.pack('HHHH', 30, 100, 0, 0))
+            self.assertTrue(
+                pump_until(lambda text: 'Alice' in text, 15),
+                'TUI did not draw the normal transcript: ' + current_text(),
+            )
+
+            # Healthy baseline: the default composer focus accepts the Ctrl+B
+            # leader, and `t` toggles the persisted theme without typing.
+            if not pump_until(lambda text: tui_json.exists(), 2):
+                os.write(master, b'\x02t')
+            self.assertTrue(
+                pump_until(lambda text: tui_json.exists(), 10),
+                'Writable config root never produced tui.json: ' + current_text(),
+            )
+            self.assertNotIn('Could not save local settings', current_text())
+
+            # Renaming the temp file onto a directory fails, so the next save
+            # cannot succeed even though the directory itself is writable.
+            os.remove(tui_json)
+            os.mkdir(tui_json)
+            self.addCleanup(os.rmdir, tui_json)
+
+            os.write(master, b'\x02t')
+            # Bound the user-visible latency well below the five-second
+            # reconciliation poll. This proves the message paints promptly; it
+            # does not isolate which queued frame request painted it.
+            self.assertTrue(
+                pump_until(lambda text: 'Could not save local settings' in text, 1.5),
+                'Failed save was not painted without another key: ' + current_text(),
+            )
+            failing_frame = bytes(raw)
+            failing_text = '\n'.join(SHOT['render'](failing_frame, 100, 30).display)
+            self.assertIn('Could not save local settings', failing_text)
+            self.assertTrue(tui_json.is_dir(), 'Failed save replaced the blocking directory')
+
+            artifacts = os.environ.get('BLOOM_E2E_ARTIFACTS')
+            if artifacts:
+                dest = Path(artifacts) / self._testMethodName
+                dest.mkdir(parents=True, exist_ok=True)
+                (dest / 'screen.txt').write_text(failing_text + '\n')
+                (dest / 'screen.ansi').write_bytes(failing_frame)
+
+            os.write(master, b'?')
+            self.assertTrue(
+                pump_until(lambda text: 'this sheet' in text, 5),
+                'Loop did not respond to a key after the failed save: ' + current_text(),
+            )
+            os.write(master, b'\x1b')
+        finally:
+            try:
+                os.kill(pid, signal.SIGTERM)
+            except OSError:
+                pass
+            os.waitpid(pid, 0)
+            os.close(master)
+
 
 if __name__ == '__main__':
     unittest.main(verbosity=2)
