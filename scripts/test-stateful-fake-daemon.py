@@ -1067,5 +1067,99 @@ class FrameSerialization(unittest.TestCase):
         self.check_fixture(DAEMON, 6)
 
 
+class FrameHeaderParity(unittest.TestCase):
+    """Both fixtures must accept and reject the same frame headers."""
+
+    def call_read_frame(self, module, data):
+        client, server = socket.socketpair()
+        outcome = {}
+
+        def worker():
+            try:
+                outcome["value"] = module["read_frame"](server)
+            except BaseException as error:  # noqa: BLE001 - recorded for assertion
+                outcome["error"] = error
+
+        thread = threading.Thread(target=worker, daemon=True)
+        try:
+            client.sendall(data)
+            thread.start()
+            thread.join(TIMEOUT)
+            if thread.is_alive():
+                server.close()
+                client.close()
+                thread.join(TIMEOUT)
+            self.assertFalse(thread.is_alive(), "read_frame did not return within the timeout")
+        finally:
+            client.close()
+            server.close()
+        return outcome
+
+    def test_valid_v6_frame_parses_in_both_fixtures(self):
+        payload = {"request_id": 3, "request": {"op": "echo", "who": identity("me@example.invalid")}}
+        for path in (DAEMON, FAKE):
+            with self.subTest(fixture=os.path.basename(path)):
+                module = runpy.run_path(path)
+                frame_version, body, size = parse_frame(module["frame"](payload))
+                self.assertEqual(frame_version, 6)
+                self.assertEqual(size, len(json.dumps(body, separators=(",", ":"), ensure_ascii=False).encode()))
+                outcome = self.call_read_frame(module, module["frame"](payload))
+                self.assertNotIn("error", outcome)
+                self.assertEqual(outcome.get("value"), body)
+
+    def test_malformed_headers_rejected_identically_by_both_fixtures(self):
+        limit = runpy.run_path(FAKE)["MAX_FRAME"]
+        cases = {
+            "version 5": (5, 2),
+            "version 99": (99, 2),
+            "zero length": (6, 0),
+            "oversized length": (6, limit + 1),
+        }
+        for label, (version, length) in cases.items():
+            outcomes = []
+            for path in (DAEMON, FAKE):
+                with self.subTest(fixture=os.path.basename(path), case=label):
+                    outcome = self.call_read_frame(
+                        runpy.run_path(path), struct.pack(">BI", version, length)
+                    )
+                    self.assertIn("error", outcome, "malformed header was accepted")
+                    self.assertIsInstance(outcome["error"], ValueError)
+                    outcomes.append((type(outcome["error"]), str(outcome["error"])))
+            self.assertEqual(outcomes[0], outcomes[1], "fixtures disagree on the rejection")
+
+
+class StaticServeClientInvalidHeader(unittest.TestCase):
+    def test_v5_request_closes_without_response(self):
+        module = runpy.run_path(FAKE)
+        client, server = socket.socketpair()
+        thread = None
+        try:
+            request = {"request_id": 9, "request": {"op": "list_conversations"}}
+            payload = json.dumps(request).encode()
+            client.settimeout(TIMEOUT)
+            thread = threading.Thread(target=module["serve_client"], args=(server,), daemon=True)
+            thread.start()
+            client.sendall(b"\x05" + struct.pack(">I", len(payload)) + payload)
+            received = bytearray()
+            while True:
+                try:
+                    chunk = client.recv(4096)
+                except socket.timeout:
+                    self.fail("serve_client did not close the invalid connection")
+                except ConnectionResetError:
+                    break
+                if not chunk:
+                    break
+                received.extend(chunk)
+            self.assertEqual(bytes(received), b"", "serve_client wrote a response to an invalid header")
+            thread.join(TIMEOUT)
+            self.assertFalse(thread.is_alive(), "serve_client thread did not exit")
+        finally:
+            client.close()
+            server.close()
+            if thread is not None:
+                thread.join(TIMEOUT)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

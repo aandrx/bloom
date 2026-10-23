@@ -80,7 +80,9 @@ def read_frame(conn: socket.socket) -> dict | None:
         if not chunk:
             return None
         header += chunk
-    (_version, length) = struct.unpack(">BI", header)
+    (version, length) = struct.unpack(">BI", header)
+    if version != PROTOCOL_VERSION or length < 1 or length > MAX_FRAME:
+        raise ValueError("invalid frame header")
     body = b""
     while len(body) < length:
         chunk = conn.recv(length - len(body))
@@ -421,7 +423,11 @@ def search_messages(query, limit, participant=None) -> list[dict]:
 
 def serve_client(conn: socket.socket) -> None:
     while True:
-        request = read_frame(conn)
+        try:
+            request = read_frame(conn)
+        except ValueError:
+            conn.close()
+            break
         if request is None:
             break
         request_id = request.get("request_id", 0)
