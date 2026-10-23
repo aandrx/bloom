@@ -8,7 +8,7 @@ use bloom_domain::{
 };
 use bloom_ipc::EventKind;
 use bloom_tui::{
-    app::{Action, App, SendPhase},
+    app::{Action, App, SendPhase, UnreadCount},
     daemon::Snapshot,
     KeyCode, KeyEvent, KeyModifiers,
 };
@@ -1894,5 +1894,159 @@ fn a_successful_send_clears_composer_history() {
     assert_eq!(
         app.draft, "",
         "sent text cannot be undone back into a draft"
+    );
+}
+
+#[test]
+fn unread_command_and_leader_chord_anchor_the_first_unread_or_report_none() {
+    let chat = conversation("Weekend crew", 2);
+    let rows = vec![
+        message(&chat, "m1"),
+        message(&chat, "m2"),
+        message(&chat, "m3"),
+    ];
+    let mut app = App::default();
+    app.set_conversations(vec![chat.clone()]);
+    app.select(Some(chat.id.clone()));
+    app.messages.insert(chat.id.clone(), rows.clone());
+    app.read_positions
+        .insert(chat.id.clone(), (rows[0].created_at, rows[0].id().clone()));
+
+    for character in "/unread".chars() {
+        app.handle_key(key(KeyCode::Char(character)));
+    }
+    app.handle_key(key(KeyCode::Enter));
+    assert_eq!(
+        app.reading_anchor
+            .as_ref()
+            .map(|anchor| anchor.message.clone()),
+        Some(rows[1].id().clone()),
+        "the slash command anchors on the oldest unread message"
+    );
+    assert!(app.scroll > 0);
+
+    app.reading_anchor = None;
+    app.scroll = 0;
+    app.handle_key(ctrl(KeyCode::Char('b')));
+    app.handle_key(key(KeyCode::Char('u')));
+    assert_eq!(
+        app.reading_anchor
+            .as_ref()
+            .map(|anchor| anchor.message.clone()),
+        Some(rows[1].id().clone()),
+        "Ctrl+B u reaches the same first unread message"
+    );
+
+    app.mark_read(chat.id.clone(), rows[2].clone());
+    app.reading_anchor = None;
+    app.scroll = 0;
+    app.handle_key(ctrl(KeyCode::Char('b')));
+    app.handle_key(key(KeyCode::Char('u')));
+    assert!(app.reading_anchor.is_none());
+    assert_eq!(app.notice.as_deref(), Some("No unread messages."));
+
+    app.notice = None;
+    for character in "/unread".chars() {
+        app.handle_key(key(KeyCode::Char(character)));
+    }
+    app.handle_key(key(KeyCode::Enter));
+    assert_eq!(app.notice.as_deref(), Some("No unread messages."));
+}
+
+#[test]
+fn following_the_newest_row_marks_read_but_reading_back_does_not() {
+    let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 20)).unwrap();
+    let mut paint = |app: &mut App| {
+        let mut view = None;
+        terminal
+            .draw(|frame| view = bloom_tui::ui::render(frame, app).transcript_view)
+            .unwrap();
+        app.record_transcript(view);
+    };
+    let chat = conversation("Weekend crew", 2);
+    let mut first = message(&chat, "m1");
+    first.parts = vec![MessagePart::Text("a long visible history\n".repeat(50))];
+    let second = message(&chat, "m2");
+    let mut app = App::default();
+    app.set_conversations(vec![chat.clone()]);
+    app.select(Some(chat.id.clone()));
+
+    app.apply_snapshot(Snapshot {
+        revision: 1,
+        conversations: vec![chat.clone()],
+        visible: Some(chat.id.clone()),
+        history: vec![first.clone()],
+    });
+    assert!(
+        app.read_positions.is_empty(),
+        "receiving a snapshot is not reading it"
+    );
+    paint(&mut app);
+    assert_eq!(
+        app.read_positions.get(&chat.id),
+        Some(&(first.created_at, first.id().clone())),
+        "a frame following the newest row records it as read"
+    );
+
+    app.scroll = 3;
+    app.apply_snapshot(Snapshot {
+        revision: 2,
+        conversations: vec![chat.clone()],
+        visible: Some(chat.id.clone()),
+        history: vec![first.clone(), second.clone()],
+    });
+    paint(&mut app);
+    assert!(app.scroll > 0);
+    assert_eq!(
+        app.read_positions.get(&chat.id),
+        Some(&(first.created_at, first.id().clone())),
+        "reading back must not advance the stored position"
+    );
+
+    app.scroll = 0;
+    app.help_open = true;
+    app.apply_snapshot(Snapshot {
+        revision: 3,
+        conversations: vec![chat.clone()],
+        visible: Some(chat.id.clone()),
+        history: vec![first.clone(), second.clone()],
+    });
+    paint(&mut app);
+    assert_eq!(
+        app.read_positions.get(&chat.id),
+        Some(&(first.created_at, first.id().clone())),
+        "an overlay owning input must not mark the thread read"
+    );
+}
+
+#[test]
+fn persisted_read_position_survives_apply_read_positions_round_trip() {
+    let chat = conversation("Weekend crew", 2);
+    let rows = vec![
+        message(&chat, "m1"),
+        message(&chat, "m2"),
+        message(&chat, "m3"),
+    ];
+    let mut app = App::default();
+    app.set_conversations(vec![chat.clone()]);
+    app.messages.insert(chat.id.clone(), rows.clone());
+    app.mark_read(chat.id.clone(), rows[0].clone());
+    let stored = app.read_positions_for_config();
+
+    let mut reloaded = App::default();
+    reloaded.set_conversations(vec![chat.clone()]);
+    reloaded.messages.insert(chat.id.clone(), rows.clone());
+    reloaded.apply_read_positions(&stored);
+
+    assert_eq!(
+        reloaded.unread_count(&chat.id),
+        Some(UnreadCount {
+            shown: 2,
+            capped: false,
+        })
+    );
+    assert_eq!(
+        reloaded.first_unread(&chat.id).map(Message::id),
+        Some(rows[1].id())
     );
 }

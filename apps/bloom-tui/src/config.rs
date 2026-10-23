@@ -13,6 +13,18 @@ fn default_true() -> bool {
     true
 }
 
+/// The newest message the user has seen in one conversation. This is local
+/// navigation state only: it is never sent anywhere and never acts as a read
+/// receipt or a claim about remote read state.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct StoredReadPosition {
+    /// Store ordering: `created_at`, then the message id's JSON encoding.
+    pub created_at: i64,
+    pub transport: String,
+    pub value: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(default)]
 pub struct Config {
@@ -31,6 +43,9 @@ pub struct Config {
     /// Conversations closed locally, keyed by canonical conversation identity. The
     /// messages are untouched; the chat is only hidden from the list.
     pub hidden: Vec<String>,
+    /// Local read positions keyed by canonical conversation key. Missing keys and
+    /// unknown keys are harmless: an unread count simply falls back to no state.
+    pub read_positions: HashMap<String, StoredReadPosition>,
 }
 
 impl Default for Config {
@@ -43,6 +58,7 @@ impl Default for Config {
             nicknames: HashMap::new(),
             titles: HashMap::new(),
             hidden: Vec::new(),
+            read_positions: HashMap::new(),
         }
     }
 }
@@ -302,6 +318,56 @@ mod tests {
         assert!(!valid_nickname("  "));
         assert!(!valid_nickname("line\nbreak"));
         assert!(!valid_nickname(&"x".repeat(81)));
+    }
+
+    #[test]
+    fn configs_without_read_positions_load_with_an_empty_map() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("settings.json");
+        fs::write(
+            &path,
+            r#"{"version":1,"titles":{"openbubbles|chat":"Maya"}}"#,
+        )
+        .unwrap();
+        let (config, warning) = Config::load(&path);
+        assert_eq!(warning, None);
+        assert!(config.read_positions.is_empty());
+        assert_eq!(
+            config.titles.get("openbubbles|chat").map(String::as_str),
+            Some("Maya")
+        );
+    }
+
+    #[test]
+    fn read_positions_roundtrip_through_a_saved_config() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("settings.json");
+        let mut config = Config::default();
+        config.read_positions.insert(
+            "openbubbles|chat".into(),
+            StoredReadPosition {
+                created_at: 42,
+                transport: "openbubbles".into(),
+                value: "message-7".into(),
+            },
+        );
+        config.save(&path).unwrap();
+        assert_eq!(Config::load(&path), (config, None));
+    }
+
+    #[test]
+    fn unknown_read_position_keys_are_kept_without_disturbing_the_config() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("settings.json");
+        fs::write(
+            &path,
+            r#"{"version":1,"read_positions":{"not-a-known-key":{"created_at":7,"transport":"x","value":"y"}}}"#,
+        )
+        .unwrap();
+        let (config, warning) = Config::load(&path);
+        assert_eq!(warning, None);
+        assert_eq!(config.version, 1);
+        assert!(config.read_positions.contains_key("not-a-known-key"));
     }
 
     #[cfg(unix)]

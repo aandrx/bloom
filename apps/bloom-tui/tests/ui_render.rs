@@ -11,7 +11,7 @@ use bloom_domain::{
 use bloom_ipc::MessageSearchHit;
 use bloom_tui::{
     app::{App, Focus, SendFeedback, SendPhase, Theme, OLDER_PAGE_LIMIT, SEARCH_RESULT_LIMIT},
-    daemon::ConnectionState,
+    daemon::{ConnectionState, HISTORY_LIMIT},
     ui,
 };
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEventKind};
@@ -4125,5 +4125,171 @@ fn search_overlay_paints_over_the_transcript_and_owns_the_wheel() {
         app.search.as_ref().expect("search state").selected,
         1,
         "the wheel moves the hit selection"
+    );
+}
+
+#[test]
+fn sidebar_unread_badges_show_counts_and_skip_read_chats() {
+    let weekend = conversation("Weekend crew", 2, 40);
+    let jules = conversation("Jules Lee", 2, 20);
+    let mut app = App::default();
+    app.set_conversations(vec![weekend.clone(), jules.clone()]);
+    app.selected = Some(weekend.id.clone());
+
+    let weekend_rows = vec![
+        message(&weekend, "w1", 10, "older weekend", false),
+        message(&weekend, "w2", 20, "newest weekend", false),
+    ];
+    let jules_rows = vec![
+        message(&jules, "j1", 10, "older jules", false),
+        message(&jules, "j2", 20, "middle jules", false),
+        message(&jules, "j3", 30, "newest jules", false),
+    ];
+    app.messages
+        .insert(weekend.id.clone(), weekend_rows.clone());
+    app.messages.insert(jules.id.clone(), jules_rows.clone());
+    app.read_positions
+        .insert(weekend.id.clone(), (20, weekend_rows[1].id().clone()));
+    app.read_positions
+        .insert(jules.id.clone(), (10, jules_rows[0].id().clone()));
+
+    let grid = buffer(&app, 100, 30);
+    let sidebar_row = |title: &str| {
+        (0..grid.area.height)
+            .map(|y| {
+                row_text(&grid, y)
+                    .split('│')
+                    .next()
+                    .unwrap_or_default()
+                    .to_owned()
+            })
+            .find(|sidebar| sidebar.contains(title))
+            .expect("sidebar conversation row")
+    };
+    let weekend_row = sidebar_row("Weekend crew");
+    let jules_row = sidebar_row("Jules Lee");
+    assert!(weekend_row.contains("Weekend crew"));
+    assert!(
+        !weekend_row.contains("·"),
+        "a fully read chat has no badge: {weekend_row:?}"
+    );
+    assert!(
+        jules_row.contains("Jules Lee · 2"),
+        "unread count follows the chat name: {jules_row:?}"
+    );
+}
+
+#[test]
+fn sidebar_renders_the_capped_unread_form() {
+    let capped = conversation("Capped chat", 2, 1);
+    let mut app = App::default();
+    app.set_conversations(vec![capped.clone()]);
+    let rows: Vec<_> = (0..HISTORY_LIMIT)
+        .map(|index| {
+            message(
+                &capped,
+                &format!("c{index:03}"),
+                1_000 + i64::from(index),
+                "unread",
+                false,
+            )
+        })
+        .collect();
+    app.messages.insert(capped.id.clone(), rows);
+    app.read_positions.insert(
+        capped.id.clone(),
+        (0, MessageId::new(transport(), "floor").unwrap()),
+    );
+
+    let grid = buffer(&app, 100, 30);
+    let sidebar: Vec<String> = (0..grid.area.height)
+        .map(|y| {
+            row_text(&grid, y)
+                .split('│')
+                .next()
+                .unwrap_or_default()
+                .to_owned()
+        })
+        .collect();
+    assert!(
+        sidebar.iter().any(|row| row.contains("Capped chat · 200+")),
+        "the full loaded page renders the capped form: {sidebar:?}"
+    );
+}
+
+#[test]
+fn sidebar_and_drawer_badges_keep_the_name_at_narrow_widths() {
+    let weekend = conversation("Weekend crew", 2, 40);
+    let mut app = App::default();
+    app.set_conversations(vec![weekend.clone()]);
+    let rows = vec![
+        message(&weekend, "w1", 10, "older", false),
+        message(&weekend, "w2", 20, "newer", false),
+        message(&weekend, "w3", 30, "newest", false),
+    ];
+    app.messages.insert(weekend.id.clone(), rows.clone());
+    app.read_positions
+        .insert(weekend.id.clone(), (10, rows[0].id().clone()));
+    app.compact_sidebar = true;
+
+    let rail = buffer(&app, 72, 24);
+    let rail_text = (0..rail.area.height)
+        .map(|y| {
+            row_text(&rail, y)
+                .split('│')
+                .next()
+                .unwrap_or_default()
+                .to_owned()
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(
+        rail_text.contains("Weekend") && rail_text.contains("· 2"),
+        "a clipped narrow rail keeps both the name and badge:\n{rail_text}"
+    );
+
+    app.open_chat_drawer();
+    let drawer = buffer(&app, 44, 12);
+    let drawer_text = (0..drawer.area.height)
+        .map(|y| row_text(&drawer, y))
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(
+        drawer_text.contains("Weekend crew · 2"),
+        "the narrow Chats drawer carries the same badge:\n{drawer_text}"
+    );
+}
+
+#[test]
+fn header_drops_unread_count_before_identity_at_tight_widths() {
+    let weekend = conversation("Weekend crew planning", 2, 40);
+    let mut app = App::default();
+    app.set_conversations(vec![weekend.clone()]);
+    app.selected = Some(weekend.id.clone());
+    let rows = vec![
+        message(&weekend, "w1", 10, "older", false),
+        message(&weekend, "w2", 20, "newer", false),
+        message(&weekend, "w3", 30, "newest", false),
+    ];
+    app.messages.insert(weekend.id.clone(), rows.clone());
+    app.read_positions
+        .insert(weekend.id.clone(), (10, rows[0].id().clone()));
+
+    let wide = buffer(&app, 120, 30);
+    let wide_header = row_text(&wide, 0);
+    assert!(
+        wide_header.contains("Weekend crew planning") && wide_header.contains("· 2"),
+        "wide header shows identity and count: {wide_header:?}"
+    );
+
+    let tight = buffer(&app, 44, 10);
+    let tight_header = row_text(&tight, 0);
+    assert!(
+        tight_header.contains("Weekend"),
+        "identity survives a tight header: {tight_header:?}"
+    );
+    assert!(
+        !tight_header.contains("· 2"),
+        "the optional unread count goes first: {tight_header:?}"
     );
 }

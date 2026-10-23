@@ -9,6 +9,7 @@
 - Recipient-owned session drafts and modal suspension, literal bracketed paste, grapheme editing/wrapping, exact multiline whitespace, responsive resize, and session-only composer undo/redo that clears when the draft changes owner.
 - On-demand older-page loading from local storage: reaching the oldest loaded row fetches the previous keyset page, keeps it across reconciliation for chats you paged back, and bounds retained paged history. Chats you never paged still replace wholesale, and no remote history is fetched.
 - Message-owned reading anchors across arrivals/reconciliation/edits/reflow and canonical identities; measured mouse/End Latest action and painted-overlay wheel ownership.
+- Local unread badges and `/unread` or Ctrl+B then `u` navigation over loaded incoming messages. Markers advance only after a successfully displayed latest transcript, migrate across aliases, and persist in private but unencrypted TUI preferences. No marker or loaded history means unknown unread state, not zero. These are not remote read receipts.
 - Below 70 columns, full-width conversations with a searchable Chats navigator. Query/candidate stay separate from actual recipient and parked composition until explicit open.
 - Known-participant contacts/search/local nicknames, local titles/hiding, conversation filtering, settings/theme/command pickers, keyboard/mouse paths, light/dark/automatic themes and monochrome cues.
 - Metadata `/sync` with explicit in-flight lifetime and post-refresh local reread. Inbound message/update/delivery/list events infer activity until two quiet seconds. Failed/blocked/disconnected session states outrank activity. This is not archive completion.
@@ -25,12 +26,14 @@
 | Rich messaging | Unsupported inbound parts are placeholders; no attachment send/open/download, reactions, edits or unsend UI |
 | Delivery | Labels reflect mapped transport events; presence of a Read enum is not proof of remote read-receipt support |
 | Accounts | Reuses an existing registration; no Bloom sign-in/activation/recovery; renewal unconfirmed |
-| Composition/reading | Session-only drafts and undo, no unread count, no attachment search and no reviewed encrypted durable drafts |
+| Composition/reading | Session-only drafts and undo; local unread counts cover only loaded messages with a saved marker; markers have no automatic expiry; no attachment search or reviewed encrypted durable drafts |
 | Packaging/platforms | Linux/OpenBubbles Flatpak is the documented setup; not a standalone Cargo-only or Windows distribution |
 | Accessibility | Keyboard/grapheme/monochrome/light-theme coverage, not broad terminal/font/screen-reader validation |
 | Future GUI/transport | GPUI not started; independent registration blocked at Gate 0; Matrix remains an excluded proof |
 
 ## Evidence
+
+Local unread navigation was verified under shipp after the review corrections: workspace all-target tests, Tokyo-timezone TUI tests, strict workspace Clippy, formatting, source guard, rebuilt binaries, and all synthetic runtime suites passed. Runtime counts are 10 fixture, 12 input, 4 messaging, 10 reading/navigation, and 8 launcher tests. The scoped source rereview found no confirmed defects in the corrections. Parent inspected the PTY badge, read-clear, and first-unread output. A failed settings save can wait for another redraw to display its error and retry on later loop iterations; this remains a non-blocking limitation.
 
 - `apps/bloomd/tests/engine_sidecar.rs`: real daemon/service/store code with a fake child stdio sidecar, including persistence, duplicate handling, identity/routing, metadata sync, malformed output and shutdown drain.
 - TUI library/interactions/render tests: state, ownership/recovery, cursor/palette/hitboxes and responsive geometry. `daemon_session.rs` uses a real synthetic Unix socket for subscription/snapshot/reconciliation/reconnect.
@@ -46,6 +49,6 @@ Independent source review for the current UI pass found a canonical-alias readin
 
 ## Release blockers and next work
 
-The user-directed priority remains UI/UX; this bounded reading/navigation pass is accepted, not permission to resume integrations or access a live account. [The roadmap](implementation-plan.md) keeps backend work queued: generation-scoped engine recovery, verified historical ingestion semantics/implementation, message search and unread navigation, then standalone runtime packaging. Keep the existing registration exclusively owned and do not automatically replay uncertain sends. [IDS validation](ids-validation-gate.md) remains separate and blocked.
+The user-directed priority remains UI/UX; this bounded reading/navigation pass is accepted, not permission to resume integrations or access a live account. [The roadmap](implementation-plan.md) next addresses deep search hits beyond the retained history budget. Generation-scoped engine recovery, verified historical ingestion, and standalone runtime packaging remain queued backend work. Keep the existing registration exclusively owned and do not automatically replay uncertain sends. [IDS validation](ids-validation-gate.md) remains separate and blocked.
 
 Optional mutation guards in `scripts/check-guards` require clean files and restore their mutations; they are not CI evidence or permission to reset working changes. Inspect the manifest and current tests before running them.

@@ -1,11 +1,11 @@
 //! UI state for the Bloom TUI. Rendering lives in `ui.rs`.
 
 use crate::composer::wrap_draft;
-use crate::daemon::{ConnectionState, Snapshot};
+use crate::daemon::{ConnectionState, Snapshot, HISTORY_LIMIT};
 use crate::ui::{Hit, HitMap};
 use bloom_domain::{
     Conversation, ConversationId, ConversationKind, Handle, HandleKind, Message, MessageId,
-    Participant,
+    Participant, TransportId,
 };
 use bloom_ipc::{ConversationSyncStatus, EventKind, MessageSearchHit};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEventKind};
@@ -16,7 +16,7 @@ use unicode_segmentation::UnicodeSegmentation;
 /// Rows a single PageUp or PageDown moves through the transcript.
 const SCROLL_PAGE: usize = 10;
 
-pub const HELP_ROW_COUNT: usize = 18;
+pub const HELP_ROW_COUNT: usize = 19;
 
 /// Messages requested per older-history page.
 pub const OLDER_PAGE_LIMIT: u32 = 200;
@@ -129,6 +129,12 @@ fn message_order(a: &Message, b: &Message) -> std::cmp::Ordering {
 
 fn oldest_message(messages: &[Message]) -> Option<&Message> {
     messages.iter().min_by(|a, b| message_order(a, b))
+}
+
+/// The same store ordering applied to a stored read position, which keeps only a
+/// timestamp and message id rather than a whole message.
+fn position_order(created_at: i64, id: &MessageId) -> (i64, String) {
+    (created_at, serde_json::to_string(id).unwrap_or_default())
 }
 
 fn sanitize_paste(input: &str) -> String {
@@ -364,6 +370,9 @@ pub struct App {
     /// Conversations closed locally. They stay in the store and can be restored
     /// with `/unhide`; closing never deletes messages.
     pub hidden: HashSet<String>,
+    /// The newest message the user has seen in each conversation. Local
+    /// navigation state only: never a read receipt and never remote read state.
+    pub read_positions: HashMap<ConversationId, (i64, MessageId)>,
     /// The right-click menu for a conversation, when open.
     pub context_menu: Option<ContextMenu>,
     /// The conversation whose local title the composer is editing.
@@ -381,6 +390,15 @@ pub struct App {
     pub pending_search: Option<(u64, String)>,
     /// Monotonic id for message-search replies.
     pub search_request: u64,
+}
+
+/// Local unread navigation state for one conversation. `shown` counts only loaded
+/// messages; `capped` means the count is bounded by the newest loaded page and may
+/// understate how much is unread.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct UnreadCount {
+    pub shown: usize,
+    pub capped: bool,
 }
 
 /// Navigation is a separate input owner. Highlighting never retargets a draft;
@@ -505,6 +523,7 @@ impl Default for App {
             help_scroll: 0,
             titles: HashMap::new(),
             hidden: HashSet::new(),
+            read_positions: HashMap::new(),
             context_menu: None,
             renaming: None,
             search: None,
@@ -773,6 +792,28 @@ impl App {
     }
 
     pub fn set_conversations(&mut self, mut conversations: Vec<Conversation>) {
+        // Read markers belong to every known conversation, not just the open one.
+        // Merge aliases before selection reconciliation, including after reload.
+        for conversation in &conversations {
+            for alias in &conversation.aliases {
+                if alias == &conversation.id {
+                    continue;
+                }
+                if let Some(position) = self.read_positions.remove(alias) {
+                    let advances =
+                        self.read_positions
+                            .get(&conversation.id)
+                            .is_none_or(|current| {
+                                position_order(position.0, &position.1)
+                                    > position_order(current.0, &current.1)
+                            });
+                    if advances {
+                        self.read_positions
+                            .insert(conversation.id.clone(), position);
+                    }
+                }
+            }
+        }
         if let Some(selected) = self.selected.clone() {
             if let Some(canonical) = conversations
                 .iter()
@@ -1009,12 +1050,13 @@ impl App {
                 None
             };
             self.transcript_viewport = Some(view);
+            self.mark_selected_read_if_following();
         } else if self.new_conversation || self.selected.is_none() {
             self.scroll_to_newest();
             self.transcript_viewport = None;
         }
         // A tiny fallback frame has no transcript; retain its last reading anchor
-        // so restoring a usable terminal size does not silently jump to latest.
+        // and do not mark unseen messages read.
     }
 
     /// True when a panel or popup consumes input instead of the transcript.
@@ -2451,6 +2493,7 @@ impl App {
             ("/filter", "Filter your conversations"),
             ("/compact", "Toggle sidebar density"),
             ("/unhide", "Restore chats hidden with Close"),
+            ("/unread", "Jump to the first unread message"),
             ("/cancel", "Close the composer"),
         ]
         .into_iter()
@@ -2603,6 +2646,12 @@ impl App {
                 self.error = None;
                 self.retire_active_draft();
                 self.begin_new_conversation();
+            }
+            ["/unread"] => {
+                self.error = None;
+                self.jump_to_first_unread_or_notice();
+                self.draft.clear();
+                self.draft_cursor = 0;
             }
             ["/filter"] => {
                 self.error = None;
@@ -3243,6 +3292,7 @@ impl App {
                 KeyCode::Char('f') => self.begin_filter(),
                 KeyCode::Char('t') => self.toggle_theme(),
                 KeyCode::Char('s') => self.open_settings(),
+                KeyCode::Char('u') => self.jump_to_first_unread_or_notice(),
                 _ => {}
             }
             return Action::None;
@@ -3878,6 +3928,151 @@ impl App {
     /// A stable local key for a conversation, used for titles and hidden ids.
     pub fn conversation_key(id: &ConversationId) -> String {
         conversation_key(id)
+    }
+
+    /// Replace the local read positions from a loaded config. Keys that cannot be
+    /// parsed into a conversation and message identity are ignored, so a stale or
+    /// unknown key is harmless.
+    pub fn apply_read_positions(
+        &mut self,
+        stored: &HashMap<String, crate::config::StoredReadPosition>,
+    ) {
+        self.read_positions.clear();
+        for (key, position) in stored {
+            let Some((conversation_transport, conversation_value)) = key.split_once('|') else {
+                continue;
+            };
+            let Ok(conversation_transport) = TransportId::new(conversation_transport) else {
+                continue;
+            };
+            let Ok(conversation) = ConversationId::new(conversation_transport, conversation_value)
+            else {
+                continue;
+            };
+            let Ok(message_transport) = TransportId::new(position.transport.clone()) else {
+                continue;
+            };
+            let Ok(message) = MessageId::new(message_transport, position.value.clone()) else {
+                continue;
+            };
+            self.read_positions
+                .insert(conversation, (position.created_at, message));
+        }
+    }
+
+    /// The local read positions in the shape the saved config stores.
+    pub fn read_positions_for_config(&self) -> HashMap<String, crate::config::StoredReadPosition> {
+        self.read_positions
+            .iter()
+            .map(|(conversation, (created_at, message))| {
+                (
+                    conversation_key(conversation),
+                    crate::config::StoredReadPosition {
+                        created_at: *created_at,
+                        transport: message.transport().as_str().to_owned(),
+                        value: message.value().to_owned(),
+                    },
+                )
+            })
+            .collect()
+    }
+
+    /// Record a message as the newest seen for its conversation. Positions only
+    /// move forward, so marking an older message read changes nothing.
+    pub fn mark_read(&mut self, conversation: ConversationId, message: Message) -> bool {
+        let advanced = self
+            .read_positions
+            .get(&conversation)
+            .is_none_or(|(created_at, id)| {
+                position_order(message.created_at, message.id()) > position_order(*created_at, id)
+            });
+        if advanced {
+            self.read_positions
+                .insert(conversation, (message.created_at, message.id().clone()));
+        }
+        advanced
+    }
+
+    /// How many loaded messages are newer than the stored position, and whether
+    /// that count is bounded by the newest loaded page.
+    pub fn unread_count(&self, conversation: &ConversationId) -> Option<UnreadCount> {
+        let (created_at, id) = self.read_positions.get(conversation)?;
+        let messages = self.messages.get(conversation)?;
+        if messages.is_empty() {
+            return None;
+        }
+        let position = position_order(*created_at, id);
+        let shown = messages
+            .iter()
+            .filter(|message| {
+                !message.from_me && position_order(message.created_at, message.id()) > position
+            })
+            .count();
+        let capped = messages.len() >= HISTORY_LIMIT as usize
+            && messages
+                .iter()
+                .all(|message| position_order(message.created_at, message.id()) > position);
+        Some(UnreadCount { shown, capped })
+    }
+
+    /// The oldest loaded message newer than the stored position.
+    pub fn first_unread(&self, conversation: &ConversationId) -> Option<&Message> {
+        let (created_at, id) = self.read_positions.get(conversation)?;
+        let position = position_order(*created_at, id);
+        self.messages
+            .get(conversation)?
+            .iter()
+            .filter(|message| {
+                !message.from_me && position_order(message.created_at, message.id()) > position
+            })
+            .min_by(|a, b| message_order(a, b))
+    }
+
+    /// Mark the newest loaded message read only when the transcript is following
+    /// it. Reading back through history must not clear anything.
+    pub fn mark_selected_read_if_following(&mut self) -> bool {
+        if self.new_conversation || self.scroll != 0 || self.overlay_owns_input() {
+            return false;
+        }
+        let Some(conversation) = self.selected.clone() else {
+            return false;
+        };
+        let Some(newest) = self
+            .messages
+            .get(&conversation)
+            .and_then(|messages| messages.iter().max_by(|a, b| message_order(a, b)))
+            .cloned()
+        else {
+            return false;
+        };
+        self.mark_read(conversation, newest)
+    }
+
+    fn jump_to_first_unread_or_notice(&mut self) {
+        if !self.jump_to_first_unread() {
+            self.notice = Some("No unread messages.".into());
+        }
+    }
+
+    /// Anchor the transcript on the first unread message, the same way a search
+    /// jump anchors a hit. Returns false when the selected chat has nothing unread.
+    pub fn jump_to_first_unread(&mut self) -> bool {
+        // Explicit navigation supersedes an asynchronous search destination.
+        self.abandon_search_jump();
+        self.older_requested = false;
+        let Some(conversation) = self.selected.clone() else {
+            return false;
+        };
+        let Some(message) = self.first_unread(&conversation).map(|row| row.id().clone()) else {
+            return false;
+        };
+        self.reading_anchor = Some(crate::transcript::ReadingAnchor {
+            conversation,
+            message,
+            row: 0,
+        });
+        self.scroll = 1;
+        true
     }
 
     pub fn open_context_menu(&mut self, conversation: ConversationId) {
@@ -6520,5 +6715,297 @@ mod tests {
         );
         assert_eq!(app.search_query(), Some("needle"));
         assert!(app.search.as_ref().expect("search state").loading);
+    }
+
+    fn read_app() -> (App, Conversation) {
+        let conversation = conversation("read-chat", None);
+        let mut app = App::default();
+        app.select(Some(conversation.id.clone()));
+        (app, conversation)
+    }
+
+    #[test]
+    fn snapshots_and_missing_transcript_frames_do_not_mark_unseen_messages_read() {
+        let (mut app, conversation) = read_app();
+        let newest = message(&conversation, "m1", 10, "unseen");
+        app.apply_snapshot(Snapshot {
+            revision: 1,
+            conversations: vec![conversation.clone()],
+            visible: Some(conversation.id.clone()),
+            history: vec![newest],
+        });
+        assert!(app.read_positions.is_empty());
+        app.record_transcript(None);
+        assert!(app.read_positions.is_empty());
+    }
+
+    #[test]
+    fn read_positions_never_move_backwards() {
+        let (mut app, conversation) = read_app();
+        let older = message(&conversation, "m1", 10, "one");
+        let newer = message(&conversation, "m2", 20, "two");
+        assert!(app.mark_read(conversation.id.clone(), newer.clone()));
+        assert!(!app.mark_read(conversation.id.clone(), older));
+        assert_eq!(
+            app.read_positions.get(&conversation.id),
+            Some(&(20, newer.id().clone()))
+        );
+    }
+
+    #[test]
+    fn unread_counts_ignore_the_stored_position_and_anything_older() {
+        let (mut app, conversation) = read_app();
+        let rows = vec![
+            message(&conversation, "m1", 10, "one"),
+            message(&conversation, "m2", 20, "two"),
+            message(&conversation, "m3", 30, "three"),
+            message(&conversation, "m4", 40, "four"),
+        ];
+        app.messages.insert(conversation.id.clone(), rows.clone());
+        assert_eq!(app.unread_count(&conversation.id), None);
+
+        assert!(app.mark_read(conversation.id.clone(), rows[0].clone()));
+        assert_eq!(
+            app.unread_count(&conversation.id),
+            Some(UnreadCount {
+                shown: 3,
+                capped: false,
+            })
+        );
+
+        assert!(app.mark_read(conversation.id.clone(), rows[2].clone()));
+        assert_eq!(
+            app.unread_count(&conversation.id),
+            Some(UnreadCount {
+                shown: 1,
+                capped: false,
+            })
+        );
+    }
+
+    #[test]
+    fn unread_counts_are_capped_only_by_a_full_all_unread_page() {
+        let (mut app, conversation) = read_app();
+        let rows: Vec<_> = (0..HISTORY_LIMIT)
+            .map(|index| {
+                message(
+                    &conversation,
+                    &format!("m{index}"),
+                    1_000 + i64::from(index),
+                    "unread",
+                )
+            })
+            .collect();
+        app.messages.insert(conversation.id.clone(), rows.clone());
+        app.read_positions.insert(
+            conversation.id.clone(),
+            (
+                0,
+                MessageId::new(conversation.id.transport().clone(), "floor").unwrap(),
+            ),
+        );
+        assert_eq!(
+            app.unread_count(&conversation.id),
+            Some(UnreadCount {
+                shown: HISTORY_LIMIT as usize,
+                capped: true,
+            })
+        );
+
+        assert!(app.mark_read(conversation.id.clone(), rows[0].clone()));
+        assert_eq!(
+            app.unread_count(&conversation.id),
+            Some(UnreadCount {
+                shown: HISTORY_LIMIT as usize - 1,
+                capped: false,
+            })
+        );
+    }
+
+    #[test]
+    fn first_unread_is_the_oldest_unread_message() {
+        let (mut app, conversation) = read_app();
+        let rows = vec![
+            message(&conversation, "m1", 10, "one"),
+            message(&conversation, "m2", 20, "two"),
+            message(&conversation, "m3", 30, "three"),
+        ];
+        app.messages.insert(conversation.id.clone(), rows.clone());
+        assert!(app.mark_read(conversation.id.clone(), rows[0].clone()));
+        assert_eq!(
+            app.first_unread(&conversation.id).map(Message::id),
+            Some(rows[1].id())
+        );
+
+        assert!(app.mark_read(conversation.id.clone(), rows[2].clone()));
+        assert!(app.first_unread(&conversation.id).is_none());
+    }
+
+    #[test]
+    fn marking_read_follows_the_newest_only_while_following() {
+        let (mut app, conversation) = read_app();
+        let rows = vec![
+            message(&conversation, "m1", 10, "one"),
+            message(&conversation, "m2", 20, "two"),
+        ];
+        app.messages.insert(conversation.id.clone(), rows.clone());
+
+        app.scroll = 3;
+        assert!(!app.mark_selected_read_if_following());
+        assert!(app.read_positions.is_empty());
+
+        app.scroll = 0;
+        assert!(app.mark_selected_read_if_following());
+        assert_eq!(
+            app.read_positions.get(&conversation.id),
+            Some(&(20, rows[1].id().clone()))
+        );
+    }
+
+    #[test]
+    fn jump_to_first_unread_anchors_the_oldest_unread() {
+        let (mut app, conversation) = read_app();
+        let rows = vec![
+            message(&conversation, "m1", 10, "one"),
+            message(&conversation, "m2", 20, "two"),
+            message(&conversation, "m3", 30, "three"),
+        ];
+        app.messages.insert(conversation.id.clone(), rows.clone());
+        assert!(app.mark_read(conversation.id.clone(), rows[0].clone()));
+
+        assert!(app.jump_to_first_unread());
+        assert!(app.scroll > 0);
+        let anchor = app.reading_anchor.as_ref().expect("reading anchor");
+        assert_eq!(anchor.conversation, conversation.id);
+        assert_eq!(anchor.message, rows[1].id().clone());
+        assert_eq!(anchor.row, 0);
+
+        assert!(app.mark_read(conversation.id.clone(), rows[2].clone()));
+        app.scroll = 0;
+        app.reading_anchor = None;
+        assert!(!app.jump_to_first_unread());
+    }
+
+    #[test]
+    fn unread_review_aliases_preserve_the_newest_read_position_even_when_not_selected() {
+        let old = conversation("old-read-chat", None);
+        let mut canonical = conversation("canonical-read-chat", None);
+        canonical.aliases = vec![old.id.clone()];
+        for old_is_newer in [false, true] {
+            let mut app = App::default();
+            let old_at = if old_is_newer { 30 } else { 10 };
+            let old_message = message(&old, "old-marker", old_at, "seen");
+            let canonical_message = message(&canonical, "canonical-marker", 20, "seen");
+            app.mark_read(old.id.clone(), old_message.clone());
+            app.mark_read(canonical.id.clone(), canonical_message.clone());
+            // A config reload also has no selection before metadata arrives.
+            let mut restored = App::default();
+            restored.apply_read_positions(&app.read_positions_for_config());
+            restored.set_conversations(vec![canonical.clone()]);
+            let expected = if old_is_newer {
+                &old_message
+            } else {
+                &canonical_message
+            };
+            assert_eq!(
+                restored.read_positions.get(&canonical.id),
+                Some(&(expected.created_at, expected.id().clone()))
+            );
+            assert!(!restored.read_positions.contains_key(&old.id));
+            assert!(!restored
+                .read_positions_for_config()
+                .contains_key(&App::conversation_key(&old.id)));
+        }
+    }
+
+    #[test]
+    fn unread_review_own_messages_are_not_unread_or_navigation_targets() {
+        let (mut app, conversation) = read_app();
+        let seen = message(&conversation, "seen", 10, "seen");
+        let mut sent = message(&conversation, "sent", 20, "own outgoing");
+        sent.from_me = true;
+        let incoming = message(&conversation, "incoming", 30, "new inbound");
+        app.mark_read(conversation.id.clone(), seen.clone());
+        app.messages
+            .insert(conversation.id.clone(), vec![seen, sent]);
+        assert_eq!(
+            app.unread_count(&conversation.id),
+            Some(UnreadCount {
+                shown: 0,
+                capped: false
+            })
+        );
+        assert!(app.first_unread(&conversation.id).is_none());
+        app.messages
+            .get_mut(&conversation.id)
+            .unwrap()
+            .push(incoming.clone());
+        assert_eq!(
+            app.unread_count(&conversation.id),
+            Some(UnreadCount {
+                shown: 1,
+                capped: false
+            })
+        );
+        assert_eq!(
+            app.first_unread(&conversation.id).map(Message::id),
+            Some(incoming.id())
+        );
+    }
+
+    #[test]
+    fn unread_review_navigation_cancels_an_older_search_jump() {
+        let (mut app, conversation) = read_app();
+        let rows = vec![
+            message(&conversation, "seen", 10, "seen"),
+            message(&conversation, "unread", 20, "unread"),
+            message(&conversation, "old-search-target", 30, "target"),
+        ];
+        app.mark_read(conversation.id.clone(), rows[0].clone());
+        app.messages.insert(conversation.id.clone(), rows.clone());
+        app.search_jump = Some((conversation.id.clone(), rows[2].id().clone()));
+        app.older_requested = true;
+        assert!(app.jump_to_first_unread());
+        app.advance_search_jump();
+        assert!(app.search_jump.is_none());
+        assert!(!app.older_requested);
+        assert_eq!(
+            app.reading_anchor.as_ref().map(|anchor| &anchor.message),
+            Some(rows[1].id())
+        );
+    }
+
+    #[test]
+    fn read_positions_roundtrip_through_config_and_ignore_unknown_keys() {
+        let (mut app, conversation) = read_app();
+        let newest = message(&conversation, "m1", 10, "one");
+        assert!(app.mark_read(conversation.id.clone(), newest.clone()));
+
+        let stored = app.read_positions_for_config();
+        assert_eq!(
+            stored.get(&App::conversation_key(&conversation.id)),
+            Some(&crate::config::StoredReadPosition {
+                created_at: 10,
+                transport: conversation.id.transport().as_str().to_owned(),
+                value: "m1".to_owned(),
+            })
+        );
+
+        let mut with_unknown = stored.clone();
+        with_unknown.insert(
+            "not-a-known-key".into(),
+            crate::config::StoredReadPosition {
+                created_at: 1,
+                transport: "x".into(),
+                value: "y".into(),
+            },
+        );
+        let mut reloaded = App::default();
+        reloaded.apply_read_positions(&with_unknown);
+        assert_eq!(
+            reloaded.read_positions.get(&conversation.id),
+            Some(&(10, newest.id().clone()))
+        );
+        assert_eq!(reloaded.read_positions.len(), 1);
     }
 }

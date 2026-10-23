@@ -445,7 +445,22 @@ fn composer_content(app: &App, width: usize) -> (String, String, usize, bool, bo
     }
 }
 
-/// Conversation identity gets the whole rail width; counts are not unread badges.
+/// The local unread count for a conversation, from the newest loaded page. Counts
+/// are navigation state, never read receipts, and an empty or zero count is absent.
+fn unread_badge(app: &App, conversation: &bloom_domain::Conversation) -> Option<String> {
+    let count = app.unread_count(&conversation.id)?;
+    if count.shown == 0 {
+        return None;
+    }
+    Some(if count.capped {
+        format!("{}+", count.shown)
+    } else {
+        count.shown.to_string()
+    })
+}
+
+/// Conversation identity gets the rail width first, then the unread badge. When
+/// there is not enough room for both, the name remains and the badge is dropped.
 fn sidebar_name_line(
     app: &App,
     conversation: &bloom_domain::Conversation,
@@ -453,7 +468,19 @@ fn sidebar_name_line(
     palette: Palette,
 ) -> Line<'static> {
     let selected = Some(&conversation.id) == app.selected.as_ref() && !app.new_conversation;
-    let name = truncate_with_ellipsis(&app.conversation_name(conversation), width);
+    let mut name = app.conversation_name(conversation);
+    if let Some(badge) = unread_badge(app, conversation) {
+        let suffix = format!(" · {badge}");
+        let suffix_width = unicode_width::UnicodeWidthStr::width(suffix.as_str());
+        let name_width = width.saturating_sub(suffix_width);
+        name = if name_width >= 4 {
+            format!("{}{}", truncate_with_ellipsis(&name, name_width), suffix)
+        } else {
+            truncate_with_ellipsis(&name, width)
+        };
+    } else {
+        name = truncate_with_ellipsis(&name, width);
+    }
     Line::from(vec![Span::styled(
         name,
         Style::default()
@@ -2480,6 +2507,12 @@ fn render_cached_with_mode(
                 Span::styled(subtitle, Style::default().fg(palette.muted)),
             ]);
         }
+        if let Some(badge) = unread_badge(app, c) {
+            heading.extend([
+                Span::raw("  "),
+                Span::styled(format!("· {badge}"), Style::default().fg(palette.muted)),
+            ]);
+        }
     }
     let pane = right[0];
     let gutter = 2u16.min(pane.width / 4);
@@ -2597,7 +2630,17 @@ fn render_cached_with_mode(
         .map(|span| unicode_width::UnicodeWidthStr::width(span.content.as_ref()))
         .sum();
     if heading_width > usize::from(title_width) {
-        heading.truncate(1);
+        // The unread count is optional, so it yields before identity and status.
+        if heading.len() > 1 {
+            heading.truncate(heading.len().saturating_sub(2));
+        }
+        let remaining_width: usize = heading
+            .iter()
+            .map(|span| unicode_width::UnicodeWidthStr::width(span.content.as_ref()))
+            .sum();
+        if remaining_width > usize::from(title_width) {
+            heading.truncate(1);
+        }
     }
     let title_text: String = heading.iter().map(|span| span.content.as_ref()).collect();
     frame.render_widget(
@@ -3503,10 +3546,11 @@ fn render_help(frame: &mut Frame<'_>, app: &App, content: Rect, palette: Palette
         ("Ctrl+B n/p", "next / previous chat", "next / prev chat"),
         ("Ctrl+P", "previous chat", "previous chat"),
         (
-            "Ctrl+B f/s/t",
-            "filter / settings / theme",
-            "filter / settings / theme",
+            "Ctrl+B f/s/t/u",
+            "filter / settings / theme / unread",
+            "filter / settings / theme / unread",
         ),
+        ("/unread", "first unread message", "first unread"),
         ("Ctrl+C", "clear input; quit when empty", "clear / quit"),
     ];
     if content.height < 4 || content.width < 4 {

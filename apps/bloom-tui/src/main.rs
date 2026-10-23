@@ -201,6 +201,7 @@ async fn main() -> Result<()> {
         _ => None,
     };
     let mut terminal = Terminal::new(CrosstermBackend::new(io::stdout()))?;
+    let read_positions = config.read_positions.clone();
     let mut app = App {
         theme: theme_override.unwrap_or(system_theme),
         system_theme,
@@ -215,6 +216,7 @@ async fn main() -> Result<()> {
         connection_state: ConnectionState::Connecting,
         ..Default::default()
     };
+    app.apply_read_positions(&read_positions);
 
     let (event_tx, mut event_rx) = mpsc::unbounded_channel::<EventKind>();
     let (snapshot_tx, mut snapshot_rx) = mpsc::unbounded_channel::<Snapshot>();
@@ -312,6 +314,35 @@ async fn main() -> Result<()> {
                     sequence,
                     drawn_at.duration_since(received_at),
                 );
+            }
+        }
+
+        // Read positions can advance after a successful draw or an asynchronous
+        // refresh, not just during input handling. Persist the completed frame's
+        // state before waiting for the next event.
+        let updated_config = Config {
+            version: 1,
+            theme: app.theme_override.map(|theme| match theme {
+                Theme::Dark => "dark".to_owned(),
+                Theme::Light => "light".to_owned(),
+            }),
+            compact_sidebar: app.compact_sidebar,
+            wrap_composer: app.wrap_composer,
+            nicknames: app.nicknames.clone(),
+            titles: app.titles.clone(),
+            hidden: {
+                let mut hidden: Vec<String> = app.hidden.iter().cloned().collect();
+                hidden.sort();
+                hidden
+            },
+            read_positions: app.read_positions_for_config(),
+        };
+        if updated_config != config {
+            match updated_config.save(&config_path) {
+                Ok(()) => config = updated_config,
+                Err(error) => {
+                    app.error = Some(format!("Could not save local settings: {error}"));
+                }
             }
         }
 
@@ -518,30 +549,6 @@ async fn main() -> Result<()> {
                         });
                     }
                     bloom_tui::app::Action::None => {}
-                }
-                let updated_config = Config {
-                    version: 1,
-                    theme: app.theme_override.map(|theme| match theme {
-                        Theme::Dark => "dark".to_owned(),
-                        Theme::Light => "light".to_owned(),
-                    }),
-                    compact_sidebar: app.compact_sidebar,
-                    wrap_composer: app.wrap_composer,
-                    nicknames: app.nicknames.clone(),
-                    titles: app.titles.clone(),
-                    hidden: {
-                        let mut hidden: Vec<String> = app.hidden.iter().cloned().collect();
-                        hidden.sort();
-                        hidden
-                    },
-                };
-                if updated_config != config {
-                    match updated_config.save(&config_path) {
-                        Ok(()) => config = updated_config,
-                        Err(error) => {
-                            app.error = Some(format!("Could not save local settings: {error}"));
-                        }
-                    }
                 }
                 // A selection change is a request for a fresh read, not an event.
                 if app.selected != last_visible {

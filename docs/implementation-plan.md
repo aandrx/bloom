@@ -2,17 +2,29 @@
 
 **Status: active next-work plan, not completed features.** Replaces the obsolete foundation/direct-transport wave list. Read [handoff](handoff.md), [current design](system-design.md), [status](status.md) and [completed iteration](iteration-review.md) first.
 
-**Current user priority: UI/UX quality for the existing chat client.** The [reading/navigation pass](ux-polish-review.md) records its accepted bounded scope. The current [switching-latency follow-up](tui-switching-performance.md) records the user's subsequent lag report, fresh synthetic PTY measurements and acceptance. Backend recovery/history work below remains queued, not part of this bounded UI iteration.
+**Current user priority: UI/UX quality for the existing chat client.** The [reading/navigation pass](ux-polish-review.md) records its accepted bounded scope, and the [switching-latency follow-up](tui-switching-performance.md) records the lag report, measurements and acceptance. The daily reading loop has since gained local paging, local message search and session composer undo. Backend recovery and historical import remain queued behind that work.
 
 Multi-service integration and workspace/server navigation are deferred. Preserve [multi-service-research.md](multi-service-research.md) as research, not an active implementation instruction.
 
 ## Completed foundation
 
-Rust daemon/domain/IPC/secret-store boundary, encrypted persistence, external Dart engine integration, local conversation/message storage, TUI text sends and safe new-chat correlation, known-participant contacts/local preferences, exact direct identity reconciliation, literal multiline paste, recipient-bound session drafts/modal suspension, metadata sync request tracking, neutral responsive UI and installed launcher lifecycle have synthetic regression coverage. Cargo installs commands but not the complete runtime. Current live engine, historical import and renewal remain separate unverified gates.
+Rust daemon/domain/IPC/secret-store boundary, encrypted persistence, external Dart engine integration, local conversation/message storage, TUI text sends and safe new-chat correlation, known-participant contacts/local preferences, exact direct identity reconciliation, literal multiline paste, recipient-bound session drafts/modal suspension, metadata sync request tracking, neutral responsive UI and installed launcher lifecycle have synthetic regression coverage. The daily loop now also has keyset paging, local message search with paging jumps, and session composer undo, all with synthetic regression coverage. Cargo installs commands but not the complete runtime. Current live engine, historical import and renewal remain separate unverified gates.
+
+## Current priority and next action
+
+The section numbers below group work by area; they are not execution order.
+
+1. Address search hits beyond the retained paging budget. Keep memory bounded and preserve the selected recipient, draft, reading anchor, and an explicit return to latest. Freeze the history-window contract before implementation.
+2. Keep participant and attachment search queued until deep-hit navigation is accepted.
+3. Start generation-scoped engine recovery only when resuming backend work. Historical ingestion, packaging, and rich messaging remain queued.
+
+Keep the launcher on debug. Do not add durable drafts, remote read receipts, or multi-service work to this unit.
+
+Local unread navigation is accepted under shipp with synthetic evidence. Workspace all-target tests, Tokyo-timezone TUI tests, strict workspace Clippy, formatting, and source guard pass after the review fixes. Final rebuilt runtime suites pass: 10 fixture, 12 input, 4 messaging, 10 reading/navigation, and 8 launcher tests. The scoped follow-up source review found no confirmed defects in the corrections. Regressions were observed failing before fixes for stranded alias markers, outgoing unread counts, and competing search jumps. The actual PTY flow also proves saved marker advancement after drawing and a first-unread jump distinct from latest. A non-blocking review note remains: a failed settings save occurs after drawing, so its error can wait for another redraw and retries can repeat on subsequent loop iterations. No live account or engine was accessed.
 
 ## Queued backend/product work and acceptance
 
-### 1. Generation-scoped engine recovery
+### 1. Generation-scoped engine recovery (next backend phase)
 
 Problem: TUI reconnects to IPC but a dead engine child is not automatically replaced.
 
@@ -32,19 +44,30 @@ Acceptance: synthetic pages cover duplicates, out-of-order live overlap, tombsto
 
 ### 3. Daily reading/composition loop
 
-The current bounded UI pass implements stable message-owned reading anchors, a measured Latest/End action, overlay wheel ownership and full-width narrow conversations with a searchable Chats navigator. Its acceptance evidence is in [the UI review](ux-polish-review.md); do not redispatch these as unimplemented features.
+This section covers reading and composition. Reading anchors, the measured Latest/End action, overlay wheel ownership and the narrow Chats navigator are already accepted in [the UI review](ux-polish-review.md); do not redispatch them as unimplemented features.
 
 Shipped in this loop so far:
 
 - Keyset local pagination end to end. The store and IPC page backwards from a known message (protocol version 3), and the transcript loads the previous page when the reader reaches the oldest loaded row, keeps paged history across reconciliation for that chat, and stops at a bounded retained budget instead of repeating a discarded request.
 - Local message search end to end. `search_messages` matches stored text parts case-insensitively, newest first, with char-boundary-safe snippets and canonical conversation ids. Ctrl+F or `/search` opens a modal that lists hits with chat identity and snippet, and opening a hit pages back until that message is loaded and anchors the transcript on it.
 - Failure and identity handling around paging: page failures stay readable until the next interaction, alias reconciliation carries paged history and unions caches, and leaving a chat releases the in-flight page slot.
+- Session-only composer undo/redo and completed-search result counts, committed in `f85ce33`. Undo is bounded and recipient-owned; durable drafts are not implemented. A search at its result cap says "may be more" rather than claiming completeness.
 
-Remaining in this section:
+Local unread navigation, accepted with synthetic coverage:
 
-- Search polish: attachment and participant-context search, and a result list that stays usable for very deep hits beyond the retained paging budget.
-- Authoritative unread navigation. There is no read-state authority yet, so this needs a storage and transport decision before UI work. Chats searches conversation names and addresses only.
-- Undo shipped as session-only composer undo/redo; durable encrypted drafts still need a privacy and retention review.
+- Local read position and unread navigation are implemented, not remote read state or read receipts. A successfully displayed transcript following latest advances a per-conversation marker. Reading back, overlays, and absent transcripts do not advance it. `/unread` and Ctrl+B then `u` jump to the oldest loaded message newer than that marker.
+- Counts cover incoming loaded messages only; your own outgoing messages are neither unread nor unread-jump targets. A full page entirely newer than the marker shows a lower bound such as `200+`, conservatively including an exactly-full history whose end is not known. Without a stored marker or loaded history, unread state is unknown and no count is shown. This is not an authoritative count for every conversation or a complete archive.
+- The current implementation stores conversation IDs, the last-seen message ID, and its timestamp in the existing private but unencrypted `tui.json`. It stores no message bodies. Unlike manually assigned titles, these markers accumulate automatically as chats are opened and have no automatic expiry or pruning. This reading-activity metadata remains a privacy and retention limit, not encrypted message storage. Alias reconciliation merges markers under the canonical ID and keeps the newest position, including after config reload.
+- Actual-PTY coverage proves badge appearance, clearing after opening latest, saved marker advancement without extra input, and a first-unread jump distinct from latest. Existing ownership, paging, search, and send regressions pass.
+
+Next in this section:
+
+- Open search hits beyond the retained paging budget without accumulating intermediate history. Cover stale responses, aliases, reconciliation, cancellation, and return to latest in state and PTY tests.
+
+Later in this section:
+
+- Participant-context search (find messages by who was in the chat) and attachment search remain queued.
+- Durable encrypted drafts still need a privacy and retention review; undo stays session-only until then.
 - Typed interaction modes to reduce independent flag combinations, but only behind regression coverage for modal transitions, recipient changes, aliases, filters and asynchronous results.
 
 Acceptance: actual PTY tests for long local histories, new arrivals while reading back, search navigation, drawer/focus/mouse paths, unicode cursor behavior and cancel/recovery ownership. Preserve exact body whitespace and uncertain-send policy.

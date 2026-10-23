@@ -80,7 +80,7 @@ There is no automatic engine-generation recovery after child failure. IPC reconn
 
 ## UI architecture
 
-`App` owns interaction state, draft ownership and recovery. Session-only drafts preserve text, cursor and literal-paste provenance; new-chat keys include recipient context. Transient panels suspend composition and restore only the correct owner. Preferences store display settings/labels, not plaintext drafts.
+`App` owns interaction state, draft ownership and recovery. Session-only drafts preserve text, cursor and literal-paste provenance; new-chat keys include recipient context. Transient panels suspend composition and restore only the correct owner. Preferences store display settings/labels, not plaintext drafts. Local read positions also store conversation and message IDs plus timestamps in the private but unencrypted TUI config. They advance after a latest transcript is successfully drawn, not on snapshot receipt, and merge monotonically across identity aliases. Badges count loaded incoming messages only; no marker means unknown unread state. This metadata has no automatic expiry and is never sent as a read receipt.
 
 `composer.rs` wraps extended graphemes and maps cursor geometry. `ui.rs` returns hitboxes from the same frame it draws. The terminal loop owns a bounded session-only transcript layout cache; unchanged layouts reuse exact ratatui geometry and paint only visible logical lines, without mutating App. `main.rs` routes input and asynchronous events/results through a coalescing `RedrawScheduler` capped at 120 FPS; animation ticks are 33 ms. See [rendering internals](tui-internals.md).
 
@@ -91,7 +91,7 @@ There is no automatic engine-generation recovery after child failure. IPC reconn
 - Engine startup reads/writes registration and consumes pushes. Only synthetic fixtures run by default. Live tests require fresh explicit authorization and safe durable capture.
 - No engine binary vendoring or generated-binding hand edits. Matching engine version/content hash is required.
 - No Bloom-owned authentication, registration or account recovery. Current state labels do not prove renewal support.
-- No rich-message UI, message-content search, unread counter or complete archive support. Keep product claims aligned with end-to-end implementation.
+- No rich-message UI, authoritative unread totals for all conversations, remote read-state authority, or complete archive support. Local text search and bounded local unread navigation are implemented. Keep product claims aligned with end-to-end implementation.
 
 ## Future surfaces and transports
 

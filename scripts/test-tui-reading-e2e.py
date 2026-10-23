@@ -21,6 +21,7 @@ HERE = Path(__file__).resolve().parent
 H = runpy.run_path(str(HERE / 'test-tui-messaging-e2e.py'), run_name='helpers')
 R = runpy.run_path(str(HERE / 'test-stateful-fake-daemon.py'), run_name='helpers')
 CID = {'transport': 'openbubbles', 'value': 'alice@example.invalid'}
+BOB = {'transport': 'openbubbles', 'value': 'bob@example.invalid'}
 
 
 class ReadingFlows(unittest.TestCase):
@@ -101,6 +102,76 @@ class ReadingFlows(unittest.TestCase):
             destination.mkdir(parents=True, exist_ok=True)
             (destination / (name + '.txt')).write_text(self.text() + '\n')
             (destination / (name + '.html')).write_text(H['SHOT']['to_html'](self.screen, self.width, self.height))
+
+    def append_fixture_message(self, conversation_id, text):
+        return R['request'](str(self.fixture.socket_path), 'fixture_append_message',
+                            conversation_id=conversation_id, text=text)
+
+    def test_unread_badge_open_reads_and_jump_to_first_unread(self):
+        # Give Bob enough history that one page-up is a deliberate reading position
+        # rather than a no-op on content that already fits.
+        for index in range(24):
+            self.append_fixture_message(BOB, f'BOB_BASE_MARKER_{index:03d} synthetic history')
+        self.wait_for(lambda: 'BOB_BASE_MARKER_023' in self.text(), timeout=15)
+        self.key(b'\x02p')  # Ctrl+B p: Bob is newest after the fixture appends.
+        self.wait_for(lambda: 'Bob' in self.screen.display[0])
+        self.wait_for(lambda: 'BOB_BASE_MARKER_023' in self.text())
+        self.key(b'\x1b[5~')  # Read back so arriving messages stay unread.
+
+        for index in range(3):
+            self.append_fixture_message(
+                BOB, f'UNREAD_MARKER_{index:03d} synthetic unread')
+        self.wait_for(lambda: 'UNREAD_MARKER_002' in self.text(), timeout=15)
+        unread = [item for item in self.fixture.persisted()['messages']
+                  if item['conversation_id'] == BOB
+                  and item['parts'][0]['value'].startswith('UNREAD_MARKER_')]
+        newest_at = max(item['created_at'] for item in unread)
+        newest_ids = {item['id']['value'] for item in unread
+                      if item['created_at'] == newest_at}
+
+        self.key(b'\x02n')  # Back to Alice; Bob is no longer selected.
+        self.wait_for(lambda: 'Alice' in self.screen.display[0])
+        self.wait_for(lambda: 'Bob · 3' in self.text())
+        self.artifact('unread-badge-before-open')
+
+        # Opening Bob follows its newest row, which marks the local position read.
+        self.key(b'\x02p')
+        self.wait_for(lambda: 'Bob' in self.screen.display[0])
+        config_path = self.fixture.root / 'config' / 'bloom' / 'tui.json'
+
+        def bob_position():
+            try:
+                config = json.loads(config_path.read_text())
+            except (FileNotFoundError, json.JSONDecodeError):
+                return None
+            return config.get('read_positions', {}).get('openbubbles|bob@example.invalid')
+
+        self.wait_for(lambda: bob_position() is not None, timeout=10)
+        self.wait_for(lambda: (bob_position() or {}).get('created_at') == newest_at,
+                      timeout=10)
+        self.assertIn(
+            bob_position().get('value'), newest_ids,
+            f'opening Bob must mark its newest row read: {bob_position()!r}')
+        self.wait_for(lambda: 'Bob · 3' not in self.text())
+        self.artifact('unread-badge-cleared-after-open')
+
+        # More than a viewport of unread rows makes first-unread navigation
+        # distinguishable from clamping to latest. Ignore sidebar previews.
+        self.key(b'\x1b[5~')
+        for index in range(40):
+            self.append_fixture_message(BOB, f'UNREAD2_MARKER_{index:03d} synthetic unread')
+        self.wait_for(lambda: 'UNREAD2_MARKER_039' in self.text(), timeout=15)
+        self.key(b'/unread\r')
+
+        def unread_transcript_markers():
+            divider = self.screen.display[0].find('│')
+            left = divider + 3 if divider >= 0 else 2
+            return re.findall(r'UNREAD2_MARKER_\d+', '\n'.join(
+                line[left:] for line in self.screen.display[2:-5]))
+
+        self.wait_for(lambda: unread_transcript_markers()[:1] == ['UNREAD2_MARKER_000'])
+        self.assertNotIn('UNREAD2_MARKER_039', unread_transcript_markers())
+        self.artifact('unread-jump-first-unread')
 
     def test_arrivals_reconciliation_latest_and_literal_draft(self):
         body = '/new\nPrivate literal Alice draft'
