@@ -68,6 +68,35 @@ def request(path, op, **kwargs):
         return recv(client)["response"]
 
 
+def typed_parts():
+    """Synthetic mixed parts: text, two attachments, unsupported, text."""
+    return [
+        {"type": "text", "value": "typed line one\n  indented\ttail  "},
+        {"type": "attachment", "value": {
+            "id": "synthetic-att-0001",
+            "mime_type": "application/octet-stream",
+            "file_name": "r\u00e9sum\u00e9 synth\u00e9tique.txt",
+            "byte_len": 0,
+        }},
+        {"type": "unsupported", "value": {"kind": "attachment"}},
+        {"type": "attachment", "value": {
+            "id": "synthetic-name-only.bin",
+            "mime_type": "application/x-synthetic",
+            "file_name": None,
+            "byte_len": 0,
+        }},
+        {"type": "text", "value": "typed line two\n"},
+    ]
+
+
+def typed_message(builder, conversation_id, ident="typed-0001", at=1_650_000_000_000):
+    """Build the canonical incoming shape, then replace its parts explicitly."""
+    item = builder("placeholder@example.invalid", ident, at, "unused", False)
+    item["conversation_id"] = copy.deepcopy(conversation_id)
+    item["parts"] = typed_parts()
+    return item
+
+
 class Tests(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
@@ -342,6 +371,42 @@ class Tests(unittest.TestCase):
                                  message_id={"transport": "openbubbles", "value": "row-0007"},
                                  limit=1)["messages"][0]["id"]["value"], "row-0007")
 
+    def test_stateful_typed_parts_survive_history_and_context_restart(self):
+        self.stop()
+        canonical = identity("alice@example.invalid")
+        alias = identity("alice-typed-legacy")
+        with open(self.store, encoding="utf-8") as stream:
+            state = json.load(stream)
+        conversation = next(c for c in state["conversations"] if c["id"] == canonical)
+        conversation["aliases"] = [alias]
+        expected = typed_message(runpy.run_path(FAKE)["message"], canonical)
+        state["messages"].append(copy.deepcopy(expected))
+        with open(self.store, "w", encoding="utf-8") as stream:
+            json.dump(state, stream, ensure_ascii=False)
+        self.start()
+
+        for restart in (False, True):
+            if restart:
+                self.stop()
+                self.start()
+            history = request(self.sock, "history", conversation_id=canonical, limit=5)
+            self.assertEqual([m["id"] for m in history["messages"]], [expected["id"]])
+            self.assertEqual(history["messages"][0]["conversation_id"], canonical)
+            self.assertEqual(history["messages"][0]["parts"], expected["parts"])
+            for requested in (canonical, alias):
+                response = request(self.sock, "message_context", conversation_id=requested,
+                                   message_id=expected["id"], limit=5)
+                self.assertEqual([m["id"] for m in response["messages"]], [expected["id"]])
+                self.assertEqual(response["messages"][0]["conversation_id"], canonical)
+                self.assertEqual(response["messages"][0]["parts"], expected["parts"])
+            if not restart:
+                # Force the daemon's real save path, not just a second load of
+                # pre-seeded JSON. A supported fake text send in another chat
+                # leaves Alice's history unchanged while persisting all parts.
+                saved = request(self.sock, "send", conversation_id=identity("bob@example.invalid"),
+                                body={"parts": [{"type": "text", "value": "synthetic save checkpoint"}]})
+                self.assertEqual(saved["result"], "send")
+
     def test_search_messages_returns_snippet_and_ignores_empty_query(self):
         conversation = {"transport": "openbubbles", "value": "alice@example.invalid"}
         prefix = "0123456789" * 4
@@ -572,6 +637,50 @@ class FakeParticipantSearch(ParticipantSearchMixin, unittest.TestCase):
 
     def search(self, query, limit, participant=None):
         return self.module["search_messages"](query, limit, participant)
+
+
+class FakeTypedPartsRPC(unittest.TestCase):
+    def setUp(self):
+        self.module = runpy.run_path(FAKE)
+        self.canonical = identity("weekend@example.invalid")
+        self.alias = identity("weekend-typed-legacy")
+        conversation = next(c for c in self.module["CONVERSATIONS"] if c["id"] == self.canonical)
+        conversation["aliases"] = [self.alias]
+        self.message = typed_message(self.module["message"], self.alias)
+        self.module["HISTORY"].setdefault(self.alias["value"], []).append(self.message)
+
+    def test_typed_parts_survive_history_and_context_rpc(self):
+        client, server = socket.socketpair()
+        client.settimeout(TIMEOUT)
+        # serve_client blocks on reads, so closing the client gives it EOF.
+        thread = threading.Thread(target=self.module["serve_client"], args=(server,), daemon=True)
+        thread.start()
+        snapshot = copy.deepcopy(self.message)
+        try:
+            send(client, {"request_id": 1, "request": {
+                "op": "history", "conversation_id": self.alias, "limit": 5}})
+            history = recv(client)["response"]
+            self.assertEqual([m["id"] for m in history["messages"]], [self.message["id"]])
+            self.assertEqual(history["messages"][0]["conversation_id"], self.alias)
+            self.assertEqual(history["messages"][0]["parts"], self.message["parts"])
+            for requested in (self.alias, self.canonical):
+                send(client, {"request_id": 2, "request": {
+                    "op": "message_context", "conversation_id": requested,
+                    "message_id": self.message["id"], "limit": 1}})
+                context = recv(client)["response"]
+                self.assertEqual([m["id"] for m in context["messages"]], [self.message["id"]])
+                self.assertEqual(context["messages"][0]["conversation_id"], self.canonical)
+                self.assertEqual(context["messages"][0]["parts"], self.message["parts"])
+            self.assertEqual(self.message, snapshot)
+            self.assertEqual(self.module["HISTORY"][self.alias["value"]][-1], snapshot)
+        finally:
+            client.close()
+            thread.join(timeout=2)
+            if thread.is_alive():
+                server.close()
+                thread.join(timeout=2)
+            self.assertFalse(thread.is_alive())
+            server.close()
 
 
 class FrameSerialization(unittest.TestCase):
