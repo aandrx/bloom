@@ -3,7 +3,8 @@ use std::{future::Future, pin::Pin, time::Duration};
 
 use bloom_domain::{Conversation, ConversationId, Message, MessageId, OutgoingBody};
 use bloom_ipc::{
-    HistoryCursor, MessageSearchHit, ProtocolError, RequestKind, Response, ResponseKind,
+    HistoryCursor, MessageSearchHit, ParticipantFilter, ProtocolError, RequestKind, Response,
+    ResponseKind,
 };
 use tokio::{io::AsyncWrite, time::timeout};
 
@@ -36,6 +37,18 @@ pub trait RequestHandler: Send + Sync {
         query: String,
         limit: u16,
     ) -> HandlerFuture<'_, Vec<MessageSearchHit>>;
+    fn search_messages_with_participant(
+        &self,
+        query: String,
+        limit: u16,
+        participant: Option<ParticipantFilter>,
+    ) -> HandlerFuture<'_, Vec<MessageSearchHit>> {
+        if participant.is_some() {
+            Box::pin(async { Err(ProtocolError::Unsupported) })
+        } else {
+            self.search_messages(query, limit)
+        }
+    }
     fn message_context(
         &self,
         _conversation_id: ConversationId,
@@ -154,13 +167,20 @@ async fn serve_inner<H: RequestHandler>(
                     Err(error) => ResponseKind::Error { error },
                 }
             }
-            RequestKind::SearchMessages { query, limit } => {
+            RequestKind::SearchMessages {
+                query,
+                limit,
+                participant,
+            } => {
                 if limit == 0 || limit > u16::MAX as u32 {
                     ResponseKind::Error {
                         error: ProtocolError::InvalidRequest,
                     }
                 } else {
-                    match handler.search_messages(query, limit as u16).await {
+                    match handler
+                        .search_messages_with_participant(query, limit as u16, participant)
+                        .await
+                    {
                         Ok(hits) => ResponseKind::SearchResults { hits },
                         Err(error) => ResponseKind::Error { error },
                     }
@@ -770,6 +790,7 @@ mod tests {
                     request: RequestKind::SearchMessages {
                         query: "needle".into(),
                         limit,
+                        participant: None,
                     },
                 },
             )
@@ -801,6 +822,59 @@ mod tests {
             searches.load(Ordering::SeqCst),
             1,
             "invalid limits are rejected before the search handler runs"
+        );
+    }
+
+    #[tokio::test]
+    async fn unsupported_participant_filter_is_not_silently_ignored() {
+        let (_dir, listener, path) = socket();
+        let searches = Arc::new(AtomicUsize::new(0));
+        let server_searches = searches.clone();
+        let server = tokio::spawn(async move {
+            serve(
+                listener.accept().await.unwrap(),
+                &FakeHandler(
+                    Arc::new(AtomicUsize::new(0)),
+                    Arc::new(AtomicUsize::new(0)),
+                    server_searches,
+                ),
+            )
+            .await;
+        });
+        let mut client = UnixStream::connect(path).await.unwrap();
+        write_request(
+            &mut client,
+            &Request {
+                request_id: 24,
+                request: RequestKind::SearchMessages {
+                    query: "needle".into(),
+                    limit: 5,
+                    participant: Some(bloom_ipc::ParticipantFilter {
+                        transport: TransportId::new("fake").unwrap(),
+                        handle: bloom_domain::Handle::new(
+                            bloom_domain::HandleKind::Opaque,
+                            "friend",
+                        )
+                        .unwrap(),
+                    }),
+                },
+            },
+        )
+        .await
+        .unwrap();
+        let response = read_response(&mut client).await.unwrap();
+        assert!(matches!(
+            response.response,
+            ResponseKind::Error {
+                error: ProtocolError::Unsupported
+            }
+        ));
+        drop(client);
+        server.await.unwrap();
+        assert_eq!(
+            searches.load(Ordering::SeqCst),
+            0,
+            "a present filter must not fall back to the unfiltered handler"
         );
     }
 

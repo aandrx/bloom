@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Black-box tests for stateful-fake-daemon.py over real Unix sockets."""
 import json
+import copy
 import os
 import runpy
 import socket
@@ -38,7 +39,7 @@ def oversized_response(limit):
 
 def send(client, obj):
     payload = json.dumps(obj).encode()
-    client.sendall(b"\x04" + struct.pack(">I", len(payload)) + payload)
+    client.sendall(b"\x05" + struct.pack(">I", len(payload)) + payload)
 
 
 def recv_exact(client, size):
@@ -54,7 +55,7 @@ def recv_exact(client, size):
 def recv(client):
     header = recv_exact(client, 5)
     version, size = struct.unpack(">BI", header)
-    if version != 4 or not 0 < size <= 1048576:
+    if version != 5 or not 0 < size <= 1048576:
         raise AssertionError("invalid response frame")
     return json.loads(recv_exact(client, size))
 
@@ -451,6 +452,128 @@ class FakeContextHelper(unittest.TestCase):
         self.assertIsNone(self.context(identity("bob"), 'a2"', 3))
 
 
+def participant_scenario():
+    """Shared membership fixture: direct, group, transport, kind, alias, no metadata."""
+    direct = identity("direct@example.invalid")
+    group = identity("group@example.invalid")
+    parallel = identity("parallel@example.invalid", transport="other")
+    phone = identity("phone@example.invalid")
+    archive = identity("archive@example.invalid")
+    archive_old = identity("archive-legacy")
+    ghost = identity("ghost@example.invalid")
+    me = {"kind": "email", "value": "me@example.invalid"}
+
+    def person(kind, value):
+        return {"handle": {"kind": kind, "value": value}, "display_name": None, "is_me": False}
+
+    conversations = [
+        {"id": direct, "kind": "direct", "aliases": [],
+         "participants": [{"handle": me, "is_me": True}, person("email", "alice@example.invalid")]},
+        {"id": group, "kind": "group", "aliases": [],
+         "participants": [{"handle": me, "is_me": True}, person("email", "bob@example.invalid"),
+                           person("email", "carol@example.invalid")]},
+        {"id": parallel, "kind": "direct", "aliases": [],
+         "participants": [{"handle": me, "is_me": True}, person("email", "alice@example.invalid")]},
+        {"id": phone, "kind": "direct", "aliases": [],
+         "participants": [{"handle": me, "is_me": True}, person("tel", "alice@example.invalid")]},
+        {"id": archive, "kind": "direct", "aliases": [archive_old],
+         "participants": [{"handle": me, "is_me": True}, person("email", "erin@example.invalid")]},
+    ]
+    rows = []
+
+    def row(value, conversation, text, at, sender):
+        rows.append({"id": identity(value), "conversation_id": conversation, "created_at": at,
+                     "sender": {"kind": "email", "value": sender},
+                     "parts": [{"type": "text", "value": text}]})
+
+    row("direct-1", direct, "Needle direct", 100, "bob@example.invalid")
+    row("group-1", group, "Needle group", 110, "carol@example.invalid")
+    row("parallel-1", parallel, "Needle parallel", 120, "alice@example.invalid")
+    row("phone-1", phone, "Needle phone", 130, "alice@example.invalid")
+    row("archive-1", archive_old, "Needle archived", 140, "retired@example.invalid")
+    row("ghost-1", ghost, "Needle ghost", 150, "ghost@example.invalid")
+    row("haystack-1", direct, "No match here", 160, "alice@example.invalid")
+    for index in range(60):
+        row(f"newer-{index:02d}", ghost, f"Needle newer {index}", 1000 + index, "ghost@example.invalid")
+    return conversations, rows, archive
+
+
+def scope(transport, kind, value):
+    return {"transport": transport, "handle": {"kind": kind, "value": value}}
+
+
+class ParticipantSearchMixin:
+    def search(self, query, limit, participant=None):
+        raise NotImplementedError
+
+    def ids(self, hits):
+        return [hit["message_id"]["value"] for hit in hits]
+
+    def test_direct_and_group_membership_ignores_sender(self):
+        self.assertEqual(
+            self.ids(self.search("needle", 10, scope("openbubbles", "email", "alice@example.invalid"))),
+            ["direct-1"],
+        )
+        self.assertEqual(
+            self.ids(self.search("needle", 10, scope("openbubbles", "email", "bob@example.invalid"))),
+            ["group-1"],
+        )
+
+    def test_alias_membership_and_retired_only_participant(self):
+        hits = self.search("needle", 1, scope("openbubbles", "email", "erin@example.invalid"))
+        self.assertEqual(self.ids(hits), ["archive-1"])
+        self.assertEqual(hits[0]["conversation_id"], self.archive)
+        self.assertEqual(self.search("needle", 10, scope("openbubbles", "email", "retired@example.invalid")), [])
+
+    def test_transport_and_handle_kind_are_exact(self):
+        self.assertEqual(
+            self.ids(self.search("needle", 10, scope("openbubbles", "tel", "alice@example.invalid"))),
+            ["phone-1"],
+        )
+        self.assertEqual(
+            self.ids(self.search("needle", 10, scope("other", "email", "alice@example.invalid"))),
+            ["parallel-1"],
+        )
+        self.assertEqual(self.search("needle", 10, scope("openbubbles", "opaque", "alice@example.invalid")), [])
+
+    def test_missing_membership_and_missing_body_match_are_empty(self):
+        self.assertEqual(self.search("needle", 10, scope("openbubbles", "email", "ghost@example.invalid")), [])
+        self.assertEqual(self.search("absent", 10, scope("openbubbles", "email", "alice@example.invalid")), [])
+
+    def test_unfiltered_results_are_unchanged(self):
+        hits = self.search("needle", 500)
+        self.assertEqual(len(hits), 66)
+        self.assertEqual(self.ids(hits)[0], "newer-59")
+        self.assertEqual(self.ids(hits)[-1], "direct-1")
+        self.assertEqual(self.search("needle", 500, None), hits)
+        archived = next(hit for hit in hits if hit["message_id"]["value"] == "archive-1")
+        self.assertEqual(archived["conversation_id"], self.archive,
+                         "unfiltered results must retain canonical alias identity too")
+
+
+class StatefulParticipantSearch(ParticipantSearchMixin, unittest.TestCase):
+    def setUp(self):
+        self.module = runpy.run_path(DAEMON)
+        conversations, rows, self.archive = participant_scenario()
+        self.state = {"conversations": copy.deepcopy(conversations), "messages": copy.deepcopy(rows)}
+
+    def search(self, query, limit, participant=None):
+        return self.module["search_messages"](self.state, query, limit, participant)
+
+
+class FakeParticipantSearch(ParticipantSearchMixin, unittest.TestCase):
+    def setUp(self):
+        self.module = runpy.run_path(FAKE)
+        conversations, rows, self.archive = participant_scenario()
+        self.module["CONVERSATIONS"][:] = copy.deepcopy(conversations)
+        self.module["HISTORY"].clear()
+        for row in rows:
+            self.module["HISTORY"].setdefault(row["conversation_id"]["value"], []).append(copy.deepcopy(row))
+
+    def search(self, query, limit, participant=None):
+        return self.module["search_messages"](query, limit, participant)
+
+
 class FrameSerialization(unittest.TestCase):
     def check_fixture(self, path, version):
         module = runpy.run_path(path)
@@ -475,10 +598,10 @@ class FrameSerialization(unittest.TestCase):
             module["frame"](event)
 
     def test_fake_daemon_frames_stay_within_limit(self):
-        self.check_fixture(FAKE, 4)
+        self.check_fixture(FAKE, 5)
 
     def test_stateful_fake_daemon_frames_stay_within_limit(self):
-        self.check_fixture(DAEMON, 4)
+        self.check_fixture(DAEMON, 5)
 
 
 if __name__ == "__main__":

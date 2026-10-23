@@ -1,9 +1,10 @@
 use crate::app::{
     conversation_subtitle, message_text, status_text, status_tone, timestamp, App, ComposerPrompt,
-    Focus, SearchState, StatusTone, Theme, SEARCH_RESULT_LIMIT,
+    Focus, SearchParticipantCandidate, SearchState, StatusTone, Theme, SEARCH_RESULT_LIMIT,
 };
 
-use bloom_domain::{Conversation, ConversationId, DeliveryState, Message, MessageId};
+use bloom_domain::{Conversation, ConversationId, DeliveryState, HandleKind, Message, MessageId};
+use bloom_ipc::ParticipantFilter;
 use ratatui::{prelude::*, widgets::*};
 use std::sync::OnceLock;
 use unicode_segmentation::UnicodeSegmentation;
@@ -625,6 +626,27 @@ fn footer_hints(width: usize, palette: Palette, app: &App, wrapped_input: bool) 
     const CONTACTS_TIGHT: [(&str, &str); 1] = [("Esc", " close")];
     const RENAME_FULL: [(&str, &str); 2] = [("Enter", " save"), ("Esc", " cancel")];
     const RENAME_TIGHT: [(&str, &str); 1] = [("Esc", " cancel")];
+    const SEARCH_FULL: [(&str, &str); 4] = [
+        ("Enter", " search text"),
+        ("Ctrl+P", " chats with"),
+        ("↑↓", " choose"),
+        ("Esc", " close"),
+    ];
+    const SEARCH_COMPACT: [(&str, &str); 3] = [
+        ("Enter", " search"),
+        ("Ctrl+P", " scope"),
+        ("Esc", " close"),
+    ];
+    const SEARCH_TIGHT: [(&str, &str); 2] = [("Ctrl+P", " scope"), ("Esc", " close")];
+    const SEARCH_PICKER_FULL: [(&str, &str); 4] = [
+        ("↑↓", " choose"),
+        ("Enter", " set scope"),
+        ("Type", " filter"),
+        ("Esc", " back"),
+    ];
+    const SEARCH_PICKER_COMPACT: [(&str, &str); 3] =
+        [("↑↓", " choose"), ("↵", " scope"), ("Esc", " back")];
+    const SEARCH_PICKER_TIGHT: [(&str, &str); 2] = [("↑↓", ""), ("Esc", " back")];
 
     let hints: &[(&str, &str)] = if app.leader_pending {
         if width >= 64 {
@@ -633,6 +655,22 @@ fn footer_hints(width: usize, palette: Palette, app: &App, wrapped_input: bool) 
             &LEADER_COMPACT
         } else {
             &LEADER_COMPACT[..1]
+        }
+    } else if app.search.is_some() {
+        if app.search_participant_picker_open() {
+            if width >= 45 {
+                &SEARCH_PICKER_FULL
+            } else if width >= 27 {
+                &SEARCH_PICKER_COMPACT
+            } else {
+                &SEARCH_PICKER_TIGHT
+            }
+        } else if width >= 52 {
+            &SEARCH_FULL
+        } else if width >= 30 {
+            &SEARCH_COMPACT
+        } else {
+            &SEARCH_TIGHT
         }
     } else if app.contacts_open {
         if app.contacts_editing.is_some() {
@@ -1557,21 +1595,65 @@ fn search_status_text(state: &SearchState) -> Option<String> {
     }
 }
 
-fn render_search(
-    frame: &mut Frame<'_>,
-    area: Rect,
-    app: &App,
-    palette: Palette,
-) -> Vec<(Rect, usize)> {
+fn search_handle_kind_label(kind: &HandleKind) -> &'static str {
+    match kind {
+        HandleKind::Tel => "tel",
+        HandleKind::Email => "email",
+        HandleKind::Opaque => "opaque",
+    }
+}
+
+/// Exact handle kind/value and transport, because labels and local nicknames are
+/// never identity keys.
+fn search_participant_identity(filter: &ParticipantFilter) -> String {
+    format!(
+        "{} · {}:{}",
+        filter.transport.as_str(),
+        search_handle_kind_label(filter.handle.kind()),
+        filter.handle.value()
+    )
+}
+
+fn search_scope_text(scope: Option<&ParticipantFilter>) -> String {
+    match scope {
+        None => "All chats · Ctrl+P chats with".to_owned(),
+        Some(filter) => format!("Chats with {}", search_participant_identity(filter)),
+    }
+}
+
+fn search_participant_candidate_identity(candidate: &SearchParticipantCandidate) -> String {
+    candidate
+        .filter()
+        .map_or_else(|| "All chats".to_owned(), search_participant_identity)
+}
+
+#[derive(Default)]
+struct SearchHitRows {
+    results: Vec<(Rect, usize)>,
+    participants: Vec<(Rect, Option<ParticipantFilter>)>,
+}
+
+fn render_search(frame: &mut Frame<'_>, area: Rect, app: &App, palette: Palette) -> SearchHitRows {
+    let empty = SearchHitRows::default();
     if area.width == 0 || area.height == 0 {
-        return Vec::new();
+        return empty;
     }
     let Some(state) = app.search.as_ref() else {
-        return Vec::new();
+        return empty;
     };
     let inset = 2u16.min(area.width / 2);
     let text_x = area.x.saturating_add(inset);
     let text_width = area.width.saturating_sub(inset.saturating_mul(2)).max(1) as usize;
+    if app.search_participant_picker_open() && area.height < 4 {
+        // Compact terminals need selectable identities before redundant query
+        // context. The panel title already says Chats with.
+        return SearchHitRows {
+            results: Vec::new(),
+            participants: render_search_participant_picker(
+                frame, area, app, palette, text_x, text_width,
+            ),
+        };
+    }
     let prefix = "Search: ";
     let cursor = "▏";
     let query_width = text_width
@@ -1591,6 +1673,31 @@ fn render_search(
 
     let mut row = area.y.saturating_add(1);
     let bottom = area.y.saturating_add(area.height);
+    if app.search_participant_picker_open() {
+        let picker_area = Rect::new(area.x, row, area.width, bottom.saturating_sub(row));
+        return SearchHitRows {
+            results: Vec::new(),
+            participants: render_search_participant_picker(
+                frame,
+                picker_area,
+                app,
+                palette,
+                text_x,
+                text_width,
+            ),
+        };
+    }
+    if row < bottom {
+        frame.render_widget(
+            Paragraph::new(truncate_display_graphemes(
+                &search_scope_text(app.search_participant_scope()),
+                text_width,
+            ))
+            .style(Style::default().fg(palette.muted)),
+            Rect::new(text_x, row, text_width as u16, 1),
+        );
+        row = row.saturating_add(1);
+    }
     let status = search_status_text(state).map(|message| {
         let style = if state.error.is_some() {
             Style::default().fg(palette.red)
@@ -1610,11 +1717,17 @@ fn render_search(
     }
     let mut hits = Vec::new();
     if state.loading || state.error.is_some() || state.hits.is_empty() || row >= bottom {
-        return hits;
+        return SearchHitRows {
+            results: hits,
+            ..Default::default()
+        };
     }
     let visible = (bottom - row).min(state.hits.len() as u16).min(8) as usize;
     if visible == 0 {
-        return hits;
+        return SearchHitRows {
+            results: hits,
+            ..Default::default()
+        };
     }
     let selected = state.selected.min(state.hits.len().saturating_sub(1));
     let first = selected
@@ -1669,6 +1782,215 @@ fn render_search(
         );
         hits.push((row_area, index));
         row = row.saturating_add(1);
+    }
+    SearchHitRows {
+        results: hits,
+        ..Default::default()
+    }
+}
+
+fn participant_candidate_text(candidate: &SearchParticipantCandidate, width: usize) -> String {
+    if candidate.is_all_chats() {
+        return candidate.label().to_owned();
+    }
+    let identity = search_participant_candidate_identity(candidate);
+    let labelled = format!("{}  {identity}", candidate.label());
+    if unicode_width::UnicodeWidthStr::width(labelled.as_str()) <= width {
+        labelled
+    } else {
+        identity
+    }
+}
+
+fn participant_candidate_height(candidate: &SearchParticipantCandidate, width: usize) -> usize {
+    Paragraph::new(participant_candidate_text(candidate, width))
+        .wrap(Wrap { trim: false })
+        .line_count(width.max(1) as u16)
+        .max(1)
+}
+
+fn participant_picker_content_rows(app: &App, width: u16) -> usize {
+    let inset = 2u16.min(width / 2);
+    let body_width = width.saturating_sub(inset * 2).saturating_sub(2).max(1) as usize;
+    let candidates = app.search_participant_candidates();
+    let selected = app
+        .selected_search_participant_candidate()
+        .and_then(|selected| {
+            candidates
+                .iter()
+                .position(|candidate| candidate.filter() == selected.filter())
+        })
+        .unwrap_or(0);
+    2 + candidates
+        .iter()
+        .skip(selected.saturating_sub(5))
+        .take(6)
+        .map(|candidate| participant_candidate_height(candidate, body_width))
+        .sum::<usize>()
+}
+
+/// Narrow participant selection uses the same full-width ownership as Chats,
+/// leaving room for complete wrapped identities instead of ambiguous prefixes.
+fn render_narrow_participant_picker(
+    frame: &mut Frame<'_>,
+    app: &App,
+    area: Rect,
+    palette: Palette,
+) -> HitMap {
+    frame.render_widget(Clear, area);
+    frame.render_widget(
+        Block::default().style(Style::default().bg(palette.input_surface)),
+        area,
+    );
+    let inset = 2u16.min(area.width / 2);
+    let text_x = area.x + inset;
+    let text_width = area.width.saturating_sub(inset * 2).max(1) as usize;
+    frame.render_widget(
+        Paragraph::new("Chats with").style(
+            Style::default()
+                .fg(palette.cyan)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Rect::new(text_x, area.y, text_width as u16, 1),
+    );
+    let rows = Rect::new(
+        area.x,
+        area.y + 1,
+        area.width,
+        area.height.saturating_sub(2),
+    );
+    let participant_rows =
+        render_search_participant_picker(frame, rows, app, palette, text_x, text_width);
+    let hint = truncate_display_graphemes("↑↓ choose · Enter scope · Esc back", text_width);
+    frame.render_widget(
+        Paragraph::new(hint).style(Style::default().fg(palette.muted)),
+        Rect::new(text_x, area.bottom() - 1, text_width as u16, 1),
+    );
+    HitMap {
+        popup: Some(area),
+        search_participant_rows: participant_rows,
+        ..Default::default()
+    }
+}
+
+/// The nested picker owns the rows below the body query. Its window is anchored
+/// to the selected candidate's exact identity, not to a stored list position.
+fn render_search_participant_picker(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    app: &App,
+    palette: Palette,
+    text_x: u16,
+    text_width: usize,
+) -> Vec<(Rect, Option<ParticipantFilter>)> {
+    let mut hits = Vec::new();
+    if area.width == 0 || area.height == 0 {
+        return hits;
+    }
+    let bottom = area.y.saturating_add(area.height);
+    let mut row = area.y;
+    if row < bottom {
+        let prefix = "Find: ";
+        let cursor = "▏";
+        let query_width = text_width
+            .saturating_sub(unicode_width::UnicodeWidthStr::width(prefix))
+            .saturating_sub(unicode_width::UnicodeWidthStr::width(cursor));
+        let query = app.search_participant_picker_query().unwrap_or_default();
+        frame.render_widget(
+            Paragraph::new(Line::from(vec![
+                Span::styled(prefix, Style::default().fg(palette.muted)),
+                Span::styled(
+                    truncate_display_graphemes(query, query_width),
+                    Style::default().fg(palette.text),
+                ),
+                Span::styled(cursor, Style::default().fg(palette.cyan)),
+            ])),
+            Rect::new(text_x, row, text_width as u16, 1),
+        );
+        row = row.saturating_add(1);
+    }
+    if row >= bottom {
+        return hits;
+    }
+    let candidates = app.search_participant_candidates();
+    if candidates.is_empty() {
+        return hits;
+    }
+    let capacity = bottom.saturating_sub(row) as usize;
+    let marker_width = 2usize;
+    let body_width = text_width.saturating_sub(marker_width).max(1);
+    let heights: Vec<_> = candidates
+        .iter()
+        .map(|candidate| participant_candidate_height(candidate, body_width))
+        .collect();
+    let selected = app
+        .selected_search_participant_candidate()
+        .and_then(|selected| {
+            candidates
+                .iter()
+                .position(|candidate| candidate.filter() == selected.filter())
+        });
+    let mut first = selected.unwrap_or(0);
+    let mut used = heights[first];
+    while first > 0
+        && selected.unwrap_or(0).saturating_sub(first) < 5
+        && used.saturating_add(heights[first - 1]) <= capacity
+    {
+        first -= 1;
+        used += heights[first];
+    }
+    for (index, candidate) in candidates.iter().enumerate().skip(first).take(6) {
+        let remaining = bottom.saturating_sub(row) as usize;
+        if remaining == 0 || (heights[index] > remaining && selected != Some(index)) {
+            break;
+        }
+        let clipped = heights[index] > remaining;
+        let height = heights[index].min(remaining) as u16;
+        let row_area = Rect::new(area.x, row, area.width, height);
+        let active = selected == Some(index);
+        let background = if active {
+            palette.selection
+        } else {
+            palette.input_surface
+        };
+        frame.render_widget(
+            Block::default().style(Style::default().bg(background)),
+            row_area,
+        );
+        frame.render_widget(
+            Paragraph::new(if active { "› " } else { "  " }).style(
+                Style::default()
+                    .fg(palette.cyan)
+                    .bg(background)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Rect::new(text_x, row, marker_width as u16, 1),
+        );
+        let text = participant_candidate_text(candidate, body_width);
+        frame.render_widget(
+            Paragraph::new(text).wrap(Wrap { trim: false }).style(
+                Style::default()
+                    .fg(if active { palette.text } else { palette.muted })
+                    .bg(background),
+            ),
+            Rect::new(text_x + marker_width as u16, row, body_width as u16, height),
+        );
+        if clipped {
+            // Never expose a mouse target for a partially inspectable identity.
+            frame.render_widget(
+                Paragraph::new(truncate_display_graphemes("Resize for full ID", body_width))
+                    .style(Style::default().fg(palette.muted).bg(background)),
+                Rect::new(
+                    text_x + marker_width as u16,
+                    row_area.bottom() - 1,
+                    body_width as u16,
+                    1,
+                ),
+            );
+        } else {
+            hits.push((row_area, candidate.filter().cloned()));
+        }
+        row = row.saturating_add(height);
     }
     hits
 }
@@ -1850,6 +2172,7 @@ pub enum Hit {
     FilterRow(usize),
     FilterTab(usize),
     SearchRow(usize),
+    SearchParticipant(Option<ParticipantFilter>),
     EmojiRow(usize),
     ThemeRow(usize),
     ContextMenuRow(usize),
@@ -1885,6 +2208,9 @@ pub struct HitMap {
     pub filter_rows: Vec<(Rect, usize)>,
     pub filter_tabs: Vec<(Rect, usize)>,
     pub search_rows: Vec<(Rect, usize)>,
+    /// Painted participant-scope rows with their exact filter identity, so a
+    /// click never retargets a later, changed candidate list.
+    pub search_participant_rows: Vec<(Rect, Option<ParticipantFilter>)>,
     pub emoji_rows: Vec<(Rect, usize)>,
     pub theme_rows: Vec<(Rect, usize)>,
     /// The conversation context menu and its items.
@@ -1911,6 +2237,19 @@ impl HitMap {
         rows.iter()
             .find(|(area, _)| Self::contains(*area, column, row))
             .map(|(_, index)| *index)
+    }
+
+    /// The exact painted participant scope under a pointer. The outer `Option`
+    /// is presence, the inner one is All chats (`None`) versus a named scope.
+    pub fn search_participant_at(
+        &self,
+        column: u16,
+        row: u16,
+    ) -> Option<Option<ParticipantFilter>> {
+        self.search_participant_rows
+            .iter()
+            .find(|(area, _)| Self::contains(*area, column, row))
+            .map(|(_, filter)| filter.clone())
     }
 
     pub fn composer_cursor_at(&self, column: u16, row: u16) -> Option<usize> {
@@ -1995,6 +2334,9 @@ impl HitMap {
             }
             if let Some(index) = Self::row_at(&self.filter_tabs, column, row) {
                 return Some(Hit::FilterTab(index));
+            }
+            if let Some(filter) = self.search_participant_at(column, row) {
+                return Some(Hit::SearchParticipant(filter));
             }
             if let Some(index) = Self::row_at(&self.search_rows, column, row) {
                 return Some(Hit::SearchRow(index));
@@ -2291,6 +2633,9 @@ fn render_cached_with_mode(
             },
             ..Default::default()
         };
+    }
+    if app.search_participant_picker_open() && inner.width < 70 {
+        return render_narrow_participant_picker(frame, app, inner, palette);
     }
     let mut hits = HitMap::default();
 
@@ -3086,19 +3431,22 @@ fn render_cached_with_mode(
         });
         let search_layout = search_open.then(|| {
             let state = app.search.as_ref().expect("search state was checked");
-            let status = u16::from(search_status_text(state).is_some());
+            let picker_open = app.search_participant_picker_open();
+            let status = u16::from(!picker_open && search_status_text(state).is_some());
             let results = if state.loading || state.error.is_some() {
                 0
             } else {
                 state.hits.len().min(8) as u16
             };
-            titled_picker_geometry(
-                picker_bounds,
-                geometry.band.y,
-                0,
-                usize::from(1 + status + results),
-                0,
-            )
+            let content_rows = if picker_open {
+                // The title names the picker; rows hold body-query context when
+                // it fits, a Find line, and a bounded candidate window.
+                participant_picker_content_rows(app, picker_bounds.width)
+            } else {
+                // Body query, scope/discovery row, optional status, then results.
+                2 + usize::from(status) + usize::from(results)
+            };
+            titled_picker_geometry(picker_bounds, geometry.band.y, 0, content_rows, 0)
         });
         let theme_layout = app
             .theme_panel_open
@@ -3162,7 +3510,11 @@ fn render_cached_with_mode(
             } else if filter_open {
                 "Filter conversations"
             } else if search_open {
-                "Search"
+                if app.search_participant_picker_open() {
+                    "Chats with"
+                } else {
+                    "Search"
+                }
             } else if emoji_open {
                 "Emoji suggestions"
             } else {
@@ -3252,7 +3604,9 @@ fn render_cached_with_mode(
                     hits.filter_rows = render_filter_panel(frame, filter.rows, app, palette);
                 } else if search_open {
                     let search = search_layout.expect("search geometry was measured");
-                    hits.search_rows = render_search(frame, search.rows, app, palette);
+                    let rows = render_search(frame, search.rows, app, palette);
+                    hits.search_rows = rows.results;
+                    hits.search_participant_rows = rows.participants;
                 } else if emoji_open {
                     hits.emoji_rows = render_emoji_suggestions(frame, rows_area, app, palette);
                 } else {

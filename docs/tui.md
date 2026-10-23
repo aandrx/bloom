@@ -81,7 +81,7 @@ follow the visible input owner.
 | Ctrl+Left / Ctrl+Right | Move by word |
 | Ctrl+B, then `h` / `l` | Previous / next chat |
 | Ctrl+B, then `n` / `p` | Next / previous chat |
-| Ctrl+P | Previous chat |
+| Ctrl+P | Previous chat; inside Search, open the participant picker |
 | Ctrl+B, then `j` / `k` | Scroll the transcript |
 | Ctrl+B, then `f` / `s` / `t` / `u` | Filter / settings / theme / first local unread message |
 | Ctrl+C | Clear a nonempty input first; quit when it is already empty |
@@ -129,6 +129,14 @@ Use `/nickname <name>` to set a nickname for the selected direct chat, or `/nick
 
 When an engine GUID arrives for a direct chat already represented by the exact same normalized participant handle, Bloom links the GUID as an identity alias. The chat keeps one stable local row, combines both histories, and sends through the engine GUID. Original encrypted conversation rows and messages are retained. Groups, different handle types, and ambiguous or conflicting identities are not merged.
 
+### Search chats with a participant
+
+Inside Search, press Ctrl+P to open **Chats with**. Type or paste a name, nickname, handle, or transport to narrow the picker. Use arrows and Enter, or click a painted row, to select an exact handle and transport. Names are labels, not unique identities. Below 70 columns the picker uses the full frame, and identities wrap rather than silently hiding distinguishing text. Resize if a full identity cannot fit. The first row, **All chats**, clears the scope without clearing the text query. Typing resets the highlight to All chats; use Down to choose a person before pressing Enter. Esc, Ctrl+P, or Ctrl+C cancels only the inner picker; Esc from Search restores the parked draft.
+
+After selecting scope, press Enter to run the existing text query. Changing scope clears old results. The query remains literal: `from:alice` is text, not sender-filter syntax. Results include messages in chats whose current locally stored participant list contains the selected identity, even if somebody else sent the message. This is not historical group membership.
+
+Filtering occurs before the result limit, within the newest 20,000 stored messages globally. It is not an exhaustive archive search. Participant choice never changes the send recipient; only explicitly opening a search hit navigates to its conversation.
+
 ### Local unread navigation
 
 A badge such as `Bob · 3` counts incoming loaded messages newer than that chat's saved read position. Your own messages do not count. `200+` is a conservative lower bound when the entire loaded page is newer than the marker. A chat without a marker or loaded history has unknown unread state and shows no badge.
@@ -145,7 +153,7 @@ Setting `NO_COLOR` to any non-empty value disables the UI's palette distinctions
 
 - **Lag switching panels/chats:** transcript layouts are cached for four recent identity/width/palette variants and only visible lines are painted. Cold or changed large histories and IPC refreshes can still cost more than a warm local switch. Use `scripts/benchmark-tui-switching.py` for an isolated synthetic latency probe, not a live-account benchmark. See [performance evidence and limits](tui-switching-performance.md). After updating/building, reopen the TUI to load the new executable; preserve unsent drafts first because they are session-only.
 
-- **After an IPC upgrade:** client and daemon must use the same protocol version, currently 4. A newly built client rejects a reused older daemon with "unsupported IPC protocol version". Restart the daemon through its owning launcher after preserving session drafts; do not start another engine owner.
+- **After an IPC upgrade:** client and daemon must use the same protocol version, currently 5. A newly built client rejects a reused older daemon with "unsupported IPC protocol version". Restart the daemon through its owning launcher after preserving session drafts; do not start another engine owner.
 - **A stale socket file:** harmless. The launcher tests whether a daemon answers rather than trusting the file, and the daemon reclaims its own stale socket.
 - **`existing store database key is missing`:** the daemon failed closed on purpose. Nothing was deleted or overwritten. Do not remove the store to try to get past the error.
 - **`another daemon is already listening`:** a daemon is already running on that socket. Check for the engine-state owner before starting another process.

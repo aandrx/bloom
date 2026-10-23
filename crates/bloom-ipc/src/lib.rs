@@ -12,13 +12,14 @@
 pub mod client;
 
 use bloom_domain::{
-    Conversation, ConversationId, DeliveryState, Message, MessageId, OutgoingBody, SessionState,
+    Conversation, ConversationId, DeliveryState, Handle, Message, MessageId, OutgoingBody,
+    SessionState, TransportId,
 };
 use serde::{Deserialize, Serialize};
 use std::{fmt, io};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
-pub const PROTOCOL_VERSION: u16 = 4;
+pub const PROTOCOL_VERSION: u16 = 5;
 /// Largest accepted `message_context` limit. Dispatch rejects larger limits
 /// instead of clamping them.
 pub const MAX_MESSAGE_CONTEXT_LIMIT: u32 = 200;
@@ -66,6 +67,13 @@ pub struct MessageSearchHit {
     pub created_at: i64,
     pub snippet: String,
 }
+/// Exact conversation-membership scope for a local content search. The handle is
+/// not transport-qualified on its own, so transport is part of the identity.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ParticipantFilter {
+    pub transport: TransportId,
+    pub handle: Handle,
+}
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "op", rename_all = "snake_case")]
 pub enum RequestKind {
@@ -97,6 +105,10 @@ pub enum RequestKind {
     SearchMessages {
         query: String,
         limit: u32,
+        /// Scope matches to conversations whose current stored participants
+        /// include this exact transport and handle.
+        #[serde(default)]
+        participant: Option<ParticipantFilter>,
     },
     /// Read a bounded window centred on one exact stored message. The target is
     /// always included, even when it lies far outside the newest history page.
@@ -422,6 +434,10 @@ mod tests {
             request: RequestKind::SearchMessages {
                 query: "coast".into(),
                 limit: 25,
+                participant: Some(ParticipantFilter {
+                    transport: transport.clone(),
+                    handle: Handle::new(bloom_domain::HandleKind::Opaque, "friend").unwrap(),
+                }),
             },
         };
         let bytes = serde_json::to_vec(&request).unwrap();
@@ -492,7 +508,45 @@ mod tests {
             ResponseKind::MessageContext { messages } => assert_eq!(messages, vec![message]),
             _ => panic!("expected message context"),
         }
-        assert_eq!(PROTOCOL_VERSION, 4);
+        assert_eq!(PROTOCOL_VERSION, 5);
+    }
+
+    #[tokio::test]
+    async fn search_participant_defaults_to_none_and_rejects_old_versions() {
+        let without_field = serde_json::json!({
+            "request_id": 14,
+            "request": {
+                "op": "search_messages",
+                "query": "coast",
+                "limit": 25,
+            },
+        });
+        match serde_json::from_value::<Request>(without_field.clone())
+            .unwrap()
+            .request
+        {
+            RequestKind::SearchMessages { participant, .. } => assert_eq!(participant, None),
+            _ => panic!("expected a search request"),
+        }
+
+        let mut explicit_null = without_field;
+        explicit_null["request"]["participant"] = serde_json::Value::Null;
+        assert!(matches!(
+            serde_json::from_value::<Request>(explicit_null)
+                .unwrap()
+                .request,
+            RequestKind::SearchMessages {
+                participant: None,
+                ..
+            }
+        ));
+
+        let old_frame = [4_u8, 0, 0, 0, 2, b'{', b'}'];
+        let mut input = old_frame.as_slice();
+        assert_eq!(
+            read_request(&mut input).await.err().unwrap(),
+            CodecError::WrongVersion
+        );
     }
 
     #[tokio::test]

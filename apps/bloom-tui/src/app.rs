@@ -7,7 +7,7 @@ use bloom_domain::{
     Conversation, ConversationId, ConversationKind, Handle, HandleKind, Message, MessageId,
     Participant, TransportId,
 };
-use bloom_ipc::{ConversationSyncStatus, EventKind, MessageSearchHit};
+use bloom_ipc::{ConversationSyncStatus, EventKind, MessageSearchHit, ParticipantFilter};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEventKind};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::OnceLock;
@@ -50,6 +50,7 @@ pub enum Action {
     Search {
         request: u64,
         query: String,
+        participant: Option<ParticipantFilter>,
     },
 }
 
@@ -243,6 +244,98 @@ pub struct SearchState {
     pub request: Option<u64>,
     /// The query whose results are currently on display.
     pub completed_query: Option<String>,
+    /// The exact participant scope for the body query, if any.
+    pub participant: Option<ParticipantFilter>,
+    /// The scope whose results are currently on display.
+    pub completed_participant: Option<ParticipantFilter>,
+    /// The nested "Chats with" picker, when open.
+    pub picker: Option<SearchParticipantPicker>,
+}
+
+/// One pickable search scope. `None` is the leading "All chats" choice.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SearchParticipantCandidate {
+    filter: Option<ParticipantFilter>,
+    label: String,
+}
+
+impl SearchParticipantCandidate {
+    pub fn new(filter: Option<ParticipantFilter>, label: impl Into<String>) -> Self {
+        Self {
+            filter,
+            label: label.into(),
+        }
+    }
+
+    /// The exact scope this row commits. `None` means All chats.
+    pub fn filter(&self) -> Option<&ParticipantFilter> {
+        self.filter.as_ref()
+    }
+
+    pub fn into_filter(self) -> Option<ParticipantFilter> {
+        self.filter
+    }
+
+    pub fn label(&self) -> &str {
+        &self.label
+    }
+
+    pub fn transport(&self) -> Option<&TransportId> {
+        self.filter.as_ref().map(|filter| &filter.transport)
+    }
+
+    pub fn handle(&self) -> Option<&Handle> {
+        self.filter.as_ref().map(|filter| &filter.handle)
+    }
+
+    pub fn handle_kind(&self) -> Option<&HandleKind> {
+        self.handle().map(Handle::kind)
+    }
+
+    pub fn raw_handle(&self) -> Option<&str> {
+        self.handle().map(Handle::value)
+    }
+
+    pub fn is_all_chats(&self) -> bool {
+        self.filter.is_none()
+    }
+
+    fn matches_query(&self, query: &str) -> bool {
+        if query.is_empty() {
+            return true;
+        }
+        if self.label.to_lowercase().contains(query) {
+            return true;
+        }
+        let Some(filter) = self.filter.as_ref() else {
+            return false;
+        };
+        filter.handle.value().to_lowercase().contains(query)
+            || filter.transport.as_str().to_lowercase().contains(query)
+    }
+}
+
+fn handle_kind_rank(kind: Option<&HandleKind>) -> u8 {
+    match kind {
+        None => 0,
+        Some(HandleKind::Tel) => 1,
+        Some(HandleKind::Email) => 2,
+        Some(HandleKind::Opaque) => 3,
+    }
+}
+
+/// The nested participant picker. The selection is an exact filter identity, not
+/// an index into a list that can change underneath it.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct SearchParticipantPicker {
+    pub query: String,
+    selected: Option<ParticipantFilter>,
+}
+
+impl SearchParticipantPicker {
+    pub fn selected(&self) -> Option<&ParticipantFilter> {
+        self.selected.as_ref()
+    }
 }
 
 pub struct App {
@@ -388,9 +481,9 @@ pub struct App {
     /// Monotonic generation for exact-context requests.
     #[doc(hidden)]
     pub search_context_generation: u64,
-    /// A query a slash command asked the shell to run.
+    /// A query a slash command asked the shell to run, with its captured scope.
     #[doc(hidden)]
-    pub pending_search: Option<(u64, String)>,
+    pub pending_search: Option<(u64, String, Option<ParticipantFilter>)>,
     /// Monotonic id for message-search replies.
     pub search_request: u64,
 }
@@ -1452,6 +1545,11 @@ impl App {
     }
 
     pub fn search_input(&mut self, character: char) {
+        if let Some(picker) = self.search.as_mut().and_then(|state| state.picker.as_mut()) {
+            picker.query.push(character);
+            picker.selected = None;
+            return;
+        }
         if let Some(state) = self.search.as_mut() {
             state.query.push(character);
         }
@@ -1459,6 +1557,13 @@ impl App {
     }
 
     pub fn search_backspace(&mut self) {
+        if let Some(picker) = self.search.as_mut().and_then(|state| state.picker.as_mut()) {
+            if let Some((start, _)) = picker.query.grapheme_indices(true).next_back() {
+                picker.query.truncate(start);
+            }
+            picker.selected = None;
+            return;
+        }
         if let Some(state) = self.search.as_mut() {
             if let Some((start, _)) = state.query.grapheme_indices(true).next_back() {
                 state.query.truncate(start);
@@ -1468,6 +1573,17 @@ impl App {
     }
 
     pub fn search_delete_word(&mut self) {
+        if let Some(picker) = self.search.as_mut().and_then(|state| state.picker.as_mut()) {
+            let trimmed = picker.query.trim_end();
+            let start = trimmed
+                .char_indices()
+                .rev()
+                .find(|(_, character)| character.is_whitespace())
+                .map_or(0, |(index, character)| index + character.len_utf8());
+            picker.query.truncate(start);
+            picker.selected = None;
+            return;
+        }
         if let Some(state) = self.search.as_mut() {
             let trimmed = state.query.trim_end();
             let start = trimmed
@@ -1481,6 +1597,11 @@ impl App {
     }
 
     pub fn search_clear(&mut self) {
+        if let Some(picker) = self.search.as_mut().and_then(|state| state.picker.as_mut()) {
+            picker.query.clear();
+            picker.selected = None;
+            return;
+        }
         if let Some(state) = self.search.as_mut() {
             state.query.clear();
         }
@@ -1497,13 +1618,20 @@ impl App {
             state.hits.clear();
             state.completed = false;
             state.completed_query = None;
+            state.completed_participant = None;
             state.selected = 0;
         }
     }
 
-    /// Append pasted text to the query while search owns the input.
+    /// Append pasted text to the query while search owns the input. A nested
+    /// picker receives its own query text and never edits the body query.
     pub fn search_paste(&mut self, input: &str) {
         let clean = sanitize_paste(input).replace('\n', " ");
+        if let Some(picker) = self.search.as_mut().and_then(|state| state.picker.as_mut()) {
+            picker.query.push_str(&clean);
+            picker.selected = None;
+            return;
+        }
         if let Some(state) = self.search.as_mut() {
             state.query.push_str(&clean);
         }
@@ -1529,12 +1657,219 @@ impl App {
 
     pub fn search_results_visible(&self) -> bool {
         self.search.as_ref().is_some_and(|state| {
-            !state.hits.is_empty() && state.completed_query.as_deref() == Some(state.query.trim())
+            state.picker.is_none()
+                && !state.hits.is_empty()
+                && state.completed_query.as_deref() == Some(state.query.trim())
+                && state.participant == state.completed_participant
         })
     }
 
     pub fn search_query(&self) -> Option<&str> {
         self.search.as_ref().map(|state| state.query.as_str())
+    }
+
+    /// The active participant scope, or `None` for an unscoped query.
+    pub fn search_participant_scope(&self) -> Option<&ParticipantFilter> {
+        self.search
+            .as_ref()
+            .and_then(|state| state.participant.as_ref())
+    }
+
+    pub fn search_participant_picker_open(&self) -> bool {
+        self.search
+            .as_ref()
+            .is_some_and(|state| state.picker.is_some())
+    }
+
+    pub fn search_participant_picker_query(&self) -> Option<&str> {
+        self.search
+            .as_ref()
+            .and_then(|state| state.picker.as_ref())
+            .map(|picker| picker.query.as_str())
+    }
+
+    /// Open the nested picker on the current scope. It never starts or reruns a
+    /// search, and it never touches the body query or recipient draft.
+    pub fn open_search_participant_picker(&mut self) -> bool {
+        let Some(state) = self.search.as_mut() else {
+            return false;
+        };
+        let selected = state.participant.clone();
+        state.picker = Some(SearchParticipantPicker {
+            query: String::new(),
+            selected,
+        });
+        true
+    }
+
+    /// Cancel the inner picker while keeping Search, its body query, its scope and
+    /// its draft state exactly as they were.
+    pub fn close_search_participant_picker(&mut self) {
+        if let Some(state) = self.search.as_mut() {
+            state.picker = None;
+        }
+    }
+
+    /// Every known non-self participant choice, deduplicated by exact transport
+    /// and handle, plus the leading All chats row. Labels are not identity.
+    fn search_participant_options(&self) -> Vec<SearchParticipantCandidate> {
+        let mut options = vec![SearchParticipantCandidate::new(None, "All chats")];
+        let mut seen = HashSet::new();
+        for conversation in &self.conversations {
+            for participant in &conversation.participants {
+                if participant.is_me {
+                    continue;
+                }
+                let key = (
+                    conversation.id.transport().clone(),
+                    participant.handle.clone(),
+                );
+                if !seen.insert(key) {
+                    continue;
+                }
+                let label = self.search_participant_label(participant);
+                options.push(SearchParticipantCandidate::new(
+                    Some(ParticipantFilter {
+                        transport: conversation.id.transport().clone(),
+                        handle: participant.handle.clone(),
+                    }),
+                    label,
+                ));
+            }
+        }
+        let mut rest = options.split_off(1);
+        rest.sort_by(|left, right| {
+            left.label
+                .to_lowercase()
+                .cmp(&right.label.to_lowercase())
+                .then_with(|| {
+                    left.transport()
+                        .map(TransportId::as_str)
+                        .cmp(&right.transport().map(TransportId::as_str))
+                })
+                .then_with(|| {
+                    handle_kind_rank(left.handle_kind()).cmp(&handle_kind_rank(right.handle_kind()))
+                })
+                .then_with(|| left.raw_handle().cmp(&right.raw_handle()))
+        });
+        options.extend(rest);
+        options
+    }
+
+    /// The picker's currently visible candidates, including All chats.
+    pub fn search_participant_candidates(&self) -> Vec<SearchParticipantCandidate> {
+        let Some(query) = self.search_participant_picker_query() else {
+            return Vec::new();
+        };
+        let query = query.trim().to_lowercase();
+        let mut options = self.search_participant_options();
+        let all_chats = options.remove(0);
+        options.retain(|candidate| candidate.matches_query(&query));
+        let mut visible = vec![all_chats];
+        visible.extend(options);
+        visible
+    }
+
+    pub fn selected_search_participant_candidate(&self) -> Option<SearchParticipantCandidate> {
+        let visible = self.search_participant_candidates();
+        let selected = self
+            .search
+            .as_ref()
+            .and_then(|state| state.picker.as_ref())
+            .map(|picker| picker.selected.clone())?;
+        visible
+            .iter()
+            .find(|candidate| candidate.filter().cloned() == selected)
+            .cloned()
+    }
+
+    /// Move the picker selection by identity, clamped to the visible candidates.
+    pub fn step_search_participant(&mut self, delta: isize) {
+        let visible = self.search_participant_candidates();
+        if visible.is_empty() {
+            return;
+        }
+        let Some(picker) = self.search.as_ref().and_then(|state| state.picker.as_ref()) else {
+            return;
+        };
+        let current = visible
+            .iter()
+            .position(|candidate| candidate.filter() == picker.selected.as_ref())
+            .unwrap_or(0) as isize;
+        let last = visible.len().saturating_sub(1) as isize;
+        let next = current.saturating_add(delta).clamp(0, last) as usize;
+        let filter = visible[next].filter().cloned();
+        if let Some(picker) = self.search.as_mut().and_then(|state| state.picker.as_mut()) {
+            picker.selected = filter;
+        }
+    }
+
+    /// Select a visible candidate by position. The stored selection is still the
+    /// exact filter identity, so the later list can change without retargeting it.
+    pub fn select_search_participant(&mut self, index: usize) {
+        let visible = self.search_participant_candidates();
+        let index = index.min(visible.len().saturating_sub(1));
+        let Some(filter) = visible
+            .get(index)
+            .map(|candidate| candidate.filter().cloned())
+        else {
+            return;
+        };
+        if let Some(picker) = self.search.as_mut().and_then(|state| state.picker.as_mut()) {
+            picker.selected = filter;
+        }
+    }
+
+    /// Commit an exact optional scope. Unknown or removed participants are
+    /// rejected instead of falling back to All chats. A changed scope keeps the
+    /// body query but invalidates every result of the old scope.
+    pub fn commit_search_participant(&mut self, filter: Option<ParticipantFilter>) -> bool {
+        if self.search.is_none() {
+            return false;
+        }
+        let known = self.search_participant_options();
+        let valid = match filter.as_ref() {
+            None => true,
+            Some(wanted) => known
+                .iter()
+                .any(|candidate| candidate.filter() == Some(wanted)),
+        };
+        if !valid {
+            return false;
+        }
+        let changed = self
+            .search
+            .as_ref()
+            .is_some_and(|state| state.participant != filter);
+        if let Some(state) = self.search.as_mut() {
+            state.participant = filter;
+            state.picker = None;
+        }
+        if changed {
+            self.search_edited();
+        }
+        true
+    }
+
+    /// Commit whatever the picker currently highlights.
+    pub fn commit_selected_search_participant(&mut self) -> bool {
+        let Some(candidate) = self.selected_search_participant_candidate() else {
+            return false;
+        };
+        self.commit_search_participant(candidate.into_filter())
+    }
+
+    fn search_participant_label(&self, participant: &Participant) -> String {
+        if self
+            .nicknames
+            .contains_key(&nickname_key(&participant.handle))
+        {
+            return self.contact_label(&participant.handle);
+        }
+        participant
+            .display_name
+            .clone()
+            .unwrap_or_else(|| participant.handle.value().to_owned())
     }
 
     /// Start a search. An empty or whitespace-only query never enters loading.
@@ -1567,6 +1902,7 @@ impl App {
             state.hits = hits;
             state.selected = 0;
             state.completed_query = Some(state.query.trim().to_owned());
+            state.completed_participant = state.participant.clone();
         }
     }
 
@@ -2750,7 +3086,13 @@ impl App {
         for character in query.chars() {
             self.search_input(character);
         }
-        self.pending_search = self.begin_search();
+        self.pending_search = self.begin_search().map(|(request, query)| {
+            let participant = self
+                .search
+                .as_ref()
+                .and_then(|state| state.participant.clone());
+            (request, query, participant)
+        });
     }
 
     fn execute_nickname_command(&mut self) {
@@ -2879,8 +3221,12 @@ impl App {
     }
 
     fn take_pending_action(&mut self) -> Action {
-        if let Some((request, query)) = self.pending_search.take() {
-            Action::Search { request, query }
+        if let Some((request, query, participant)) = self.pending_search.take() {
+            Action::Search {
+                request,
+                query,
+                participant,
+            }
         } else if std::mem::take(&mut self.sync_requested) && !self.sync_in_flight {
             self.sync_in_flight = true;
             Action::SyncConversations
@@ -3810,10 +4156,16 @@ impl App {
     }
 
     fn search_key(&mut self, key: KeyEvent) -> Action {
+        if self.search_participant_picker_open() {
+            return self.search_participant_key(key);
+        }
         let control = key.modifiers.contains(KeyModifiers::CONTROL);
         match key.code {
             KeyCode::Esc => self.close_search(),
             KeyCode::Char('c') if control => self.close_search(),
+            KeyCode::Char('p') if control => {
+                self.open_search_participant_picker();
+            }
             KeyCode::Enter if self.search_results_visible() => {
                 if self.begin_search_jump().is_some() {
                     self.advance_search_jump();
@@ -3821,11 +4173,51 @@ impl App {
             }
             KeyCode::Enter => {
                 if let Some((request, query)) = self.begin_search() {
-                    return Action::Search { request, query };
+                    let participant = self
+                        .search
+                        .as_ref()
+                        .and_then(|state| state.participant.clone());
+                    return Action::Search {
+                        request,
+                        query,
+                        participant,
+                    };
                 }
             }
             KeyCode::Up => self.search_step(-1),
             KeyCode::Down => self.search_step(1),
+            KeyCode::Backspace => self.search_backspace(),
+            KeyCode::Char('w') if control => self.search_delete_word(),
+            KeyCode::Char('u') if control => self.search_clear(),
+            KeyCode::Char(character)
+                if !control
+                    && !key.modifiers.contains(KeyModifiers::ALT)
+                    && !character.is_control() =>
+            {
+                self.search_input(character);
+            }
+            _ => {}
+        }
+        Action::None
+    }
+
+    /// The inner picker owns every key while it is open. It edits only its own
+    /// query, commits only an exact known identity, and never closes Search.
+    fn search_participant_key(&mut self, key: KeyEvent) -> Action {
+        let control = key.modifiers.contains(KeyModifiers::CONTROL);
+        match key.code {
+            KeyCode::Esc => self.close_search_participant_picker(),
+            KeyCode::Char('p') if control => self.close_search_participant_picker(),
+            KeyCode::Char('c') if control => self.close_search_participant_picker(),
+            KeyCode::Enter => {
+                self.commit_selected_search_participant();
+            }
+            KeyCode::Up => self.step_search_participant(-1),
+            KeyCode::Down => self.step_search_participant(1),
+            KeyCode::PageUp => self.step_search_participant(-10),
+            KeyCode::PageDown => self.step_search_participant(10),
+            KeyCode::Home => self.select_search_participant(0),
+            KeyCode::End => self.select_search_participant(usize::MAX),
             KeyCode::Backspace => self.search_backspace(),
             KeyCode::Char('w') if control => self.search_delete_word(),
             KeyCode::Char('u') if control => self.search_clear(),
@@ -3887,6 +4279,31 @@ impl App {
         if self.search.is_some() {
             // Search is modal for the pointer too: only its own rows and wheel
             // reach it, so a header or pane click cannot stack an overlay on top.
+            if self.search_participant_picker_open() {
+                // Painted identities, not current row indices, own clicks. The
+                // outer Search modal still consumes events outside this picker.
+                match kind {
+                    MouseEventKind::ScrollUp | MouseEventKind::ScrollDown
+                        if hits
+                            .popup
+                            .is_some_and(|area| area.contains((column, row).into())) =>
+                    {
+                        let step = if kind == MouseEventKind::ScrollUp {
+                            -1
+                        } else {
+                            1
+                        };
+                        self.step_search_participant(step);
+                    }
+                    MouseEventKind::Down(MouseButton::Left) => {
+                        if let Some(Hit::SearchParticipant(filter)) = hits.at(column, row) {
+                            self.commit_search_participant(filter);
+                        }
+                    }
+                    _ => {}
+                }
+                return Action::None;
+            }
             match kind {
                 MouseEventKind::ScrollUp | MouseEventKind::ScrollDown => {
                     if hits

@@ -546,11 +546,11 @@ async fn main() -> Result<()> {
                             let _ = send_tx.send((attempt, target, result));
                         });
                     }
-                    bloom_tui::app::Action::Search { request, query } => {
+                    bloom_tui::app::Action::Search { request, query, participant } => {
                         let client = client.clone();
                         let tx = search_tx.clone();
                         tokio::spawn(async move {
-                            let result = client.search_messages(&query, SEARCH_RESULT_LIMIT).await;
+                            let result = client.search_messages_with_participant(&query, SEARCH_RESULT_LIMIT, participant).await;
                             let _ = tx.send((request, result));
                         });
                     }

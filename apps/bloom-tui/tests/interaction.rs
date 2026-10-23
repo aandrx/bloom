@@ -6,7 +6,7 @@ use bloom_domain::{
     Conversation, ConversationId, ConversationKind, DeliveryState, Handle, HandleKind, Message,
     MessageId, MessagePart, Participant, TransportId,
 };
-use bloom_ipc::EventKind;
+use bloom_ipc::{EventKind, MessageSearchHit, ParticipantFilter};
 use bloom_tui::{
     app::{Action, App, SendPhase, UnreadCount},
     daemon::Snapshot,
@@ -2017,6 +2017,269 @@ fn following_the_newest_row_marks_read_but_reading_back_does_not() {
         Some(&(first.created_at, first.id().clone())),
         "an overlay owning input must not mark the thread read"
     );
+}
+
+fn participant_picker_app() -> (App, Conversation, ParticipantFilter) {
+    let mut alice = conversation("Alice", 2);
+    alice.participants[1].display_name = Some("Alice".into());
+    let mut bob = conversation("Bob", 2);
+    bob.participants[1].display_name = Some("Bob".into());
+    let filter = ParticipantFilter {
+        transport: alice.id.transport().clone(),
+        handle: alice.participants[1].handle.clone(),
+    };
+    let mut app = App::default();
+    app.set_conversations(vec![alice, bob.clone()]);
+    app.select(Some(bob.id.clone()));
+    app.draft = "/new\nparked 👩‍💻 draft".into();
+    app.draft_cursor = 4;
+    app.pasted_body = true;
+    app.handle_key(ctrl(KeyCode::Char('f')));
+    for character in "needle".chars() {
+        app.handle_key(key(KeyCode::Char(character)));
+    }
+    (app, bob, filter)
+}
+
+#[test]
+fn participant_candidates_keep_exact_transport_and_kind_despite_duplicate_labels() {
+    let mut first = conversation("First", 2);
+    first.participants[1].handle = Handle::new(HandleKind::Email, "same-value").unwrap();
+    first.participants[1].display_name = Some("Duplicate".into());
+    let mut other = first.clone();
+    other.id = ConversationId::new(TransportId::new("other").unwrap(), "first").unwrap();
+    let mut phone = first.clone();
+    phone.id = ConversationId::new(transport(), "phone").unwrap();
+    phone.participants[1].handle = Handle::new(HandleKind::Tel, "same-value").unwrap();
+    let mut shared = first.clone();
+    shared.id = ConversationId::new(transport(), "shared-group").unwrap();
+    shared.kind = ConversationKind::Group;
+    let expected: Vec<_> = [&first, &other, &phone]
+        .into_iter()
+        .map(|chat| ParticipantFilter {
+            transport: chat.id.transport().clone(),
+            handle: chat.participants[1].handle.clone(),
+        })
+        .collect();
+    let mut app = App::default();
+    app.set_conversations(vec![first, other, phone, shared]);
+    app.open_search();
+    app.open_search_participant_picker();
+    let candidates = app.search_participant_candidates();
+    assert_eq!(
+        candidates.len(),
+        4,
+        "All chats plus three exact identities, without self or group duplicates"
+    );
+    assert!(candidates[0].is_all_chats());
+    for filter in expected {
+        assert!(candidates
+            .iter()
+            .any(|candidate| candidate.filter() == Some(&filter)));
+    }
+    assert!(candidates[1..]
+        .iter()
+        .all(|candidate| candidate.label() == "Duplicate"));
+}
+
+#[test]
+fn participant_scope_is_captured_in_actions_and_invalidates_old_replies() {
+    let (mut app, bob, filter) = participant_picker_app();
+    let Action::Search {
+        request: old,
+        participant: None,
+        ..
+    } = app.handle_key(key(KeyCode::Enter))
+    else {
+        panic!("first search is unfiltered");
+    };
+    app.handle_key(ctrl(KeyCode::Char('p')));
+    app.paste(" Alice ");
+    assert_eq!(app.search_query(), Some("needle"));
+    assert_eq!(app.search_participant_picker_query(), Some(" Alice "));
+    app.handle_key(key(KeyCode::Down));
+    assert_eq!(
+        app.selected_search_participant_candidate()
+            .unwrap()
+            .filter(),
+        Some(&filter)
+    );
+    app.handle_key(key(KeyCode::Enter));
+    assert_eq!(
+        app.selected,
+        Some(bob.id.clone()),
+        "scope selection is not recipient navigation"
+    );
+    assert_eq!(app.search_participant_scope(), Some(&filter));
+    let Action::Search {
+        request: current,
+        query,
+        participant,
+    } = app.handle_key(key(KeyCode::Enter))
+    else {
+        panic!("a scoped search must be captured");
+    };
+    assert_eq!(query, "needle");
+    assert_eq!(participant, Some(filter.clone()));
+    assert_ne!(old, current);
+    app.fail_search(old, "stale scope failure".into());
+    app.finish_search(
+        old,
+        vec![MessageSearchHit {
+            conversation_id: bob.id.clone(),
+            message_id: MessageId::new(transport(), "wrong-scope").unwrap(),
+            created_at: 1,
+            snippet: "needle from the old scope".into(),
+        }],
+    );
+    let state = app.search.as_ref().unwrap();
+    assert!(state.loading);
+    assert!(state.hits.is_empty());
+    assert!(state.error.is_none());
+    assert_eq!(state.request, Some(current));
+    app.finish_search(
+        current,
+        vec![MessageSearchHit {
+            conversation_id: app
+                .conversations
+                .iter()
+                .find(|chat| chat.id != bob.id)
+                .unwrap()
+                .id
+                .clone(),
+            message_id: MessageId::new(transport(), "right-scope").unwrap(),
+            created_at: 2,
+            snippet: "needle from the selected scope".into(),
+        }],
+    );
+    assert!(app.search_results_visible());
+    app.handle_key(ctrl(KeyCode::Char('p')));
+    app.handle_key(key(KeyCode::Home));
+    app.handle_key(key(KeyCode::Enter));
+    assert_eq!(app.search_participant_scope(), None);
+    assert_eq!(app.search_query(), Some("needle"));
+    assert!(!app.search_results_visible());
+    assert!(matches!(
+        app.handle_key(key(KeyCode::Enter)),
+        Action::Search {
+            participant: None,
+            ..
+        }
+    ));
+}
+
+#[test]
+fn cancelling_inner_picker_restores_search_and_outer_cancel_restores_its_draft() {
+    let (mut app, bob, filter) = participant_picker_app();
+    assert!(app.commit_search_participant(Some(filter.clone())));
+    app.handle_key(ctrl(KeyCode::Char('p')));
+    app.paste("different\nquery");
+    assert_eq!(
+        app.search_participant_picker_query(),
+        Some("different query")
+    );
+    assert_eq!(app.search_query(), Some("needle"));
+    assert!(!app.search_results_visible());
+    app.handle_key(key(KeyCode::Esc));
+    assert!(!app.search_participant_picker_open());
+    assert!(app.search.is_some());
+    assert_eq!(app.search_participant_scope(), Some(&filter));
+    app.handle_key(ctrl(KeyCode::Char('p')));
+    app.handle_key(ctrl(KeyCode::Char('p')));
+    assert!(!app.search_participant_picker_open());
+    assert_eq!(app.search_query(), Some("needle"));
+    app.handle_key(key(KeyCode::Esc));
+    assert!(app.search.is_none());
+    assert_eq!(app.selected, Some(bob.id));
+    assert_eq!(app.draft, "/new\nparked 👩‍💻 draft");
+    assert_eq!(app.draft_cursor, 4);
+    assert!(app.pasted_body);
+}
+
+#[test]
+fn editing_picker_query_cannot_commit_a_hidden_old_candidate() {
+    let (mut app, bob, _) = participant_picker_app();
+    let old = ParticipantFilter {
+        transport: bob.id.transport().clone(),
+        handle: bob.participants[1].handle.clone(),
+    };
+    assert!(app.commit_search_participant(Some(old.clone())));
+    app.open_search_participant_picker();
+    assert_eq!(
+        app.selected_search_participant_candidate()
+            .unwrap()
+            .filter(),
+        Some(&old)
+    );
+    app.paste("Alice");
+    assert!(app
+        .selected_search_participant_candidate()
+        .unwrap()
+        .is_all_chats());
+    assert_eq!(
+        app.search_participant_scope(),
+        Some(&old),
+        "typing has not committed a new scope"
+    );
+    app.handle_key(key(KeyCode::Enter));
+    assert_eq!(
+        app.search_participant_scope(),
+        None,
+        "Enter commits the visible All chats row, not hidden Bob"
+    );
+    assert_eq!(app.search_query(), Some("needle"));
+}
+
+#[test]
+fn metadata_changes_cannot_commit_a_picker_candidate_that_became_hidden() {
+    let (mut app, _, filter) = participant_picker_app();
+    let mut chats = app.conversations.clone();
+    let alice = chats
+        .iter_mut()
+        .find(|chat| chat.participants[1].handle == filter.handle)
+        .unwrap();
+    alice.participants[1].display_name = Some("School friend".into());
+    app.set_conversations(chats);
+    app.open_search_participant_picker();
+    app.search_paste("School");
+    app.step_search_participant(1);
+    assert_eq!(
+        app.selected_search_participant_candidate()
+            .unwrap()
+            .filter(),
+        Some(&filter)
+    );
+    let mut chats = app.conversations.clone();
+    let alice = chats
+        .iter_mut()
+        .find(|chat| chat.participants[1].handle == filter.handle)
+        .unwrap();
+    alice.participants[1].display_name = Some("Renamed".into());
+    app.set_conversations(chats);
+    assert!(app.selected_search_participant_candidate().is_none());
+    app.handle_key(key(KeyCode::Enter));
+    assert_eq!(app.search_participant_scope(), None);
+    assert!(app.search_participant_picker_open());
+}
+
+#[test]
+fn committing_a_removed_participant_never_falls_back_to_all_chats() {
+    let (mut app, bob, filter) = participant_picker_app();
+    app.open_search_participant_picker();
+    app.set_conversations(vec![bob.clone()]);
+    assert!(!app.commit_search_participant(Some(filter)));
+    assert!(app.search_participant_picker_open());
+    assert_eq!(app.search_query(), Some("needle"));
+    assert_eq!(app.selected, Some(bob.id));
+}
+
+#[test]
+fn unfiltered_search_actions_keep_query_text_literal() {
+    let (mut app, _, _) = participant_picker_app();
+    app.search_clear();
+    app.search_paste("from:alice");
+    assert!(matches!(app.handle_key(key(KeyCode::Enter)),
+        Action::Search { query, participant: None, .. } if query == "from:alice"));
 }
 
 #[test]

@@ -13,7 +13,9 @@ use bloom_domain::{
     Conversation, ConversationId, ConversationKind, DeliveryState, Handle, HandleKind, Message,
     MessageId, OutgoingBody, Participant,
 };
-use bloom_ipc::{Event, EventKind, HistoryCursor, MessageSearchHit, ProtocolError};
+use bloom_ipc::{
+    Event, EventKind, HistoryCursor, MessageSearchHit, ParticipantFilter, ProtocolError,
+};
 use bloom_transport::{TransportError, TransportEvent};
 use std::{
     sync::{Arc, Mutex},
@@ -315,6 +317,19 @@ impl RequestHandler for Service {
         Box::pin(async move {
             let store = self.store.lock().unwrap();
             store::search_messages(&store, &query, limit).map_err(|_| ProtocolError::Internal)
+        })
+    }
+
+    fn search_messages_with_participant(
+        &self,
+        query: String,
+        limit: u16,
+        participant: Option<ParticipantFilter>,
+    ) -> HandlerFuture<'_, Vec<MessageSearchHit>> {
+        Box::pin(async move {
+            let store = self.store.lock().unwrap();
+            store::search_messages_with_participant(&store, &query, limit, participant.as_ref())
+                .map_err(|_| ProtocolError::Internal)
         })
     }
 

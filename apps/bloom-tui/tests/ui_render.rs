@@ -8,7 +8,7 @@ use bloom_domain::{
     Conversation, ConversationId, ConversationKind, DeliveryState, Handle, HandleKind, Message,
     MessageId, MessagePart, Participant, TransportId,
 };
-use bloom_ipc::MessageSearchHit;
+use bloom_ipc::{MessageSearchHit, ParticipantFilter};
 use bloom_tui::{
     app::{App, Focus, SendFeedback, SendPhase, Theme, OLDER_PAGE_LIMIT, SEARCH_RESULT_LIMIT},
     daemon::{ConnectionState, HISTORY_LIMIT},
@@ -3897,6 +3897,306 @@ fn start_context_lookup(
     app.begin_search_jump().expect("search jump");
     app.advance_search_jump();
     app.begin_search_context_request().expect("context request")
+}
+
+fn participant_render_app(raw_handle: &str) -> (App, ParticipantFilter, ParticipantFilter) {
+    let mut first = conversation("First chat", 2, 40);
+    first.id = ConversationId::new(TransportId::new("alpha").unwrap(), "first").unwrap();
+    first.participants[1].handle = Handle::new(HandleKind::Email, raw_handle).unwrap();
+    first.participants[1].display_name = Some("Duplicate".into());
+    let mut second = first.clone();
+    second.id = ConversationId::new(TransportId::new("beta").unwrap(), "second").unwrap();
+    second.title = Some("Second chat".into());
+    let filters: Vec<_> = [&first, &second]
+        .into_iter()
+        .map(|chat| ParticipantFilter {
+            transport: chat.id.transport().clone(),
+            handle: chat.participants[1].handle.clone(),
+        })
+        .collect();
+    let mut app = App::default();
+    app.set_conversations(vec![first.clone(), second]);
+    app.select(Some(first.id.clone()));
+    app.draft = "/new\nparked draft".into();
+    app.draft_cursor = 3;
+    app.pasted_body = true;
+    let request = start_search(&mut app, "needle");
+    app.finish_search(
+        request,
+        vec![search_hit(&first, "old", "OLD_SCOPE_SNIPPET")],
+    );
+    app.open_search_participant_picker();
+    (app, filters[0].clone(), filters[1].clone())
+}
+
+#[test]
+fn participant_picker_paints_identities_not_old_result_rows() {
+    let (mut app, first, second) = participant_render_app("p@example.invalid");
+    let (grid, hits) = tracked_frame(&mut app, 100, 30);
+    let text: String = (0..grid.area.height).map(|y| row_text(&grid, y)).collect();
+    for expected in [
+        "Search: needle",
+        "Chats with",
+        "Find:",
+        "All chats",
+        "alpha",
+        "beta",
+        "p@example.invalid",
+        "Duplicate",
+    ] {
+        assert!(text.contains(expected), "missing {expected}: {text}");
+    }
+    assert!(!text.contains("OLD_SCOPE_SNIPPET"));
+    assert!(hits.search_rows.is_empty());
+    assert_eq!(hits.search_participant_rows.len(), 3);
+    for (area, filter) in &hits.search_participant_rows {
+        assert_eq!(
+            hits.at(area.x + 1, area.y),
+            Some(ui::Hit::SearchParticipant(filter.clone()))
+        );
+    }
+    assert!(hits
+        .search_participant_rows
+        .iter()
+        .any(|(_, filter)| filter.as_ref() == Some(&first)));
+    assert!(hits
+        .search_participant_rows
+        .iter()
+        .any(|(_, filter)| filter.as_ref() == Some(&second)));
+    app.close_search_participant_picker();
+    assert!(rendered(&app).contains("All chats · Ctrl+P"));
+    assert!(app.commit_search_participant(Some(first)));
+    let text = rendered(&app);
+    assert!(text.contains("Chats with"));
+    assert!(text.contains("alpha"));
+    assert!(text.contains("Search: needle"));
+}
+
+#[test]
+fn participant_picker_narrow_rows_keep_transport_and_hitboxes_stay_inside_frame() {
+    let (mut app, first, second) =
+        participant_render_app("a-very-long-shared-participant-address@example.invalid");
+    for (index, wanted) in [(1, first), (2, second)] {
+        app.select_search_participant(index);
+        let (grid, hits) = tracked_frame(&mut app, 44, 12);
+        let text: String = (0..grid.area.height).map(|y| row_text(&grid, y)).collect();
+        assert!(text.contains("Find:"), "{text}");
+        assert!(
+            text.contains(wanted.transport.as_str()),
+            "the selected transport must remain visible beside a long handle: {text}"
+        );
+        assert!(
+            hits.search_participant_rows
+                .iter()
+                .any(|(_, filter)| filter.as_ref() == Some(&wanted)),
+            "compact mode must keep the selected identity selectable"
+        );
+    }
+    for (width, height) in [(44, 12), (30, 8), (8, 4), (1, 1)] {
+        let (_, hits) = tracked_frame(&mut app, width, height);
+        for (area, filter) in &hits.search_participant_rows {
+            assert!(area.width > 0 && area.height > 0);
+            assert!(area.right() <= width && area.bottom() <= height);
+            assert_eq!(
+                hits.search_participant_at(area.x, area.y),
+                Some(filter.clone())
+            );
+        }
+        assert!(hits.search_rows.is_empty());
+    }
+}
+
+#[test]
+fn participant_picker_wraps_shared_prefix_handles_without_losing_distinguishing_text() {
+    for values in [
+        [
+            "long.name.one@example.invalid",
+            "long.name.two@example.invalid",
+        ],
+        [
+            "identical.long.name@one.example.invalid",
+            "identical.long.name@two.example.invalid",
+        ],
+    ] {
+        let (mut app, _, _) = participant_render_app(values[0]);
+        let mut chats = app.conversations.clone();
+        chats[1].id = ConversationId::new(TransportId::new("alpha").unwrap(), "second").unwrap();
+        chats[1].participants[1].handle = Handle::new(HandleKind::Email, values[1]).unwrap();
+        app.set_conversations(chats);
+        let candidates = app.search_participant_candidates();
+        for (index, candidate) in candidates.iter().enumerate().skip(1) {
+            let wanted = candidate.filter().unwrap();
+            for (width, height) in [(24, 12), (44, 12), (100, 30)] {
+                app.select_search_participant(index);
+                let (grid, hits) = tracked_frame(&mut app, width, height);
+                let row = hits
+                    .search_participant_rows
+                    .iter()
+                    .find(|(_, filter)| filter.as_ref() == Some(wanted))
+                    .expect("the selected identity must be painted")
+                    .0;
+                let identity: String = (row.y..row.bottom())
+                    .flat_map(|y| row_text(&grid, y).chars().collect::<Vec<_>>())
+                    .filter(|character| !character.is_whitespace())
+                    .collect();
+                assert!(
+                    identity.contains(wanted.handle.value()),
+                    "full distinguishing handle must be inspectable at {width}: {identity}"
+                );
+                assert!(identity.contains(wanted.transport.as_str()));
+                assert_eq!(
+                    hits.at(row.x + 1, row.bottom() - 1),
+                    Some(ui::Hit::SearchParticipant(Some(wanted.clone())))
+                );
+                if width < 70 {
+                    assert_eq!(
+                        hits.sidebar.width, 0,
+                        "the narrow picker owns the whole frame"
+                    );
+                    assert_eq!(hits.composer.width, 0);
+                    assert!(hits.transcript_view.is_none());
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn participant_picker_mouse_commits_the_painted_identity_after_reordering() {
+    let (mut app, first, second) = participant_render_app("p@example.invalid");
+    let recipient = app.selected.clone();
+    let (_, hits) = tracked_frame(&mut app, 100, 30);
+    let second_row = hits
+        .search_participant_rows
+        .iter()
+        .find(|(_, filter)| filter.as_ref() == Some(&second))
+        .unwrap()
+        .0;
+    app.handle_mouse(
+        MouseEventKind::Down(MouseButton::Left),
+        second_row.x + 1,
+        second_row.y,
+        &hits,
+    );
+    assert_eq!(app.search_participant_scope(), Some(&second));
+    assert_eq!(app.selected, recipient);
+    assert_eq!(app.search_query(), Some("needle"));
+    app.open_search_participant_picker();
+    let (_, hits) = tracked_frame(&mut app, 100, 30);
+    let all_row = hits
+        .search_participant_rows
+        .iter()
+        .find(|(_, filter)| filter.is_none())
+        .unwrap()
+        .0;
+    app.handle_mouse(
+        MouseEventKind::Down(MouseButton::Left),
+        all_row.x + 1,
+        all_row.y,
+        &hits,
+    );
+    assert_eq!(app.search_participant_scope(), None);
+    assert!(!app.search_participant_picker_open());
+    app.open_search_participant_picker();
+    let (_, hits) = tracked_frame(&mut app, 100, 30);
+    let first_row = hits
+        .search_participant_rows
+        .iter()
+        .find(|(_, filter)| filter.as_ref() == Some(&first))
+        .unwrap()
+        .0;
+    let mut chats = app.conversations.clone();
+    for chat in &mut chats {
+        chat.participants[1].display_name = Some(
+            if chat.id.transport() == &first.transport {
+                "Zed"
+            } else {
+                "Aaa"
+            }
+            .into(),
+        );
+    }
+    app.set_conversations(chats);
+    app.handle_mouse(
+        MouseEventKind::Down(MouseButton::Left),
+        first_row.x + 1,
+        first_row.y,
+        &hits,
+    );
+    assert_eq!(
+        app.search_participant_scope(),
+        Some(&first),
+        "clicks use the painted identity, never a later row index"
+    );
+    app.close_search();
+    assert_eq!(app.selected, recipient);
+    assert_eq!(app.draft, "/new\nparked draft");
+    assert_eq!(app.draft_cursor, 3);
+    assert!(app.pasted_body);
+}
+
+#[test]
+fn participant_picker_hidden_highlight_and_removed_painted_rows_do_not_commit() {
+    let (mut app, first, second) = participant_render_app("p@example.invalid");
+    assert!(app.commit_search_participant(Some(second.clone())));
+    app.open_search_participant_picker();
+    app.search_paste("Duplicate");
+    app.step_search_participant(1);
+    let mut chats = app.conversations.clone();
+    let first_chat = chats
+        .iter_mut()
+        .find(|chat| chat.id.transport() == &first.transport)
+        .unwrap();
+    first_chat.participants[1].display_name = Some("Renamed".into());
+    app.set_conversations(chats);
+    assert!(app.selected_search_participant_candidate().is_none());
+    let (grid, hits) = tracked_frame(&mut app, 100, 30);
+    for (area, _) in &hits.search_participant_rows {
+        assert!(
+            !row_text(&grid, area.y).contains("› "),
+            "no false All chats highlight"
+        );
+    }
+    app.search_clear();
+    let (_, stale_hits) = tracked_frame(&mut app, 100, 30);
+    let first_row = stale_hits
+        .search_participant_rows
+        .iter()
+        .find(|(_, filter)| filter.as_ref() == Some(&first))
+        .unwrap()
+        .0;
+    let chats = app
+        .conversations
+        .iter()
+        .filter(|chat| chat.id.transport() != &first.transport)
+        .cloned()
+        .collect();
+    app.set_conversations(chats);
+    let recipient = app.selected.clone();
+    app.handle_mouse(
+        MouseEventKind::Down(MouseButton::Left),
+        first_row.x + 1,
+        first_row.y,
+        &stale_hits,
+    );
+    assert_eq!(app.search_participant_scope(), Some(&second));
+    assert!(app.search_participant_picker_open());
+    assert_eq!(app.selected, recipient);
+}
+
+#[test]
+fn participant_picker_wheel_owns_only_its_painted_popup() {
+    let (mut app, _, _) = participant_render_app("p@example.invalid");
+    let (_, hits) = tracked_frame(&mut app, 100, 30);
+    let selected = app.selected_search_participant_candidate();
+    app.handle_mouse(MouseEventKind::ScrollDown, 0, 0, &hits);
+    assert_eq!(app.selected_search_participant_candidate(), selected);
+    let row = hits.search_participant_rows[0].0;
+    app.handle_mouse(MouseEventKind::ScrollDown, row.x + 1, row.y, &hits);
+    assert!(!app
+        .selected_search_participant_candidate()
+        .unwrap()
+        .is_all_chats());
 }
 
 #[test]

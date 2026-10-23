@@ -4,6 +4,7 @@ use rusqlite::{params, OptionalExtension};
 use std::collections::HashSet;
 
 pub use bloom_ipc::MessageSearchHit;
+use bloom_ipc::ParticipantFilter;
 
 const SEARCH_SCAN_LIMIT: usize = 20_000;
 const SNIPPET_CONTEXT_CHARS: usize = 30;
@@ -88,6 +89,19 @@ pub fn search_messages(
     query: &str,
     limit: u16,
 ) -> Result<Vec<MessageSearchHit>, StoreError> {
+    search_messages_with_participant(store, query, limit, None)
+}
+
+/// Search text parts of stored messages, optionally scoped to canonical
+/// conversations whose current participants include the exact filter handle.
+/// Membership is checked before hits are counted, so a limit never hides a
+/// matching older message behind newer out-of-scope hits.
+pub fn search_messages_with_participant(
+    store: &EncryptedStore,
+    query: &str,
+    limit: u16,
+    participant: Option<&ParticipantFilter>,
+) -> Result<Vec<MessageSearchHit>, StoreError> {
     let query = query.trim();
     if query.is_empty() || limit == 0 {
         return Ok(Vec::new());
@@ -96,6 +110,30 @@ pub fn search_messages(
     if query_lower.is_empty() {
         return Ok(Vec::new());
     }
+
+    // Resolve current canonical membership once, from metadata only. Retired rows
+    // are excluded by `list_conversations`, so an alias-only participant cannot
+    // grant membership to the canonical conversation.
+    let membership = match participant {
+        Some(filter) => {
+            let matching = super::conversations::list_conversations(store)?
+                .into_iter()
+                .filter(|conversation| {
+                    conversation.id.transport() == &filter.transport
+                        && conversation
+                            .participants
+                            .iter()
+                            .any(|participant| participant.handle == filter.handle)
+                })
+                .map(|conversation| conversation.id)
+                .collect::<HashSet<_>>();
+            if matching.is_empty() {
+                return Ok(Vec::new());
+            }
+            Some(matching)
+        }
+        None => None,
+    };
 
     // `messages_recent_order` serves this ordering, so the LIMIT bounds the rows
     // read rather than sorting the whole table first.
@@ -121,6 +159,11 @@ pub fn search_messages(
             .get(message.conversation_id())
             .cloned()
             .unwrap_or_else(|| message.conversation_id().clone());
+        if let Some(membership) = &membership {
+            if !membership.contains(&conversation_id) {
+                continue;
+            }
+        }
         hits.push(MessageSearchHit {
             conversation_id,
             message_id: message.id().clone(),
@@ -473,7 +516,8 @@ mod tests {
     use super::*;
     use crate::store::KEY_BYTES;
     use bloom_domain::{
-        Conversation, ConversationKind, DeliveryState, Handle, HandleKind, MessagePart, TransportId,
+        Conversation, ConversationKind, DeliveryState, Handle, HandleKind, MessagePart,
+        Participant, TransportId,
     };
     use std::fs;
 
@@ -813,6 +857,447 @@ mod tests {
         let hits = search_messages(&store, "needle", 10).unwrap();
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].conversation_id, conversation);
+    }
+
+    #[test]
+    fn filtered_search_finds_a_match_behind_more_than_fifty_newer_global_hits() {
+        let (_temp, mut store, conversation) = setup();
+        let friend = participant(HandleKind::Email, "friend@example.invalid", Some("Friend"));
+        super::super::conversations::upsert_conversation(
+            &mut store,
+            &scoped_conversation(
+                "alpha",
+                "room",
+                ConversationKind::Direct,
+                vec![friend.clone()],
+                Vec::new(),
+            ),
+        )
+        .unwrap();
+        super::super::conversations::upsert_conversation(
+            &mut store,
+            &scoped_conversation(
+                "alpha",
+                "elsewhere",
+                ConversationKind::Direct,
+                Vec::new(),
+                Vec::new(),
+            ),
+        )
+        .unwrap();
+        for at in 10..=60 {
+            upsert_message(
+                &mut store,
+                &fixture_message(
+                    "alpha",
+                    &format!("newer-{at}"),
+                    "elsewhere",
+                    at,
+                    "needle elsewhere",
+                    DeliveryState::Sent,
+                ),
+            )
+            .unwrap();
+        }
+        upsert_message(
+            &mut store,
+            &fixture_message(
+                "alpha",
+                "hidden",
+                "room",
+                1,
+                "needle in the scoped chat",
+                DeliveryState::Sent,
+            ),
+        )
+        .unwrap();
+
+        let unfiltered = search_messages(&store, "needle", 1).unwrap();
+        assert_eq!(unfiltered[0].message_id.value(), "newer-60");
+        assert_eq!(
+            unfiltered[0].snippet, "needle elsewhere",
+            "unfiltered snippets stay unchanged"
+        );
+
+        let newest_fifty = search_messages(&store, "needle", 50).unwrap();
+        assert_eq!(newest_fifty.len(), 50);
+        assert_eq!(newest_fifty.first().unwrap().message_id.value(), "newer-60");
+        assert_eq!(newest_fifty.last().unwrap().message_id.value(), "newer-11");
+        assert!(newest_fifty
+            .iter()
+            .all(|hit| hit.message_id.value() != "hidden"));
+
+        let filter = ParticipantFilter {
+            transport: TransportId::new("alpha").unwrap(),
+            handle: friend.handle,
+        };
+        for limit in [1, 50] {
+            let hits =
+                search_messages_with_participant(&store, "needle", limit, Some(&filter)).unwrap();
+            assert_eq!(hits.len(), 1, "limit {limit} counts only in-scope hits");
+            assert_eq!(hits[0].message_id.value(), "hidden");
+            assert_eq!(hits[0].conversation_id, conversation);
+            assert_eq!(hits[0].snippet, "needle in the scoped chat");
+        }
+    }
+
+    #[test]
+    fn participant_and_unfiltered_search_share_the_global_scan_boundary() {
+        let (_temp, mut store, _) = setup();
+        let friend = participant(HandleKind::Email, "friend@example.invalid", None);
+        for (id, people) in [("room", vec![friend.clone()]), ("elsewhere", Vec::new())] {
+            super::super::conversations::upsert_conversation(
+                &mut store,
+                &scoped_conversation("alpha", id, ConversationKind::Direct, people, Vec::new()),
+            )
+            .unwrap();
+        }
+        for (id, at) in [("outside-bound", 0), ("at-bound", 1)] {
+            upsert_message(
+                &mut store,
+                &fixture_message("alpha", id, "room", at, "needle", DeliveryState::Sent),
+            )
+            .unwrap();
+        }
+        for index in 0..SEARCH_SCAN_LIMIT - 1 {
+            upsert_message(
+                &mut store,
+                &fixture_message(
+                    "alpha",
+                    &format!("recent-{index}"),
+                    "elsewhere",
+                    index as i64 + 2,
+                    "haystack",
+                    DeliveryState::Sent,
+                ),
+            )
+            .unwrap();
+        }
+        let filter = ParticipantFilter {
+            transport: TransportId::new("alpha").unwrap(),
+            handle: friend.handle,
+        };
+        for scope in [None, Some(&filter)] {
+            let hits = search_messages_with_participant(&store, "needle", 50, scope).unwrap();
+            assert_eq!(
+                hits.len(),
+                1,
+                "membership must not move the global scan boundary"
+            );
+            assert_eq!(hits[0].message_id.value(), "at-bound");
+        }
+    }
+
+    #[test]
+    fn filter_matches_exact_transport_handle_kind_and_value_ignoring_labels() {
+        let (_temp, mut store, _conversation) = setup();
+        for (transport, value, kind) in [
+            ("alpha", "email-room", HandleKind::Email),
+            ("alpha", "tel-room", HandleKind::Tel),
+            ("alpha", "opaque-room", HandleKind::Opaque),
+            ("beta", "email-room", HandleKind::Email),
+        ] {
+            super::super::conversations::upsert_conversation(
+                &mut store,
+                &scoped_conversation(
+                    transport,
+                    value,
+                    ConversationKind::Direct,
+                    vec![participant(kind, "same-value", Some("Duplicate label"))],
+                    Vec::new(),
+                ),
+            )
+            .unwrap();
+        }
+        for (transport, value, at) in [
+            ("alpha", "email-room", 1),
+            ("alpha", "tel-room", 2),
+            ("alpha", "opaque-room", 3),
+            ("beta", "email-room", 4),
+        ] {
+            upsert_message(
+                &mut store,
+                &fixture_message(
+                    transport,
+                    &format!("m-{transport}-{value}"),
+                    value,
+                    at,
+                    "needle",
+                    DeliveryState::Sent,
+                ),
+            )
+            .unwrap();
+        }
+
+        for (transport, kind, expected) in [
+            ("alpha", HandleKind::Email, Some("email-room")),
+            ("alpha", HandleKind::Tel, Some("tel-room")),
+            ("alpha", HandleKind::Opaque, Some("opaque-room")),
+            ("beta", HandleKind::Email, Some("email-room")),
+            ("alpha-other", HandleKind::Email, None),
+        ] {
+            let filter = ParticipantFilter {
+                transport: TransportId::new(transport).unwrap(),
+                handle: Handle::new(kind, "same-value").unwrap(),
+            };
+            let hits =
+                search_messages_with_participant(&store, "needle", 10, Some(&filter)).unwrap();
+            match expected {
+                Some(expected) => {
+                    assert_eq!(hits.len(), 1, "{transport} {expected}");
+                    assert_eq!(hits[0].conversation_id.transport().as_str(), transport);
+                    assert_eq!(hits[0].conversation_id.value(), expected);
+                }
+                None => assert!(hits.is_empty(), "a different transport must not match"),
+            }
+        }
+
+        let filter = ParticipantFilter {
+            transport: TransportId::new("alpha").unwrap(),
+            handle: Handle::new(HandleKind::Email, "different-value").unwrap(),
+        };
+        assert!(
+            search_messages_with_participant(&store, "needle", 10, Some(&filter))
+                .unwrap()
+                .is_empty(),
+            "a different handle value must not match"
+        );
+    }
+
+    #[test]
+    fn group_participant_matches_regardless_of_message_sender() {
+        let (_temp, mut store, _conversation) = setup();
+        let friend = participant(HandleKind::Email, "member@example.invalid", Some("Member"));
+        super::super::conversations::upsert_conversation(
+            &mut store,
+            &scoped_conversation(
+                "alpha",
+                "group",
+                ConversationKind::Group,
+                vec![
+                    friend.clone(),
+                    participant(HandleKind::Opaque, "someone-else", Some("Other")),
+                ],
+                Vec::new(),
+            ),
+        )
+        .unwrap();
+        upsert_message(
+            &mut store,
+            &fixture_message(
+                "alpha",
+                "g1",
+                "group",
+                1,
+                "needle from another sender",
+                DeliveryState::Sent,
+            ),
+        )
+        .unwrap();
+
+        let filter = ParticipantFilter {
+            transport: TransportId::new("alpha").unwrap(),
+            handle: friend.handle,
+        };
+        let hits = search_messages_with_participant(&store, "needle", 10, Some(&filter)).unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].conversation_id.value(), "group");
+    }
+
+    #[test]
+    fn alias_messages_use_current_canonical_membership_not_retired_metadata() {
+        let (_temp, mut store, _conversation) = setup();
+        let friend = participant(HandleKind::Email, "friend@example.invalid", Some("Friend"));
+        let good_alias =
+            ConversationId::new(TransportId::new("alpha").unwrap(), "legacy-good").unwrap();
+        let bad_alias =
+            ConversationId::new(TransportId::new("alpha").unwrap(), "legacy-bad").unwrap();
+        super::super::conversations::upsert_conversation(
+            &mut store,
+            &scoped_conversation(
+                "alpha",
+                "canonical",
+                ConversationKind::Direct,
+                vec![friend.clone()],
+                vec![good_alias.clone()],
+            ),
+        )
+        .unwrap();
+        super::super::conversations::upsert_conversation(
+            &mut store,
+            &scoped_conversation(
+                "alpha",
+                "legacy-good",
+                ConversationKind::Direct,
+                Vec::new(),
+                Vec::new(),
+            ),
+        )
+        .unwrap();
+        super::super::conversations::upsert_conversation(
+            &mut store,
+            &scoped_conversation(
+                "alpha",
+                "canonical-without-member",
+                ConversationKind::Direct,
+                Vec::new(),
+                vec![bad_alias.clone()],
+            ),
+        )
+        .unwrap();
+        super::super::conversations::upsert_conversation(
+            &mut store,
+            &scoped_conversation(
+                "alpha",
+                "legacy-bad",
+                ConversationKind::Direct,
+                vec![friend.clone()],
+                Vec::new(),
+            ),
+        )
+        .unwrap();
+        upsert_message(
+            &mut store,
+            &fixture_message(
+                "alpha",
+                "via-alias",
+                "legacy-good",
+                2,
+                "needle through the alias",
+                DeliveryState::Sent,
+            ),
+        )
+        .unwrap();
+        upsert_message(
+            &mut store,
+            &fixture_message(
+                "alpha",
+                "retired-only",
+                "legacy-bad",
+                1,
+                "needle only in retired metadata",
+                DeliveryState::Sent,
+            ),
+        )
+        .unwrap();
+
+        let filter = ParticipantFilter {
+            transport: TransportId::new("alpha").unwrap(),
+            handle: friend.handle,
+        };
+        let hits = search_messages_with_participant(&store, "needle", 10, Some(&filter)).unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].message_id.value(), "via-alias");
+        assert_eq!(
+            hits[0].conversation_id.value(),
+            "canonical",
+            "the alias message reports its canonical conversation"
+        );
+    }
+
+    #[test]
+    fn filtered_search_returns_empty_for_missing_metadata_or_no_body_match() {
+        let (_temp, mut store, _conversation) = setup();
+        // Inject an orphan only in this synthetic test. Normal writes enforce the
+        // FK; filtering must still fail closed if imported/corrupt data lacks metadata.
+        store
+            ._connection
+            .pragma_update(None, "foreign_keys", false)
+            .unwrap();
+        upsert_message(
+            &mut store,
+            &fixture_message(
+                "alpha",
+                "unlisted",
+                "unlisted",
+                2,
+                "needle without conversation metadata",
+                DeliveryState::Sent,
+            ),
+        )
+        .unwrap();
+        store
+            ._connection
+            .pragma_update(None, "foreign_keys", true)
+            .unwrap();
+        let friend = participant(HandleKind::Email, "friend@example.invalid", Some("Friend"));
+        super::super::conversations::upsert_conversation(
+            &mut store,
+            &scoped_conversation(
+                "alpha",
+                "room",
+                ConversationKind::Direct,
+                vec![friend.clone()],
+                Vec::new(),
+            ),
+        )
+        .unwrap();
+        upsert_message(
+            &mut store,
+            &fixture_message(
+                "alpha",
+                "room-body",
+                "room",
+                1,
+                "different body",
+                DeliveryState::Sent,
+            ),
+        )
+        .unwrap();
+
+        let filter = ParticipantFilter {
+            transport: TransportId::new("alpha").unwrap(),
+            handle: friend.handle,
+        };
+        assert!(
+            search_messages_with_participant(&store, "needle", 10, Some(&filter))
+                .unwrap()
+                .is_empty(),
+            "missing metadata yields no hits rather than unfiltered results"
+        );
+        assert!(
+            search_messages_with_participant(&store, "absent", 10, Some(&filter))
+                .unwrap()
+                .is_empty()
+        );
+        let unknown = ParticipantFilter {
+            transport: TransportId::new("alpha").unwrap(),
+            handle: Handle::new(HandleKind::Email, "unknown@example.invalid").unwrap(),
+        };
+        assert!(
+            search_messages_with_participant(&store, "different", 10, Some(&unknown))
+                .unwrap()
+                .is_empty(),
+            "no matching conversation yields no hits"
+        );
+    }
+
+    fn participant(kind: HandleKind, value: &str, display_name: Option<&str>) -> Participant {
+        Participant {
+            handle: Handle::new(kind, value).unwrap(),
+            display_name: display_name.map(str::to_owned),
+            is_me: false,
+        }
+    }
+
+    fn scoped_conversation(
+        transport: &str,
+        value: &str,
+        kind: ConversationKind,
+        participants: Vec<Participant>,
+        aliases: Vec<ConversationId>,
+    ) -> Conversation {
+        Conversation {
+            id: ConversationId::new(TransportId::new(transport).unwrap(), value).unwrap(),
+            remote_id: value.into(),
+            kind,
+            title: None,
+            participants,
+            created_at: 0,
+            last_message_at: None,
+            aliases,
+            preview: None,
+        }
     }
 
     #[test]

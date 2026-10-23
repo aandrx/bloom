@@ -2,7 +2,7 @@
 
 **Status: active next-work plan, not completed features.** Replaces the obsolete foundation/direct-transport wave list. Read [handoff](handoff.md), [current design](system-design.md), [status](status.md) and [completed iteration](iteration-review.md) first.
 
-**Current user priority: UI/UX quality for the existing chat client.** The [reading/navigation pass](ux-polish-review.md) records its accepted bounded scope, and the [switching-latency follow-up](tui-switching-performance.md) records the lag report, measurements and acceptance. The daily reading loop has since gained local paging, local message search and session composer undo. Backend recovery and historical import remain queued behind that work.
+**Current user priority: UI/UX quality for the existing chat client.** The [reading/navigation pass](ux-polish-review.md) records its accepted bounded scope, and the [switching-latency follow-up](tui-switching-performance.md) records the lag report, measurements and acceptance. The daily reading loop now has local paging, text search with bounded deep-hit views, participant scope, session undo, and local unread navigation. Backend recovery and historical import remain queued behind that work.
 
 Multi-service integration and workspace/server navigation are deferred. Preserve [multi-service-research.md](multi-service-research.md) as research, not an active implementation instruction.
 
@@ -14,8 +14,8 @@ Rust daemon/domain/IPC/secret-store boundary, encrypted persistence, external Da
 
 The section numbers below group work by area; they are not execution order.
 
-1. Define participant-context search over local stored messages. Filter by an explicitly selected known participant identity, not an ambiguous name or a guessed sender. Freeze the request and UI semantics before implementation; bounded read-only research is underway.
-2. Keep attachment search queued. Deep-hit navigation is accepted with the evidence below.
+1. Bound stored attachment-metadata search before implementation. A five-source-file read-only research task is checking whether filenames survive transport mapping and encrypted persistence. Do not infer names from URLs, attachment IDs, or generic placeholders. If usable metadata is absent, record the blocker rather than fabricate search.
+2. Participant-context search and deep-hit navigation are accepted with the evidence below. Attachment sending, download/open, content extraction, and remote history remain outside this next research unit.
 3. Start generation-scoped engine recovery only when resuming backend work. Historical ingestion, packaging, and rich messaging remain queued.
 
 Keep the launcher on debug. Do not add durable drafts, remote read receipts, or multi-service work to this unit.
@@ -48,7 +48,7 @@ This section covers reading and composition. Reading anchors, the measured Lates
 
 Shipped in this loop so far:
 
-- Keyset local pagination end to end. The store and IPC page backwards from a known message (currently protocol version 4), and the transcript loads the previous page when the reader reaches the oldest loaded row, keeps paged history across reconciliation for that chat, and stops at a bounded retained budget instead of repeating a discarded request.
+- Keyset local pagination end to end. The store and IPC page backwards from a known message (currently protocol version 5), and the transcript loads the previous page when the reader reaches the oldest loaded row, keeps paged history across reconciliation for that chat, and stops at a bounded retained budget instead of repeating a discarded request.
 - Local message search end to end. `search_messages` matches stored text parts case-insensitively, newest first, with char-boundary-safe snippets and canonical conversation ids. Ctrl+F or `/search` opens a modal that lists hits with chat identity and snippet, and opening a loaded hit anchors directly. Unloaded hits use the exact-context view described below.
 - Failure and identity handling around paging: page failures stay readable until the next interaction, alias reconciliation carries paged history and unions caches, and leaving a chat releases the in-flight page slot.
 - Session-only composer undo/redo and completed-search result counts, committed in `f85ce33`. Undo is bounded and recipient-owned; durable drafts are not implemented. A search at its result cap says "may be more" rather than claiming completeness.
@@ -66,13 +66,19 @@ Deep-hit navigation, accepted under shipp with synthetic coverage:
 - The TUI keeps context separate from normal latest history, with request-generation correlation. Reconciliation and arrivals cannot replace it. End or Latest returns to normal history without changing the draft. Context frames never advance read markers, and a marker advanced after drawing triggers one badge redraw.
 - Final parent workspace and timezone tests, strict Clippy, formatting, and source guard pass. Rebuilt runtime suites pass: 18 fixture, 12 input, 4 messaging, 12 reading/navigation, and 8 launcher tests. The deep PTY case opens a hit 1,420 rows back, survives reconciliation and arrivals, clears its badge on Latest, and preserves literal-paste provenance and the recipient. Scoped independent source reviews and parent runtime/capture inspection informed acceptance. No live account or engine was accessed.
 
+Participant-context search, accepted under shipp with synthetic coverage:
+
+- [Its design and acceptance record](participant-search.md) defines current local chat membership, not sender filtering or historical group membership. IPC v5 carries transport plus exact handle. Filtering happens before the result limit within the existing global newest-20,000-row scan bound; plain queries stay literal.
+- Ctrl+P inside Search opens **Chats with**. Exact identity-bearing rows, All chats, nested cancel, and request invalidation preserve the body query and recipient-owned draft. Narrow pickers own the full frame and wrap identities instead of silently hiding distinguishing text.
+- Final workspace and timezone tests, strict Clippy, formatting, source guard, and rebuilt runtime suites pass: 28 fixture, 14 reading/navigation, 12 input, 4 messaging, and 8 launcher tests. Scoped independent source reviews and parent runtime/capture inspection informed acceptance. The final presentation rereview found no remaining confirmed defects in its scope. No live account or engine was accessed.
+
 Next in this section:
 
-- Participant-context search. Research exact identity selection, group membership, aliases, filtering before result limits, and plain-query compatibility before dispatching a writer.
+- Establish whether stored attachment metadata supports an honest filename-only search. Research first, then freeze a small contract and review each implementation unit. No attachment implementation is authorized by metadata that exists only in domain types.
 
 Later in this section:
 
-- Attachment search remains queued; participant-context search is the next bounded design unit.
+- Attachment search depends on the metadata research above. Participant-context search is implemented.
 - Durable encrypted drafts still need a privacy and retention review; undo stays session-only until then.
 - Typed interaction modes to reduce independent flag combinations, but only behind regression coverage for modal transitions, recipient changes, aliases, filters and asynchronous results.
 

@@ -385,6 +385,125 @@ class ReadingFlows(unittest.TestCase):
 
 
 
+    def test_participant_search_filters_before_the_hit_cap_and_preserves_draft(self):
+        query = 'from:MEMBER_NEEDLE'  # Plain text, never sender-filter syntax.
+        self.append_fixture_message(CID, query + ' ALICE_SCOPED_HIT')
+        for index in range(61):
+            self.append_fixture_message(BOB, f'{query} Bob scope hit {index:03d}')
+        self.wait_for(lambda: 'Alice' in self.screen.display[0])
+        before = len(self.fixture.persisted()['messages'])
+        draft = '/new\nParticipant search draft for Alice'
+        self.key(b'\x1b[200~' + draft.encode() + b'\x1b[201~')
+        self.key(b'\x06')
+        self.wait_for(lambda: 'Search:' in self.text())
+        self.key(query.encode())
+        self.key(b'\r')
+        self.wait_for(lambda: '50 results' in self.text(), timeout=10)
+
+        # Cancelling the inner picker preserves both the literal body query and
+        # the completed unfiltered results. Pasted names never become addresses.
+        self.key(b'\x10')
+        self.wait_for(lambda: 'Find:' in self.text() and 'Chats with' in self.text())
+        self.key(b'\x1b[200~Bob\n\x1b[201~')
+        self.key(b'\x1b')
+        self.wait_for(lambda: f'Search: {query}' in self.text())
+        self.assertIn('50 results', self.text())
+
+        def choose_alice(mouse=False):
+            self.key(b'\x10')
+            self.wait_for(lambda: 'Find:' in self.text())
+            self.key(b'Alice')
+            if mouse:
+                row, line = next((row, line) for row, line in enumerate(self.screen.display)
+                                 if 'email:alice@example.invalid' in line)
+                column = line.index('alice@example.invalid') + 1
+                self.key(f'\x1b[<0;{column};{row + 1}M'.encode())
+            else:
+                self.key(b'\x1b[B')
+                self.key(b'\r')
+            self.wait_for(lambda: f'Search: {query}' in self.text())
+            self.key(b'\r')
+            self.wait_for(lambda: re.search(r'\b1 results\b', self.text()) is not None, timeout=10)
+
+        choose_alice()
+        self.artifact('participant-scoped-results')
+        # Explicit All chats restores the original global result cap without
+        # editing the text query or committing a recipient change.
+        self.key(b'\x10')
+        self.wait_for(lambda: 'Find:' in self.text())
+        self.key(b'\x1b[H')
+        self.key(b'\r')
+        self.wait_for(lambda: f'Search: {query}' in self.text())
+        self.key(b'\r')
+        self.wait_for(lambda: '50 results' in self.text(), timeout=10)
+        choose_alice(mouse=True)
+        self.assertEqual(len(self.fixture.persisted()['messages']), before,
+                         'picker interaction must never send or change recipients')
+        self.key(b'\r')
+
+        def transcript_text():
+            divider = self.screen.display[0].find('│')
+            left = divider + 3 if divider >= 0 else 2
+            return '\n'.join(line[left:] for line in self.screen.display[2:-5])
+
+        self.wait_for(lambda: 'ALICE_SCOPED_HIT' in transcript_text())
+        self.assertIn('Alice', self.screen.display[0])
+        for line in draft.splitlines():
+            self.assertIn(line, self.text())
+        self.artifact('participant-result-opened-with-draft')
+        self.key(b'\r')
+
+        def sent_draft():
+            return [message for message in self.fixture.persisted()['messages']
+                    if message.get('from_me')
+                    and message['parts'] == [{'type': 'text', 'value': draft}]]
+
+        self.wait_for(lambda: bool(sent_draft()), timeout=10)
+        self.assertEqual(len(sent_draft()), 1)
+        self.assertEqual(sent_draft()[0]['conversation_id'], CID)
+
+    def test_narrow_participant_picker_wraps_distinct_handles_before_mouse_selection(self):
+        self.stop_tui()
+        self.fixture.stop_daemon()
+        state = self.fixture.persisted()
+        values = ['long.name.one@example.invalid', 'long.name.two@example.invalid']
+        for cid, value in zip([CID, BOB], values):
+            chat = next(chat for chat in state['conversations'] if chat['id'] == cid)
+            participant = next(person for person in chat['participants'] if not person['is_me'])
+            participant['handle'] = {'kind': 'email', 'value': value}
+            participant['display_name'] = 'Duplicate'
+        latest = max(message['created_at'] for message in state['messages'])
+        for index, cid in enumerate([CID, BOB]):
+            message = json.loads(json.dumps(state['messages'][0]))
+            message['id']['value'] = f'narrow-member-{index}'
+            message['conversation_id'] = cid
+            message['created_at'] = latest + index + 1
+            message['parts'] = [{'type': 'text', 'value': f'NARROW_MEMBER_HIT {index}'}]
+            state['messages'].append(message)
+        self.fixture.store_path.write_text(json.dumps(state))
+        self.fixture.start_daemon()
+        self.start_tui()
+        self.resize(24, 12)
+        self.wait_for(lambda: 'Alice' in self.screen.display[0])
+        self.key(b'\x06')
+        self.wait_for(lambda: 'Search:' in self.text())
+        self.key(b'\x10')
+        self.wait_for(lambda: 'Chats with' in self.text() and 'Find:' in self.text())
+        compact = ''.join(character for character in self.text() if not character.isspace())
+        for value in values:
+            self.assertIn(value, compact, 'narrow identities must wrap, not lose the distinguishing text')
+        self.artifact('narrow-wrapped-identities')
+        row, line = next((row, line) for row, line in enumerate(self.screen.display)
+                         if 'openbubbles' in line)
+        column = line.index('openbubbles') + 1
+        self.key(f'\x1b[<0;{column};{row + 1}M'.encode())
+        self.wait_for(lambda: 'Search:' in self.text() and 'Find:' not in self.text())
+        self.key(b'NARROW_MEMBER_HIT\r')
+        self.wait_for(lambda: re.search(r'\b1 results\b', self.text()) is not None, timeout=10)
+        self.key(b'\r')
+        self.wait_for(lambda: 'Search:' not in self.text())
+        self.assertIn('Alice', self.screen.display[0], 'the wrapped row click must select the exact first handle')
+
     def test_search_opens_out_of_window_hit_and_esc_restores_draft(self):
         self.search_navigation_case(220, expected_context=True)
 

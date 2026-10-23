@@ -44,6 +44,14 @@ Generated delivery icons and their words use a nonbreaking space, so wrapping ca
 
 The measured Latest/End control occupies the existing separator, not an error/uncertainty feedback row. It has no hidden hitbox under an open panel or in a layout that cannot fit it. A short history clamps away stale reading-back state. The existing no-orphan-byline adjustment runs before recording the actual viewport.
 
+## Participant scope in Search
+
+Search owns a nested **Chats with** picker with its own query and exact highlighted identity. Candidates are non-self participants deduplicated by transport plus raw handle kind/value. The outer text query and recipient draft remain separate. Closing the inner picker does not close Search.
+
+All scope changes use `commit_search_participant`, which validates a known identity and clears the old request/results when scope changes. `Action::Search` captures the filter before asynchronous IPC work starts; stale request IDs cannot populate the new scope. Keyboard commit also requires a currently visible candidate, so metadata changes cannot commit a hidden highlight.
+
+`HitMap.search_participant_rows` carries the exact painted optional filter, not a later candidate-list index. Mouse commit uses the same state helper; removed identities are ignored, not converted to All chats. Wheel selection changes only within the painted popup. Below 70 columns the picker owns a full-width frame with no underlying composer, sidebar, or transcript hitboxes. Identity rows wrap, using the same Paragraph width and Wrap settings for height measurement and painting. Selection windows account for row heights rather than candidate counts. A partially inspectable oversized identity shows a resize warning and gets no mouse hitbox. Render and actual-PTY regressions cover these boundaries.
+
 ## Exact search context
 
 `SearchContext` holds one generation-correlated preview of at most 200 rows, separate from `App.messages` and normal older-page state. Unloaded search hits use the v4 exact `message_context` request; no intermediate pages are accumulated. `displayed_messages` supplies the formatter and cache key, while `displayed_transcript_conversation` supplies matching viewport identity.

@@ -1,6 +1,6 @@
 use crate::{
     read_event, read_response, write_request, CodecError, ConversationSyncStatus, Event,
-    HistoryCursor, MessageSearchHit, Request, RequestKind, ResponseKind,
+    HistoryCursor, MessageSearchHit, ParticipantFilter, Request, RequestKind, ResponseKind,
 };
 use bloom_domain::{Conversation, ConversationId, Message, MessageId, OutgoingBody};
 use std::{
@@ -194,10 +194,23 @@ impl BloomClient {
         query: &str,
         limit: u32,
     ) -> Result<Vec<MessageSearchHit>, ClientError> {
+        self.search_messages_with_participant(query, limit, None)
+            .await
+    }
+
+    /// Search stored message text locally, optionally scoped to conversations
+    /// containing the exact participant. Results are newest first.
+    pub async fn search_messages_with_participant(
+        &self,
+        query: &str,
+        limit: u32,
+        participant: Option<ParticipantFilter>,
+    ) -> Result<Vec<MessageSearchHit>, ClientError> {
         match self
             .request(RequestKind::SearchMessages {
                 query: query.to_owned(),
                 limit,
+                participant,
             })
             .await?
         {
@@ -494,6 +507,81 @@ mod tests {
             }
             task.await.unwrap();
         }
+    }
+
+    #[tokio::test]
+    async fn legacy_search_sends_no_participant_and_preserves_literal_query() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("legacy-search");
+        let listener = UnixListener::bind(&path).unwrap();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let request = crate::read_request(&mut stream).await.unwrap();
+            assert!(matches!(&request.request, RequestKind::SearchMessages {
+                query, limit: 50, participant: None,
+            } if query == "from:alice"));
+            crate::write_response(
+                &mut stream,
+                &crate::Response {
+                    request_id: request.request_id,
+                    response: ResponseKind::SearchResults { hits: vec![] },
+                },
+            )
+            .await
+            .unwrap();
+        });
+        assert!(BloomClient::new(path)
+            .search_messages("from:alice", 50)
+            .await
+            .unwrap()
+            .is_empty());
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn search_with_participant_puts_the_filter_on_the_wire() {
+        let d = tempfile::tempdir().unwrap();
+        let p = d.path().join("search");
+        let listener = UnixListener::bind(&p).unwrap();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let request = crate::read_request(&mut stream).await.unwrap();
+            let RequestKind::SearchMessages {
+                participant, limit, ..
+            } = request.request
+            else {
+                panic!("expected a search request");
+            };
+            assert_eq!(limit, 25);
+            assert_eq!(
+                participant,
+                Some(crate::ParticipantFilter {
+                    transport: TransportId::new("fake").unwrap(),
+                    handle: bloom_domain::Handle::new(bloom_domain::HandleKind::Opaque, "friend",)
+                        .unwrap(),
+                })
+            );
+            crate::write_response(
+                &mut stream,
+                &crate::Response {
+                    request_id: request.request_id,
+                    response: ResponseKind::SearchResults { hits: vec![] },
+                },
+            )
+            .await
+            .unwrap();
+        });
+
+        let filter = crate::ParticipantFilter {
+            transport: TransportId::new("fake").unwrap(),
+            handle: bloom_domain::Handle::new(bloom_domain::HandleKind::Opaque, "friend").unwrap(),
+        };
+        assert!(BloomClient::new(p)
+            .search_messages_with_participant("needle", 25, Some(filter))
+            .await
+            .unwrap()
+            .is_empty());
+        server.await.unwrap();
     }
 
     #[tokio::test]

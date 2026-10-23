@@ -11,8 +11,9 @@ import threading
 import time
 import uuid
 
-VERSION = 4
+VERSION = 5
 MAX_FRAME = 1024 * 1024
+SEARCH_SCAN_LIMIT = 20_000
 LOCK = threading.RLock()
 SUBS = set()
 WRITE_LOCKS = {}
@@ -140,6 +141,66 @@ def canonical_conversation(state, conversation_id):
         if conversation_id in conversation.get("aliases", []):
             return conversation["id"]
     return conversation_id
+
+
+def participant_spec(value):
+    """Return (transport, kind, exact handle value), or None for an absent filter.
+
+    A present but malformed filter is rejected rather than treated as absent, so a
+    caller can never receive unfiltered results for a scope it asked to apply.
+    """
+    if value is None:
+        return None
+    if not isinstance(value, dict):
+        raise ValueError("participant")
+    transport = value.get("transport")
+    handle_spec = value.get("handle")
+    if not isinstance(transport, str) or not isinstance(handle_spec, dict):
+        raise ValueError("participant")
+    kind = handle_spec.get("kind")
+    handle_value = handle_spec.get("value")
+    if kind not in ("tel", "email", "opaque") or not isinstance(handle_value, str):
+        raise ValueError("participant")
+    return transport, kind, handle_value
+
+
+def search_messages(state, query, limit, participant=None):
+    """Search the newest global rows, applying conversation membership first."""
+    spec = participant_spec(participant)
+    memberships = None
+    if spec is not None:
+        transport, kind, handle_value = spec
+        memberships = {
+            json.dumps(conversation["id"], separators=(",", ":"), ensure_ascii=False)
+            for conversation in state["conversations"]
+            if conversation["id"].get("transport") == transport
+            and any(participant_handle.get("kind") == kind
+                    and participant_handle.get("value") == handle_value
+                    for participant_handle in (p["handle"] for p in conversation.get("participants", [])))
+        }
+    hits = []
+    if (not isinstance(query, str) or not query.strip()
+            or not isinstance(limit, int) or isinstance(limit, bool) or limit <= 0):
+        return hits
+    for message in sorted(state["messages"], key=history_key, reverse=True)[:SEARCH_SCAN_LIMIT]:
+        canonical = canonical_conversation(state, message["conversation_id"])
+        if memberships is not None and json.dumps(canonical, separators=(",", ":"), ensure_ascii=False) not in memberships:
+            continue
+        snippet = None
+        for part in message.get("parts", []):
+            if part.get("type") == "text" and isinstance(part.get("value"), str):
+                snippet = search_snippet(part["value"], query.strip())
+                if snippet is not None:
+                    break
+        if snippet is None:
+            continue
+        hits.append({"conversation_id": canonical,
+                     "message_id": message["id"],
+                     "created_at": message["created_at"],
+                     "snippet": snippet})
+        if len(hits) >= limit:
+            break
+    return hits
 
 
 def save(state, path):
@@ -375,29 +436,18 @@ def serve(client, args, state):
                         elif op == "search_messages":
                             query = body.get("query")
                             limit = body.get("limit", 0)
-                            hits = []
                             if not isinstance(limit, int) or limit <= 0:
                                 # Match the daemon: an invalid limit is rejected, not
                                 # silently answered with an empty result.
                                 response = {"result": "error", "error": "invalid_request"}
                                 write(client, {"request_id": request_id, "response": response})
                                 continue
-                            if isinstance(query, str) and query.strip():
-                                for message in sorted(state["messages"], key=history_key, reverse=True):
-                                    snippet = None
-                                    for part in message.get("parts", []):
-                                        if part.get("type") == "text" and isinstance(part.get("value"), str):
-                                            snippet = search_snippet(part["value"], query.strip())
-                                            if snippet is not None:
-                                                break
-                                    if snippet is None:
-                                        continue
-                                    hits.append({"conversation_id": canonical_conversation(state, message["conversation_id"]),
-                                                 "message_id": message["id"],
-                                                 "created_at": message["created_at"],
-                                                 "snippet": snippet})
-                                    if len(hits) >= limit:
-                                        break
+                            try:
+                                hits = search_messages(state, query, limit, body.get("participant"))
+                            except ValueError:
+                                response = {"result": "error", "error": "unsupported"}
+                                write(client, {"request_id": request_id, "response": response})
+                                continue
                             response = {"result": "search_results", "hits": hits}
                         elif op == "sync_conversations":
                             response = {"result": "conversation_sync", "status": "complete", "conversations": len(state["conversations"])}

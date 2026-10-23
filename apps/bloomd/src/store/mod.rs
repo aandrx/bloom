@@ -12,8 +12,8 @@ pub(crate) use identity::direct_conversation_matches;
 pub use identity::{reconcile_direct_conversation, reconcile_stored_direct_conversations};
 pub use ingest::{ingest_inbound, ingest_message, update_delivery};
 pub use messages::{
-    get_message, history, history_before, message_context, search_messages, upsert_message,
-    MessageUpsertOutcome,
+    get_message, history, history_before, message_context, search_messages,
+    search_messages_with_participant, upsert_message, MessageUpsertOutcome,
 };
 pub(crate) use messages::{history_for_conversation, remap_message};
 
