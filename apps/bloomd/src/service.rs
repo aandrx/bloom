@@ -5,7 +5,7 @@
 //! reconnect and re-read from the store.
 
 use crate::{
-    engine::{outgoing_text, Engine},
+    engine::{engine_slot, outgoing_text, Engine, EngineSlot},
     ipc::{HandlerFuture, RequestHandler, SubscriptionHub},
     store::{self, EncryptedStore},
 };
@@ -24,7 +24,7 @@ use std::{
 
 pub struct Service {
     store: Arc<Mutex<EncryptedStore>>,
-    engine: Arc<Engine>,
+    engine: EngineSlot,
     hub: SubscriptionHub,
 }
 
@@ -34,7 +34,28 @@ impl Service {
         engine: Arc<Engine>,
         hub: SubscriptionHub,
     ) -> Self {
+        Self {
+            store,
+            engine: engine_slot(engine),
+            hub,
+        }
+    }
+
+    /// Build a service over a caller-owned slot, so a future generation can replace
+    /// the engine without rebuilding the service.
+    pub fn with_engine_slot(
+        store: Arc<Mutex<EncryptedStore>>,
+        engine: EngineSlot,
+        hub: SubscriptionHub,
+    ) -> Self {
         Self { store, engine, hub }
+    }
+
+    /// Clone the current engine out of the slot. The lock is released here, so no
+    /// caller holds it across an await.
+    fn current_engine(&self) -> Arc<Engine> {
+        let engine = self.engine.read().unwrap();
+        Arc::clone(&engine)
     }
 
     /// Persist a transport event, then fan it out. Returns whether anything changed.
@@ -261,8 +282,8 @@ impl RequestHandler for Service {
 
     fn sync_conversations(&self) -> HandlerFuture<'_, (bloom_ipc::ConversationSyncStatus, u32)> {
         Box::pin(async move {
-            let (limited, count) = self
-                .engine
+            let engine = self.current_engine();
+            let (limited, count) = engine
                 .sync_conversations()
                 .await
                 .map_err(map_transport_error)?;
@@ -356,6 +377,9 @@ impl RequestHandler for Service {
             let text = outgoing_text(&body).map_err(|_| ProtocolError::Unsupported)?;
             let (handle, recipient) = normalize_address(&address)?;
             let engine_transport = crate::engine::transport_id();
+            // Resolve one engine for the whole operation: a swap between building
+            // the participants and sending must not mix two generations.
+            let engine = self.current_engine();
             let conversation = {
                 let mut store = self.store.lock().unwrap();
                 let linked = match store::reconcile_stored_direct_conversations(&mut store) {
@@ -393,7 +417,7 @@ impl RequestHandler for Service {
                                     display_name: None,
                                     is_me: false,
                                 }];
-                                if let Some(me) = self.engine.primary_handle() {
+                                if let Some(me) = engine.primary_handle() {
                                     participants.push(Participant {
                                         handle: me,
                                         display_name: None,
@@ -411,8 +435,7 @@ impl RequestHandler for Service {
                 }
             };
             let recipients = vec![recipient];
-            let message_id = self
-                .engine
+            let message_id = engine
                 .send_text(&recipients, Some(&conversation.remote_id), &text)
                 .await
                 .map_err(map_transport_error)?;
@@ -469,8 +492,8 @@ impl RequestHandler for Service {
             let (text, recipients, conversation) =
                 self.send_blocking_prepare(&conversation_id, &body)?;
 
-            let message_id = self
-                .engine
+            let engine = self.current_engine();
+            let message_id = engine
                 .send_text(&recipients, Some(&conversation.remote_id), &text)
                 .await
                 .map_err(map_transport_error)?;
@@ -780,6 +803,47 @@ mod sync_barrier_tests {
             1
         );
         persistence.await.unwrap();
+    }
+}
+
+#[cfg(test)]
+mod engine_slot_service_tests {
+    use super::*;
+    use crate::engine::{engine_slot, EngineConfig};
+    use std::{os::unix::fs::PermissionsExt, path::PathBuf};
+
+    fn store(directory: &tempfile::TempDir) -> Arc<Mutex<EncryptedStore>> {
+        std::fs::set_permissions(directory.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        Arc::new(Mutex::new(
+            EncryptedStore::open_with_key(directory.path().join("store.db"), &[5; 32]).unwrap(),
+        ))
+    }
+
+    fn engine(directory: &tempfile::TempDir) -> Arc<Engine> {
+        Arc::new(Engine::new(EngineConfig {
+            dart_executable: PathBuf::from("dart"),
+            script: PathBuf::from("engine.dart"),
+            state_dir: directory.path().join("state"),
+            library: PathBuf::from("engine.dylib"),
+            sync_chats: false,
+        }))
+    }
+
+    #[test]
+    fn new_builds_a_slot_holding_its_engine() {
+        let directory = tempfile::tempdir().unwrap();
+        let engine = engine(&directory);
+        let service = Service::new(store(&directory), engine.clone(), SubscriptionHub::new(4));
+        assert!(Arc::ptr_eq(&engine, &service.engine.read().unwrap()));
+    }
+
+    #[test]
+    fn with_engine_slot_shares_the_callers_slot() {
+        let directory = tempfile::tempdir().unwrap();
+        let slot = engine_slot(engine(&directory));
+        let service =
+            Service::with_engine_slot(store(&directory), slot.clone(), SubscriptionHub::new(4));
+        assert!(Arc::ptr_eq(&slot, &service.engine));
     }
 }
 

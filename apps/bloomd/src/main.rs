@@ -6,7 +6,7 @@
 use bloom_secrets::OsKeyring;
 use bloomd::{
     config::DaemonConfig,
-    engine::{Engine, EVENT_CAPACITY},
+    engine::{engine_slot, Engine, EVENT_CAPACITY},
     ipc::{serve_with_subscriptions, Listener, SubscriptionHub},
     service::Service,
     store::EncryptedStore,
@@ -99,6 +99,9 @@ async fn main() -> ExitCode {
 
     let hub = SubscriptionHub::with_default_capacity();
     let engine = Arc::new(Engine::new(engine_config));
+    // The service reads the current engine from this slot, so a future restart can
+    // replace its contents without rebuilding the service. Restart is not enabled.
+    let slot = engine_slot(engine.clone());
 
     let (sink, events) = mpsc::channel(EVENT_CAPACITY);
     let mut supervisor = Supervisor::new(engine.clone(), sink);
@@ -107,7 +110,7 @@ async fn main() -> ExitCode {
         return ExitCode::from(3);
     }
 
-    let service = Arc::new(Service::new(store, engine.clone(), hub.clone()));
+    let service = Arc::new(Service::with_engine_slot(store, slot, hub.clone()));
     let persistence = tokio::spawn(service.clone().persist_events(events));
 
     loop {

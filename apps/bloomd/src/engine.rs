@@ -44,6 +44,18 @@ pub fn transport_id() -> TransportId {
     TransportId::new("openbubbles").expect("static transport id is valid")
 }
 
+/// The engine currently serving requests.
+///
+/// The lock is held only long enough to clone the current engine, never across an
+/// await. A future generation replaces the contents so existing callers observe
+/// the new engine on their next request without owning the swap themselves.
+pub type EngineSlot = std::sync::Arc<std::sync::RwLock<std::sync::Arc<Engine>>>;
+
+/// Wrap an engine in a fresh slot.
+pub fn engine_slot(engine: std::sync::Arc<Engine>) -> EngineSlot {
+    std::sync::Arc::new(std::sync::RwLock::new(engine))
+}
+
 #[derive(Clone, Debug)]
 pub struct EngineConfig {
     pub dart_executable: PathBuf,
@@ -1188,6 +1200,41 @@ mod tests {
 
     fn transport() -> TransportId {
         transport_id()
+    }
+
+    #[test]
+    fn engine_slot_starts_with_the_given_engine() {
+        let engine = Arc::new(Engine::new(EngineConfig {
+            dart_executable: PathBuf::new(),
+            script: PathBuf::new(),
+            state_dir: PathBuf::new(),
+            library: PathBuf::new(),
+            sync_chats: false,
+        }));
+        let slot = engine_slot(engine.clone());
+        assert!(Arc::ptr_eq(&engine, &slot.read().unwrap()));
+    }
+
+    #[test]
+    fn replacing_slot_contents_is_visible_to_a_later_read() {
+        let first = Arc::new(Engine::new(EngineConfig {
+            dart_executable: PathBuf::new(),
+            script: PathBuf::new(),
+            state_dir: PathBuf::new(),
+            library: PathBuf::new(),
+            sync_chats: false,
+        }));
+        let second = Arc::new(Engine::new(EngineConfig {
+            dart_executable: PathBuf::new(),
+            script: PathBuf::new(),
+            state_dir: PathBuf::new(),
+            library: PathBuf::new(),
+            sync_chats: false,
+        }));
+        let slot = engine_slot(first.clone());
+        assert!(Arc::ptr_eq(&first, &slot.read().unwrap()));
+        *slot.write().unwrap() = second.clone();
+        assert!(Arc::ptr_eq(&second, &slot.read().unwrap()));
     }
 
     #[tokio::test]
