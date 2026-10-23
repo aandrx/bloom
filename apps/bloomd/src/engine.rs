@@ -314,70 +314,7 @@ impl Transport for Engine {
     }
 
     async fn start(&self) -> TransportResult<()> {
-        let _lifecycle = self.lifecycle_lock.lock().await;
-        if self.started.swap(true, Ordering::SeqCst) {
-            return Err(TransportError::TransportUnavailable);
-        }
-        let outgoing = match self.outgoing.lock().unwrap().take() {
-            Some(outgoing) => outgoing,
-            None => {
-                self.started.store(false, Ordering::SeqCst);
-                return Err(TransportError::TransportUnavailable);
-            }
-        };
-        let mut command = self.config.command();
-        let mut child = match command.spawn() {
-            Ok(child) => child,
-            Err(_) => {
-                *self.outgoing.lock().unwrap() = Some(outgoing);
-                self.started.store(false, Ordering::SeqCst);
-                return Err(TransportError::TransportUnavailable);
-            }
-        };
-        eprintln!("bloomd: engine child started pid={:?}", child.id());
-        let stdout = child.stdout.take().ok_or(TransportError::Internal)?;
-        let stdin = child.stdin.take().ok_or(TransportError::Internal)?;
-        *self.stdin.lock().await = Some(stdin);
-        *self.child.lock().await = Some(child);
-
-        // Hand the only sender to the reader task. If the engine held one, the
-        // supervisor's forwarder could never observe the channel closing and
-        // shutdown would always report an incomplete drain.
-        self.recipient_lists_supported
-            .store(false, Ordering::SeqCst);
-        let my_handles = self.my_handles.clone();
-        let recipient_lists_supported = self.recipient_lists_supported.clone();
-        let pending = self.pending.clone();
-        let sync_waiters = self.sync_waiters.clone();
-        let sync_events = self.sync_events.clone();
-        let started = self.started.clone();
-        let stdin = self.stdin.clone();
-        let child = self.child.clone();
-        let reader_stop = self.reader_stop.clone();
-        let reader_done = self.reader_done.clone();
-        reader_done.send_replace(false);
-        let id = self.id.clone();
-        tokio::spawn(async move {
-            read_frames(
-                stdout,
-                ReadFrameContext {
-                    outgoing,
-                    pending,
-                    sync_waiters,
-                    sync_events,
-                    id,
-                    my_handles,
-                    recipient_lists_supported,
-                    started,
-                    stdin,
-                    child,
-                    reader_stop,
-                    reader_done,
-                },
-            )
-            .await;
-        });
-        Ok(())
+        self.start_with(self.config.command()).await
     }
 
     async fn stop(&self) -> TransportResult<()> {
@@ -438,6 +375,96 @@ impl Transport for Engine {
     ) -> TransportResult<MessageId> {
         // Outbound needs a store-resolved recipient address; use `send_text`.
         Err(TransportError::Unsupported)
+    }
+}
+
+impl Engine {
+    async fn start_with(&self, mut command: Command) -> TransportResult<()> {
+        let _lifecycle = self.lifecycle_lock.lock().await;
+        if self.started.swap(true, Ordering::SeqCst) {
+            return Err(TransportError::TransportUnavailable);
+        }
+        let outgoing = match self.outgoing.lock().unwrap().take() {
+            Some(outgoing) => outgoing,
+            None => {
+                self.started.store(false, Ordering::SeqCst);
+                return Err(TransportError::TransportUnavailable);
+            }
+        };
+        let mut child = match command.spawn() {
+            Ok(child) => child,
+            Err(_) => {
+                *self.outgoing.lock().unwrap() = Some(outgoing);
+                self.started.store(false, Ordering::SeqCst);
+                return Err(TransportError::TransportUnavailable);
+            }
+        };
+        eprintln!("bloomd: engine child started pid={:?}", child.id());
+        let stdout = match child.stdout.take() {
+            Some(stdout) => stdout,
+            None => return Err(self.abort_start(child, outgoing).await),
+        };
+        let stdin = match child.stdin.take() {
+            Some(stdin) => stdin,
+            None => return Err(self.abort_start(child, outgoing).await),
+        };
+        *self.stdin.lock().await = Some(stdin);
+        *self.child.lock().await = Some(child);
+
+        // Hand the only sender to the reader task. If the engine held one, the
+        // supervisor's forwarder could never observe the channel closing and
+        // shutdown would always report an incomplete drain.
+        self.recipient_lists_supported
+            .store(false, Ordering::SeqCst);
+        let my_handles = self.my_handles.clone();
+        let recipient_lists_supported = self.recipient_lists_supported.clone();
+        let pending = self.pending.clone();
+        let sync_waiters = self.sync_waiters.clone();
+        let sync_events = self.sync_events.clone();
+        let started = self.started.clone();
+        let stdin = self.stdin.clone();
+        let child = self.child.clone();
+        let reader_stop = self.reader_stop.clone();
+        let reader_done = self.reader_done.clone();
+        reader_done.send_replace(false);
+        let id = self.id.clone();
+        tokio::spawn(async move {
+            read_frames(
+                stdout,
+                ReadFrameContext {
+                    outgoing,
+                    pending,
+                    sync_waiters,
+                    sync_events,
+                    id,
+                    my_handles,
+                    recipient_lists_supported,
+                    started,
+                    stdin,
+                    child,
+                    reader_stop,
+                    reader_done,
+                },
+            )
+            .await;
+        });
+        Ok(())
+    }
+
+    /// Terminates a child whose pipes could not be taken and restores the state
+    /// `start_with` changed, so a later start attempt is not blocked.
+    async fn abort_start(
+        &self,
+        mut child: Child,
+        outgoing: mpsc::Sender<TransportEvent>,
+    ) -> TransportError {
+        let _ = child.kill().await;
+        let _ = tokio::time::timeout(STOP_TIMEOUT, child.wait()).await;
+        *self.stdin.lock().await = None;
+        *self.child.lock().await = None;
+        *self.outgoing.lock().unwrap() = Some(outgoing);
+        self.started.store(false, Ordering::SeqCst);
+        TransportError::Internal
     }
 }
 
@@ -1186,6 +1213,39 @@ mod tests {
             .await;
         assert!(matches!(result, Err(TransportError::Unsupported)));
         assert!(engine.pending.waiters.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn failed_start_releases_child_and_allows_retry() {
+        let engine = Engine::new(EngineConfig {
+            dart_executable: PathBuf::new(),
+            script: PathBuf::new(),
+            state_dir: PathBuf::new(),
+            library: PathBuf::new(),
+            sync_chats: false,
+        });
+
+        let mut command = Command::new("sh");
+        command
+            .args(["-c", "exit 0"])
+            .stdout(std::process::Stdio::null());
+        assert!(matches!(
+            engine.start_with(command).await,
+            Err(TransportError::Internal)
+        ));
+        assert!(!engine.started.load(Ordering::SeqCst));
+        assert!(engine.outgoing.lock().unwrap().is_some());
+        assert!(engine.child.lock().await.is_none());
+        assert!(engine.stdin.lock().await.is_none());
+
+        let mut retry = Command::new("sh");
+        retry
+            .args(["-c", "exit 0"])
+            .stdout(std::process::Stdio::null());
+        assert!(matches!(
+            engine.start_with(retry).await,
+            Err(TransportError::Internal)
+        ));
     }
 
     fn payload(sender: &str, text: &str) -> Value {

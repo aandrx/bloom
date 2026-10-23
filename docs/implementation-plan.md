@@ -26,6 +26,8 @@ Local unread navigation is accepted under shipp with synthetic evidence. Workspa
 
 ### 1. Generation-scoped engine recovery (next backend phase)
 
+The proposed design is in [engine recovery plan](engine-recovery-plan.md). It is source-only planning: a pure bounded retry policy first, then generation-tagged lifecycle events, then a supervised stop-then-spawn restart, then TUI presentation. Initial start failure stays fatal, uncertain sends are never replayed, and no live-engine verification is authorized.
+
 Problem: TUI reconnects to IPC but a dead engine child is not automatically replaced.
 
 Design before implementation: exclusive registration ownership, generation IDs, fresh event channels, stale-event rejection, bounded backoff, stop/cancellation during restart, and failure presentation. Reap the old child before a new owner starts. Uncertain sends are never automatically replayed.
