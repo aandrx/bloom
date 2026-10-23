@@ -4,6 +4,7 @@ pub mod config;
 pub mod diagnostics;
 pub mod engine;
 pub mod ipc;
+pub mod recovery;
 pub mod service;
 pub mod session;
 pub mod store;
