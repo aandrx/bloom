@@ -1,6 +1,6 @@
 # Engine generation recovery plan
 
-Status: proposed under shipp, source-only planning. No recovery code exists. Unit 0, the failed-start repair, is accepted: 119 daemon library tests, strict daemon Clippy, formatting, source guard, and independent review with no confirmed defects. Units 1 to 4 remain unimplemented. Current behavior is described from source; nothing here is live-verified. A source review confirmed the invariants, corrected two citations, and found that the backoff, reader-join, and failed-start concerns above must be explicit.
+Status: proposed under shipp, source-only planning. No recovery code exists. Unit 0, the failed-start repair, is accepted: 119 daemon library tests, strict daemon Clippy, formatting, source guard, and independent review with no confirmed defects. Unit 1, the unwired bounded retry policy, is also accepted: 124 daemon library tests, strict Clippy, formatting, source guard, and review. Review found two test gaps, both closed before commit: the 300 ms base now makes the 8-second cap actually clamp, and the reset test proves a successful start restores the full attempt budget. Units 2 to 4 remain unimplemented and unwired. Current behavior is described from source; nothing here is live-verified. A source review confirmed the invariants, corrected two citations, and found that the backoff, reader-join, and failed-start concerns above must be explicit.
 
 ## Why
 
