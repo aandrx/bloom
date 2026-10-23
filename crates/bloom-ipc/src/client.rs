@@ -206,6 +206,29 @@ impl BloomClient {
         }
     }
 
+    /// Read a bounded window centred on `message_id`, oldest-first. The exact
+    /// target is always present. The older side receives `(limit - 1) / 2` slots
+    /// and the newer side receives the rest, so an even limit gives the newer side
+    /// the extra slot.
+    pub async fn message_context(
+        &self,
+        conversation_id: ConversationId,
+        message_id: MessageId,
+        limit: u32,
+    ) -> Result<Vec<Message>, ClientError> {
+        match self
+            .request(RequestKind::MessageContext {
+                conversation_id,
+                message_id,
+                limit,
+            })
+            .await?
+        {
+            ResponseKind::MessageContext { messages } => Ok(messages),
+            _ => Err(ClientError::UnexpectedResponse),
+        }
+    }
+
     pub async fn send(
         &self,
         conversation_id: ConversationId,
@@ -362,6 +385,47 @@ mod tests {
             Some(cursor),
             "the cursor reaches the daemon unchanged"
         );
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn message_context_puts_the_target_and_limit_on_the_wire() {
+        let d = tempfile::tempdir().unwrap();
+        let p = d.path().join("context");
+        let listener = UnixListener::bind(&p).unwrap();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let request = crate::read_request(&mut stream).await.unwrap();
+            match request.request {
+                RequestKind::MessageContext {
+                    conversation_id,
+                    message_id,
+                    limit,
+                } => {
+                    assert_eq!(conversation_id.value(), "c");
+                    assert_eq!(message_id.value(), "target");
+                    assert_eq!(limit, 200);
+                }
+                _ => panic!("expected a message context request"),
+            }
+            crate::write_response(
+                &mut stream,
+                &crate::Response {
+                    request_id: request.request_id,
+                    response: ResponseKind::MessageContext { messages: vec![] },
+                },
+            )
+            .await
+            .unwrap();
+        });
+        let client = BloomClient::new(&p);
+        let conversation = ConversationId::new(TransportId::new("fake").unwrap(), "c").unwrap();
+        let target = MessageId::new(TransportId::new("fake").unwrap(), "target").unwrap();
+        assert!(client
+            .message_context(conversation, target, 200)
+            .await
+            .unwrap()
+            .is_empty());
         server.await.unwrap();
     }
 

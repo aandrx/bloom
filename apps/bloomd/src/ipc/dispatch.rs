@@ -36,6 +36,14 @@ pub trait RequestHandler: Send + Sync {
         query: String,
         limit: u16,
     ) -> HandlerFuture<'_, Vec<MessageSearchHit>>;
+    fn message_context(
+        &self,
+        _conversation_id: ConversationId,
+        _message_id: MessageId,
+        _limit: u16,
+    ) -> HandlerFuture<'_, Vec<Message>> {
+        Box::pin(async { Err(ProtocolError::Unsupported) })
+    }
     fn send(
         &self,
         conversation_id: ConversationId,
@@ -158,6 +166,25 @@ async fn serve_inner<H: RequestHandler>(
                     }
                 }
             }
+            RequestKind::MessageContext {
+                conversation_id,
+                message_id,
+                limit,
+            } => {
+                if limit == 0 || limit > bloom_ipc::MAX_MESSAGE_CONTEXT_LIMIT {
+                    ResponseKind::Error {
+                        error: ProtocolError::InvalidRequest,
+                    }
+                } else {
+                    match handler
+                        .message_context(conversation_id, message_id, limit as u16)
+                        .await
+                    {
+                        Ok(messages) => ResponseKind::MessageContext { messages },
+                        Err(error) => ResponseKind::Error { error },
+                    }
+                }
+            }
             RequestKind::Subscribe => ResponseKind::Error {
                 error: if hub.is_some() {
                     ProtocolError::InvalidRequest
@@ -184,10 +211,28 @@ async fn write_response_bounded<W: AsyncWrite + Unpin>(
     response: &Response,
     deadline: Duration,
 ) -> Result<(), ()> {
-    timeout(deadline, bloom_ipc::write_response(writer, response))
-        .await
-        .map_err(|_| ())?
-        .map_err(|_| ())
+    // `write_frame` serializes the whole payload before writing any bytes, so a
+    // `TooLarge` failure leaves the stream untouched and a bounded replacement
+    // response is safe to write on it. Every other failure stays fatal.
+    timeout(deadline, async {
+        match bloom_ipc::write_response(writer, response).await {
+            Ok(()) => Ok(()),
+            Err(bloom_ipc::CodecError::TooLarge) => {
+                let fallback = Response {
+                    request_id: response.request_id,
+                    response: ResponseKind::Error {
+                        error: ProtocolError::Internal,
+                    },
+                };
+                bloom_ipc::write_response(writer, &fallback)
+                    .await
+                    .map_err(|_| ())
+            }
+            Err(_) => Err(()),
+        }
+    })
+    .await
+    .map_err(|_| ())?
 }
 
 #[cfg(test)]
@@ -388,6 +433,66 @@ mod tests {
             }
             server.await.unwrap();
         }
+    }
+
+    #[tokio::test]
+    async fn oversized_response_becomes_internal_error_on_the_same_stream() {
+        use bloom_domain::{DeliveryState, Handle, HandleKind, MessagePart};
+
+        let (mut writer, mut reader) = tokio::io::duplex(64 * 1024);
+        let transport = TransportId::new("fake").unwrap();
+        let conversation_id = ConversationId::new(transport.clone(), "conversation").unwrap();
+        let messages = (0..3)
+            .map(|index| {
+                Message::new(
+                    MessageId::new(transport.clone(), format!("message-{index}")).unwrap(),
+                    conversation_id.clone(),
+                    None,
+                    Handle::new(HandleKind::Opaque, "synthetic-sender").unwrap(),
+                    vec![MessagePart::Text("x".repeat(400_000))],
+                    1,
+                    None,
+                    DeliveryState::Sent,
+                    false,
+                    None,
+                    vec![],
+                    None,
+                )
+                .unwrap()
+            })
+            .collect();
+        let oversized = Response {
+            request_id: 9,
+            response: ResponseKind::MessageContext { messages },
+        };
+        let normal = Response {
+            request_id: 10,
+            response: ResponseKind::Conversations {
+                conversations: vec![],
+            },
+        };
+        let writer_task = tokio::spawn(async move {
+            let first =
+                write_response_bounded(&mut writer, &oversized, Duration::from_secs(5)).await;
+            let second = write_response_bounded(&mut writer, &normal, Duration::from_secs(5)).await;
+            (first, second)
+        });
+
+        let fallback = read_response(&mut reader).await.unwrap();
+        assert_eq!(fallback.request_id, 9);
+        assert!(matches!(
+            fallback.response,
+            ResponseKind::Error {
+                error: ProtocolError::Internal
+            }
+        ));
+        let following = read_response(&mut reader).await.unwrap();
+        assert_eq!(following.request_id, 10);
+        assert!(matches!(
+            following.response,
+            ResponseKind::Conversations { .. }
+        ));
+        assert_eq!(writer_task.await.unwrap(), (Ok(()), Ok(())));
     }
 
     #[tokio::test]
@@ -697,6 +802,65 @@ mod tests {
             1,
             "invalid limits are rejected before the search handler runs"
         );
+    }
+
+    #[tokio::test]
+    async fn message_context_limits_are_validated_before_the_handler() {
+        let (_dir, listener, path) = socket();
+        let server = tokio::spawn(async move {
+            serve(
+                listener.accept().await.unwrap(),
+                &FakeHandler(
+                    Arc::new(AtomicUsize::new(0)),
+                    Arc::new(AtomicUsize::new(0)),
+                    Arc::new(AtomicUsize::new(0)),
+                ),
+            )
+            .await;
+        });
+        let mut client = UnixStream::connect(path).await.unwrap();
+        let conversation_id = ConversationId::new(TransportId::new("fake").unwrap(), "c").unwrap();
+        let message_id = MessageId::new(TransportId::new("fake").unwrap(), "target").unwrap();
+        for (id, limit, invalid) in [
+            (1, 0, true),
+            (2, 201, true),
+            (3, u32::MAX, true),
+            (4, 1, false),
+            (5, 200, false),
+        ] {
+            write_request(
+                &mut client,
+                &Request {
+                    request_id: id,
+                    request: RequestKind::MessageContext {
+                        conversation_id: conversation_id.clone(),
+                        message_id: message_id.clone(),
+                        limit,
+                    },
+                },
+            )
+            .await
+            .unwrap();
+            let response = read_response(&mut client).await.unwrap();
+            assert_eq!(response.request_id, id);
+            if invalid {
+                assert!(matches!(
+                    response.response,
+                    ResponseKind::Error {
+                        error: ProtocolError::InvalidRequest
+                    }
+                ));
+            } else {
+                assert!(matches!(
+                    response.response,
+                    ResponseKind::Error {
+                        error: ProtocolError::Unsupported
+                    }
+                ));
+            }
+        }
+        drop(client);
+        server.await.unwrap();
     }
 
     #[tokio::test]

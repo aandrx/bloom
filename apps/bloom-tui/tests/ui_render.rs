@@ -3887,6 +3887,18 @@ fn start_search(app: &mut App, query: &str) -> u64 {
     app.begin_search().expect("search starts").0
 }
 
+fn start_context_lookup(
+    app: &mut App,
+    conversation: &Conversation,
+    target: &str,
+) -> (u64, ConversationId, MessageId) {
+    let request = start_search(app, "needle");
+    app.finish_search(request, vec![search_hit(conversation, target, "needle")]);
+    app.begin_search_jump().expect("search jump");
+    app.advance_search_jump();
+    app.begin_search_context_request().expect("context request")
+}
+
 #[test]
 fn search_overlay_renders_the_query_snippets_and_other_chat_names() {
     let selected = conversation("Weekend crew", 3, 40);
@@ -4126,6 +4138,102 @@ fn search_overlay_paints_over_the_transcript_and_owns_the_wheel() {
         1,
         "the wheel moves the hit selection"
     );
+}
+
+#[test]
+fn search_context_paints_its_rows_not_latest_and_labels_loading_and_exit() {
+    let chat = conversation("Context render", 2, 1);
+    let mut app = App {
+        selected: Some(chat.id.clone()),
+        ..Default::default()
+    };
+    app.set_conversations(vec![chat.clone()]);
+    app.upsert(
+        chat.id.clone(),
+        message(&chat, "normal-newest", 90, "NORMAL_LATEST_ROW", false),
+    );
+    let normal_history = app.messages[&chat.id].clone();
+    let (generation, conversation, target) = start_context_lookup(&mut app, &chat, "target");
+
+    let loading = rendered(&app);
+    assert!(loading.contains("Search context"), "{loading}");
+    assert!(loading.contains("loading exact message"), "{loading}");
+    assert!(!loading.contains("NORMAL_LATEST_ROW"), "{loading}");
+
+    let rows = vec![
+        message(&chat, "before", 10, "CONTEXT_BEFORE_ROW", false),
+        message(&chat, "target", 20, "CONTEXT_TARGET_ROW", false),
+        message(&chat, "after", 30, "CONTEXT_AFTER_ROW", false),
+    ];
+    assert!(app.finish_message_context(generation, conversation.clone(), target, rows.clone()));
+    let (buffer, hits) = tracked_frame(&mut app, 100, 24);
+    let painted: String = (0..24).map(|y| row_text(&buffer, y)).collect();
+    assert!(painted.contains("CONTEXT_TARGET_ROW"), "{painted}");
+    assert!(!painted.contains("NORMAL_LATEST_ROW"), "{painted}");
+    assert!(painted.contains("Search context"), "{painted}");
+    assert!(
+        painted.contains("End/Latest returns to newest"),
+        "{painted}"
+    );
+    let view = hits.transcript_view.as_ref().expect("context viewport");
+    assert_eq!(view.conversation, chat.id);
+    assert_eq!(
+        view.messages
+            .iter()
+            .map(|row| row.id.value())
+            .collect::<Vec<_>>(),
+        vec!["before", "target", "after"]
+    );
+    assert_eq!(app.messages[&chat.id], normal_history);
+
+    app.open_search();
+    let (_, overlay_hits) = tracked_frame(&mut app, 100, 24);
+    assert!(
+        overlay_hits.latest.is_none(),
+        "overlay must cover the context Latest control"
+    );
+    app.close_search();
+    assert!(
+        app.search_context_active(),
+        "cancelling an overlay keeps ready context"
+    );
+}
+
+#[test]
+fn short_search_context_still_has_a_measured_latest_control() {
+    let chat = conversation("Short context", 2, 1);
+    let mut app = App {
+        selected: Some(chat.id.clone()),
+        ..Default::default()
+    };
+    app.set_conversations(vec![chat.clone()]);
+    app.upsert(
+        chat.id.clone(),
+        message(&chat, "normal-newest", 90, "normal newest", false),
+    );
+    let (generation, conversation, target) = start_context_lookup(&mut app, &chat, "target");
+    assert!(app.finish_message_context(
+        generation,
+        conversation,
+        target,
+        vec![message(&chat, "target", 20, "short target", false)]
+    ));
+
+    let (buffer, hits) = tracked_frame(&mut app, 100, 24);
+    assert_eq!(app.scroll, 0, "short context clamps to scroll zero");
+    assert!(app.is_scrolled_back());
+    let latest = hits.latest.expect("short context Latest hitbox");
+    assert_eq!(hits.at(latest.x, latest.y), Some(ui::Hit::Latest));
+    app.handle_mouse(
+        MouseEventKind::Down(MouseButton::Left),
+        latest.x,
+        latest.y,
+        &hits,
+    );
+    assert!(!app.is_scrolled_back());
+    assert!(!app.search_context_active());
+    let painted: String = (0..24).map(|y| row_text(&buffer, y)).collect();
+    assert!(painted.contains("short target"));
 }
 
 #[test]

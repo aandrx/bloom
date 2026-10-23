@@ -2104,11 +2104,7 @@ impl TranscriptKey {
         if new_message {
             return &[];
         }
-        app.selected
-            .as_ref()
-            .and_then(|id| app.messages.get(id))
-            .map(Vec::as_slice)
-            .unwrap_or_default()
+        app.displayed_messages()
     }
 
     fn matches(&self, app: &App, width: u16, palette: Palette, new_message: bool) -> bool {
@@ -2697,17 +2693,29 @@ fn render_cached_with_mode(
         }
     }
     if let Some(context_row) = context_row {
+        let context_active = !new_message && app.search_context_active();
+        let loading_context = context_active
+            && app
+                .search_context
+                .as_ref()
+                .is_some_and(|context| context.loading);
         let context = if new_message {
             app.pending_address
                 .as_ref()
                 .map(|address| format!("To: {address}"))
                 .unwrap_or_else(|| "Choose a recipient below".into())
+        } else if context_active {
+            if loading_context {
+                "Search context · loading exact message · End/Latest returns to newest".into()
+            } else {
+                "Search context · End/Latest returns to newest history".into()
+            }
         } else {
             "─".repeat(available as usize)
         };
         frame.render_widget(
             Paragraph::new(truncate_with_ellipsis(&context, available as usize)).style(
-                Style::default().fg(if new_message {
+                Style::default().fg(if new_message || context_active {
                     palette.cyan
                 } else {
                     palette.rule
@@ -2721,12 +2729,12 @@ fn render_cached_with_mode(
         let mut lines = Vec::new();
         let mut header_lines: Vec<usize> = Vec::new();
         let mut message_lines = Vec::new();
-        if let Some(messages) = app
-            .selected
-            .as_ref()
-            .filter(|_| !new_message)
-            .and_then(|id| app.messages.get(id))
         {
+            let messages = if new_message {
+                &[][..]
+            } else {
+                app.displayed_messages()
+            };
             // Pad speaker names to a common column so timestamps line up, the way the
             // mockup's transcript does. Capped so one long name cannot push the times
             // off the visible line.
@@ -2896,9 +2904,8 @@ fn render_cached_with_mode(
     let line_starts = &layout.line_starts;
     let rows = layout.rows;
     let mut viewport = app
-        .selected
-        .as_ref()
-        .filter(|id| !new_message && app.messages.contains_key(*id))
+        .displayed_transcript_conversation()
+        .filter(|_| !new_message)
         .map(|id| crate::transcript::TranscriptViewport {
             conversation: id.clone(),
             messages: message_lines
@@ -2956,7 +2963,9 @@ fn render_cached_with_mode(
         || (app.new_conversation && app.pending_address.is_none())
         || !app.emoji_suggestions().is_empty()
         || app.context_menu.is_some();
-    if back > 0 && spacer_rows > 0 && !panel_open && content.width >= 8 {
+    // A short context can sit at scroll zero and still needs a measured exit.
+    let latest_available = back > 0 || app.search_context_active();
+    if latest_available && spacer_rows > 0 && !panel_open && content.width >= 8 {
         let label = if content.width >= 14 {
             "↓ Latest · End"
         } else {
@@ -2986,6 +2995,8 @@ fn render_cached_with_mode(
             } else {
                 ("New conversation", "", "Enter a phone number or email")
             }
+        } else if app.search_context_active() {
+            ("Search context", "", "Loading the exact message context")
         } else if app.connection_state == crate::daemon::ConnectionState::Disconnected {
             (
                 "Daemon unavailable",

@@ -1,4 +1,5 @@
 use super::*;
+use crate::app::SearchContext;
 use bloom_domain::{ConversationKind, Handle, HandleKind, MessagePart, Participant, TransportId};
 use ratatui::{backend::TestBackend, buffer::Buffer, Terminal};
 
@@ -224,6 +225,73 @@ fn edited_or_removed_history_drops_obsolete_width_variants() {
         .transcripts
         .iter()
         .all(|entry| entry.key.messages.is_empty()));
+}
+
+#[test]
+fn context_loading_and_ready_switch_layouts_and_latest_geometry() {
+    let mut app = fixture();
+    let id = app.selected.clone().unwrap();
+    let mut cache = RenderCache::default();
+    equivalent(&app, 100, 30, &mut cache, false);
+    assert_eq!(cache.builds, 1);
+
+    app.search_context = Some(SearchContext {
+        generation: 1,
+        conversation: id.clone(),
+        target: app.messages[&id][5].id().clone(),
+        loading: true,
+        requested: true,
+        messages: Vec::new(),
+    });
+    let loading = equivalent(&app, 100, 30, &mut cache, false);
+    assert_eq!(
+        cache.builds, 2,
+        "loading context reflows to an empty transcript"
+    );
+    assert!(
+        cache.transcripts.last().unwrap().key.messages.is_empty(),
+        "loading context never caches normal history as its rows"
+    );
+
+    let rows = app.messages[&id][4..7].to_vec();
+    let target = rows[1].id().clone();
+    app.search_context = Some(SearchContext {
+        generation: 2,
+        conversation: id.clone(),
+        target,
+        loading: false,
+        requested: true,
+        messages: rows.clone(),
+    });
+    let ready = equivalent(&app, 100, 30, &mut cache, false);
+    assert_eq!(
+        cache.builds, 3,
+        "ready context reflows to its own bounded rows"
+    );
+    assert_eq!(cache.transcripts.last().unwrap().key.messages, rows);
+    assert!(
+        ready.latest.is_some(),
+        "ready context always has a Latest exit"
+    );
+    assert_eq!(
+        ready.transcript_view.as_ref().map(|view| view
+            .messages
+            .iter()
+            .map(|row| row.id.clone())
+            .collect::<Vec<_>>()),
+        Some(rows.iter().map(|row| row.id().clone()).collect())
+    );
+    assert!(
+        loading.latest.is_some(),
+        "loading context still offers a Latest exit"
+    );
+
+    let builds = cache.builds;
+    equivalent(&app, 100, 30, &mut cache, false);
+    assert_eq!(
+        cache.builds, builds,
+        "unchanged ready context reuses its layout"
+    );
 }
 
 #[test]

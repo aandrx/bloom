@@ -20,7 +20,8 @@ import sys
 import threading
 import time
 
-PROTOCOL_VERSION = 3
+PROTOCOL_VERSION = 4
+MAX_FRAME = 1024 * 1024
 SESSION_STATE = os.environ.get("BLOOM_FAKE_SESSION_STATE", "active")
 LONG_TITLE = os.environ.get("BLOOM_FAKE_LONG_TITLE") == "1"
 SUBSCRIBERS: set[socket.socket] = set()
@@ -28,7 +29,30 @@ SUBSCRIBERS_LOCK = threading.Lock()
 
 
 def frame(payload: dict) -> bytes:
-    body = json.dumps(payload).encode()
+    """Serialize one frame, replacing an oversized response with an Internal error.
+
+    The real dispatch serializes the whole payload before writing, so an oversized
+    response leaves the stream untouched and a bounded replacement is safe. An
+    oversized event has no valid replacement and raises before any bytes are sent.
+    """
+    body = json.dumps(payload, separators=(",", ":"), ensure_ascii=False).encode()
+    if len(body) > MAX_FRAME:
+        request_id = payload.get("request_id") if isinstance(payload, dict) else None
+        is_response = (
+            isinstance(payload, dict)
+            and isinstance(payload.get("response"), dict)
+            and isinstance(request_id, int)
+            and not isinstance(request_id, bool)
+        )
+        if not is_response:
+            raise ValueError("oversized non-response frame")
+        body = json.dumps(
+            {"request_id": request_id, "response": {"result": "error", "error": "internal"}},
+            separators=(",", ":"),
+            ensure_ascii=False,
+        ).encode()
+        if len(body) > MAX_FRAME:
+            raise ValueError("oversized response fallback")
     return bytes([PROTOCOL_VERSION]) + struct.pack(">I", len(body)) + body
 
 
@@ -134,6 +158,57 @@ def history_key(item: dict) -> tuple[int, str]:
     return item["created_at"], json.dumps(item["id"], separators=(",", ":"), ensure_ascii=False)
 
 
+def canonical_conversation(conversation_id: dict) -> dict:
+    """Resolve an alias to its canonical conversation identity."""
+    for conversation in CONVERSATIONS:
+        if conversation_id == conversation["id"] or conversation_id in conversation.get("aliases", []):
+            return conversation["id"]
+    return conversation_id
+
+
+def scoped_id(item: dict) -> str:
+    """Compare conversation identities including their transport."""
+    return json.dumps(item, separators=(",", ":"), ensure_ascii=False)
+
+
+def message_context(conversation_id: dict, message_id: dict, limit: int) -> list[dict] | None:
+    """Return the bounded window centred on an exact stored message, or None.
+
+    Mirrors the real store: resolve the canonical conversation and its aliases,
+    search every history row by full scoped identity, always include the exact
+    target, and remap returned identities to the canonical conversation.
+    """
+    target = next((item for thread in HISTORY.values() for item in thread
+                   if item["id"] == message_id), None)
+    if target is None:
+        return None
+    canonical = canonical_conversation(conversation_id)
+    conversation = next((item for item in CONVERSATIONS if item["id"] == canonical), None)
+    aliases = conversation.get("aliases", []) if conversation is not None else []
+    if target["conversation_id"] != canonical and target["conversation_id"] not in aliases:
+        return None
+    identities = {scoped_id(item) for item in [canonical, *aliases]}
+    rows = [item for thread in HISTORY.values() for item in thread]
+    bound = history_key(target)
+    older_quota = (limit - 1) // 2
+    newer_quota = limit - 1 - older_quota
+    older = [item for item in rows
+             if scoped_id(item["conversation_id"]) in identities and history_key(item) < bound]
+    older.sort(key=history_key)
+    older = older[-older_quota:] if older_quota else []
+    newer = [item for item in rows
+             if scoped_id(item["conversation_id"]) in identities and history_key(item) > bound]
+    newer.sort(key=history_key)
+    newer = newer[:newer_quota]
+
+    def remap(item: dict) -> dict:
+        result = dict(item)
+        result["conversation_id"] = canonical
+        return result
+
+    return [remap(item) for item in older] + [remap(target)] + [remap(item) for item in newer]
+
+
 def search_snippet(text, query):
     """Return a 30-character context window around the match, or None.
 
@@ -220,6 +295,17 @@ def serve_client(conn: socket.socket) -> None:
             }))
         elif op == "list_conversations":
             conn.sendall(frame({"request_id": request_id, "response": {"result": "conversations", "conversations": CONVERSATIONS}}))
+        elif op == "message_context":
+            limit = kind.get("limit")
+            if not isinstance(limit, int) or isinstance(limit, bool) or not 1 <= limit <= 200:
+                conn.sendall(frame({"request_id": request_id, "response": {"result": "error", "error": "invalid_request"}}))
+                continue
+            requested = kind.get("conversation_id", {})
+            selected = message_context(requested, kind.get("message_id", {}), limit)
+            if selected is None:
+                conn.sendall(frame({"request_id": request_id, "response": {"result": "error", "error": "not_found"}}))
+                continue
+            conn.sendall(frame({"request_id": request_id, "response": {"result": "message_context", "messages": selected}}))
         elif op == "search_messages":
             if not isinstance(kind.get("limit", 0), int) or kind.get("limit", 0) <= 0:
                 conn.sendall(frame({"request_id": request_id, "response": {"result": "error", "error": "invalid_request"}}))

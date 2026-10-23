@@ -44,6 +44,14 @@ Generated delivery icons and their words use a nonbreaking space, so wrapping ca
 
 The measured Latest/End control occupies the existing separator, not an error/uncertainty feedback row. It has no hidden hitbox under an open panel or in a layout that cannot fit it. A short history clamps away stale reading-back state. The existing no-orphan-byline adjustment runs before recording the actual viewport.
 
+## Exact search context
+
+`SearchContext` holds one generation-correlated preview of at most 200 rows, separate from `App.messages` and normal older-page state. Unloaded search hits use the v4 exact `message_context` request; no intermediate pages are accumulated. `displayed_messages` supplies the formatter and cache key, while `displayed_transcript_conversation` supplies matching viewport identity.
+
+Normal snapshots, arrivals, and older-page replies update normal history. They do not extend the preview. Canonical alias changes restart the same target under a new generation. Replies for a superseded generation, target, or selection are ignored. Context replies must contain the target, stay within the row cap, and use the expected conversation ID.
+
+Context frames never advance local read markers. Normal older paging is disabled in the preview. End or the measured Latest control drops context, clears its viewport geometry, and returns to normal history without modifying composition. Short contexts retain that exit even when their local scroll distance is zero. Overlays and tiny layouts still suppress hidden mouse targets.
+
 ## Themes and terminal detection
 
 Dark uses neutral RGB surfaces; light uses readable gray/white surfaces, and both define semantic accents/selection. These remain fixed RGB palettes, not general color-depth quantization or contrast adaptation. Theme override persists; automatic theme follows startup OSC 11 background detection.

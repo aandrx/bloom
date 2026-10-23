@@ -235,6 +235,18 @@ impl FakeDaemon {
                                     )
                                     .await;
                                 }
+                                RequestKind::MessageContext { .. } => {
+                                    let _ = write_response(
+                                        &mut stream,
+                                        &Response {
+                                            request_id,
+                                            response: ResponseKind::Error {
+                                                error: ProtocolError::Unsupported,
+                                            },
+                                        },
+                                    )
+                                    .await;
+                                }
                                 RequestKind::Subscribe => {
                                     // Register before acknowledging, so an event
                                     // published after the client sees Subscribed

@@ -385,9 +385,18 @@ class ReadingFlows(unittest.TestCase):
 
 
 
-    def test_search_finds_and_jumps_to_paged_history_and_esc_restores_draft(self):
-        # Seed an older page whose oldest message has a marker no other message
-        # contains, so a hit can only resolve by paging back through the store.
+    def test_search_opens_out_of_window_hit_and_esc_restores_draft(self):
+        self.search_navigation_case(220, expected_context=True)
+
+    def test_search_anchors_an_already_loaded_hit_without_context(self):
+        self.search_navigation_case(20, expected_context=False)
+
+    def test_deep_search_context_survives_arrivals_and_reconciliation_then_latest(self):
+        self.search_navigation_case(1420, expected_context=True, check_latest=True)
+
+    def search_navigation_case(self, older_count, expected_context, check_latest=False):
+        # Only the oldest seeded message has the marker. The deep case exceeds
+        # the normal retained budget; the small case is already in newest history.
         self.stop_tui()
         self.fixture.stop_daemon()
         state = self.fixture.persisted()
@@ -397,7 +406,7 @@ class ReadingFlows(unittest.TestCase):
         baseline = min(item['created_at'] for item in state['messages'])
         marker = 'OLDER_MARKER_999'
         seeded = []
-        for index in range(220):
+        for index in range(older_count):
             text = (f'{marker} only in the oldest stored message' if index == 0
                     else f'OLDER_SEARCH_CONTEXT_{index:03d} synthetic context')
             seeded.append({
@@ -406,7 +415,7 @@ class ReadingFlows(unittest.TestCase):
                 'remote_id': None,
                 'sender': sender,
                 'parts': [{'type': 'text', 'value': text}],
-                'created_at': baseline - (220 - index) * 10,
+                'created_at': baseline - (older_count - index) * 10,
                 'sent_at': None,
                 'delivery': 'delivered',
                 'from_me': False,
@@ -423,13 +432,15 @@ class ReadingFlows(unittest.TestCase):
         self.assertNotIn(marker, self.text(),
                          'the oldest stored message must start outside the loaded history')
 
-        draft = 'Private Alice search draft'
+        draft = ('/new\nPrivate Alice search draft' if check_latest
+                 else 'Private Alice search draft')
         self.key(b'\x1b[200~' + draft.encode() + b'\x1b[201~')
         self.key(b'\x06')  # Ctrl+F
         self.wait_for(lambda: 'Search:' in self.text())
         self.key(b'\x1b')
-        self.wait_for(lambda: draft in self.text())
-        self.assertIn(draft, self.text(), 'Esc must restore the parked composer draft')
+        self.wait_for(lambda: all(line in self.text() for line in draft.splitlines()))
+        for line in draft.splitlines():
+            self.assertIn(line, self.text(), 'Esc must restore the parked composer draft')
 
         self.key(b'\x06')
         self.wait_for(lambda: 'Search:' in self.text())
@@ -441,9 +452,45 @@ class ReadingFlows(unittest.TestCase):
         self.key(b'\r')
         self.wait_for(lambda: marker in self.markers(), timeout=15)
         self.assertEqual(self.markers()[0], marker,
-                         'the jump must page back and land on the matched message')
-        self.assertIn(draft, self.text(), 'closing search restores the draft')
+                         'the jump must land on the exact matched message')
+        for line in draft.splitlines():
+            self.assertIn(line, self.text(), 'closing search restores the draft')
+        self.assertEqual('Search context' in self.text(), expected_context)
         self.artifact('search-jumped')
+        if not check_latest:
+            return
+
+        self.append_fixture_message(CID, 'READ_MARKER_999 synthetic newest arrival')
+        self.wait_for(lambda: 'READ_MARKER_999' in self.text(), timeout=10)
+        # The sidebar can update, but an arrival and the five-second local
+        # reconciliation must not replace the context transcript.
+        self.pump(5.6)
+        self.assertEqual(self.markers()[0], marker)
+        self.assertNotIn('READ_MARKER_999', self.markers())
+        self.assertIn('Search context', self.text())
+        self.artifact('context-after-reconciliation')
+
+        self.key(b'\x1b[F')  # End is an explicit return to normal latest history.
+        self.wait_for(lambda: 'READ_MARKER_999' in self.markers())
+        # A post-paint read marker needs its own redraw, not another key or the
+        # next five-second reconciliation before its unread badge disappears.
+        self.wait_for(lambda: 'Alice · 1' not in self.text(), timeout=3)
+        self.assertNotIn('Search context', self.text())
+        self.assertIn('Alice', self.screen.display[0])
+        for line in draft.splitlines():
+            self.assertIn(line, self.text())
+        self.artifact('context-returned-to-latest')
+        self.key(b'\r')
+
+        def restored_sends():
+            return [message for message in self.fixture.persisted()['messages']
+                    if message.get('from_me')
+                    and message['parts'] == [{'type': 'text', 'value': draft}]]
+
+        self.wait_for(lambda: bool(restored_sends()), timeout=10)
+        self.assertEqual(len(restored_sends()), 1)
+        self.assertEqual(restored_sends()[0]['conversation_id'], CID,
+                         'Latest must preserve literal-paste provenance and recipient')
 
 if __name__ == '__main__':
     unittest.main(verbosity=2)

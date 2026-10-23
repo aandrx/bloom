@@ -312,6 +312,97 @@ fn history_before_for_identities(
     Ok(messages)
 }
 
+/// Read a bounded window centred on one exact stored message. The target is
+/// always included when it belongs to the requested conversation (or one of its
+/// canonical aliases). Missing targets, cross-conversation targets, and a zero
+/// limit return `None`; dispatch rejects zero and out-of-range limits first.
+///
+/// The older and newer sides are selected with strict `(created_at, stable id)`
+/// keyset predicates against the target's currently stored timestamp, so no
+/// timestamp arithmetic or synthetic cursor is involved.
+pub fn message_context(
+    store: &EncryptedStore,
+    conversation_id: &ConversationId,
+    message_id: &MessageId,
+    limit: u16,
+) -> Result<Option<Vec<Message>>, StoreError> {
+    if limit == 0 {
+        return Ok(None);
+    }
+    let Some(target) = get_message(store, message_id)? else {
+        return Ok(None);
+    };
+    let (canonical_id, aliases) =
+        match super::conversations::get_conversation(store, conversation_id)? {
+            Some(canonical) => (canonical.id, canonical.aliases),
+            None => (conversation_id.clone(), Vec::new()),
+        };
+    let belongs = target.conversation_id() == &canonical_id
+        || aliases
+            .iter()
+            .any(|alias| alias == target.conversation_id());
+    if !belongs {
+        return Ok(None);
+    }
+
+    let older_quota = (limit as usize - 1) / 2;
+    let newer_quota = limit as usize - 1 - older_quota;
+    let target_key = stable_id(target.id())?;
+    let target_at = target.created_at;
+
+    let mut identities = vec![canonical_id.clone()];
+    identities.extend(aliases.iter().cloned());
+    identities.sort_by(|left, right| left.value().cmp(right.value()));
+    identities.dedup();
+
+    let mut older = Vec::new();
+    let mut newer = Vec::new();
+    for identity in identities {
+        let key = stable_conversation_id(&identity)?;
+        if older_quota > 0 {
+            let mut statement = store._connection.prepare("SELECT data FROM (SELECT id, data, created_at FROM messages WHERE conversation_id=?1 AND (created_at < ?2 OR (created_at = ?2 AND id < ?3)) ORDER BY created_at DESC, id DESC LIMIT ?4) ORDER BY created_at ASC, id ASC")?;
+            let records = statement.query_map(
+                params![key, target_at, target_key, older_quota as i64],
+                |row| row.get::<_, Vec<u8>>(0),
+            )?;
+            for record in records {
+                let message: Message =
+                    serde_json::from_slice(&record?).map_err(|_| StoreError::Schema)?;
+                older.push(remap_message(&message, &canonical_id)?);
+            }
+        }
+        if newer_quota > 0 {
+            let mut statement = store._connection.prepare("SELECT data FROM (SELECT id, data, created_at FROM messages WHERE conversation_id=?1 AND (created_at > ?2 OR (created_at = ?2 AND id > ?3)) ORDER BY created_at ASC, id ASC LIMIT ?4) ORDER BY created_at ASC, id ASC")?;
+            let records = statement.query_map(
+                params![key, target_at, target_key, newer_quota as i64],
+                |row| row.get::<_, Vec<u8>>(0),
+            )?;
+            for record in records {
+                let message: Message =
+                    serde_json::from_slice(&record?).map_err(|_| StoreError::Schema)?;
+                newer.push(remap_message(&message, &canonical_id)?);
+            }
+        }
+    }
+
+    // Each identity contributed its closest quota rows. Merge across aliases and
+    // keep the closest rows to the target: the tail of the older set and the head
+    // of the newer set.
+    sort_by_store_order(&mut older)?;
+    if older.len() > older_quota {
+        older.drain(..older.len() - older_quota);
+    }
+    sort_by_store_order(&mut newer)?;
+    if newer.len() > newer_quota {
+        newer.truncate(newer_quota);
+    }
+
+    let mut messages = older;
+    messages.push(remap_message(&target, &canonical_id)?);
+    messages.extend(newer);
+    Ok(Some(messages))
+}
+
 fn history_for_identities(
     store: &EncryptedStore,
     canonical_id: &ConversationId,
@@ -1072,5 +1163,223 @@ mod tests {
             Err(StoreError::MessageConversationMismatch)
         ));
         assert_eq!(get_message(&store, message.id()).unwrap(), Some(message));
+    }
+
+    fn ids(messages: &[Message]) -> Vec<&str> {
+        messages
+            .iter()
+            .map(|message| message.id().value())
+            .collect()
+    }
+
+    #[test]
+    fn message_context_includes_old_target_in_long_history() {
+        let (_temp, mut store, conversation) = setup();
+        for index in 0..2000 {
+            let message = fixture_message(
+                "alpha",
+                &format!("m{index:04}"),
+                "room",
+                1_000 + index,
+                "body",
+                DeliveryState::Sent,
+            );
+            upsert_message(&mut store, &message).unwrap();
+        }
+        let target = message_id("alpha", "m0007");
+        let context = message_context(&store, &conversation, &target, 5)
+            .unwrap()
+            .expect("target exists");
+        assert_eq!(ids(&context), ["m0005", "m0006", "m0007", "m0008", "m0009"]);
+        let far = message_id("alpha", "m1420");
+        let context = message_context(&store, &conversation, &far, 5)
+            .unwrap()
+            .unwrap();
+        assert_eq!(ids(&context), ["m1418", "m1419", "m1420", "m1421", "m1422"]);
+        let context = message_context(&store, &conversation, &target, 2)
+            .unwrap()
+            .expect("target exists");
+        assert_eq!(ids(&context), ["m0007", "m0008"]);
+    }
+
+    #[test]
+    fn message_context_sorts_escaped_same_timestamp_neighbours_by_store_key() {
+        let (_temp, mut store, conversation) = setup();
+        let suffixes = ["\"", "\\", "\u{e9}", "}"];
+        for index in 0..250 {
+            let value = format!("m{index:03}{}", suffixes[index % suffixes.len()]);
+            let message = fixture_message(
+                "alpha",
+                &value,
+                "room",
+                i64::MAX,
+                "body",
+                DeliveryState::Sent,
+            );
+            upsert_message(&mut store, &message).unwrap();
+        }
+        let target_index = 124;
+        let target_value = format!(
+            "m{target_index:03}{}",
+            suffixes[target_index % suffixes.len()]
+        );
+        let target = message_id("alpha", &target_value);
+        let context = message_context(&store, &conversation, &target, 200)
+            .unwrap()
+            .unwrap();
+        assert_eq!(context.len(), 200);
+        let position = context
+            .iter()
+            .position(|message| message.id().value() == target_value)
+            .expect("exact target is present");
+        assert_eq!(position, 99, "older side gets (200-1)/2 slots");
+
+        let mut all: Vec<(String, i64)> = context
+            .iter()
+            .map(|message| (stable_id(message.id()).unwrap(), message.created_at))
+            .collect();
+        all.sort();
+        let mut expected: Vec<(String, i64)> = (0..250)
+            .map(|index| {
+                let value = format!("m{index:03}{}", suffixes[index % suffixes.len()]);
+                (stable_id(&message_id("alpha", &value)).unwrap(), i64::MAX)
+            })
+            .collect();
+        expected.sort();
+        let target_key = stable_id(&target).unwrap();
+        let target_position = expected
+            .iter()
+            .position(|(key, _)| key == &target_key)
+            .unwrap();
+        let start = target_position - 99;
+        assert_eq!(all, expected[start..start + 200]);
+    }
+
+    #[test]
+    fn message_context_limit_one_and_zero_are_well_defined() {
+        let (_temp, mut store, conversation) = setup();
+        for index in 0..5 {
+            upsert_message(
+                &mut store,
+                &fixture_message(
+                    "alpha",
+                    &format!("m{index}"),
+                    "room",
+                    10 + index,
+                    "body",
+                    DeliveryState::Sent,
+                ),
+            )
+            .unwrap();
+        }
+        let target = message_id("alpha", "m2");
+        let one = message_context(&store, &conversation, &target, 1)
+            .unwrap()
+            .unwrap();
+        assert_eq!(ids(&one), ["m2"]);
+        assert!(message_context(&store, &conversation, &target, 0)
+            .unwrap()
+            .is_none());
+    }
+
+    #[test]
+    fn message_context_missing_and_wrong_conversation_are_none() {
+        let (_temp, mut store, conversation) = setup();
+        let other = ConversationId::new(TransportId::new("alpha").unwrap(), "other").unwrap();
+        super::super::conversations::upsert_conversation(
+            &mut store,
+            &Conversation {
+                id: other.clone(),
+                remote_id: "other".into(),
+                kind: ConversationKind::Direct,
+                title: None,
+                participants: Vec::new(),
+                created_at: 0,
+                last_message_at: None,
+                aliases: Vec::new(),
+                preview: None,
+            },
+        )
+        .unwrap();
+        upsert_message(
+            &mut store,
+            &fixture_message("alpha", "m1", "room", 1, "body", DeliveryState::Sent),
+        )
+        .unwrap();
+        upsert_message(
+            &mut store,
+            &fixture_message("alpha", "x1", "other", 2, "body", DeliveryState::Sent),
+        )
+        .unwrap();
+        let target = message_id("alpha", "m1");
+        assert!(
+            message_context(&store, &conversation, &message_id("alpha", "missing"), 5)
+                .unwrap()
+                .is_none()
+        );
+        assert!(message_context(&store, &other, &target, 5)
+            .unwrap()
+            .is_none());
+    }
+
+    #[test]
+    fn message_context_resolves_aliases_and_remaps_results() {
+        let (_temp, mut store, conversation) = setup();
+        let alias = ConversationId::new(TransportId::new("alpha").unwrap(), "legacy").unwrap();
+        super::super::conversations::upsert_conversation(
+            &mut store,
+            &Conversation {
+                id: alias.clone(),
+                remote_id: "legacy".into(),
+                kind: ConversationKind::Direct,
+                title: None,
+                participants: Vec::new(),
+                created_at: 0,
+                last_message_at: None,
+                aliases: Vec::new(),
+                preview: None,
+            },
+        )
+        .unwrap();
+        super::super::conversations::upsert_conversation(
+            &mut store,
+            &Conversation {
+                id: conversation.clone(),
+                remote_id: "room".into(),
+                kind: ConversationKind::Direct,
+                title: None,
+                participants: Vec::new(),
+                created_at: 0,
+                last_message_at: None,
+                aliases: vec![alias.clone()],
+                preview: None,
+            },
+        )
+        .unwrap();
+        upsert_message(
+            &mut store,
+            &fixture_message("alpha", "a1", "legacy", 1, "one", DeliveryState::Sent),
+        )
+        .unwrap();
+        upsert_message(
+            &mut store,
+            &fixture_message("alpha", "c2", "room", 2, "two", DeliveryState::Sent),
+        )
+        .unwrap();
+        upsert_message(
+            &mut store,
+            &fixture_message("alpha", "a3", "legacy", 3, "three", DeliveryState::Sent),
+        )
+        .unwrap();
+        let target = message_id("alpha", "a1");
+        for requested in [&conversation, &alias] {
+            let context = message_context(&store, requested, &target, 4)
+                .unwrap()
+                .unwrap();
+            assert_eq!(ids(&context), ["a1", "c2", "a3"]);
+            assert!(context
+                .iter()
+                .all(|message| message.conversation_id() == &conversation));
+        }
     }
 }

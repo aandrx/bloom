@@ -382,14 +382,33 @@ pub struct App {
     /// Message the transcript is paging back to after a search hit was opened.
     #[doc(hidden)]
     pub search_jump: Option<(ConversationId, MessageId)>,
-    /// How many times a jump has waited for its conversation's history.
+    /// Bounded exact context for a search hit outside normal loaded history.
     #[doc(hidden)]
-    pub search_jump_waits: u8,
+    pub search_context: Option<SearchContext>,
+    /// Monotonic generation for exact-context requests.
+    #[doc(hidden)]
+    pub search_context_generation: u64,
     /// A query a slash command asked the shell to run.
     #[doc(hidden)]
     pub pending_search: Option<(u64, String)>,
     /// Monotonic id for message-search replies.
     pub search_request: u64,
+}
+
+/// A fixed preview around one search hit, separate from normal loaded history.
+/// It owns at most [`bloom_ipc::MAX_MESSAGE_CONTEXT_LIMIT`] rows and never
+/// replaces or extends `App::messages`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SearchContext {
+    /// Replies with another generation are stale and must be ignored.
+    pub generation: u64,
+    pub conversation: ConversationId,
+    pub target: MessageId,
+    /// True while the exact lookup is in flight; `messages` is empty then.
+    pub loading: bool,
+    /// True once the shell has taken the request, so it is spawned at most once.
+    pub requested: bool,
+    pub messages: Vec<Message>,
 }
 
 /// Local unread navigation state for one conversation. `shown` counts only loaded
@@ -528,7 +547,8 @@ impl Default for App {
             renaming: None,
             search: None,
             search_jump: None,
-            search_jump_waits: 0,
+            search_context: None,
+            search_context_generation: 0,
             pending_search: None,
             search_request: 0,
         }
@@ -668,6 +688,9 @@ impl App {
 
     /// Whether an older history page can be requested for the selected thread.
     pub fn can_load_older(&self) -> bool {
+        if self.search_context_active() {
+            return false;
+        }
         let Some(id) = self.selected.as_ref() else {
             return false;
         };
@@ -824,6 +847,7 @@ impl App {
                 let canonical_id = canonical.id.clone();
                 self.migrate_draft_owner(&selected, &canonical_id);
                 self.migrate_older_state(&selected, &canonical_id);
+                self.migrate_search_context_alias(&selected, &canonical_id);
                 // An alias is not navigation. Keep the semantic reading context
                 // through the gap before the canonical identity's history loads.
                 self.selected = Some(canonical_id.clone());
@@ -869,13 +893,9 @@ impl App {
     /// so opening a different thread returns to that thread's newest message.
     pub fn select(&mut self, id: Option<ConversationId>) {
         if self.selected != id {
-            if self
-                .search_jump
-                .as_ref()
-                .is_some_and(|(conversation, _)| Some(conversation) != id.as_ref())
-            {
-                self.abandon_search_jump();
-            }
+            // Changing threads retires any exact-context lookup and its reply.
+            self.clear_search_context();
+            self.abandon_search_jump();
             self.older_requested = false;
             self.older_error = None;
             // A page still in flight belongs to the chat being left; its result is
@@ -1040,8 +1060,12 @@ impl App {
         view.top_for(self.scroll, self.reading_anchor.as_ref())
     }
 
-    /// Record only a successfully displayed frame. Rendering remains immutable.
-    pub fn record_transcript(&mut self, view: Option<crate::transcript::TranscriptViewport>) {
+    /// Record only a successfully displayed frame. Returns whether a read marker
+    /// advanced, requiring a follow-up redraw of badges. Rendering stays immutable.
+    pub fn record_transcript(
+        &mut self,
+        view: Option<crate::transcript::TranscriptViewport>,
+    ) -> bool {
         if let Some(view) = view {
             self.scroll = view.back();
             self.reading_anchor = if self.scroll > 0 {
@@ -1050,13 +1074,14 @@ impl App {
                 None
             };
             self.transcript_viewport = Some(view);
-            self.mark_selected_read_if_following();
+            return self.mark_selected_read_if_following();
         } else if self.new_conversation || self.selected.is_none() {
             self.scroll_to_newest();
             self.transcript_viewport = None;
         }
         // A tiny fallback frame has no transcript; retain its last reading anchor
         // and do not mark unseen messages read.
+        false
     }
 
     /// True when a panel or popup consumes input instead of the transcript.
@@ -1117,15 +1142,21 @@ impl App {
         self.note_older_request();
     }
 
-    /// Return to the newest message without changing composition.
+    /// Return to the newest normal history without changing composition. This is
+    /// also the End/Latest exit from a search context.
     pub fn scroll_to_newest(&mut self) {
         self.scroll = 0;
         self.reading_anchor = None;
+        self.transcript_viewport = None;
+        self.clear_search_context();
+        self.abandon_search_jump();
     }
 
-    /// True while the transcript is showing something other than the newest message.
+    /// True while the transcript is showing something other than the newest
+    /// normal message. A search context stays scrolled back even when its short
+    /// preview clamps to zero.
     pub fn is_scrolled_back(&self) -> bool {
-        self.scroll > 0
+        self.scroll > 0 || self.search_context_active()
     }
 
     /// Start a new conversation: first the recipient address, then the message.
@@ -1557,19 +1588,23 @@ impl App {
     }
 
     /// Commit the selected hit: close the modal, open its conversation, and
-    /// remember the message that paging must reach.
+    /// remember the message the transcript must reach. Loading the normal thread
+    /// still owns its draft; a hit already in ordinary history anchors at once.
     pub fn begin_search_jump(&mut self) -> Option<(ConversationId, MessageId)> {
         let hit = self.selected_search_hit()?;
         let previous = self.selected.clone();
         let conversation = hit.conversation_id;
         let message = hit.message_id;
+        // A replacement hit retires any older exact-context request.
+        self.clear_search_context();
+        self.abandon_search_jump();
         self.close_search();
         if previous.as_ref() != Some(&conversation) {
             self.select(Some(conversation.clone()));
         }
         // Paged history stays with its own chat, exactly as a normal switch does.
         self.search_jump = Some((conversation.clone(), message.clone()));
-        self.search_jump_waits = 0;
+        self.reach_search_jump();
         Some((conversation, message))
     }
 
@@ -1595,61 +1630,227 @@ impl App {
             return false;
         }
         self.search_jump = None;
+        self.clear_search_context();
         self.reading_anchor = Some(crate::transcript::ReadingAnchor {
             conversation,
             message,
             row: 0,
         });
         self.scroll = 1;
+        self.transcript_viewport = None;
         true
     }
 
     pub fn abandon_search_jump(&mut self) {
         self.search_jump = None;
-        self.search_jump_waits = 0;
     }
 
-    /// Continue a pending search jump: reach the message, page one more time, or
-    /// give up when the store has no further history to offer. A chat whose
-    /// window has not loaded yet waits instead of declaring the hit missing.
+    /// Continue a pending search jump. A hit in ordinary loaded history anchors
+    /// directly; anything else starts exactly one bounded context lookup instead
+    /// of paging through intermediate history.
     pub fn advance_search_jump(&mut self) {
-        let Some((conversation, _)) = self.search_jump.clone() else {
+        let Some((conversation, message)) = self.search_jump.clone() else {
             return;
         };
         if self.selected.as_ref() != Some(&conversation) {
             self.abandon_search_jump();
+            self.clear_search_context();
             return;
         }
         if self.reach_search_jump() {
             return;
         }
-        let loaded = self
-            .messages
-            .get(&conversation)
-            .is_some_and(|messages| !messages.is_empty());
-        if !loaded {
-            // A handful of snapshots is enough for a listed conversation to load.
-            // Without this bound, a hit whose conversation never loads would leave
-            // the jump pending forever with no explanation.
-            self.search_jump_waits = self.search_jump_waits.saturating_add(1);
-            if self.search_jump_waits > 3 {
-                self.abandon_search_jump();
-                self.notice =
-                    Some("That message is outside the history Bloom keeps loaded.".into());
+        if self.search_context.as_ref().is_some_and(|context| {
+            context.conversation == conversation && context.target == message
+        }) {
+            return;
+        }
+        self.start_search_context(conversation, message);
+    }
+
+    /// True while the selected transcript is showing a search context preview.
+    pub fn search_context_active(&self) -> bool {
+        !self.new_conversation
+            && self
+                .search_context
+                .as_ref()
+                .is_some_and(|context| self.selected.as_ref() == Some(&context.conversation))
+    }
+
+    /// The one buffer the transcript formatter, layout cache and viewport use.
+    /// Loading context is deliberately empty, never the unrelated latest history.
+    pub fn displayed_messages(&self) -> &[Message] {
+        if self.search_context_active() {
+            return self
+                .search_context
+                .as_ref()
+                .map(|context| context.messages.as_slice())
+                .unwrap_or_default();
+        }
+        self.selected
+            .as_ref()
+            .and_then(|id| self.messages.get(id))
+            .map(Vec::as_slice)
+            .unwrap_or_default()
+    }
+
+    /// The conversation whose rows `displayed_messages` describes, including a
+    /// loading context whose messages are not painted yet.
+    pub fn displayed_transcript_conversation(&self) -> Option<&ConversationId> {
+        if self.new_conversation {
+            return None;
+        }
+        if self.search_context_active() {
+            return self.selected.as_ref();
+        }
+        self.selected
+            .as_ref()
+            .filter(|id| self.messages.contains_key(*id))
+    }
+
+    /// Take the pending exact-context lookup so the shell spawns it once.
+    pub fn begin_search_context_request(&mut self) -> Option<(u64, ConversationId, MessageId)> {
+        let context = self.search_context.as_mut()?;
+        if !context.loading || context.requested {
+            return None;
+        }
+        context.requested = true;
+        Some((
+            context.generation,
+            context.conversation.clone(),
+            context.target.clone(),
+        ))
+    }
+
+    fn start_search_context(&mut self, conversation: ConversationId, target: MessageId) {
+        self.search_context_generation = self.search_context_generation.wrapping_add(1);
+        self.search_context = Some(SearchContext {
+            generation: self.search_context_generation,
+            conversation,
+            target,
+            loading: true,
+            requested: false,
+            messages: Vec::new(),
+        });
+    }
+
+    fn clear_search_context(&mut self) {
+        self.search_context = None;
+    }
+
+    /// Carry an exact-context lookup across an identity alias by restarting the
+    /// same target under a new generation and canonical identity.
+    fn migrate_search_context_alias(&mut self, from: &ConversationId, to: &ConversationId) {
+        if from == to {
+            return;
+        }
+        if let Some((conversation, _)) = self.search_jump.as_mut() {
+            if conversation == from {
+                *conversation = to.clone();
             }
+        }
+        let restart = self
+            .search_context
+            .as_ref()
+            .is_some_and(|context| &context.conversation == from);
+        if !restart {
             return;
         }
-        if self.older_loading.is_some() {
-            // Another page (for this chat or a different one) will report back;
-            // deciding now would abandon the jump on a false negative.
-            return;
+        self.search_context_generation = self.search_context_generation.wrapping_add(1);
+        let generation = self.search_context_generation;
+        if let Some(context) = self.search_context.as_mut() {
+            context.generation = generation;
+            context.conversation = to.clone();
+            context.loading = true;
+            context.requested = false;
+            context.messages.clear();
         }
-        if self.can_load_older() {
-            self.older_requested = true;
-            return;
+    }
+
+    /// Apply an exact-context reply only when its generation, conversation and
+    /// target still match. Invalid rows become an honest, recoverable notice.
+    pub fn finish_message_context(
+        &mut self,
+        generation: u64,
+        conversation: ConversationId,
+        target: MessageId,
+        messages: Vec<Message>,
+    ) -> bool {
+        if !self.context_reply_matches(generation, &conversation, &target) {
+            return false;
         }
-        self.abandon_search_jump();
-        self.notice = Some("That message is outside the history Bloom keeps loaded.".into());
+        let valid = !messages.is_empty()
+            && messages.len() <= bloom_ipc::MAX_MESSAGE_CONTEXT_LIMIT as usize
+            && messages.iter().any(|message| message.id() == &target)
+            && messages
+                .iter()
+                .all(|message| message.conversation_id() == &conversation);
+        if !valid {
+            self.reject_message_context(
+                generation,
+                &conversation,
+                &target,
+                "That search result is no longer available. End or Latest returns to newest history.",
+            );
+            return false;
+        }
+        if let Some(context) = self.search_context.as_mut() {
+            context.messages = messages;
+            context.loading = false;
+        }
+        self.search_jump = None;
+        self.reading_anchor = Some(crate::transcript::ReadingAnchor {
+            conversation,
+            message: target,
+            row: 0,
+        });
+        self.scroll = 1;
+        self.transcript_viewport = None;
+        true
+    }
+
+    /// Cancel a failed exact-context lookup. Stale replies are ignored.
+    pub fn fail_message_context(
+        &mut self,
+        generation: u64,
+        conversation: ConversationId,
+        target: MessageId,
+    ) {
+        self.reject_message_context(
+            generation,
+            &conversation,
+            &target,
+            "Search context could not be loaded. End or Latest returns to newest history.",
+        );
+    }
+
+    fn context_reply_matches(
+        &self,
+        generation: u64,
+        conversation: &ConversationId,
+        target: &MessageId,
+    ) -> bool {
+        self.search_context.as_ref().is_some_and(|context| {
+            context.generation == generation
+                && &context.conversation == conversation
+                && &context.target == target
+                && self.selected.as_ref() == Some(conversation)
+        })
+    }
+
+    fn reject_message_context(
+        &mut self,
+        generation: u64,
+        conversation: &ConversationId,
+        target: &MessageId,
+        notice: &str,
+    ) -> bool {
+        if !self.context_reply_matches(generation, conversation, target) {
+            return false;
+        }
+        self.scroll_to_newest();
+        self.notice = Some(notice.into());
+        true
     }
 
     fn contacts_step(&mut self, delta: isize) {
@@ -1717,6 +1918,9 @@ impl App {
         if self.contacts_open {
             self.close_contacts();
         }
+        // A new chat must not expose or retarget the previous chat's context.
+        self.clear_search_context();
+        self.abandon_search_jump();
         self.retarget_draft(None);
         self.leader_pending = false;
         self.settings_open = false;
@@ -4031,7 +4235,12 @@ impl App {
     /// Mark the newest loaded message read only when the transcript is following
     /// it. Reading back through history must not clear anything.
     pub fn mark_selected_read_if_following(&mut self) -> bool {
-        if self.new_conversation || self.scroll != 0 || self.overlay_owns_input() {
+        if self.new_conversation
+            || self.scroll != 0
+            || self.overlay_owns_input()
+            || self.search_context_active()
+            || self.search_jump_pending().is_some()
+        {
             return false;
         }
         let Some(conversation) = self.selected.clone() else {
@@ -4057,8 +4266,10 @@ impl App {
     /// Anchor the transcript on the first unread message, the same way a search
     /// jump anchors a hit. Returns false when the selected chat has nothing unread.
     pub fn jump_to_first_unread(&mut self) -> bool {
-        // Explicit navigation supersedes an asynchronous search destination.
+        // Explicit navigation supersedes an asynchronous search destination and
+        // exits a ready context before anchoring normal history.
         self.abandon_search_jump();
+        self.clear_search_context();
         self.older_requested = false;
         let Some(conversation) = self.selected.clone() else {
             return false;
@@ -6274,6 +6485,21 @@ mod tests {
         }
     }
 
+    fn start_context_lookup(
+        app: &mut App,
+        hit: MessageSearchHit,
+    ) -> (u64, ConversationId, MessageId) {
+        app.open_search();
+        for character in "needle".chars() {
+            app.search_input(character);
+        }
+        let (request, _) = app.begin_search().expect("search");
+        app.finish_search(request, vec![hit]);
+        app.begin_search_jump().expect("jump");
+        app.advance_search_jump();
+        app.begin_search_context_request().expect("context request")
+    }
+
     #[test]
     fn search_modal_parks_and_restores_the_recipient_draft() {
         let mut app = App::default();
@@ -6536,40 +6762,51 @@ mod tests {
     }
 
     #[test]
-    fn a_jump_waits_for_history_before_declaring_the_hit_missing() {
+    fn a_jump_outside_normal_history_starts_one_bounded_context_lookup() {
         let mut app = App::default();
         let source = conversation("wait-source@example.test", Some(20));
         let target = conversation("wait-target@example.test", Some(10));
         app.set_conversations(vec![source.clone(), target.clone()]);
         app.select(Some(source.id.clone()));
+        let normal = message(&target, "other", 50, "unrelated normal row");
+        app.messages.insert(target.id.clone(), vec![normal.clone()]);
         let hit = search_hit(&target, "needle", "needle");
-        app.open_search();
-        for character in "needle".chars() {
-            app.search_input(character);
-        }
-        let (request, _) = app.begin_search().expect("search");
-        app.finish_search(request, vec![hit]);
-        app.begin_search_jump().expect("jump");
+        let expected = hit.message_id.clone();
 
-        // No history for the target yet: the jump must wait, not give up.
-        app.advance_search_jump();
-        assert!(app.search_jump_pending().is_some());
-        assert_eq!(app.notice, None);
+        let (generation, conversation, message_id) = start_context_lookup(&mut app, hit);
 
-        // History arrived but the message is not in it, and nothing older exists.
-        app.upsert(
-            target.id.clone(),
-            message(&target, "other", 50, "unrelated"),
-        );
-        app.older_exhausted.insert(target.id.clone());
-        app.advance_search_jump();
-
-        assert!(app.search_jump_pending().is_none());
+        assert_eq!(conversation, target.id);
+        assert_eq!(message_id, expected);
+        assert!(app.search_context_active());
+        assert!(app.search_context.as_ref().expect("context").loading);
         assert!(
-            app.notice
-                .as_deref()
-                .is_some_and(|notice| notice.contains("outside the history")),
-            "the abandoned jump explains itself"
+            app.displayed_messages().is_empty(),
+            "loading paints no history"
+        );
+        assert_eq!(app.messages.get(&target.id), Some(&vec![normal.clone()]));
+        assert!(app.search_jump_pending().is_some());
+        assert!(app.begin_search_context_request().is_none());
+        assert!(!app.older_requested);
+        assert!(!app.can_load_older(), "context disables older paging");
+
+        let rows = vec![
+            message(&target, "before", 10, "before"),
+            message(&target, "needle", 20, "needle"),
+            message(&target, "after", 30, "after"),
+        ];
+        assert!(app.finish_message_context(
+            generation,
+            conversation.clone(),
+            expected.clone(),
+            rows.clone()
+        ));
+        assert_eq!(app.displayed_messages(), rows.as_slice());
+        assert_eq!(app.messages.get(&conversation), Some(&vec![normal]));
+        assert!(!app.search_context.as_ref().expect("context").loading);
+        assert!(app.search_jump_pending().is_none());
+        assert_eq!(
+            app.reading_anchor.as_ref().map(|anchor| &anchor.message),
+            Some(&expected)
         );
     }
 
@@ -6598,35 +6835,368 @@ mod tests {
     }
 
     #[test]
-    fn a_jump_for_a_conversation_that_never_loads_gives_up_with_a_notice() {
+    fn a_failed_context_lookup_restores_normal_history_with_a_notice() {
         let mut app = App::default();
         let source = conversation("never-source@example.test", Some(20));
-        let gone = conversation("never-target@example.test", Some(10));
-        app.set_conversations(vec![source.clone(), gone.clone()]);
+        let target = conversation("never-target@example.test", Some(10));
+        app.set_conversations(vec![source.clone(), target.clone()]);
         app.select(Some(source.id.clone()));
-        let hit = search_hit(&gone, "needle", "needle");
+        let normal = message(&target, "other", 50, "normal transcript");
+        app.messages.insert(target.id.clone(), vec![normal.clone()]);
+        let hit = search_hit(&target, "needle", "needle");
+
+        let (generation, conversation, message_id) = start_context_lookup(&mut app, hit);
+        assert!(app.search_context_active());
+        app.fail_message_context(generation, conversation.clone(), message_id);
+
+        assert!(!app.search_context_active());
+        assert!(app.search_jump_pending().is_none());
+        assert_eq!(app.displayed_messages(), std::slice::from_ref(&normal));
+        assert!(
+            app.notice
+                .as_deref()
+                .is_some_and(|notice| notice.contains("Search context could not be loaded")),
+            "a failed exact lookup explains itself without raw IPC details"
+        );
+    }
+
+    #[test]
+    fn stale_context_replies_after_exit_selection_or_replacement_are_ignored() {
+        let mut app = App::default();
+        let source = conversation("late-source@example.test", Some(20));
+        let target = conversation("late-target@example.test", Some(10));
+        app.set_conversations(vec![source.clone(), target.clone()]);
+        app.select(Some(source.id.clone()));
+        let normal = message(&target, "other", 50, "normal");
+        app.messages.insert(target.id.clone(), vec![normal.clone()]);
+        let hit = search_hit(&target, "needle", "needle");
+        let (first, conversation, message_id) = start_context_lookup(&mut app, hit.clone());
+
+        app.scroll_to_newest();
+        assert!(!app.search_context_active());
+        assert!(!app.finish_message_context(
+            first,
+            conversation.clone(),
+            message_id.clone(),
+            vec![message(&target, "needle", 20, "late")]
+        ));
+        assert_eq!(app.displayed_messages(), std::slice::from_ref(&normal));
+
+        let (second, conversation, message_id) = start_context_lookup(&mut app, hit);
+        assert_ne!(first, second);
+        app.select(Some(source.id.clone()));
+        assert!(!app.finish_message_context(
+            second,
+            conversation.clone(),
+            message_id.clone(),
+            vec![message(&target, "needle", 20, "selected away")]
+        ));
+        assert!(app.search_context.is_none());
+
+        app.select(Some(target.id.clone()));
+        let (third, conversation, message_id) =
+            start_context_lookup(&mut app, search_hit(&target, "needle", "needle"));
+        // A replacement request gets a new generation while the old reply stays stale.
+        let (fourth, newer_conversation, newer_message) =
+            start_context_lookup(&mut app, search_hit(&target, "needle", "needle"));
+        assert_ne!(third, fourth);
+        assert!(!app.finish_message_context(
+            third,
+            conversation,
+            message_id,
+            vec![message(&target, "needle", 20, "old request")]
+        ));
+        assert!(app.finish_message_context(
+            fourth,
+            newer_conversation,
+            newer_message,
+            vec![message(&target, "needle", 20, "new request")]
+        ));
+    }
+
+    #[test]
+    fn stale_context_failures_after_loading_cancellation_leave_no_notice() {
+        for exit in ["latest", "selection", "unread", "new-chat", "replacement"] {
+            let mut app = App::default();
+            let source = conversation("cancel-error-source", Some(20));
+            let target = conversation("cancel-error-target", Some(10));
+            app.set_conversations(vec![source.clone(), target.clone()]);
+            app.select(Some(source.id.clone()));
+            let (generation, conversation, target_id) =
+                start_context_lookup(&mut app, search_hit(&target, "needle", "needle"));
+            assert!(app.search_context.as_ref().unwrap().loading);
+            match exit {
+                "latest" => app.scroll_to_newest(),
+                "selection" => app.select(Some(source.id.clone())),
+                "unread" => {
+                    app.jump_to_first_unread();
+                }
+                "new-chat" => app.begin_new_conversation(),
+                "replacement" => {
+                    start_context_lookup(&mut app, search_hit(&target, "replacement", "new hit"));
+                }
+                _ => unreachable!(),
+            }
+            let selected = app.selected.clone();
+            let draft = app.draft.clone();
+            let notice = app.notice.clone();
+            let active_generation = app
+                .search_context
+                .as_ref()
+                .map(|context| context.generation);
+            app.fail_message_context(generation, conversation, target_id);
+            assert_eq!(app.notice, notice, "late error after {exit}");
+            assert_eq!(app.selected, selected);
+            assert_eq!(app.draft, draft);
+            assert_eq!(
+                app.search_context
+                    .as_ref()
+                    .map(|context| context.generation),
+                active_generation
+            );
+        }
+    }
+
+    #[test]
+    fn cold_thread_hits_use_one_exact_context_lookup_without_waiting_for_snapshot() {
+        let mut app = App::default();
+        let target = conversation("cold-context-thread", Some(10));
+        app.set_conversations(vec![target.clone()]);
+        assert!(!app.messages.contains_key(&target.id));
+        let (generation, conversation, target_id) =
+            start_context_lookup(&mut app, search_hit(&target, "needle", "needle"));
+        assert!(
+            app.begin_search_context_request().is_none(),
+            "only one lookup is started"
+        );
+        assert!(app.finish_message_context(
+            generation,
+            conversation,
+            target_id,
+            vec![message(&target, "needle", 20, "exact cold hit")]
+        ));
+        assert!(app.search_context_active());
+        assert_eq!(app.displayed_messages()[0].id().value(), "needle");
+        assert!(!app.mark_selected_read_if_following());
+    }
+
+    #[test]
+    fn snapshots_and_live_arrivals_leave_ready_context_fixed() {
+        let mut app = App::default();
+        let source = conversation("fixed-source@example.test", Some(20));
+        let target = conversation("fixed-target@example.test", Some(10));
+        app.set_conversations(vec![source.clone(), target.clone()]);
+        app.select(Some(source.id.clone()));
+        app.messages.insert(
+            target.id.clone(),
+            vec![message(&target, "normal", 90, "normal latest")],
+        );
+        let hit = search_hit(&target, "needle", "needle");
+        let (generation, conversation, message_id) = start_context_lookup(&mut app, hit);
+        let context_rows = vec![
+            message(&target, "before", 10, "context before"),
+            message(&target, "needle", 20, "context hit"),
+            message(&target, "after", 30, "context after"),
+        ];
+        assert!(app.finish_message_context(
+            generation,
+            conversation.clone(),
+            message_id,
+            context_rows.clone()
+        ));
+
+        app.apply_snapshot(Snapshot {
+            revision: 1,
+            conversations: vec![source, target.clone()],
+            visible: Some(target.id.clone()),
+            history: vec![message(&target, "reconciled", 100, "newest normal")],
+        });
+        app.apply_event(EventKind::Message {
+            conversation_id: target.id.clone(),
+            message: message(&target, "live", 110, "live normal"),
+            push_sequence: None,
+        });
+
+        assert_eq!(app.displayed_messages(), context_rows.as_slice());
+        assert!(app.search_context_active());
+        assert!(!app.can_load_older());
+    }
+
+    #[test]
+    fn alias_changes_restart_context_under_a_new_generation_and_canonical_id() {
+        let mut app = App::default();
+        let old = conversation("alias-old@example.test", Some(10));
+        let mut canonical = conversation("alias-new@example.test", Some(10));
+        canonical.aliases = vec![old.id.clone()];
+        app.set_conversations(vec![old.clone()]);
+        app.select(Some(old.id.clone()));
+        let hit = search_hit(&old, "needle", "needle");
+        let (old_generation, old_conversation, target) = start_context_lookup(&mut app, hit);
+
+        app.set_conversations(vec![canonical.clone()]);
+
+        let context = app.search_context.as_ref().expect("restarted context");
+        assert_ne!(context.generation, old_generation);
+        assert_eq!(context.conversation, canonical.id);
+        assert_eq!(context.target, target);
+        assert!(context.loading);
+        assert!(!context.requested);
+        assert!(!app.finish_message_context(
+            old_generation,
+            old_conversation,
+            target.clone(),
+            vec![message(&old, "needle", 20, "old reply")]
+        ));
+        let (new_generation, new_conversation, new_target) = app
+            .begin_search_context_request()
+            .expect("canonical request");
+        assert_eq!(new_conversation, canonical.id);
+        assert!(app.finish_message_context(
+            new_generation,
+            new_conversation,
+            new_target,
+            vec![message(&canonical, "needle", 20, "canonical reply")]
+        ));
+        assert_eq!(
+            app.displayed_messages()
+                .first()
+                .map(Message::id)
+                .map(MessageId::value),
+            Some("needle")
+        );
+    }
+
+    #[test]
+    fn context_frames_never_advance_read_markers_even_when_short() {
+        let mut app = App::default();
+        let chat = conversation("read-context@example.test", Some(10));
+        app.set_conversations(vec![chat.clone()]);
+        app.select(Some(chat.id.clone()));
+        let newest = message(&chat, "newest", 90, "newest normal");
+        app.messages.insert(chat.id.clone(), vec![newest]);
+        let hit = search_hit(&chat, "target", "target");
+        let (generation, conversation, target) = start_context_lookup(&mut app, hit);
+        assert!(app.finish_message_context(
+            generation,
+            conversation.clone(),
+            target.clone(),
+            vec![message(&chat, "target", 10, "short context")]
+        ));
+
+        app.record_transcript(Some(crate::transcript::TranscriptViewport {
+            conversation: chat.id.clone(),
+            messages: vec![crate::transcript::MessageRows {
+                id: target,
+                start: 0,
+                end: 2,
+            }],
+            rows: 2,
+            height: 24,
+            top: 0,
+        }));
+
+        assert_eq!(app.scroll, 0, "the short context clamps to scroll zero");
+        assert!(app.is_scrolled_back(), "context still has a Latest exit");
+        assert!(app.read_positions.is_empty());
+        assert!(!app.mark_selected_read_if_following());
+        assert!(app.read_positions.is_empty());
+        app.scroll_to_oldest();
+        assert!(!app.older_requested, "context never requests older pages");
+        assert!(app.begin_load_older().is_none());
+    }
+
+    #[test]
+    fn a_near_hit_already_in_normal_history_anchors_without_a_context_request() {
+        let mut app = App::default();
+        let chat = conversation("near-hit@example.test", Some(10));
+        app.set_conversations(vec![chat.clone()]);
+        app.select(Some(chat.id.clone()));
+        let target = message(&chat, "needle", 20, "near hit");
+        app.messages.insert(chat.id.clone(), vec![target.clone()]);
+        let hit = search_hit(&chat, "needle", "near hit");
         app.open_search();
         for character in "needle".chars() {
             app.search_input(character);
         }
         let (request, _) = app.begin_search().expect("search");
         app.finish_search(request, vec![hit]);
+
         app.begin_search_jump().expect("jump");
 
-        // The conversation never produces history; the jump must still resolve.
-        for _ in 0..6 {
-            app.advance_search_jump();
-            if app.search_jump_pending().is_none() {
-                break;
-            }
-        }
+        assert!(app.search_context.is_none());
         assert!(app.search_jump_pending().is_none());
-        assert!(
-            app.notice
-                .as_deref()
-                .is_some_and(|notice| notice.contains("outside the history")),
-            "an unreachable jump explains itself instead of hanging"
+        assert_eq!(
+            app.reading_anchor.as_ref().map(|anchor| &anchor.message),
+            Some(target.id())
         );
+        assert!(app.begin_search_context_request().is_none());
+    }
+
+    #[test]
+    fn latest_and_overlays_preserve_draft_owner_cursor_and_paste_provenance() {
+        let mut app = App::default();
+        let chat = conversation("context-draft@example.test", Some(10));
+        app.set_conversations(vec![chat.clone()]);
+        app.select(Some(chat.id.clone()));
+        app.messages.insert(
+            chat.id.clone(),
+            vec![message(&chat, "normal", 90, "normal latest")],
+        );
+        app.draft = "literal /body draft".into();
+        app.draft_cursor = 4;
+        app.pasted_body = true;
+        let hit = search_hit(&chat, "target", "target");
+        let (generation, conversation, target) = start_context_lookup(&mut app, hit);
+        assert!(app.finish_message_context(
+            generation,
+            conversation.clone(),
+            target.clone(),
+            vec![message(&chat, "target", 10, "context")]
+        ));
+        let owner = app.active_draft_owner.clone();
+
+        app.open_search();
+        app.close_search();
+        assert!(
+            app.search_context_active(),
+            "closing an overlay keeps context"
+        );
+        assert_eq!(app.draft, "literal /body draft");
+        assert_eq!(app.draft_cursor, 4);
+        assert!(app.pasted_body);
+        assert_eq!(app.active_draft_owner, owner);
+
+        app.scroll_to_newest();
+        assert!(!app.search_context_active());
+        assert_eq!(app.displayed_messages()[0].id().value(), "normal");
+        assert_eq!(app.draft, "literal /body draft");
+        assert_eq!(app.draft_cursor, 4);
+        assert!(app.pasted_body);
+        assert_eq!(app.active_draft_owner, owner);
+
+        let unread = message(&chat, "unread", 100, "incoming unread");
+        app.messages.insert(chat.id.clone(), vec![unread.clone()]);
+        app.mark_read(chat.id.clone(), message(&chat, "normal", 90, "seen"));
+        let hit = search_hit(&chat, "target", "target");
+        let (generation, conversation, target) = start_context_lookup(&mut app, hit);
+        assert!(app.finish_message_context(
+            generation,
+            conversation,
+            target,
+            vec![message(&chat, "target", 10, "context")]
+        ));
+        assert!(app.jump_to_first_unread());
+        assert!(
+            !app.search_context_active(),
+            "unread navigation exits context"
+        );
+        assert_eq!(
+            app.reading_anchor.as_ref().map(|anchor| &anchor.message),
+            Some(unread.id())
+        );
+        assert_eq!(app.draft, "literal /body draft");
+        assert_eq!(app.draft_cursor, 4);
+        assert!(app.pasted_body);
     }
 
     #[test]
@@ -6722,6 +7292,37 @@ mod tests {
         let mut app = App::default();
         app.select(Some(conversation.id.clone()));
         (app, conversation)
+    }
+
+    #[test]
+    fn a_new_read_marker_requests_one_followup_badge_redraw_not_a_loop() {
+        let (mut app, conversation) = read_app();
+        let newest = message(&conversation, "painted", 10, "shown");
+        app.messages
+            .insert(conversation.id.clone(), vec![newest.clone()]);
+        let view = crate::transcript::TranscriptViewport {
+            conversation: conversation.id.clone(),
+            messages: vec![crate::transcript::MessageRows {
+                id: newest.id().clone(),
+                start: 0,
+                end: 1,
+            }],
+            rows: 1,
+            height: 1,
+            top: 0,
+        };
+        assert!(
+            app.record_transcript(Some(view.clone())),
+            "new marker changes badges"
+        );
+        assert!(
+            !app.record_transcript(Some(view)),
+            "unchanged marker must not redraw forever"
+        );
+        assert!(
+            !app.record_transcript(None),
+            "no transcript means no marker redraw"
+        );
     }
 
     #[test]

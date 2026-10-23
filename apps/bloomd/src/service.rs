@@ -318,6 +318,20 @@ impl RequestHandler for Service {
         })
     }
 
+    fn message_context(
+        &self,
+        conversation_id: ConversationId,
+        message_id: MessageId,
+        limit: u16,
+    ) -> HandlerFuture<'_, Vec<Message>> {
+        Box::pin(async move {
+            let store = self.store.lock().unwrap();
+            store::message_context(&store, &conversation_id, &message_id, limit)
+                .map_err(|_| ProtocolError::Internal)?
+                .ok_or(ProtocolError::NotFound)
+        })
+    }
+
     fn start_conversation(
         &self,
         address: String,

@@ -11,7 +11,7 @@ import threading
 import time
 import uuid
 
-VERSION = 3
+VERSION = 4
 MAX_FRAME = 1024 * 1024
 LOCK = threading.RLock()
 SUBS = set()
@@ -21,7 +21,30 @@ PEOPLE = {"alice@example.invalid": "Alice", "bob@example.invalid": "Bob"}
 
 
 def frame(obj):
+    """Serialize one frame, replacing an oversized response with an Internal error.
+
+    Payload serialization completes before any bytes are written, matching the real
+    dispatch, so an oversized response can be replaced safely. An oversized event
+    has no valid replacement and raises before any bytes are sent.
+    """
     data = json.dumps(obj, separators=(",", ":"), ensure_ascii=False).encode()
+    if len(data) > MAX_FRAME:
+        request_id = obj.get("request_id") if isinstance(obj, dict) else None
+        is_response = (
+            isinstance(obj, dict)
+            and isinstance(obj.get("response"), dict)
+            and isinstance(request_id, int)
+            and not isinstance(request_id, bool)
+        )
+        if not is_response:
+            raise ValueError("oversized non-response frame")
+        data = json.dumps(
+            {"request_id": request_id, "response": {"result": "error", "error": "internal"}},
+            separators=(",", ":"),
+            ensure_ascii=False,
+        ).encode()
+        if len(data) > MAX_FRAME:
+            raise ValueError("oversized response fallback")
     return bytes([VERSION]) + struct.pack(">I", len(data)) + data
 
 
@@ -61,6 +84,40 @@ def read_frame(c):
 def history_key(item):
     """Match the store ordering (created_at, id) with the id's stable JSON form."""
     return item["created_at"], json.dumps(item["id"], separators=(",", ":"), ensure_ascii=False)
+
+
+def message_context(state, conversation_id, message_id, limit):
+    """Return the bounded window centred on an exact stored message, or None."""
+    target = next((m for m in state["messages"] if m["id"] == message_id), None)
+    if target is None:
+        return None
+    canonical = canonical_conversation(state, conversation_id)
+    conversation = next((c for c in state["conversations"] if c["id"] == canonical), None)
+    aliases = conversation.get("aliases", []) if conversation is not None else []
+    if target["conversation_id"] != canonical and target["conversation_id"] not in aliases:
+        return None
+    identities = {json.dumps(item, separators=(",", ":"), ensure_ascii=False)
+                  for item in [canonical, *aliases]}
+    bound = history_key(target)
+    older_quota = (limit - 1) // 2
+    newer_quota = limit - 1 - older_quota
+    older = [m for m in state["messages"]
+             if json.dumps(m["conversation_id"], separators=(",", ":"), ensure_ascii=False) in identities
+             and history_key(m) < bound]
+    older.sort(key=history_key)
+    older = older[-older_quota:] if older_quota else []
+    newer = [m for m in state["messages"]
+             if json.dumps(m["conversation_id"], separators=(",", ":"), ensure_ascii=False) in identities
+             and history_key(m) > bound]
+    newer.sort(key=history_key)
+    newer = newer[:newer_quota]
+
+    def remap(message):
+        result = copy.deepcopy(message)
+        result["conversation_id"] = canonical
+        return result
+
+    return [remap(message) for message in older] + [remap(target)] + [remap(message) for message in newer]
 
 
 def search_snippet(text, query):
@@ -299,6 +356,22 @@ def serve(client, args, state):
                                 older.sort(key=history_key)
                                 selected = older[-limit:]
                             response = {"result": "history", "messages": copy.deepcopy(selected)}
+                        elif op == "message_context":
+                            limit = body.get("limit")
+                            if (not isinstance(limit, int) or isinstance(limit, bool)
+                                    or limit < 1 or limit > 200):
+                                response = {"result": "error", "error": "invalid_request"}
+                                write(client, {"request_id": request_id, "response": response})
+                                continue
+                            selected = message_context(
+                                state,
+                                body.get("conversation_id", {}),
+                                body.get("message_id", {}),
+                                limit,
+                            )
+                            if selected is None:
+                                raise LookupError
+                            response = {"result": "message_context", "messages": selected}
                         elif op == "search_messages":
                             query = body.get("query")
                             limit = body.get("limit", 0)

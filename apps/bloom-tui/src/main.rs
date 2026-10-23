@@ -235,6 +235,12 @@ async fn main() -> Result<()> {
     )>();
     let (search_tx, mut search_rx) =
         mpsc::unbounded_channel::<(u64, Result<Vec<bloom_ipc::MessageSearchHit>, ClientError>)>();
+    let (context_tx, mut context_rx) = mpsc::unbounded_channel::<(
+        u64,
+        bloom_domain::ConversationId,
+        MessageId,
+        Result<Vec<bloom_domain::Message>, ClientError>,
+    )>();
     let (visible_tx, visible_rx) = watch::channel::<Option<bloom_domain::ConversationId>>(None);
 
     {
@@ -306,7 +312,11 @@ async fn main() -> Result<()> {
             terminal.draw(|frame| {
                 hits = ui::render_with_cache(frame, &app, &mut render_cache);
             })?;
-            app.record_transcript(hits.transcript_view.take());
+            if app.record_transcript(hits.transcript_view.take()) {
+                // The just-painted badges predate the newly observed read marker.
+                // Coalesce one follow-up frame instead of waiting for more input.
+                redraw.request();
+            }
             let drawn_at = std::time::Instant::now();
             while let Some((sequence, received_at)) = inbound_redraws.pop_front() {
                 diagnostics::inbound_timing(
@@ -458,6 +468,17 @@ async fn main() -> Result<()> {
                 }
                 redraw.request();
             },
+            Some((generation, conversation, target, result)) = context_rx.recv() => {
+                match result {
+                    Ok(messages) => {
+                        app.finish_message_context(generation, conversation, target, messages);
+                    }
+                    Err(_) => {
+                        app.fail_message_context(generation, conversation, target);
+                    }
+                }
+                redraw.request();
+            },
             Some(result) = sync_rx.recv() => {
                 app.finish_sync(result);
                 // `/sync` refreshes metadata, not remote message history. Re-read
@@ -579,6 +600,21 @@ async fn main() -> Result<()> {
             last_visible = app.selected.clone();
             app.thread_loading = last_visible.is_some();
             let _ = visible_tx.send(last_visible.clone());
+        }
+        if let Some((generation, conversation, target)) = app.begin_search_context_request() {
+            let client = client.clone();
+            let tx = context_tx.clone();
+            tokio::spawn(async move {
+                let result = client
+                    .message_context(
+                        conversation.clone(),
+                        target.clone(),
+                        bloom_ipc::MAX_MESSAGE_CONTEXT_LIMIT,
+                    )
+                    .await;
+                let _ = tx.send((generation, conversation, target, result));
+            });
+            redraw.request();
         }
         if app.older_requested {
             // Keep the request pending while another page is in flight, so a

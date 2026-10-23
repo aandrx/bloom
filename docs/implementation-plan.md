@@ -14,8 +14,8 @@ Rust daemon/domain/IPC/secret-store boundary, encrypted persistence, external Da
 
 The section numbers below group work by area; they are not execution order.
 
-1. Address search hits beyond the retained paging budget. Keep memory bounded and preserve the selected recipient, draft, reading anchor, and an explicit return to latest. Freeze the history-window contract before implementation.
-2. Keep participant and attachment search queued until deep-hit navigation is accepted.
+1. Define participant-context search over local stored messages. Filter by an explicitly selected known participant identity, not an ambiguous name or a guessed sender. Freeze the request and UI semantics before implementation; bounded read-only research is underway.
+2. Keep attachment search queued. Deep-hit navigation is accepted with the evidence below.
 3. Start generation-scoped engine recovery only when resuming backend work. Historical ingestion, packaging, and rich messaging remain queued.
 
 Keep the launcher on debug. Do not add durable drafts, remote read receipts, or multi-service work to this unit.
@@ -48,8 +48,8 @@ This section covers reading and composition. Reading anchors, the measured Lates
 
 Shipped in this loop so far:
 
-- Keyset local pagination end to end. The store and IPC page backwards from a known message (protocol version 3), and the transcript loads the previous page when the reader reaches the oldest loaded row, keeps paged history across reconciliation for that chat, and stops at a bounded retained budget instead of repeating a discarded request.
-- Local message search end to end. `search_messages` matches stored text parts case-insensitively, newest first, with char-boundary-safe snippets and canonical conversation ids. Ctrl+F or `/search` opens a modal that lists hits with chat identity and snippet, and opening a hit pages back until that message is loaded and anchors the transcript on it.
+- Keyset local pagination end to end. The store and IPC page backwards from a known message (currently protocol version 4), and the transcript loads the previous page when the reader reaches the oldest loaded row, keeps paged history across reconciliation for that chat, and stops at a bounded retained budget instead of repeating a discarded request.
+- Local message search end to end. `search_messages` matches stored text parts case-insensitively, newest first, with char-boundary-safe snippets and canonical conversation ids. Ctrl+F or `/search` opens a modal that lists hits with chat identity and snippet, and opening a loaded hit anchors directly. Unloaded hits use the exact-context view described below.
 - Failure and identity handling around paging: page failures stay readable until the next interaction, alias reconciliation carries paged history and unions caches, and leaving a chat releases the in-flight page slot.
 - Session-only composer undo/redo and completed-search result counts, committed in `f85ce33`. Undo is bounded and recipient-owned; durable drafts are not implemented. A search at its result cap says "may be more" rather than claiming completeness.
 
@@ -60,13 +60,19 @@ Local unread navigation, accepted with synthetic coverage:
 - The current implementation stores conversation IDs, the last-seen message ID, and its timestamp in the existing private but unencrypted `tui.json`. It stores no message bodies. Unlike manually assigned titles, these markers accumulate automatically as chats are opened and have no automatic expiry or pruning. This reading-activity metadata remains a privacy and retention limit, not encrypted message storage. Alias reconciliation merges markers under the canonical ID and keeps the newest position, including after config reload.
 - Actual-PTY coverage proves badge appearance, clearing after opening latest, saved marker advancement without extra input, and a first-unread jump distinct from latest. Existing ownership, paging, search, and send regressions pass.
 
+Deep-hit navigation, accepted under shipp with synthetic coverage:
+
+- [Deep-search design and acceptance](deep-search-navigation.md) records the exact local `message_context(conversation_id, message_id, limit)` lookup. IPC version 4 returns at most 200 rows including the target, resolves aliases, and rejects missing or wrong-conversation targets. Loaded hits anchor directly; other hits use one exact lookup, not intermediate paging.
+- The TUI keeps context separate from normal latest history, with request-generation correlation. Reconciliation and arrivals cannot replace it. End or Latest returns to normal history without changing the draft. Context frames never advance read markers, and a marker advanced after drawing triggers one badge redraw.
+- Final parent workspace and timezone tests, strict Clippy, formatting, and source guard pass. Rebuilt runtime suites pass: 18 fixture, 12 input, 4 messaging, 12 reading/navigation, and 8 launcher tests. The deep PTY case opens a hit 1,420 rows back, survives reconciliation and arrivals, clears its badge on Latest, and preserves literal-paste provenance and the recipient. Scoped independent source reviews and parent runtime/capture inspection informed acceptance. No live account or engine was accessed.
+
 Next in this section:
 
-- Open search hits beyond the retained paging budget without accumulating intermediate history. Cover stale responses, aliases, reconciliation, cancellation, and return to latest in state and PTY tests.
+- Participant-context search. Research exact identity selection, group membership, aliases, filtering before result limits, and plain-query compatibility before dispatching a writer.
 
 Later in this section:
 
-- Participant-context search (find messages by who was in the chat) and attachment search remain queued.
+- Attachment search remains queued; participant-context search is the next bounded design unit.
 - Durable encrypted drafts still need a privacy and retention review; undo stays session-only until then.
 - Typed interaction modes to reduce independent flag combinations, but only behind regression coverage for modal transitions, recipient changes, aliases, filters and asynchronous results.
 

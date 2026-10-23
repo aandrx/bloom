@@ -20,7 +20,7 @@
 
 | Area | Boundary |
 | --- | --- |
-| History | Only Bloom's stored messages; the transcript opens the newest 200, loads earlier pages on demand (bounded session budget) and searches stored message text locally, paging back to a hit when needed; no remote/app historical import |
+| History | Only Bloom's stored messages; the transcript opens the newest 200, loads earlier pages on demand (bounded session budget) and searches stored message text locally, opening a separate bounded exact-context view for unloaded hits; no remote/app historical import |
 | Live service | Synthetic sidecar/IPC/PTY coverage; current real-engine changes not live-revalidated; no automatic engine-generation recovery |
 | Groups | Existing group text conditional on recipient-list capability; no group-management workflow |
 | Rich messaging | Unsupported inbound parts are placeholders; no attachment send/open/download, reactions, edits or unsend UI |
@@ -32,6 +32,8 @@
 | Future GUI/transport | GPUI not started; independent registration blocked at Gate 0; Matrix remains an excluded proof |
 
 ## Evidence
+
+Deep-search context is accepted under shipp with synthetic coverage. Final parent workspace all-target and timezone tests, strict Clippy, formatting, source guard, and rebuilt runtime suites pass: 18 fixture, 12 input, 4 messaging, 12 reading/navigation, and 8 launcher tests. The actual PTY covers loaded and unloaded hits, plus a hit 1,420 rows back that survives reconciliation and an arrival before returning to latest with the literal draft and recipient intact. The badge-clear regression failed before the post-paint redraw fix and passes afterward. Scoped independent source reviews covered context isolation, cancellation, framing, and redraw follow-ups. Parent inspected final captures. See [deep-search acceptance](deep-search-navigation.md) for boundaries.
 
 Local unread navigation was verified under shipp after the review corrections: workspace all-target tests, Tokyo-timezone TUI tests, strict workspace Clippy, formatting, source guard, rebuilt binaries, and all synthetic runtime suites passed. Runtime counts are 10 fixture, 12 input, 4 messaging, 10 reading/navigation, and 8 launcher tests. The scoped source rereview found no confirmed defects in the corrections. Parent inspected the PTY badge, read-clear, and first-unread output. A failed settings save can wait for another redraw to display its error and retry on later loop iterations; this remains a non-blocking limitation.
 
@@ -49,6 +51,6 @@ Independent source review for the current UI pass found a canonical-alias readin
 
 ## Release blockers and next work
 
-The user-directed priority remains UI/UX; this bounded reading/navigation pass is accepted, not permission to resume integrations or access a live account. [The roadmap](implementation-plan.md) next addresses deep search hits beyond the retained history budget. Generation-scoped engine recovery, verified historical ingestion, and standalone runtime packaging remain queued backend work. Keep the existing registration exclusively owned and do not automatically replay uncertain sends. [IDS validation](ids-validation-gate.md) remains separate and blocked.
+The user-directed priority remains UI/UX; this bounded reading/navigation pass is accepted, not permission to resume integrations or access a live account. [The roadmap](implementation-plan.md) next defines participant-context search over local stored messages; deep-hit navigation is accepted. Generation-scoped engine recovery, verified historical ingestion, and standalone runtime packaging remain queued backend work. Keep the existing registration exclusively owned and do not automatically replay uncertain sends. [IDS validation](ids-validation-gate.md) remains separate and blocked.
 
 Optional mutation guards in `scripts/check-guards` require clean files and restore their mutations; they are not CI evidence or permission to reset working changes. Inspect the manifest and current tests before running them.

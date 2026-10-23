@@ -2,6 +2,7 @@
 """Black-box tests for stateful-fake-daemon.py over real Unix sockets."""
 import json
 import os
+import runpy
 import socket
 import struct
 import subprocess
@@ -12,12 +13,32 @@ import time
 import unittest
 
 DAEMON = os.path.join(os.path.dirname(__file__), "stateful-fake-daemon.py")
+FAKE = os.path.join(os.path.dirname(__file__), "fake-daemon.py")
 TIMEOUT = 2.0
+
+
+def identity(value, transport="openbubbles"):
+    return {"transport": transport, "value": value}
+
+
+def parse_frame(data):
+    version, size = struct.unpack(">BI", data[:5])
+    return version, json.loads(data[5:5 + size]), len(data) - 5
+
+
+def oversized_response(limit):
+    return {
+        "request_id": 41,
+        "response": {
+            "result": "message_context",
+            "messages": [{"parts": [{"type": "text", "value": "x" * (limit + 16)}]}],
+        },
+    }
 
 
 def send(client, obj):
     payload = json.dumps(obj).encode()
-    client.sendall(b"\x03" + struct.pack(">I", len(payload)) + payload)
+    client.sendall(b"\x04" + struct.pack(">I", len(payload)) + payload)
 
 
 def recv_exact(client, size):
@@ -33,7 +54,7 @@ def recv_exact(client, size):
 def recv(client):
     header = recv_exact(client, 5)
     version, size = struct.unpack(">BI", header)
-    if version != 3 or not 0 < size <= 1048576:
+    if version != 4 or not 0 < size <= 1048576:
         raise AssertionError("invalid response frame")
     return json.loads(recv_exact(client, size))
 
@@ -251,6 +272,75 @@ class Tests(unittest.TestCase):
         self.assertEqual(len(collected), len(set(collected)))
 
 
+    def test_message_context_is_centred_bounded_and_validated(self):
+        conversation = {"transport": "openbubbles", "value": "alice@example.invalid"}
+        for index in range(7):
+            request(self.sock, "fixture_append_message",
+                    conversation_id=conversation, text=f"context {index}")
+        self.stop()
+        with open(self.store, encoding="utf-8") as stream:
+            state = json.load(stream)
+        for index, message in enumerate(state["messages"]):
+            message["created_at"] = 1000 + index * 10
+            message["id"]["value"] = f"ctx-{index}"
+        with open(self.store, "w", encoding="utf-8") as stream:
+            json.dump(state, stream)
+        self.start()
+
+        def context(message_id, limit, cid=conversation):
+            return request(self.sock, "message_context", conversation_id=cid,
+                           message_id={"transport": "openbubbles", "value": message_id},
+                           limit=limit)
+
+        def ids(response):
+            return [message["id"]["value"] for message in response["messages"]]
+
+        self.assertEqual(ids(context("ctx-3", 3)), ["ctx-2", "ctx-3", "ctx-4"])
+        self.assertEqual(ids(context("ctx-3", 4)), ["ctx-2", "ctx-3", "ctx-4", "ctx-5"])
+        self.assertEqual(ids(context("ctx-3", 1)), ["ctx-3"])
+        self.assertEqual(ids(context("ctx-0", 5)), ["ctx-0", "ctx-1", "ctx-2"])
+        self.assertEqual(ids(context("ctx-6", 5)), ["ctx-4", "ctx-5", "ctx-6"])
+        for invalid in (0, 201):
+            self.assertEqual(context("ctx-3", invalid),
+                             {"result": "error", "error": "invalid_request"})
+        self.assertEqual(context("ctx-3", 5, cid={"transport": "openbubbles", "value": "bob@example.invalid"}),
+                         {"result": "error", "error": "not_found"})
+        self.assertEqual(context("missing", 5),
+                         {"result": "error", "error": "not_found"})
+
+    def test_message_context_reaches_old_target_across_aliases(self):
+        self.stop()
+        with open(self.store, encoding="utf-8") as stream:
+            state = json.load(stream)
+        canonical = state["conversations"][0]
+        alias = {"transport": "openbubbles", "value": "alice-legacy"}
+        canonical["aliases"] = [alias]
+        for index in range(2000):
+            conversation = alias if index == 7 else canonical["id"]
+            state["messages"].append({
+                "id": {"transport": "openbubbles", "value": f"row-{index:04d}"},
+                "conversation_id": conversation, "remote_id": None,
+                "sender": canonical["participants"][1]["handle"],
+                "parts": [{"type": "text", "value": f"row {index}"}],
+                "created_at": 1000 + index, "sent_at": None, "delivery": "delivered",
+                "from_me": False, "edited_at": None, "reactions": [], "unsent_at": None,
+            })
+        with open(self.store, "w", encoding="utf-8") as stream:
+            json.dump(state, stream)
+        self.start()
+
+        expected = ["row-0005", "row-0006", "row-0007", "row-0008", "row-0009"]
+        for requested in (canonical["id"], alias):
+            response = request(self.sock, "message_context", conversation_id=requested,
+                               message_id={"transport": "openbubbles", "value": "row-0007"},
+                               limit=5)
+            self.assertEqual([message["id"]["value"] for message in response["messages"]], expected)
+            self.assertTrue(all(message["conversation_id"] == canonical["id"]
+                                for message in response["messages"]))
+        self.assertEqual(request(self.sock, "message_context", conversation_id=canonical["id"],
+                                 message_id={"transport": "openbubbles", "value": "row-0007"},
+                                 limit=1)["messages"][0]["id"]["value"], "row-0007")
+
     def test_search_messages_returns_snippet_and_ignores_empty_query(self):
         conversation = {"transport": "openbubbles", "value": "alice@example.invalid"}
         prefix = "0123456789" * 4
@@ -276,6 +366,119 @@ class Tests(unittest.TestCase):
             request(self.sock, "search_messages", query="needle", limit=0),
             {"result": "error", "error": "invalid_request"},
         )
+
+
+def context_state():
+    """Same-timestamp, escaped-id rows split across a canonical id and an alias."""
+    canonical = identity("weekend")
+    alias = identity("weekend-legacy")
+    rows = []
+    for value, conversation in [
+        ("a1", canonical),
+        ('a2"', alias),
+        ("a3}", canonical),
+        ("a4\\", alias),
+    ]:
+        rows.append({
+            "id": identity(value),
+            "conversation_id": conversation,
+            "created_at": 1000,
+        })
+    return {
+        "conversations": [{"id": canonical, "aliases": [alias]}],
+        "messages": rows,
+    }
+
+
+class StatefulContextHelper(unittest.TestCase):
+    def setUp(self):
+        self.module = runpy.run_path(DAEMON)
+        self.state = context_state()
+        self.canonical = identity("weekend")
+        self.alias = identity("weekend-legacy")
+
+    def context(self, conversation_id, value, limit):
+        return self.module["message_context"](
+            self.state, conversation_id, identity(value), limit
+        )
+
+    def test_alias_target_and_neighbours_canonicalize_for_both_requests(self):
+        for requested in (self.canonical, self.alias):
+            selected = self.context(requested, 'a2"', 3)
+            self.assertEqual([item["id"]["value"] for item in selected],
+                             ["a1", 'a2"', "a3}"])
+            self.assertTrue(all(item["conversation_id"] == self.canonical
+                                for item in selected))
+            self.assertEqual(
+                [item["id"]["value"] for item in self.context(requested, 'a2"', 2)],
+                ['a2"', "a3}"],
+            )
+
+    def test_missing_and_wrong_chat_are_not_found(self):
+        self.assertIsNone(self.context(self.canonical, "missing", 3))
+        self.assertIsNone(self.context(identity("bob"), 'a2"', 3))
+
+
+class FakeContextHelper(unittest.TestCase):
+    def setUp(self):
+        self.module = runpy.run_path(FAKE)
+        state = context_state()
+        self.module["CONVERSATIONS"][:] = state["conversations"]
+        self.module["HISTORY"].clear()
+        self.module["HISTORY"].update({"weekend": state["messages"]})
+        self.canonical = identity("weekend")
+        self.alias = identity("weekend-legacy")
+
+    def context(self, conversation_id, value, limit):
+        return self.module["message_context"](
+            conversation_id, identity(value), limit
+        )
+
+    def test_alias_target_and_neighbours_canonicalize_for_both_requests(self):
+        for requested in (self.canonical, self.alias):
+            selected = self.context(requested, 'a2"', 3)
+            self.assertEqual([item["id"]["value"] for item in selected],
+                             ["a1", 'a2"', "a3}"])
+            self.assertTrue(all(item["conversation_id"] == self.canonical
+                                for item in selected))
+            self.assertEqual(
+                [item["id"]["value"] for item in self.context(requested, 'a2"', 2)],
+                ['a2"', "a3}"],
+            )
+
+    def test_missing_and_wrong_chat_are_not_found(self):
+        self.assertIsNone(self.context(self.canonical, "missing", 3))
+        self.assertIsNone(self.context(identity("bob"), 'a2"', 3))
+
+
+class FrameSerialization(unittest.TestCase):
+    def check_fixture(self, path, version):
+        module = runpy.run_path(path)
+        limit = module.get("MAX_FRAME", 1024 * 1024)
+        small = {"request_id": 7, "response": {"result": "conversations", "conversations": []}}
+        frame_version, body, size = parse_frame(module["frame"](small))
+        self.assertEqual(frame_version, version)
+        self.assertEqual(body, small)
+        self.assertEqual(size, len(json.dumps(body, separators=(",", ":"), ensure_ascii=False).encode()))
+
+        oversized = oversized_response(limit)
+        frame_version, body, size = parse_frame(module["frame"](oversized))
+        self.assertEqual(frame_version, version)
+        self.assertLessEqual(size, limit)
+        self.assertEqual(body, {
+            "request_id": 41,
+            "response": {"result": "error", "error": "internal"},
+        })
+
+        event = {"event": {"event": "message", "body": "x" * (limit + 16)}}
+        with self.assertRaises(ValueError):
+            module["frame"](event)
+
+    def test_fake_daemon_frames_stay_within_limit(self):
+        self.check_fixture(FAKE, 4)
+
+    def test_stateful_fake_daemon_frames_stay_within_limit(self):
+        self.check_fixture(DAEMON, 4)
 
 
 if __name__ == "__main__":

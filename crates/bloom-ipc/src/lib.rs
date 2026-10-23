@@ -18,7 +18,10 @@ use serde::{Deserialize, Serialize};
 use std::{fmt, io};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
-pub const PROTOCOL_VERSION: u16 = 3;
+pub const PROTOCOL_VERSION: u16 = 4;
+/// Largest accepted `message_context` limit. Dispatch rejects larger limits
+/// instead of clamping them.
+pub const MAX_MESSAGE_CONTEXT_LIMIT: u32 = 200;
 /// Default daemon socket, shared by the daemon and its clients so both sides
 /// agree without configuration.
 pub fn default_socket_path() -> std::path::PathBuf {
@@ -95,6 +98,13 @@ pub enum RequestKind {
         query: String,
         limit: u32,
     },
+    /// Read a bounded window centred on one exact stored message. The target is
+    /// always included, even when it lies far outside the newest history page.
+    MessageContext {
+        conversation_id: ConversationId,
+        message_id: MessageId,
+        limit: u32,
+    },
 }
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Response {
@@ -120,6 +130,9 @@ pub enum ResponseKind {
     },
     SearchResults {
         hits: Vec<MessageSearchHit>,
+    },
+    MessageContext {
+        messages: Vec<Message>,
     },
     Error {
         error: ProtocolError,
@@ -433,6 +446,53 @@ mod tests {
             ResponseKind::SearchResults { hits } => assert_eq!(hits, vec![hit]),
             _ => panic!("expected search results"),
         }
+    }
+
+    #[test]
+    fn message_context_request_and_response_round_trip() {
+        let transport = bloom_domain::TransportId::new("test").unwrap();
+        let conversation_id = ConversationId::new(transport.clone(), "conversation").unwrap();
+        let message_id = MessageId::new(transport.clone(), "target").unwrap();
+        let request = Request {
+            request_id: 13,
+            request: RequestKind::MessageContext {
+                conversation_id: conversation_id.clone(),
+                message_id: message_id.clone(),
+                limit: MAX_MESSAGE_CONTEXT_LIMIT,
+            },
+        };
+        let decoded: Request =
+            serde_json::from_slice(&serde_json::to_vec(&request).unwrap()).unwrap();
+        assert!(decoded.request == request.request);
+
+        let message = Message::new(
+            message_id.clone(),
+            conversation_id,
+            None,
+            bloom_domain::Handle::new(bloom_domain::HandleKind::Opaque, "sender").unwrap(),
+            vec![bloom_domain::MessagePart::Text("body".into())],
+            1,
+            None,
+            DeliveryState::Delivered,
+            false,
+            None,
+            Vec::new(),
+            None,
+        )
+        .unwrap();
+        let response = Response {
+            request_id: 13,
+            response: ResponseKind::MessageContext {
+                messages: vec![message.clone()],
+            },
+        };
+        let decoded: Response =
+            serde_json::from_slice(&serde_json::to_vec(&response).unwrap()).unwrap();
+        match decoded.response {
+            ResponseKind::MessageContext { messages } => assert_eq!(messages, vec![message]),
+            _ => panic!("expected message context"),
+        }
+        assert_eq!(PROTOCOL_VERSION, 4);
     }
 
     #[tokio::test]
