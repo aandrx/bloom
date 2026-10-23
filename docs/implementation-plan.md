@@ -14,8 +14,8 @@ Rust daemon/domain/IPC/secret-store boundary, encrypted persistence, external Da
 
 The section numbers below group work by area; they are not execution order.
 
-1. Bound stored attachment-metadata search before implementation. A five-source-file read-only research task is checking whether filenames survive transport mapping and encrypted persistence. Do not infer names from URLs, attachment IDs, or generic placeholders. If usable metadata is absent, record the blocker rather than fabricate search.
-2. Participant-context search and deep-hit navigation are accepted with the evidence below. Attachment sending, download/open, content extraction, and remote history remain outside this next research unit.
+1. The [one-file metadata-preservation prerequisite](attachment-metadata.md) is accepted under shipp: 107 daemon unit tests, 13 fake-sidecar tests, the full rebuilt gate, and scoped independent final review pass. It preserves descriptive scalars with bounded local tokens, not engine/download identity. Next writer: only `AttachmentRef::file_name(&self) -> Option<&str>` and tests in `crates/bloom-domain/src/lib.rs`, with no normalization, extra accessors, serialization changes, search, or rendering. Parent verification and independent review follow. Freeze separate search/display contracts afterward; never search placeholders or infer filenames. [The baseline gap](attachment-search-gap.md) remains relevant to old records.
+2. Participant-context search and deep-hit navigation are accepted with the evidence below. Attachment sending, download/open, content extraction, and remote history remain outside these metadata/search units.
 3. Start generation-scoped engine recovery only when resuming backend work. Historical ingestion, packaging, and rich messaging remain queued.
 
 Keep the launcher on debug. Do not add durable drafts, remote read receipts, or multi-service work to this unit.
@@ -74,11 +74,11 @@ Participant-context search, accepted under shipp with synthetic coverage:
 
 Next in this section:
 
-- Establish whether stored attachment metadata supports an honest filename-only search. Research first, then freeze a small contract and review each implementation unit. No attachment implementation is authorized by metadata that exists only in domain types.
+- Resolve the [attachment ingestion prerequisite](attachment-search-gap.md) before filename search. Verify part identity and privacy boundaries, then scope metadata preservation and encrypted round-trip tests separately from search or download. Do not copy raw attachment envelopes, infer names, or claim recovery of old placeholders.
 
 Later in this section:
 
-- Attachment search depends on the metadata research above. Participant-context search is implemented.
+- Attachment search is blocked on verified metadata preservation. Participant-context search is implemented.
 - Durable encrypted drafts still need a privacy and retention review; undo stays session-only until then.
 - Typed interaction modes to reduce independent flag combinations, but only behind regression coverage for modal transitions, recipient changes, aliases, filters and asynchronous results.
 

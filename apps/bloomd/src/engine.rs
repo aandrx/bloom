@@ -10,8 +10,8 @@
 
 use async_trait::async_trait;
 use bloom_domain::{
-    Capabilities, Conversation, ConversationId, ConversationKind, DeliveryState, Handle,
-    HandleKind, Message, MessageId, MessagePart, OutgoingBody, Participant, SessionState,
+    AttachmentRef, Capabilities, Conversation, ConversationId, ConversationKind, DeliveryState,
+    Handle, HandleKind, Message, MessageId, MessagePart, OutgoingBody, Participant, SessionState,
     TransportId,
 };
 use bloom_transport::{SyncCompletion, Transport, TransportError, TransportEvent, TransportResult};
@@ -855,6 +855,79 @@ fn text_of(parts: &[MessagePart]) -> Option<String> {
     }
 }
 
+/// Keep the descriptive fields an inbound attachment actually carries.
+///
+/// Only `name`, `mime`, and a length whose `attachment_type.kind` names the
+/// field's meaning are copied. Everything else, including engine numbering,
+/// `uti_type`, `iris`, and remote access material, is ignored. The reference is
+/// an opaque token for this decoded message revision at this physical position;
+/// it is not a stored index and promises nothing across edits or reordering.
+fn attachment_part(
+    part: &Value,
+    transport: &TransportId,
+    raw_message_id: &str,
+    position: usize,
+) -> MessagePart {
+    const MAX_TOKEN_BYTES: usize = 256;
+    // Bound the shared context before encoding it once per attachment.
+    if transport
+        .as_str()
+        .len()
+        .saturating_add(raw_message_id.len())
+        > MAX_TOKEN_BYTES
+    {
+        return MessagePart::Unsupported {
+            kind: "attachment".to_owned(),
+        };
+    }
+
+    fn nonempty_string(value: Option<&Value>) -> Option<String> {
+        value
+            .and_then(Value::as_str)
+            .filter(|text| !text.is_empty())
+            .map(str::to_owned)
+    }
+
+    let file_name = nonempty_string(part.get("name"));
+    let mime_type = nonempty_string(part.get("mime"));
+    let attachment_type = part.get("attachment_type");
+    let byte_len = match attachment_type.and_then(|kind| kind.get("kind")) {
+        Some(kind) if kind.as_str() == Some("inline") => attachment_type
+            .and_then(|kind| kind.get("byte_length"))
+            .and_then(Value::as_u64),
+        Some(kind) if kind.as_str() == Some("mmcs") => attachment_type
+            .and_then(|kind| kind.get("size"))
+            .and_then(Value::as_u64),
+        _ => None,
+    };
+
+    if file_name.is_none() && mime_type.is_none() && byte_len.is_none() {
+        return MessagePart::Unsupported {
+            kind: "attachment".to_owned(),
+        };
+    }
+
+    let Ok(numbering) = serde_json::to_string(&(transport.as_str(), raw_message_id, position))
+    else {
+        return MessagePart::Unsupported {
+            kind: "attachment".to_owned(),
+        };
+    };
+    let token = format!("local-metadata:{numbering}");
+    // JSON escaping can expand even a short raw context beyond the budget.
+    if token.len() > MAX_TOKEN_BYTES {
+        return MessagePart::Unsupported {
+            kind: "attachment".to_owned(),
+        };
+    }
+    match AttachmentRef::new(token, mime_type, file_name, byte_len) {
+        Ok(reference) => MessagePart::Attachment(reference),
+        Err(_) => MessagePart::Unsupported {
+            kind: "attachment".to_owned(),
+        },
+    }
+}
+
 /// Map an engine payload into a domain conversation and message pair.
 ///
 /// Only normal inbound iMessages are mapped. Reactions, edits, unsends, delivery
@@ -907,7 +980,7 @@ fn map_inbound_with_sequence(
 
     let mut parts = Vec::new();
     if let Some(list) = normal.get("parts").and_then(Value::as_array) {
-        for entry in list {
+        for (position, entry) in list.iter().enumerate() {
             let part = match entry.get("part") {
                 Some(part) => part,
                 None => continue,
@@ -920,6 +993,7 @@ fn map_inbound_with_sequence(
                         }
                     }
                 }
+                Some("attachment") => parts.push(attachment_part(part, id, message_id, position)),
                 Some(kind) => parts.push(MessagePart::Unsupported {
                     kind: kind.to_owned(),
                 }),
@@ -1198,22 +1272,491 @@ mod tests {
         assert!(message.from_me);
     }
 
-    #[test]
-    fn attachment_only_messages_are_kept_as_unsupported_parts() {
+    fn attachment_payload(parts: Value) -> Value {
         let mut value = payload("tel:+15550000001", "ignored");
-        value["inst"]["message"]["value"]["parts"] = json!([
-            {"idx": 0, "part": {"type": "attachment", "complete": true, "name": "a.jpg"}}
-        ]);
-        let event = map_inbound(&value, &[], &transport()).unwrap();
-        let TransportEvent::Message { message, .. } = event else {
+        value["inst"]["message"]["value"]["parts"] = parts;
+        value
+    }
+
+    fn mapped_message(value: &Value) -> Message {
+        let TransportEvent::Message { message, .. } =
+            map_inbound(value, &[], &transport()).expect("payload maps")
+        else {
             panic!("expected a message event");
         };
+        message
+    }
+
+    fn first_attachment(message: &Message) -> &AttachmentRef {
+        message
+            .parts()
+            .iter()
+            .find_map(|part| match part {
+                MessagePart::Attachment(reference) => Some(reference),
+                _ => None,
+            })
+            .expect("message has an attachment")
+    }
+
+    fn expected_token(message_id: &str, position: usize) -> String {
+        format!(
+            "local-metadata:{}",
+            serde_json::to_string(&("openbubbles", message_id, position)).unwrap()
+        )
+    }
+
+    const MESSAGE_ID: &str = "11111111-2222-3333-4444-555555555555";
+
+    fn attachment_field(part: &MessagePart, field: &str) -> Value {
+        serde_json::to_value(part).unwrap()["value"][field].clone()
+    }
+
+    #[test]
+    fn attachment_metadata_is_preserved_for_named_parts() {
+        let value = attachment_payload(json!([
+            {"idx": 0, "part": {"type": "attachment", "complete": true, "name": "a.jpg"}}
+        ]));
+        let message = mapped_message(&value);
+        let reference = first_attachment(&message);
+        assert_eq!(reference.id(), expected_token(MESSAGE_ID, 0));
+        assert_eq!(
+            message.parts(),
+            &[MessagePart::Attachment(
+                AttachmentRef::new(
+                    expected_token(MESSAGE_ID, 0),
+                    None,
+                    Some("a.jpg".to_owned()),
+                    None
+                )
+                .unwrap()
+            )]
+        );
+    }
+
+    #[test]
+    fn attachment_without_metadata_falls_back_to_unsupported() {
+        let value = attachment_payload(json!([
+            {"idx": 0, "part": {"type": "attachment", "complete": true}}
+        ]));
+        let message = mapped_message(&value);
         assert_eq!(
             message.parts(),
             &[MessagePart::Unsupported {
                 kind: "attachment".to_owned()
             }]
         );
+    }
+
+    #[test]
+    fn attachment_metadata_preserves_exact_filename_and_mime() {
+        let value = attachment_payload(json!([
+            {"part": {"type": "attachment", "name": " Report  Final.PDF ", "mime": "application/x-Custom"}}
+        ]));
+        let reference = first_attachment(&mapped_message(&value)).clone();
+        assert_eq!(
+            serde_json::to_value(&reference).unwrap()["file_name"],
+            json!(" Report  Final.PDF ")
+        );
+        assert_eq!(
+            serde_json::to_value(&reference).unwrap()["mime_type"],
+            json!("application/x-Custom")
+        );
+    }
+
+    #[test]
+    fn attachment_metadata_reads_inline_lengths() {
+        let value = attachment_payload(json!([
+            {"part": {"type": "attachment", "name": "zero", "attachment_type": {"kind": "inline", "byte_length": 0}}},
+            {"part": {"type": "attachment", "name": "max", "attachment_type": {"kind": "inline", "byte_length": u64::MAX}}}
+        ]));
+        let message = mapped_message(&value);
+        assert_eq!(attachment_field(&message.parts()[0], "byte_len"), json!(0));
+        assert_eq!(
+            attachment_field(&message.parts()[1], "byte_len"),
+            json!(u64::MAX)
+        );
+    }
+
+    #[test]
+    fn attachment_metadata_reads_mmcs_size_only() {
+        let value = attachment_payload(json!([
+            {"part": {"type": "attachment", "name": "mmcs", "attachment_type": {"kind": "mmcs", "size": 12}}},
+            {"part": {"type": "attachment", "name": "wrong-kind", "attachment_type": {"kind": "mmcs", "byte_length": 8, "size": 4}}},
+            {"part": {"type": "attachment", "name": "maximum", "attachment_type": {"kind": "mmcs", "size": u64::MAX}}}
+        ]));
+        let message = mapped_message(&value);
+        assert_eq!(attachment_field(&message.parts()[0], "byte_len"), json!(12));
+        assert_eq!(attachment_field(&message.parts()[1], "byte_len"), json!(4));
+        assert_eq!(
+            attachment_field(&message.parts()[2], "byte_len"),
+            json!(u64::MAX)
+        );
+    }
+
+    #[test]
+    fn attachment_metadata_rejects_malformed_lengths() {
+        for (kind, field) in [("inline", "byte_length"), ("mmcs", "size")] {
+            for invalid in [
+                json!(-1),
+                json!(1.5),
+                json!(1.0),
+                json!("7"),
+                json!(true),
+                Value::Null,
+                json!({}),
+            ] {
+                let mut part = json!({"type": "attachment", "name": "invalid.bin",
+                    "attachment_type": {"kind": kind}});
+                part["attachment_type"][field] = invalid;
+                let message = mapped_message(&attachment_payload(json!([{"part": part}])));
+                assert_eq!(
+                    attachment_field(&message.parts()[0], "byte_len"),
+                    Value::Null
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn attachment_metadata_does_not_use_uti_or_extensions_for_mime() {
+        let value = attachment_payload(json!([
+            {"part": {"type": "attachment", "name": "photo.HEIC", "uti_type": "public.jpeg"}}
+        ]));
+        let user_value = first_attachment(&mapped_message(&value)).clone();
+        assert_eq!(
+            serde_json::to_value(&user_value).unwrap()["mime_type"],
+            Value::Null
+        );
+    }
+
+    #[test]
+    fn attachment_metadata_keeps_mixed_text_order_and_whitespace() {
+        let value = attachment_payload(json!([
+            {"idx": 0, "part": {"type": "text", "text": "  leading"}},
+            {"idx": 1, "part": {"type": "attachment", "name": "one.bin", "attachment_type": {"kind": "mmcs", "size": 3}}},
+            {"idx": 2, "part": {"type": "text", "text": "trailing\n"}},
+            {"idx": 3, "part": {"type": "attachment", "name": "two.bin"}},
+            {"idx": 4, "part": {"type": "poll"}}
+        ]));
+        let message = mapped_message(&value);
+        assert_eq!(message.parts().len(), 5);
+        assert_eq!(
+            message.parts()[0],
+            MessagePart::Text("  leading".to_owned())
+        );
+        assert_eq!(
+            message.parts()[2],
+            MessagePart::Text("trailing\n".to_owned())
+        );
+        assert_eq!(
+            message.parts()[4],
+            MessagePart::Unsupported {
+                kind: "poll".to_owned()
+            }
+        );
+        assert_eq!(attachment_field(&message.parts()[1], "byte_len"), json!(3));
+        let ids: Vec<_> = message
+            .parts()
+            .iter()
+            .filter_map(|part| match part {
+                MessagePart::Attachment(reference) => Some(reference.id().to_owned()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            ids,
+            vec![expected_token(MESSAGE_ID, 1), expected_token(MESSAGE_ID, 3)]
+        );
+    }
+
+    #[test]
+    fn attachment_metadata_skips_entries_without_a_part_container() {
+        let value = attachment_payload(json!([
+            {"idx": 0},
+            {"part": {"type": "attachment", "name": "second.bin"}}
+        ]));
+        let message = mapped_message(&value);
+        assert_eq!(
+            first_attachment(&message).id(),
+            expected_token(MESSAGE_ID, 1)
+        );
+    }
+
+    #[test]
+    fn attachment_metadata_token_is_exact_and_replay_deterministic() {
+        let value = attachment_payload(json!([
+            {"part": {"type": "attachment", "name": "x.bin"}}
+        ]));
+        let first = first_attachment(&mapped_message(&value)).id().to_owned();
+        let second = first_attachment(&mapped_message(&value)).id().to_owned();
+        assert_eq!(first, second);
+        assert_eq!(
+            first,
+            format!("local-metadata:[\"openbubbles\",\"{MESSAGE_ID}\",0]")
+        );
+    }
+
+    #[test]
+    fn attachment_metadata_token_varies_by_message_transport_and_position() {
+        let value = attachment_payload(json!([
+            {"part": {"type": "attachment", "name": "x.bin"}}
+        ]));
+        let base = first_attachment(&mapped_message(&value)).id().to_owned();
+
+        let mut other_message = value.clone();
+        other_message["inst"]["id"] = json!("99999999-0000-0000-0000-000000000000");
+        let other = first_attachment(&mapped_message(&other_message))
+            .id()
+            .to_owned();
+        assert_ne!(base, other);
+
+        let TransportEvent::Message { message, .. } =
+            map_inbound(&value, &[], &TransportId::new("other-transport").unwrap()).unwrap()
+        else {
+            panic!("expected a message event");
+        };
+        assert_ne!(base, first_attachment(&message).id());
+
+        let two = attachment_payload(json!([
+            {"part": {"type": "attachment", "name": "x.bin"}},
+            {"part": {"type": "attachment", "name": "x.bin"}}
+        ]));
+        let message = mapped_message(&two);
+        assert_ne!(message.parts()[0], message.parts()[1]);
+    }
+
+    #[test]
+    fn attachment_metadata_token_ignores_engine_numbering() {
+        let numbered = attachment_payload(json!([
+            {"idx": 7, "part": {"type": "attachment", "part": 99, "name": "x.bin"}}
+        ]));
+        let unnumbered = attachment_payload(json!([
+            {"part": {"type": "attachment", "name": "x.bin"}}
+        ]));
+        assert_eq!(
+            first_attachment(&mapped_message(&numbered)).id(),
+            first_attachment(&mapped_message(&unnumbered)).id()
+        );
+    }
+
+    #[test]
+    fn attachment_metadata_accepts_exact_token_budget() {
+        let overhead = expected_token("", 0).len();
+        for extra in [0, 1] {
+            let mut value = attachment_payload(json!([
+                {"part": {"type": "attachment", "name": "boundary.bin"}}
+            ]));
+            value["inst"]["id"] = json!("m".repeat(256 - overhead + extra));
+            let message = mapped_message(&value);
+            if extra == 0 {
+                assert_eq!(first_attachment(&message).id().len(), 256);
+            } else {
+                assert_eq!(
+                    message.parts(),
+                    &[MessagePart::Unsupported {
+                        kind: "attachment".into()
+                    }]
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn attachment_metadata_rejects_oversized_tokens_without_losing_text() {
+        for (transport_name, raw_id) in [
+            ("openbubbles".to_owned(), "m".repeat(300)),
+            ("t".repeat(200), "m".repeat(100)),
+            ("openbubbles".to_owned(), "\\".repeat(120)),
+        ] {
+            let mut value = attachment_payload(json!([
+                {"part": {"type": "text", "text": " before\n"}},
+                {"part": {"type": "attachment", "name": "bounded.bin"}},
+                {"part": {"type": "text", "text": "after "}}
+            ]));
+            value["inst"]["id"] = json!(raw_id);
+            let transport = TransportId::new(transport_name).unwrap();
+            let TransportEvent::Message { message, .. } =
+                map_inbound(&value, &[], &transport).unwrap()
+            else {
+                panic!("expected a message event");
+            };
+            assert_eq!(
+                message.parts(),
+                &[
+                    MessagePart::Text(" before\n".into()),
+                    MessagePart::Unsupported {
+                        kind: "attachment".into()
+                    },
+                    MessagePart::Text("after ".into()),
+                ]
+            );
+        }
+    }
+
+    #[test]
+    fn attachment_metadata_validates_optional_fields_independently() {
+        let value = attachment_payload(json!([
+            {"part": {"type": "attachment", "name": 12, "mime": "image/png"}},
+            {"part": {"type": "attachment", "name": "", "mime": false,
+                "attachment_type": {"kind": "inline", "byte_length": 0}}},
+            {"part": {"type": "attachment", "name": false, "mime": {},
+                "attachment_type": {"kind": "mmcs", "size": "2"}}},
+            {"part": {"type": "attachment", "uti_type": "public.jpeg",
+                "attachment_type": {"kind": "unknown", "size": 2, "byte_length": 2}}},
+            {"part": {"type": "attachment", "name": "", "mime": "",
+                "attachment_type": {"size": 2, "byte_length": 2}}}
+        ]));
+        let message = mapped_message(&value);
+        assert_eq!(
+            attachment_field(&message.parts()[0], "file_name"),
+            Value::Null
+        );
+        assert_eq!(
+            attachment_field(&message.parts()[0], "mime_type"),
+            json!("image/png")
+        );
+        assert_eq!(
+            attachment_field(&message.parts()[0], "byte_len"),
+            Value::Null
+        );
+        assert_eq!(
+            attachment_field(&message.parts()[1], "file_name"),
+            Value::Null
+        );
+        assert_eq!(
+            attachment_field(&message.parts()[1], "mime_type"),
+            Value::Null
+        );
+        assert_eq!(attachment_field(&message.parts()[1], "byte_len"), json!(0));
+        for part in &message.parts()[2..] {
+            assert_eq!(
+                part,
+                &MessagePart::Unsupported {
+                    kind: "attachment".into()
+                }
+            );
+        }
+    }
+
+    #[test]
+    fn attachment_metadata_ignores_remote_access_canaries() {
+        let value = attachment_payload(json!([
+            {"part": {
+                "type": "attachment",
+                "name": "safe.bin",
+                "mime": "application/octet-stream",
+                "attachment_type": {
+                    "kind": "mmcs", "size": 5,
+                    "object": "CANARY_OBJECT", "url": "https://CANARY_URL.invalid/x",
+                    "key_base64": {"ignored": "CANARY_KEY"},
+                    "signature_base64": ["CANARY_SIGNATURE"]
+                },
+                "iris": "CANARY_IRIS",
+                "uti_type": "CANARY_UTI",
+                "weird": {"nested": ["CANARY_NESTED", 3]},
+                "wrong_bool": "CANARY_WRONG_BOOL",
+                "wrong_number": "CANARY_WRONG_NUMBER"
+            }}
+        ]));
+        let message = mapped_message(&value);
+        let serialized = serde_json::to_string(&message).unwrap();
+        for canary in [
+            "CANARY_OBJECT",
+            "CANARY_URL",
+            "CANARY_KEY",
+            "CANARY_SIGNATURE",
+            "CANARY_IRIS",
+            "CANARY_UTI",
+            "CANARY_NESTED",
+            "CANARY_WRONG_BOOL",
+            "CANARY_WRONG_NUMBER",
+        ] {
+            assert!(!serialized.contains(canary), "leaked {canary}");
+        }
+        let reference = first_attachment(&message);
+        let serialized_reference = serde_json::to_value(reference).unwrap();
+        assert_eq!(serialized_reference["file_name"], json!("safe.bin"));
+        assert_eq!(
+            serialized_reference["mime_type"],
+            json!("application/octet-stream")
+        );
+        assert_eq!(serialized_reference["byte_len"], json!(5));
+    }
+
+    #[test]
+    fn attachment_metadata_survives_encrypted_store_roundtrip() {
+        use crate::store::{
+            get_message, upsert_conversation, upsert_message, EncryptedStore, MessageUpsertOutcome,
+        };
+
+        let value = attachment_payload(json!([
+            {"part": {
+                "type": "attachment",
+                "name": "roundtrip.bin",
+                "mime": "application/octet-stream",
+                "attachment_type": {
+                    "kind": "mmcs", "size": 0,
+                    "object": "CANARY_OBJECT", "url": "CANARY_URL",
+                    "key_base64": {"ignored": "CANARY_KEY"},
+                    "signature_base64": ["CANARY_SIGNATURE"]
+                },
+                "part": "CANARY_NUMBER", "uti_type": "CANARY_UTI", "iris": "CANARY_IRIS"
+            }}
+        ]));
+        let TransportEvent::Message {
+            conversation,
+            message,
+            ..
+        } = map_inbound(&value, &[], &transport()).unwrap()
+        else {
+            panic!("expected a message event");
+        };
+
+        let temp = tempfile::tempdir().unwrap();
+        let private = temp.path().join("private");
+        std::fs::create_dir(&private).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&private, std::fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        let database = private.join("messages.db");
+        let key = [42u8; 32];
+
+        let mut store = EncryptedStore::open_with_key(&database, &key).unwrap();
+        upsert_conversation(&mut store, &conversation).unwrap();
+        assert_eq!(
+            upsert_message(&mut store, &message).unwrap(),
+            MessageUpsertOutcome::Inserted
+        );
+        assert_eq!(
+            upsert_message(&mut store, &mapped_message(&value)).unwrap(),
+            MessageUpsertOutcome::Unchanged
+        );
+        drop(store);
+
+        let store = EncryptedStore::open_with_key(&database, &key).unwrap();
+        let stored = get_message(&store, message.id()).unwrap().expect("stored");
+        assert_eq!(stored, message);
+        let reference = serde_json::to_value(first_attachment(&stored)).unwrap();
+        assert_eq!(reference["file_name"], json!("roundtrip.bin"));
+        assert_eq!(reference["mime_type"], json!("application/octet-stream"));
+        assert_eq!(reference["byte_len"], json!(0));
+        let serialized = serde_json::to_string(&stored).unwrap();
+        for canary in [
+            "CANARY_OBJECT",
+            "CANARY_URL",
+            "CANARY_KEY",
+            "CANARY_SIGNATURE",
+            "CANARY_NUMBER",
+            "CANARY_UTI",
+            "CANARY_IRIS",
+        ] {
+            assert!(
+                !serialized.contains(canary),
+                "leaked {canary} after reopening"
+            );
+        }
     }
 
     #[test]
