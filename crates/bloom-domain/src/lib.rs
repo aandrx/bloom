@@ -406,6 +406,14 @@ impl AttachmentRef {
     pub fn id(&self) -> &str {
         &self.id
     }
+    /// Reported attachment file name, exactly as supplied by the transport.
+    ///
+    /// This is display metadata only: it is not a trusted local path, not a
+    /// MIME source, and not a download handle. Returns `None` when the
+    /// transport did not report a name.
+    pub fn file_name(&self) -> Option<&str> {
+        self.file_name.as_deref()
+    }
 }
 impl fmt::Debug for AttachmentRef {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -604,6 +612,54 @@ mod tests {
             serde_json::from_str::<Message>(&serde_json::to_string(&m).unwrap()).unwrap(),
             m
         );
+    }
+    #[test]
+    fn attachment_file_name_getter_returns_exact_borrowed_value() {
+        let absent = AttachmentRef::new("a", None, None, None).unwrap();
+        assert_eq!(absent.file_name(), None);
+        for name in ["", "  ", "\t\n", "report.pdf", "часть.txt", "名前 💾"] {
+            let attachment = AttachmentRef::new(
+                "a",
+                Some("application/octet-stream".into()),
+                Some(name.into()),
+                None,
+            )
+            .unwrap();
+            assert_eq!(attachment.file_name(), Some(name));
+            // Borrowed accessor: the returned slice aliases the stored string.
+            let borrowed: Option<&str> = attachment.file_name();
+            assert_eq!(borrowed, Some(name));
+        }
+    }
+    #[test]
+    fn attachment_roundtrip_keeps_file_name_and_wire_shape() {
+        for file_name in [None, Some(String::new()), Some("файл.txt".into())] {
+            let attachment = AttachmentRef::new(
+                "synthetic-id",
+                Some("text/plain".into()),
+                file_name.clone(),
+                Some(42),
+            )
+            .unwrap();
+            let value = serde_json::to_value(&attachment).unwrap();
+            let object = value.as_object().unwrap();
+            assert_eq!(object.len(), 4);
+            assert!(object.contains_key("id"));
+            assert!(object.contains_key("mime_type"));
+            assert!(object.contains_key("file_name"));
+            assert!(object.contains_key("byte_len"));
+            let restored: AttachmentRef = serde_json::from_value(value).unwrap();
+            assert_eq!(restored, attachment);
+            assert_eq!(restored.file_name(), file_name.as_deref());
+        }
+    }
+    #[test]
+    fn attachment_json_without_file_name_decodes_to_none() {
+        let restored: AttachmentRef = serde_json::from_str(
+            r#"{"id":"uuid-like-1234.pdf","mime_type":"application/pdf","byte_len":7}"#,
+        )
+        .unwrap();
+        assert_eq!(restored.file_name(), None);
     }
     #[test]
     fn empty_attachment_id_rejected_constructor_and_part_json() {

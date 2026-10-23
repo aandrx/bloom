@@ -54,6 +54,14 @@ The final workspace all-target, Tokyo-timezone TUI, strict Clippy, formatting, s
 
 A non-blocking review observation remains: filename and MIME strings have no separate per-field cap, unlike the local token. They can enlarge stored/IPC payloads; this unit preserves reported metadata rather than truncating it. No performance or oversized-metadata UI acceptance is claimed.
 
-## Next bounded unit
+## Filename accessor bridge
 
-Add only `AttachmentRef::file_name(&self) -> Option<&str>` and its tests in `crates/bloom-domain/src/lib.rs`. Return the borrowed stored field exactly, including `None` versus present empty/whitespace/Unicode strings through serialization round-trip. Do not infer names from IDs/MIME/URLs, allocate or normalize in the getter, add other accessors, alter wire/schema/debug behavior, match search queries, or render metadata. Parent verification and a scoped independent review follow before a search unit is selected.
+Accepted under shipp as a separate API-only unit: `AttachmentRef::file_name(&self) -> Option<&str>` returns the stored field through `as_deref()`. Only `crates/bloom-domain/src/lib.rs` changed. No inference, normalization, allocation, extra accessors, wire/schema/validation/Debug changes, matching, or rendering was added.
+
+Parent ran all 10 domain tests, strict workspace all-target Clippy, formatting, and the source guard. Tests cover absent, empty, whitespace and Unicode getter values; optional-name round-trip and the existing four-field wire shape; and legacy JSON with a filename-like ID/MIME but no filename. The exact `as_deref()` implementation establishes borrowing; the value assertions are not a pointer-identity test. A retained independent source-only review found no confirmed defects and confirmed the one-file scope. The earlier review completion also reported no defects, but its full-report lookup failed, so it was repeated before acceptance.
+
+The actual public API and serializer were exercised. No new full rebuilt/PTY gate was run for this unused additive accessor; the prior full runtime evidence above belongs to the mapper milestone. No search or filename UI acceptance is implied.
+
+## Next bounded work
+
+Read-only preflight is checking typed attachment retention in `scripts/fake-daemon.py`, `scripts/stateful-fake-daemon.py`, and their fixture tests before a native search/display contract is selected. Existing Rust search prefers text-only snippets and scans the newest 20,000 global rows. Preserve body behavior, exact participant membership, ordering, and hit limits. No matching/UI writer has started; protocol compatibility and fixture parity must be addressed explicitly in the next contract.
