@@ -351,6 +351,78 @@ void main() {
       expect(jsonEncode(editMessage), contains('edited'));
     });
 
+    test('react encodes its target, part and reaction state', () {
+      api.ReactMessage reactMessage({
+        required api.Reaction reaction,
+        required bool enable,
+      }) =>
+          api.ReactMessage(
+            toUuid: 'target-uuid',
+            toPart: 2,
+            reaction: api.ReactMessageType.react(
+              reaction: reaction,
+              enable: enable,
+            ),
+            toText: 'placeholder',
+          );
+
+      Map<String, Object?> encodeReact({
+        required api.Reaction reaction,
+        required bool enable,
+      }) =>
+          messageBody(
+            encodePushMessage(
+              api.PushMessage.iMessage(
+                withMessage(
+                  api.Message.react(
+                    reactMessage(reaction: reaction, enable: enable),
+                  ),
+                ),
+              ),
+            ),
+          );
+
+      final added = encodeReact(
+        reaction: const api.Reaction.heart(),
+        enable: true,
+      );
+      expect(added['type'], 'react');
+      expect(added['complete'], isTrue);
+      expect(added['to_uuid'], 'target-uuid');
+      expect(added['to_part'], 2);
+      final addedReaction = added['reaction']! as Map<String, Object?>;
+      expect(addedReaction['kind'], 'react');
+      expect(addedReaction['enable'], isTrue);
+      expect(addedReaction['reaction'], 'heart');
+
+      final removed = encodeReact(
+        reaction: const api.Reaction.heart(),
+        enable: false,
+      );
+      final removedReaction = removed['reaction']! as Map<String, Object?>;
+      expect(removedReaction['enable'], isFalse);
+      expect(removedReaction['reaction'], 'heart');
+
+      // Reaction is a sealed union, so an unknown kind cannot reach the codec.
+      // Every arm is mapped; assert the mapping stays total.
+      final expected = <api.Reaction, Object?>{
+        const api.Reaction.heart(): 'heart',
+        const api.Reaction.like(): 'like',
+        const api.Reaction.dislike(): 'dislike',
+        const api.Reaction.laugh(): 'laugh',
+        const api.Reaction.emphasize(): 'emphasize',
+        const api.Reaction.question(): 'question',
+        const api.Reaction.emoji('synthetic'): 'synthetic',
+      };
+      for (final entry in expected.entries) {
+        final message = encodeReact(reaction: entry.key, enable: true);
+        final reaction = message['reaction']! as Map<String, Object?>;
+        expect(reaction['kind'], 'react');
+        expect(reaction['enable'], isTrue);
+        expect(reaction['reaction'], entry.value);
+      }
+    });
+
     test('unmodelled message variants are marked', () {
       final encoded = encodePushMessage(
         api.PushMessage.iMessage(
