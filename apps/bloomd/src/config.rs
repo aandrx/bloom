@@ -75,18 +75,13 @@ pub fn default_engine_library() -> Option<PathBuf> {
     candidate.is_file().then_some(candidate)
 }
 
-/// The sidecar entry point: installed beside the binary, else the repo layout.
+/// The sidecar entry point: environment, installed prefix, legacy sibling, else
+/// the repository layout. Shared with the launcher's doctor.
 pub fn default_script() -> Option<PathBuf> {
-    if let Ok(executable) = std::env::current_exe() {
-        if let Some(directory) = executable.parent() {
-            let candidate = directory.join("bloom-engine/bloom_engine.dart");
-            if candidate.is_file() {
-                return Some(candidate);
-            }
-        }
-    }
-    let candidate = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(REPO_SCRIPT);
-    candidate.is_file().then_some(candidate)
+    let executable = std::env::current_exe().unwrap_or_default();
+    let checkout = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(REPO_SCRIPT);
+    let script_env = std::env::var_os("BLOOM_ENGINE_SCRIPT");
+    bloom_ipc::sidecar_script(&executable, script_env.as_deref(), &checkout)
 }
 
 /// Dart from `PATH`, else a user-local SDK, so no export is normally needed.
@@ -137,13 +132,10 @@ impl DaemonConfig {
                 ),
             })?;
 
-        let script = env("BLOOM_ENGINE_SCRIPT")
-            .map(PathBuf::from)
-            .or_else(default_script)
-            .ok_or_else(|| ConfigError::Missing {
-                variable: "BLOOM_ENGINE_SCRIPT",
-                hint: "set it to ext/bloom-engine-sidecar/dart/bin/bloom_engine.dart".to_owned(),
-            })?;
+        let script = default_script().ok_or_else(|| ConfigError::Missing {
+            variable: "BLOOM_ENGINE_SCRIPT",
+            hint: "set it to ext/bloom-engine-sidecar/dart/bin/bloom_engine.dart".to_owned(),
+        })?;
 
         let dart_executable = env("BLOOM_DART_EXECUTABLE")
             .map(PathBuf::from)

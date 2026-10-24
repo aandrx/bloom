@@ -93,6 +93,85 @@ fn socket_path_from(
 
 pub const MAX_FRAME_LEN: usize = 1024 * 1024;
 
+/// Which candidate supplied the resolved sidecar script.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SidecarSource {
+    /// `BLOOM_ENGINE_SCRIPT` supplied the path.
+    Environment,
+    /// The installed prefix layout supplied the path.
+    Prefix,
+    /// The legacy sibling `bloom-engine/` directory supplied the path.
+    LegacySibling,
+    /// The compiled-in repository checkout supplied the path.
+    Checkout,
+}
+
+impl SidecarSource {
+    /// Short plain-text label for diagnostics, matching the daemon's source names.
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Environment => "BLOOM_ENGINE_SCRIPT",
+            Self::Prefix => "installed prefix",
+            Self::LegacySibling => "next to the daemon",
+            Self::Checkout => "repository checkout",
+        }
+    }
+}
+
+/// Resolve the engine sidecar script for a daemon at `bloomd_exe`.
+///
+/// Order: a usable `BLOOM_ENGINE_SCRIPT` value, then the installed prefix
+/// (`<bloomd_exe>/../share/bloom/engine/bloom_engine.dart`), then the legacy
+/// sibling (`<bloomd_exe>/bloom-engine/bloom_engine.dart`), then `checkout`.
+/// Only the filesystem candidates must exist as files; an explicit environment
+/// value always wins, including one that does not exist, so configuration errors
+/// surface at engine start rather than silently falling back.
+///
+/// "Usable" follows the daemon rule: trimmed non-empty and valid UTF-8. Other
+/// values fall through. The checkout path is a parameter so this crate never
+/// reads the environment or depends on a compiled-in layout.
+pub fn sidecar_script(
+    bloomd_exe: &std::path::Path,
+    env_value: Option<&std::ffi::OsStr>,
+    checkout: &std::path::Path,
+) -> Option<std::path::PathBuf> {
+    sidecar_script_with_source(bloomd_exe, env_value, checkout).map(|(path, _)| path)
+}
+
+/// Like [`sidecar_script`], but also report which candidate won, so callers that
+/// print a source label cannot disagree with the shared rule.
+pub fn sidecar_script_with_source(
+    bloomd_exe: &std::path::Path,
+    env_value: Option<&std::ffi::OsStr>,
+    checkout: &std::path::Path,
+) -> Option<(std::path::PathBuf, SidecarSource)> {
+    if let Some(value) = env_value.filter(|value| is_usable_script(value)) {
+        return Some((std::path::PathBuf::from(value), SidecarSource::Environment));
+    }
+    if let Some(directory) = bloomd_exe
+        .parent()
+        .filter(|directory| !directory.as_os_str().is_empty())
+    {
+        if let Some(prefix) = directory.parent() {
+            let candidate = prefix.join("share/bloom/engine/bloom_engine.dart");
+            if candidate.is_file() {
+                return Some((candidate, SidecarSource::Prefix));
+            }
+        }
+        let candidate = directory.join("bloom-engine/bloom_engine.dart");
+        if candidate.is_file() {
+            return Some((candidate, SidecarSource::LegacySibling));
+        }
+    }
+    checkout
+        .is_file()
+        .then(|| (checkout.to_path_buf(), SidecarSource::Checkout))
+}
+
+fn is_usable_script(value: &std::ffi::OsStr) -> bool {
+    value.to_str().is_some_and(|text| !text.trim().is_empty())
+}
+
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Request {
     pub request_id: u64,
@@ -758,5 +837,124 @@ mod tests {
             read_request(&mut input).await.err().unwrap(),
             CodecError::Truncated
         );
+    }
+
+    fn write_file(path: &std::path::Path) {
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, "// sidecar\n").unwrap();
+    }
+
+    fn prefix_with_daemon(
+        root: &std::path::Path,
+    ) -> (std::path::PathBuf, std::path::PathBuf, std::path::PathBuf) {
+        let daemon = root.join("bin/bloomd");
+        write_file(&daemon);
+        (
+            daemon,
+            root.join("share/bloom/engine/bloom_engine.dart"),
+            root.join("bin/bloom-engine/bloom_engine.dart"),
+        )
+    }
+
+    #[test]
+    fn sidecar_environment_wins_over_installed_candidates() {
+        let directory = tempfile::tempdir().unwrap();
+        let (daemon, prefix_sidecar, _) = prefix_with_daemon(directory.path());
+        write_file(&prefix_sidecar);
+        let checkout = directory.path().join("repo/bloom_engine.dart");
+        write_file(&checkout);
+        let explicit = directory.path().join("explicit/bloom_engine.dart");
+        write_file(&explicit);
+
+        let (found, source) =
+            sidecar_script_with_source(&daemon, Some(explicit.as_os_str()), &checkout).unwrap();
+        assert_eq!(found, explicit);
+        assert_eq!(source, SidecarSource::Environment);
+        assert_eq!(source.label(), "BLOOM_ENGINE_SCRIPT");
+    }
+
+    #[test]
+    fn sidecar_prefix_wins_over_legacy_sibling_when_both_exist() {
+        let directory = tempfile::tempdir().unwrap();
+        let (daemon, prefix_sidecar, legacy_sidecar) = prefix_with_daemon(directory.path());
+        write_file(&prefix_sidecar);
+        write_file(&legacy_sidecar);
+        let checkout = directory.path().join("repo/bloom_engine.dart");
+        write_file(&checkout);
+
+        let (found, source) = sidecar_script_with_source(&daemon, None, &checkout).unwrap();
+        assert_eq!(found, prefix_sidecar);
+        assert_eq!(source, SidecarSource::Prefix);
+    }
+
+    #[test]
+    fn sidecar_legacy_sibling_wins_when_prefix_is_absent() {
+        let directory = tempfile::tempdir().unwrap();
+        let (daemon, _prefix_sidecar, legacy_sidecar) = prefix_with_daemon(directory.path());
+        write_file(&legacy_sidecar);
+        let checkout = directory.path().join("repo/bloom_engine.dart");
+        write_file(&checkout);
+
+        let (found, source) = sidecar_script_with_source(&daemon, None, &checkout).unwrap();
+        assert_eq!(found, legacy_sidecar);
+        assert_eq!(source, SidecarSource::LegacySibling);
+    }
+
+    #[test]
+    fn sidecar_falls_back_to_the_checkout() {
+        let directory = tempfile::tempdir().unwrap();
+        let (daemon, _prefix_sidecar, _legacy_sidecar) = prefix_with_daemon(directory.path());
+        let checkout = directory.path().join("repo/bloom_engine.dart");
+        write_file(&checkout);
+
+        assert_eq!(
+            sidecar_script(&daemon, None, &checkout),
+            Some(checkout.clone())
+        );
+        let (found, source) = sidecar_script_with_source(&daemon, None, &checkout).unwrap();
+        assert_eq!(found, checkout);
+        assert_eq!(source, SidecarSource::Checkout);
+    }
+
+    #[test]
+    fn sidecar_unusable_environment_values_fall_through() {
+        let directory = tempfile::tempdir().unwrap();
+        let (daemon, prefix_sidecar, _) = prefix_with_daemon(directory.path());
+        write_file(&prefix_sidecar);
+        let checkout = directory.path().join("repo/bloom_engine.dart");
+        write_file(&checkout);
+
+        for value in [OsStr::new("   "), OsStr::new("\t\n")] {
+            let (found, source) =
+                sidecar_script_with_source(&daemon, Some(value), &checkout).unwrap();
+            assert_eq!(found, prefix_sidecar);
+            assert_eq!(source, SidecarSource::Prefix);
+        }
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::ffi::OsStrExt;
+            let non_utf8 = OsStr::from_bytes(b"\xff\xfe");
+            let (found, source) =
+                sidecar_script_with_source(&daemon, Some(non_utf8), &checkout).unwrap();
+            assert_eq!(found, prefix_sidecar);
+            assert_eq!(source, SidecarSource::Prefix);
+        }
+    }
+
+    #[test]
+    fn sidecar_nonexistent_candidates_are_skipped() {
+        let directory = tempfile::tempdir().unwrap();
+        let (daemon, _prefix_sidecar, _legacy_sidecar) = prefix_with_daemon(directory.path());
+        // Neither installed candidate exists, so only the checkout can win.
+        let absent = directory.path().join("absent/bloom_engine.dart");
+        assert!(!absent.exists());
+        let checkout = directory.path().join("repo/bloom_engine.dart");
+        write_file(&checkout);
+
+        let (found, source) = sidecar_script_with_source(&daemon, None, &checkout).unwrap();
+        assert_eq!(found, checkout);
+        assert_eq!(source, SidecarSource::Checkout);
+        assert_eq!(sidecar_script(&daemon, None, &absent), None);
     }
 }

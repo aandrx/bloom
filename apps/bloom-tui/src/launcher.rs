@@ -403,33 +403,25 @@ pub struct DoctorInput {
     pub flatpak_library: Option<PathBuf>,
 }
 
-/// Sidecar entry point: environment, then beside the binary, then the checkout.
+/// Sidecar entry point, resolved by the same rule as the daemon: environment,
+/// installed prefix, legacy sibling, then the checkout. The prefix derives from
+/// `bloomd`'s path so the doctor agrees with the daemon even if the launcher
+/// lives elsewhere.
 pub fn resolve_sidecar(
-    executable: &Path,
+    bloomd_exe: &Path,
     script_env: Option<&OsStr>,
     repo_script: &Path,
 ) -> Option<Resolved> {
-    if let Some(value) = script_env.filter(|value| !value.is_empty()) {
-        return Some(Resolved {
-            path: PathBuf::from(value),
-            source: "BLOOM_ENGINE_SCRIPT",
-        });
-    }
-    // A missing executable parent must not skip the checkout fallback, or the
-    // doctor reports a false failure that the daemon would not hit.
-    if let Some(parent) = executable.parent() {
-        let sibling = parent.join("bloom-engine/bloom_engine.dart");
-        if sibling.is_file() {
-            return Some(Resolved {
-                path: sibling,
-                source: "next to the launcher",
-            });
-        }
-    }
-    repo_script.is_file().then(|| Resolved {
-        path: repo_script.to_path_buf(),
-        source: "repository checkout",
-    })
+    // The daemon resolves its own executable through /proc/self/exe, so a
+    // symlinked install must be canonicalised here or the two prefixes differ.
+    let resolved_exe =
+        std::fs::canonicalize(bloomd_exe).unwrap_or_else(|_| bloomd_exe.to_path_buf());
+    bloom_ipc::sidecar_script_with_source(&resolved_exe, script_env, repo_script).map(
+        |(path, source)| Resolved {
+            path,
+            source: source.label(),
+        },
+    )
 }
 
 /// Engine library: the environment override, then the installed Flatpak payload.
@@ -592,10 +584,16 @@ impl DoctorInput {
 pub fn doctor_checks(input: &DoctorInput) -> Vec<DoctorCheck> {
     let mut checks = Vec::new();
 
+    let mut bloomd = None;
     for name in ["bloom-tui", "bloomd"] {
         let label = format!("companion {name}");
         match find_companion(&input.executable, input.path_env.as_deref(), name) {
-            Some(found) => checks.push(DoctorCheck::pass(label, true, found.detail())),
+            Some(found) => {
+                if name == "bloomd" {
+                    bloomd = Some(found.path.clone());
+                }
+                checks.push(DoctorCheck::pass(label, true, found.detail()));
+            }
             None => checks.push(DoctorCheck::fail(
                 label,
                 true,
@@ -604,11 +602,10 @@ pub fn doctor_checks(input: &DoctorInput) -> Vec<DoctorCheck> {
         }
     }
 
-    let sidecar = resolve_sidecar(
-        &input.executable,
-        input.engine_script.as_deref(),
-        &input.repo_script,
-    );
+    // The daemon resolves its prefix from its own executable, so the sidecar
+    // check uses the discovered `bloomd` path rather than the launcher's.
+    let bloomd = bloomd.unwrap_or_else(|| input.executable.clone());
+    let sidecar = resolve_sidecar(&bloomd, input.engine_script.as_deref(), &input.repo_script);
     checks.push(match sidecar {
         Some(found) if is_readable_file(&found.path) => {
             DoctorCheck::pass("sidecar script", true, found.detail())
@@ -621,7 +618,7 @@ pub fn doctor_checks(input: &DoctorInput) -> Vec<DoctorCheck> {
         None => DoctorCheck::fail(
             "sidecar script",
             true,
-            "not found via BLOOM_ENGINE_SCRIPT, next to the launcher, or in the repository checkout",
+            "not found via BLOOM_ENGINE_SCRIPT, the installed prefix, next to the daemon, or in the repository checkout",
         ),
     });
 
@@ -974,6 +971,43 @@ mod tests {
         assert!(companion.required);
         assert!(doctor_report(&checks).contains("FAIL companion bloomd"));
         assert_eq!(doctor_exit_code(&checks), 1);
+    }
+
+    #[test]
+    fn doctor_prefix_sidecar_matches_the_shared_resolver_source() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut input = complete_input(directory.path());
+        // Move the binaries into `bin/` so the install matches the canonical
+        // prefix layout; the legacy sibling stays to prove prefix precedence.
+        let bin = directory.path().join("bin");
+        fs::create_dir(&bin).unwrap();
+        for name in ["bloom", "bloom-tui", "bloomd"] {
+            fs::rename(directory.path().join(name), bin.join(name)).unwrap();
+        }
+        input.executable = bin.join("bloom");
+        let prefix_sidecar = directory
+            .path()
+            .join("share/bloom/engine/bloom_engine.dart");
+        fs::create_dir_all(prefix_sidecar.parent().unwrap()).unwrap();
+        fs::write(&prefix_sidecar, "// sidecar\n").unwrap();
+
+        let checks = doctor_checks(&input);
+        let sidecar = check_named(&checks, "sidecar script");
+        let (expected, source) =
+            bloom_ipc::sidecar_script_with_source(&bin.join("bloomd"), None, &input.repo_script)
+                .unwrap();
+        assert_eq!(expected, prefix_sidecar);
+        assert!(sidecar.ok);
+        assert!(
+            sidecar.detail.contains(source.label()),
+            "doctor detail {:?} must name {:?}",
+            sidecar.detail,
+            source.label()
+        );
+        assert_eq!(
+            sidecar.detail,
+            format!("{} ({})", expected.display(), source.label())
+        );
     }
 
     #[test]
