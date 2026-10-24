@@ -26,6 +26,8 @@ Local unread navigation is accepted under shipp with synthetic evidence. Workspa
 
 ### 1. Generation-scoped engine recovery (next backend phase)
 
+Historical message ingestion has a [design-only plan](historical-ingestion-plan.md). It is blocked: the sidecar exposes no message archive, `history_message` and `history_complete` are stubs, and the headless ObjectBox path is unavailable. Do not start that work without the gate evidence, and do not fabricate identity, dedupe by body or time, or claim completeness from a placeholder frame.
+
 The proposed design is in [engine recovery plan](engine-recovery-plan.md). It is source-only planning: a pure bounded retry policy first, then generation-tagged lifecycle events, then a supervised stop-then-spawn restart, then TUI presentation. Initial start failure stays fatal, uncertain sends are never replayed, and no live-engine verification is authorized.
 
 Problem: TUI reconnects to IPC but a dead engine child is not automatically replaced.

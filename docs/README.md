@@ -24,6 +24,7 @@ Start with [fresh-session handoff](handoff.md). The root [AGENTS.md](../AGENTS.m
 
 | Document | Status / how to use |
 | --- | --- |
+| [Historical ingestion plan](historical-ingestion-plan.md) | Design-only gate for importing past messages; blocked at the engine boundary |
 | [Engine recovery plan](engine-recovery-plan.md) | Proposed generation-scoped engine restart, invariants, phased units, risks; not implemented |
 | [Attachment filename baseline](attachment-search-gap.md) | Historical ingestion gap, accepted prerequisites, and limits of old unsupported records |
 | [Multi-service research and proposed plan](multi-service-research.md) | Deferred Slack/Discord feasibility, policy/access limits, service-native navigation and staged acceptance gates; not implemented connectors |
