@@ -7,7 +7,9 @@ use bloom_secrets::OsKeyring;
 use bloomd::{
     config::DaemonConfig,
     engine::{engine_slot, Engine, EVENT_CAPACITY},
+    generation::{Outcome, RecoveryLoop},
     ipc::{serve_with_subscriptions, Listener, SubscriptionHub},
+    recovery::RecoveryPolicy,
     service::Service,
     store::EncryptedStore,
     supervisor::Supervisor,
@@ -17,7 +19,7 @@ use std::{
     sync::{Arc, Mutex},
     time::Duration,
 };
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, watch};
 
 const SHUTDOWN_DRAIN: Duration = Duration::from_secs(10);
 
@@ -98,17 +100,29 @@ async fn main() -> ExitCode {
     };
 
     let hub = SubscriptionHub::with_default_capacity();
-    let engine = Arc::new(Engine::new(engine_config));
-    // The service reads the current engine from this slot, so a future restart can
-    // replace its contents without rebuilding the service. Restart is not enabled.
+    let engine = Arc::new(Engine::new(engine_config.clone()));
+    // The service reads the current engine from this slot, so the recovery loop can
+    // replace its contents without rebuilding the service.
     let slot = engine_slot(engine.clone());
 
     let (sink, events) = mpsc::channel(EVENT_CAPACITY);
-    let mut supervisor = Supervisor::new(engine.clone(), sink);
+    let mut supervisor = Supervisor::new(engine.clone(), sink.clone());
     if let Err(error) = supervisor.start().await {
         eprintln!("bloomd: engine unavailable: {error}");
         return ExitCode::from(3);
     }
+
+    // Replacements are built over the same sink and engine config, so the new
+    // supervisor always wraps the engine it returns.
+    let builder = move || {
+        let engine = Arc::new(Engine::new(engine_config.clone()));
+        let supervisor = Supervisor::new(engine.clone(), sink.clone());
+        (supervisor, engine)
+    };
+    let (cancel_tx, mut cancel_rx) = watch::channel(false);
+    let mut recovery =
+        RecoveryLoop::new(slot.clone(), supervisor, RecoveryPolicy::default(), builder);
+    let recovery_task = tokio::spawn(async move { recovery.run(&mut cancel_rx).await });
 
     let service = Arc::new(Service::with_engine_slot(store, slot, hub.clone()));
     let persistence = tokio::spawn(service.clone().persist_events(events));
@@ -135,22 +149,27 @@ async fn main() -> ExitCode {
     drop(listener);
     // Leave no stale socket behind for the next start to trip over.
     let _ = std::fs::remove_file(&config.socket_path);
-    let shutdown = supervisor.shutdown(SHUTDOWN_DRAIN).await;
-    drop(supervisor); // closes the final sender so persistence observes end-of-stream
+    let _ = cancel_tx.send(true);
+    // The loop stops the current generation and drops its builder, so this is the
+    // last sender and persistence observes end-of-stream. If the loop overruns its
+    // budget, abort it so it cannot publish another generation after the service is
+    // dropped, and so its captured sink closes for persistence.
+    let mut recovery_task = recovery_task;
+    let recovery_result = match tokio::time::timeout(SHUTDOWN_DRAIN, &mut recovery_task).await {
+        Ok(joined) => Ok(joined),
+        Err(elapsed) => {
+            recovery_task.abort();
+            let _ = recovery_task.await;
+            Err(elapsed)
+        }
+    };
     drop(service);
     let persistence_result = tokio::time::timeout(SHUTDOWN_DRAIN, persistence).await;
 
     let mut clean = true;
-    match shutdown {
-        Ok(report) if report.discarded_events == 0 && !report.drain_incomplete => {}
-        Ok(_) => {
-            eprintln!("bloomd: shutdown incomplete: engine event forwarding did not fully drain");
-            clean = false;
-        }
-        Err(_) => {
-            eprintln!("bloomd: shutdown incomplete: engine producer failed to stop");
-            clean = false;
-        }
+    if let Some(message) = RecoveryShutdown::classify(recovery_result).incomplete_message() {
+        eprintln!("bloomd: shutdown incomplete: {message}");
+        clean = false;
     }
     match persistence_result {
         Ok(Ok(())) => {}
@@ -171,6 +190,52 @@ async fn main() -> ExitCode {
     }
 }
 
+/// Terminal recovery-loop result reduced to what the clean/unclean decision needs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RecoveryShutdown {
+    /// The loop stopped the current generation and reported its drain.
+    Cancelled {
+        discarded_events: usize,
+        drain_incomplete: bool,
+    },
+    /// The retry policy stopped trying.
+    GiveUp,
+    /// The task did not finish inside the shutdown budget.
+    TimedOut,
+    /// The task panicked or was cancelled.
+    Failed,
+}
+
+impl RecoveryShutdown {
+    fn classify(
+        result: Result<Result<Outcome, tokio::task::JoinError>, tokio::time::error::Elapsed>,
+    ) -> Self {
+        match result {
+            Ok(Ok(Outcome::Cancelled { report })) => Self::Cancelled {
+                discarded_events: report.discarded_events,
+                drain_incomplete: report.drain_incomplete,
+            },
+            Ok(Ok(Outcome::GiveUp(_))) => Self::GiveUp,
+            Ok(Err(_)) => Self::Failed,
+            Err(_) => Self::TimedOut,
+        }
+    }
+
+    /// Static, path-free reason when this result makes shutdown unclean.
+    fn incomplete_message(self) -> Option<&'static str> {
+        match self {
+            Self::Cancelled {
+                discarded_events: 0,
+                drain_incomplete: false,
+            } => None,
+            Self::Cancelled { .. } => Some("engine event forwarding did not fully drain"),
+            Self::GiveUp => Some("engine restart policy gave up"),
+            Self::TimedOut => Some("engine recovery loop did not stop in time"),
+            Self::Failed => Some("engine producer failed to stop"),
+        }
+    }
+}
+
 fn create_private_dir(path: &std::path::Path) -> std::io::Result<()> {
     if path.is_dir() {
         return Ok(());
@@ -183,5 +248,73 @@ fn create_private_dir(path: &std::path::Path) -> std::io::Result<()> {
     #[cfg(not(unix))]
     {
         std::fs::create_dir_all(path)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use bloomd::{generation::Outcome, recovery::GiveUpReason, supervisor::ShutdownReport};
+
+    fn cancelled(discarded_events: usize, drain_incomplete: bool) -> RecoveryShutdown {
+        RecoveryShutdown::classify(Ok(Ok(Outcome::Cancelled {
+            report: ShutdownReport {
+                discarded_events,
+                drain_incomplete,
+            },
+        })))
+    }
+
+    #[test]
+    fn clean_cancelled_is_clean() {
+        assert_eq!(cancelled(0, false).incomplete_message(), None);
+    }
+
+    #[test]
+    fn cancelled_with_discarded_events_is_unclean() {
+        assert_eq!(
+            cancelled(3, false).incomplete_message(),
+            Some("engine event forwarding did not fully drain")
+        );
+    }
+
+    #[test]
+    fn cancelled_with_incomplete_drain_is_unclean() {
+        assert_eq!(
+            cancelled(0, true).incomplete_message(),
+            Some("engine event forwarding did not fully drain")
+        );
+    }
+
+    #[test]
+    fn give_up_is_unclean() {
+        let result =
+            RecoveryShutdown::classify(Ok(Ok(Outcome::GiveUp(GiveUpReason::AttemptsExhausted))));
+        assert_eq!(
+            result.incomplete_message(),
+            Some("engine restart policy gave up")
+        );
+    }
+
+    #[tokio::test]
+    async fn timeout_waiting_for_the_task_is_unclean() {
+        let elapsed = tokio::time::timeout(Duration::ZERO, std::future::pending::<()>())
+            .await
+            .unwrap_err();
+        assert_eq!(
+            RecoveryShutdown::classify(Err(elapsed)).incomplete_message(),
+            Some("engine recovery loop did not stop in time")
+        );
+    }
+
+    #[tokio::test]
+    async fn failed_task_is_unclean() {
+        let handle = tokio::spawn(std::future::pending::<()>());
+        handle.abort();
+        let error = handle.await.unwrap_err();
+        assert_eq!(
+            RecoveryShutdown::classify(Ok(Err(error))).incomplete_message(),
+            Some("engine producer failed to stop")
+        );
     }
 }
