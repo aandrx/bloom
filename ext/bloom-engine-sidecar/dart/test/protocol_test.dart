@@ -226,6 +226,24 @@ void main() {
       }
     });
 
+    test('history stays unavailable until a producer exists', () {
+      expect(historyCapability, isFalse);
+      // Assert the frame the bin emits, not a frame reconstructed here, so a
+      // call-site revert to chat sync fails this test.
+      final frame = decodeFrame(
+        sidecarReadyFrame(
+          engineVersion: 'v',
+          handles: const ['mailto:me@example.invalid'],
+        ),
+      );
+      expect(frame['capabilities'], <String, Object?>{
+        'send': true,
+        'history': false,
+        'recipient_lists': true,
+      });
+      expect(frame['handles'], ['mailto:me@example.invalid']);
+    });
+
     test('ready advertises capabilities', () {
       final frame = decodeFrame(
         readyFrame(

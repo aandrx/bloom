@@ -24,11 +24,11 @@ Local unread navigation is accepted under shipp with synthetic evidence. Workspa
 
 ## Queued backend/product work and acceptance
 
-### 1. Generation-scoped engine recovery (next backend phase)
+### 1. Generation-scoped engine recovery (accepted, live-unverified)
 
 Historical message ingestion has a [design-only plan](historical-ingestion-plan.md). It is blocked: the sidecar exposes no message archive, `history_message` and `history_complete` are stubs, and the headless ObjectBox path is unavailable. Do not start that work without the gate evidence, and do not fabricate identity, dedupe by body or time, or claim completeness from a placeholder frame.
 
-The proposed design is in [engine recovery plan](engine-recovery-plan.md). It is source-only planning: a pure bounded retry policy first, then generation-tagged lifecycle events, then a supervised stop-then-spawn restart, then TUI presentation. Initial start failure stays fatal, uncertain sends are never replayed, and no live-engine verification is authorized.
+The [engine recovery plan](engine-recovery-plan.md) is implemented and wired. A pure bounded retry policy, a swappable engine slot, a drain-and-join generation seam, an unwired-then-wired restart loop, and TUI outage labels all pass synthetic checks, including a runtime test that kills a real child process and observes a replacement. Crash loops now exhaust the attempt budget because a generation must stay up for a stability window before it resets the budget. Initial start failure stays fatal, uncertain sends are never replayed, and the real Dart sidecar remains live-unverified.
 
 Problem: TUI reconnects to IPC but a dead engine child is not automatically replaced.
 
@@ -38,7 +38,9 @@ Likely ownership: daemon `engine.rs`, `supervisor.rs`, `session.rs` and service/
 
 Acceptance: fake-sidecar E2E covers crash, malformed output, delayed old-generation events, repeated failure/backoff, shutdown during backoff, queued persistence, single owner and no duplicate send. Authorized live receive/restart is a separate user-approved release gate.
 
-### 2. Verified historical ingestion
+### 2. Verified historical ingestion (design complete, blocked)
+
+The [design-only plan](historical-ingestion-plan.md) records the gate. It is blocked: no sidecar command returns message bodies, the history frames are stubs, the headless ObjectBox path is unavailable, and `capabilities.history` is now correctly false. The first live step is not read-only because restoring the engine rewrites registration files.
 
 Do not start by calling generated methods and labeling results history. First verify pinned-engine source semantics for archive availability, pagination/token lifetime, identity, edits/unsend/tombstones and resume/cancellation. ObjectBox app history is not automatically available through the headless engine. Keep unsupported cases explicit.
 

@@ -197,6 +197,14 @@ String? _optionalChatGuid(Map<String, dynamic> decoded) {
 String _frame(Map<String, Object?> body) =>
     jsonEncode(<String, Object?>{'version': protocolVersion, ...body});
 
+/// Whether the sidecar can return historical messages.
+///
+/// No command produces history today: `history_message` and `history_complete`
+/// are declared frames with no producer. Chat sync returns conversation
+/// metadata only, so it must not enable this capability. Flip it only together
+/// with a working history command and its tests.
+const bool historyCapability = false;
+
 /// Emitted once the engine is restored and the receive loop is running.
 String readyFrame({
   required String engineVersion,
@@ -214,6 +222,21 @@ String readyFrame({
         'recipient_lists': true,
       },
     });
+
+/// The ready frame this sidecar actually emits.
+///
+/// Keeping the capability wiring here means the bin cannot silently advertise
+/// history that no command can produce; the protocol test asserts this frame.
+String sidecarReadyFrame({
+  required String engineVersion,
+  List<String> handles = const [],
+}) =>
+    readyFrame(
+      engineVersion: engineVersion,
+      canSend: true,
+      canReadHistory: historyCapability,
+      handles: handles,
+    );
 
 /// One decoded inbound push payload, in the order it was received.
 String inboundFrame({

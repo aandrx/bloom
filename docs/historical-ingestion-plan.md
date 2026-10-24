@@ -1,13 +1,13 @@
 # Historical message ingestion plan
 
-Status: design only. Blocked at the engine boundary. No code, protocol change, or live engine start is authorized or implemented. Design review found three issues, all corrected here: the probe is not read-only, the advertised `capabilities.history` flag is wrong, and two citations were off.
+Status: design only, and blocked at the engine boundary. No ingestion code exists, no live engine has been started, and none of the ingestion gate evidence exists. One small sidecar correctness fix was made independently: `capabilities.history` is now hard-wired false, with a Dart protocol test. The Dart toolchain is not installed locally, so that test was not run here and relies on CI.
 
 ## What exists today
 
-- The sidecar protocol exposes the `send`, `sync_conversations`, and `shutdown` commands, plus `ready`, `inbound_message`, `send_confirmation`, `sync_result`, `shutdown_ack`, and `conversation` frames (`ext/bloom-engine-sidecar/dart/lib/protocol.dart:30,57,168,201,219,238,252,258,263`).
-- The `ready` frame advertises `capabilities.history` from `config.syncChats` (`protocol.dart:203-215`, `bin/bloom_engine.dart:256-261`). That flag is currently wrong: it is true whenever chat sync is enabled, while no history producer exists. Do not trust it for import decisions until a real producer backs it; a scoped fix is recorded below.
-- `history_message` and `history_complete` are declared protocol frames with no producer or consumer semantics (`protocol.dart:274,287`; `bin/bloom_engine.dart:452` emits only conversation frames). They are placeholders, not a contract.
-- `sync_chats` returns paginated conversation metadata, not message bodies (`upstream/api/api.dart:962`; `bin/bloom_engine.dart:403-463`). `sync_conversations` maps that to a limited count (`apps/bloomd/src/engine.rs:257`).
+- The sidecar protocol exposes the `send`, `sync_conversations`, and `shutdown` commands, plus `ready`, `inbound_message`, `send_confirmation`, `sync_result`, `shutdown_ack`, and `conversation` frames (`ext/bloom-engine-sidecar/dart/lib/protocol.dart:30,57,168,209,242,253,268,281,286`).
+- The `ready` frame advertises `capabilities.history` from the `historyCapability` constant (`protocol.dart:199-206,230-241`), which is false because no command produces history (`bin/bloom_engine.dart:252-259`). Chat sync returns conversation metadata only and no longer enables this flag.
+- `history_message` and `history_complete` are declared protocol frames with no producer or consumer semantics (`protocol.dart:297,310`; `bin/bloom_engine.dart:455` emits only conversation frames). They are placeholders, not a contract.
+- `sync_chats` returns paginated conversation metadata, not message bodies (`upstream/api/api.dart:962`; `bin/bloom_engine.dart:416-458`). `sync_conversations` maps that to a limited count (`apps/bloomd/src/engine.rs:257`).
 - The engine transport's `history` method returns `Unsupported` (`engine.rs:375-382`).
 - The engine's local ObjectBox history is not reachable headlessly because its models import Flutter (`docs/engine-sidecar.md`, item 17).
 - Inbound identity is transport plus the engine payload `id` (`engine.rs:1006-1011,1050`); the store keys on that `MessageId` and upserts by conversation plus serialized message (`store/ingest.rs:103`, `store/mod.rs:291`, `store/messages.rs:30-51`).
@@ -46,6 +46,6 @@ None of these is satisfied today. The first step is an authorized live observati
 
 No direct ObjectBox reads, no plaintext archive export, no dedupe by body text or timestamp, no fabricated ids, no completeness claim without a source signal, no automatic resend, no second registration owner. This plan does not change live accounts or start an engine.
 
-## Open defect outside this design
+## Capability flag fixed
 
-`capabilities.history` is advertised from `config.syncChats` with no history producer (`bin/bloom_engine.dart:256-261`). Any client that trusts it is misled. A scoped unit should set that capability to false until a real producer exists and add a Dart protocol test. That unit is separate from the ingestion work and has not been started.
+`capabilities.history` was advertised from `config.syncChats` although no history producer exists. The capability now comes from `historyCapability = false` through `sidecarReadyFrame`, the only ready-frame constructor the bin calls, so a revert to chat sync would require editing that function. The protocol test asserts the emitted frame, not a locally rebuilt one. Enabling it requires a working history command and tests, not chat sync alone. The Rust fake sidecar used by daemon integration tests still advertises `history: true`; the daemon ignores that field, and changing the fixture is left to a separate test-hygiene unit.

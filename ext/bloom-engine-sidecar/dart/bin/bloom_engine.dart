@@ -252,13 +252,10 @@ Future<void> main(List<String> arguments) async {
       'could not read account handles; own messages may be labelled incorrectly',
     );
   }
+  // The ready frame owns the capability wiring, so chat sync cannot advertise
+  // history that no command can produce.
   stdout.writeln(
-    readyFrame(
-      engineVersion: engineVersion,
-      canSend: true,
-      canReadHistory: config.syncChats,
-      handles: handles,
-    ),
+    sidecarReadyFrame(engineVersion: engineVersion, handles: handles),
   );
 
   final syncFlight = SingleFlight<_SyncResult>();
