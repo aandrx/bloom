@@ -4748,6 +4748,33 @@ fn sidebar_and_drawer_badges_keep_the_name_at_narrow_widths() {
 }
 
 #[test]
+fn header_reports_engine_session_state_separately_from_daemon_connection() {
+    let chat = conversation("Session", 2, 1);
+    let mut app = App {
+        selected: Some(chat.id.clone()),
+        ..Default::default()
+    };
+    app.set_conversations(vec![chat.clone()]);
+
+    // The daemon keeps the IPC connection while the engine generation dies.
+    app.connection_state = ConnectionState::Connected;
+    app.session = "Disconnected".into();
+    let text = rendered(&app);
+    assert!(
+        text.contains("Disconnected"),
+        "engine death must be visible in the header: {text}"
+    );
+
+    // A lost daemon connection has its own, stronger label.
+    app.connection_state = ConnectionState::Disconnected;
+    let text = rendered(&app);
+    assert!(
+        text.contains("Offline"),
+        "a lost daemon connection must read as offline: {text}"
+    );
+}
+
+#[test]
 fn header_drops_unread_count_before_identity_at_tight_widths() {
     let weekend = conversation("Weekend crew planning", 2, 40);
     let mut app = App::default();
