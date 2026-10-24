@@ -418,12 +418,16 @@ pub fn resolve_sidecar(
             source: "BLOOM_ENGINE_SCRIPT",
         });
     }
-    let sibling = executable.parent()?.join("bloom-engine/bloom_engine.dart");
-    if sibling.is_file() {
-        return Some(Resolved {
-            path: sibling,
-            source: "next to the launcher",
-        });
+    // A missing executable parent must not skip the checkout fallback, or the
+    // doctor reports a false failure that the daemon would not hit.
+    if let Some(parent) = executable.parent() {
+        let sibling = parent.join("bloom-engine/bloom_engine.dart");
+        if sibling.is_file() {
+            return Some(Resolved {
+                path: sibling,
+                source: "next to the launcher",
+            });
+        }
     }
     repo_script.is_file().then(|| Resolved {
         path: repo_script.to_path_buf(),
