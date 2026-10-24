@@ -90,7 +90,9 @@ Later in this section:
 
 Acceptance: actual PTY tests for long local histories, new arrivals while reading back, search navigation, drawer/focus/mouse paths, unicode cursor behavior and cancel/recovery ownership. Preserve exact body whitespace and uncertain-send policy.
 
-### 4. Standalone runtime packaging and onboarding
+### 4. Standalone runtime packaging and onboarding (design complete)
+
+The [packaging plan](packaging-plan.md) records the required runtime pieces, the launcher and daemon discovery rules, the licensing boundary, and four phases. The first is a read-only `bloom --doctor`; bundling the engine and claiming Cargo-only installation remain forbidden.
 
 Current install requires retained sidecar checkout, resolved Dart packages, Dart and an existing compatible engine/registration. Design portable discovery/version diagnostics and reproducible runtime staging. Do not bundle the external engine or imply Cargo alone installs it. Check licensing/ABI requirements before distribution.
 
