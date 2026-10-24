@@ -1,6 +1,6 @@
 # Historical message ingestion plan
 
-Status: design only, and blocked at the engine boundary. No ingestion code exists, no live engine has been started, and none of the ingestion gate evidence exists. One small sidecar correctness fix was made independently: `capabilities.history` is now hard-wired false, with a Dart protocol test. The Dart toolchain is not installed locally, so that test was not run here and relies on CI.
+Status: design only, and blocked at the engine boundary. No ingestion code exists, no live engine has been started, and none of the ingestion gate evidence exists. One small sidecar correctness fix was made independently: `capabilities.history` is now hard-wired false, with a Dart protocol test. Dart 3.13.4 was then run locally from `~/.cache/dart-sdk`: formatting is unchanged, the three edited files analyze clean, and all 57 sidecar tests pass. A repository-wide analyze still reports 24 pre-existing warnings, all in generated `lib/upstream/frb_generated.dart`.
 
 ## What exists today
 
@@ -48,4 +48,4 @@ No direct ObjectBox reads, no plaintext archive export, no dedupe by body text o
 
 ## Capability flag fixed
 
-`capabilities.history` was advertised from `config.syncChats` although no history producer exists. The capability now comes from `historyCapability = false` through `sidecarReadyFrame`, the only ready-frame constructor the bin calls, so a revert to chat sync would require editing that function. The protocol test asserts the emitted frame, not a locally rebuilt one. Enabling it requires a working history command and tests, not chat sync alone. The Rust fake sidecar used by daemon integration tests still advertises `history: true`; the daemon ignores that field, and changing the fixture is left to a separate test-hygiene unit.
+`capabilities.history` was advertised from `config.syncChats` although no history producer exists. The capability now comes from `historyCapability = false` through `sidecarReadyFrame`, the only ready-frame constructor the bin calls, so a revert to chat sync would require editing that function. The protocol test asserts the emitted frame, not a locally rebuilt one. Enabling it requires a working history command and tests, not chat sync alone. The Rust fake sidecar used by daemon integration tests still advertises `history: true`; the daemon ignores that field, and changing the fixture is left to a separate test-hygiene unit. Verification: `dart format` changed nothing, `dart analyze` is clean for the edited files, and `dart test` passes 57 tests including the capability case.
