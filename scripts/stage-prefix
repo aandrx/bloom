@@ -1,0 +1,269 @@
+#!/usr/bin/env python3
+"""Stage Bloom binaries and the owned sidecar sources into an install prefix.
+
+This script performs no network access, runs no package manager, starts no
+daemon or engine, and never copies an engine library. The engine stays external
+and is loaded at runtime. The post-install step `dart pub get` is explicit and
+separate.
+
+Usage:
+    stage-prefix --bin-dir DIR --prefix DIR [--with-sidecar] [--dry-run] [--force]
+"""
+import hashlib
+import json
+import os
+import re
+import shutil
+import sys
+from pathlib import Path
+
+BINARIES = ('bloom', 'bloom-tui', 'bloomd')
+SIDECAR_RUNTIME = ('bin', 'lib', 'pubspec.yaml', 'pubspec.lock')
+SKIP_DIRS = {'.dart_tool', 'build', '.pub-cache', '.packages'}
+SKIP_SUFFIXES = ('.snapshot', '.dill')
+SHARED_LIBRARY_SUFFIXES = ('.so', '.dylib', '.dll')
+SCHEMA_VERSION = 1
+FILE_MODE = 0o755
+
+
+class UsageError(Exception):
+    pass
+
+
+class Refused(Exception):
+    pass
+
+
+def usage(message):
+    raise UsageError(message)
+
+
+def parse_args(argv):
+    options = {'bin_dir': None, 'prefix': None, 'with_sidecar': False,
+               'dry_run': False, 'force': False}
+    seen = set()
+    flags = {'--with-sidecar': 'with_sidecar', '--dry-run': 'dry_run',
+             '--force': 'force'}
+    values = {'--bin-dir': 'bin_dir', '--prefix': 'prefix'}
+    index = 0
+    while index < len(argv):
+        arg = argv[index]
+        if arg in flags:
+            if arg in seen:
+                usage(f'duplicate option: {arg}')
+            seen.add(arg)
+            options[flags[arg]] = True
+            index += 1
+            continue
+        key, sep, inline = arg.partition('=')
+        if key in values:
+            if key in seen:
+                usage(f'duplicate option: {key}')
+            seen.add(key)
+            if sep:
+                value = inline
+            elif index + 1 < len(argv):
+                index += 1
+                value = argv[index]
+            else:
+                usage(f'{key} requires a value')
+            if not value:
+                usage(f'{key} requires a non-empty value')
+            options[values[key]] = value
+            index += 1
+            continue
+        usage(f'unknown argument: {arg}')
+    if options['bin_dir'] is None:
+        usage('--bin-dir is required')
+    if options['prefix'] is None:
+        usage('--prefix is required')
+    if options['dry_run'] and options['force']:
+        usage('--force cannot be combined with --dry-run')
+    return options
+
+
+def regular_files(root):
+    for path in sorted(root.rglob('*')):
+        if path.is_symlink() or not path.is_file():
+            continue
+        if any(part in SKIP_DIRS for part in path.relative_to(root).parts):
+            continue
+        if path.name in SKIP_DIRS or path.name.endswith(SKIP_SUFFIXES):
+            continue
+        yield path
+
+
+def read_attribution(sidecar, root):
+    candidates = [sidecar / 'ATTRIBUTION', root / 'ATTRIBUTION']
+    for candidate in candidates:
+        if not candidate.is_file():
+            continue
+        text = candidate.read_text(encoding='utf-8', errors='replace')
+        tag = re.search(r'release tag\s+([^\s,]+)', text)
+        commit = re.search(r'commit\s+([0-9a-fA-F]{7,40})', text)
+        if not tag and not commit:
+            return None, None
+
+        def clean(value):
+            if value is None:
+                return None
+            return re.sub(r'[^A-Za-z0-9._+/@:-]', '', value)[:120] or None
+
+        return {'tag': clean(tag.group(1) if tag else None),
+                'commit': clean(commit.group(1) if commit else None)}, candidate
+    return None, None
+
+
+def protected_entries(prefix):
+    hits = []
+    for relative in ('state', 'store.db', 'share/bloom/state',
+                     'share/bloom/store.db'):
+        if (prefix / relative).exists():
+            hits.append(relative)
+    if prefix.is_dir():
+        for path in prefix.rglob('*'):
+            if path.is_symlink():
+                continue
+            name = path.name.lower()
+            if 'registration' in name or name.endswith('.reg'):
+                hits.append(str(path.relative_to(prefix)))
+    return sorted(set(hits))
+
+
+def build_plan(options, source_root):
+    bin_dir = Path(options['bin_dir']).expanduser().resolve()
+    prefix = Path(options['prefix']).expanduser().resolve()
+
+    if not bin_dir.is_dir():
+        raise Refused(f'bin directory does not exist: {options["bin_dir"]}')
+    missing = [name for name in BINARIES if not (bin_dir / name).is_file()]
+    if missing:
+        raise Refused(f'missing binary in bin directory: {", ".join(missing)}')
+
+    if prefix == source_root or prefix.is_relative_to(source_root):
+        raise Refused('prefix must not be inside the source tree')
+
+    engine_library = os.environ.get('BLOOM_ENGINE_LIBRARY', '').strip()
+    if engine_library:
+        library = Path(engine_library).expanduser().resolve()
+        if library == prefix or library.is_relative_to(prefix):
+            raise Refused('resolved engine library path is inside the prefix; '
+                          'the engine must stay external')
+
+    if prefix.exists() and not prefix.is_dir():
+        raise Refused('prefix exists and is not a directory: ' + str(prefix))
+
+    protected = protected_entries(prefix)
+    if protected:
+        raise Refused('prefix already contains state or registration data: '
+                      + ', '.join(protected))
+
+    if prefix.exists() and any(prefix.iterdir()) and not options['force']:
+        raise Refused('prefix is not empty; pass --force to stage into it')
+
+    plan = []
+    for name in BINARIES:
+        plan.append((bin_dir / name, Path('bin') / name))
+
+    attribution = None
+    sidecar = source_root / 'ext' / 'bloom-engine-sidecar' / 'dart'
+    sidecar_root = source_root / 'ext' / 'bloom-engine-sidecar'
+    if options['with_sidecar']:
+        absent = [name for name in SIDECAR_RUNTIME
+                  if not (sidecar / name).exists()]
+        attribution_data, attribution_path = read_attribution(sidecar,
+                                                              sidecar_root)
+        if not attribution_path:
+            absent.append('ATTRIBUTION')
+        if absent or not sidecar.is_dir():
+            raise Refused('sidecar source tree is absent or incomplete: '
+                          + ', '.join(sorted(set(absent))))
+        for item in SIDECAR_RUNTIME:
+            path = sidecar / item
+            files = [path] if path.is_file() else list(regular_files(path))
+            for source in files:
+                relative = Path('share/bloom/engine') / source.relative_to(sidecar)
+                plan.append((source, relative))
+        plan.append((attribution_path,
+                     Path('share/bloom/engine/ATTRIBUTION')))
+        attribution = attribution_data
+
+    for source, relative in plan:
+        if is_shared_library(relative.name):
+            raise Refused('refusing to stage a shared library into the prefix: '
+                          + str(relative))
+
+    return prefix, plan, attribution
+
+
+def is_shared_library(name):
+    lowered = name.lower()
+    return (lowered.endswith(SHARED_LIBRARY_SUFFIXES)
+            or any(f'{suffix}.' in lowered for suffix in SHARED_LIBRARY_SUFFIXES))
+
+
+def digest(path):
+    hasher = hashlib.sha256()
+    with path.open('rb') as handle:
+        for block in iter(lambda: handle.read(65536), b''):
+            hasher.update(block)
+    return hasher.hexdigest()
+
+
+def main(argv):
+    try:
+        options = parse_args(argv)
+        source_root = Path(__file__).resolve().parent.parent
+        prefix, plan, attribution = build_plan(options, source_root)
+    except UsageError as error:
+        print(f'stage-prefix: {error}', file=sys.stderr)
+        return 2
+    except Refused as error:
+        print(f'stage-prefix: refused: {error}', file=sys.stderr)
+        return 1
+
+    if options['dry_run']:
+        for _, relative in plan:
+            print(f'would copy {relative.as_posix()} (mode {FILE_MODE:o})')
+        print('would write stage-manifest.json')
+        print('dry run: nothing written')
+        return 0
+
+    try:
+        prefix.mkdir(parents=True, exist_ok=True)
+        for source, relative in plan:
+            target = prefix / relative
+            target.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copyfile(source, target)
+            target.chmod(FILE_MODE)
+        entries = [{'path': relative.as_posix(),
+                    'sha256': digest(prefix / relative),
+                    'mode': FILE_MODE}
+                   for _, relative in plan]
+        entries.sort(key=lambda entry: entry['path'])
+        manifest = {'schema_version': SCHEMA_VERSION,
+                    'attribution': attribution,
+                    'entries': entries}
+        manifest_path = prefix / 'stage-manifest.json'
+        manifest_path.write_text(
+            json.dumps(manifest, indent=2, sort_keys=True) + '\n',
+            encoding='utf-8')
+        manifest_path.chmod(0o644)
+    except OSError as error:
+        print(f'stage-prefix: copy failed: {error}', file=sys.stderr)
+        return 1
+
+    sidecar = prefix / 'share/bloom/engine'
+    if options['with_sidecar']:
+        print(f'export BLOOM_ENGINE_SCRIPT={sidecar / "bin/bloom_engine.dart"}')
+        print(f'# post-install (separate step): dart pub get --directory {sidecar}')
+    else:
+        print('# BLOOM_ENGINE_SCRIPT not set: rerun with --with-sidecar to stage '
+              'the owned sidecar')
+        print('# post-install (separate step): dart pub get in the sidecar tree')
+    print(f'staged {len(entries)} file(s) into {prefix}')
+    return 0
+
+
+if __name__ == '__main__':
+    sys.exit(main(sys.argv[1:]))
