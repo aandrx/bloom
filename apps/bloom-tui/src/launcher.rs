@@ -394,8 +394,8 @@ pub struct DoctorInput {
     pub engine_library: Option<OsString>,
     pub engine_state: Option<OsString>,
     pub dart: Option<OsString>,
-    pub socket_env: Option<OsString>,
-    pub default_socket: PathBuf,
+    pub socket: PathBuf,
+    pub socket_source: bloom_ipc::SocketSource,
     pub store_env: Option<OsString>,
     pub data_home: Option<OsString>,
     pub home: Option<PathBuf>,
@@ -508,17 +508,11 @@ pub fn resolve_dart(
     None
 }
 
-/// Socket path: the environment override, then the platform default.
-pub fn resolve_socket(socket_env: Option<&OsStr>, default: &Path) -> Resolved {
-    if let Some(value) = socket_env.filter(|value| !value.is_empty()) {
-        return Resolved {
-            path: PathBuf::from(value),
-            source: "BLOOM_SOCKET_PATH",
-        };
-    }
-    Resolved {
-        path: default.to_path_buf(),
-        source: "default runtime path",
+fn socket_source_label(source: bloom_ipc::SocketSource) -> &'static str {
+    match source {
+        bloom_ipc::SocketSource::ExplicitPath => "BLOOM_SOCKET_PATH",
+        bloom_ipc::SocketSource::LegacyAlias => "BLOOM_SOCKET (legacy alias)",
+        bloom_ipc::SocketSource::Default => "default runtime path",
     }
 }
 
@@ -574,6 +568,7 @@ fn flatpak_engine_library() -> Option<PathBuf> {
 impl DoctorInput {
     /// Read the process environment; only paths and executables are inspected.
     pub fn from_process() -> Self {
+        let (socket, socket_source) = bloom_ipc::socket_path_from_env_with_source();
         Self {
             executable: std::env::current_exe().unwrap_or_default(),
             path_env: std::env::var_os("PATH"),
@@ -581,9 +576,8 @@ impl DoctorInput {
             engine_library: std::env::var_os("BLOOM_ENGINE_LIBRARY"),
             engine_state: std::env::var_os("BLOOM_ENGINE_STATE"),
             dart: std::env::var_os("BLOOM_DART_EXECUTABLE"),
-            socket_env: std::env::var_os("BLOOM_SOCKET_PATH")
-                .or_else(|| std::env::var_os("BLOOM_SOCKET")),
-            default_socket: bloom_ipc::default_socket_path(),
+            socket,
+            socket_source,
             store_env: std::env::var_os("BLOOM_STORE_PATH"),
             data_home: std::env::var_os("XDG_DATA_HOME"),
             home: std::env::var_os("HOME").map(PathBuf::from),
@@ -701,17 +695,25 @@ pub fn doctor_checks(input: &DoctorInput) -> Vec<DoctorCheck> {
         ),
     });
 
-    let socket = resolve_socket(input.socket_env.as_deref(), &input.default_socket);
-    let listening = daemon_answers(&socket.path);
+    let socket = &input.socket;
+    let listening = daemon_answers(socket);
     let daemon_detail = if listening {
-        format!("a daemon is already listening at {}", socket.path.display())
+        format!("a daemon is already listening at {}", socket.display())
     } else {
         format!(
             "not listening at {}; bloom would start bloomd",
-            socket.path.display()
+            socket.display()
         )
     };
-    checks.push(DoctorCheck::pass("socket path", false, socket.detail()));
+    checks.push(DoctorCheck::pass(
+        "socket path",
+        false,
+        format!(
+            "{} ({})",
+            socket.display(),
+            socket_source_label(input.socket_source)
+        ),
+    ));
     checks.push(DoctorCheck::pass("daemon", false, daemon_detail));
 
     let store = resolve_store(
@@ -912,8 +914,8 @@ mod tests {
             engine_library: Some(library.into_os_string()),
             engine_state: Some(state.into_os_string()),
             dart: Some(dart.into_os_string()),
-            socket_env: None,
-            default_socket: prefix.join("absent.sock"),
+            socket: prefix.join("absent.sock"),
+            socket_source: bloom_ipc::SocketSource::Default,
             store_env: None,
             data_home: None,
             home: Some(prefix.to_path_buf()),
@@ -927,6 +929,23 @@ mod tests {
             .iter()
             .find(|check| check.name == name)
             .unwrap_or_else(|| panic!("no check named {name}"))
+    }
+
+    #[test]
+    fn socket_source_labels_match_each_source() {
+        use bloom_ipc::SocketSource;
+        assert_eq!(
+            socket_source_label(SocketSource::ExplicitPath),
+            "BLOOM_SOCKET_PATH"
+        );
+        assert_eq!(
+            socket_source_label(SocketSource::LegacyAlias),
+            "BLOOM_SOCKET (legacy alias)"
+        );
+        assert_eq!(
+            socket_source_label(SocketSource::Default),
+            "default runtime path"
+        );
     }
 
     #[test]

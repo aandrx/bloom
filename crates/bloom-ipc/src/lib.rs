@@ -46,27 +46,49 @@ pub fn default_socket_path() -> std::path::PathBuf {
     base.join("bloom/bloomd.sock")
 }
 
+/// Which environment setting supplied the resolved daemon socket.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SocketSource {
+    /// `BLOOM_SOCKET_PATH` supplied the path.
+    ExplicitPath,
+    /// The legacy `BLOOM_SOCKET` alias supplied the path.
+    LegacyAlias,
+    /// Neither variable supplied a path, so [`default_socket_path`] applies.
+    Default,
+}
+
 /// Resolve the daemon socket: `BLOOM_SOCKET_PATH`, then the legacy
 /// `BLOOM_SOCKET` alias, then [`default_socket_path`].
 pub fn socket_path_from_env() -> std::path::PathBuf {
+    socket_path_from_env_with_source().0
+}
+
+/// Resolve the daemon socket and report which source supplied it, so callers
+/// that print the path cannot disagree with the shared rule.
+pub fn socket_path_from_env_with_source() -> (std::path::PathBuf, SocketSource) {
     socket_path_from(
         std::env::var_os("BLOOM_SOCKET_PATH").as_deref(),
         std::env::var_os("BLOOM_SOCKET").as_deref(),
+        default_socket_path(),
     )
 }
 
 fn socket_path_from(
     explicit: Option<&std::ffi::OsStr>,
     alias: Option<&std::ffi::OsStr>,
-) -> std::path::PathBuf {
+    default: std::path::PathBuf,
+) -> (std::path::PathBuf, SocketSource) {
     // Blank values mean "unset", which is how the daemon always treated them.
     fn usable(value: Option<&std::ffi::OsStr>) -> Option<&std::ffi::OsStr> {
         value.filter(|value| !value.to_string_lossy().trim().is_empty())
     }
-    usable(explicit)
-        .or_else(|| usable(alias))
-        .map(std::path::PathBuf::from)
-        .unwrap_or_else(default_socket_path)
+    if let Some(value) = usable(explicit) {
+        (std::path::PathBuf::from(value), SocketSource::ExplicitPath)
+    } else if let Some(value) = usable(alias) {
+        (std::path::PathBuf::from(value), SocketSource::LegacyAlias)
+    } else {
+        (default, SocketSource::Default)
+    }
 }
 
 pub const MAX_FRAME_LEN: usize = 1024 * 1024;
@@ -365,35 +387,59 @@ mod tests {
     use std::ffi::OsStr;
     use tokio::io::duplex;
     #[test]
-    fn socket_explicit_path_wins_over_alias() {
+    fn socket_explicit_path_wins_and_reports_explicit_source() {
         assert_eq!(
             socket_path_from(
                 Some(OsStr::new("/explicit.sock")),
-                Some(OsStr::new("/alias.sock"))
+                Some(OsStr::new("/alias.sock")),
+                default_socket_path()
             ),
-            std::path::PathBuf::from("/explicit.sock")
+            (
+                std::path::PathBuf::from("/explicit.sock"),
+                SocketSource::ExplicitPath
+            )
         );
     }
     #[test]
-    fn socket_alias_used_when_only_alias_is_set() {
+    fn socket_alias_reports_legacy_alias_source() {
         assert_eq!(
-            socket_path_from(None, Some(OsStr::new("/alias.sock"))),
-            std::path::PathBuf::from("/alias.sock")
+            socket_path_from(None, Some(OsStr::new("/alias.sock")), default_socket_path()),
+            (
+                std::path::PathBuf::from("/alias.sock"),
+                SocketSource::LegacyAlias
+            )
         );
     }
     #[test]
-    fn socket_default_when_neither_is_set() {
-        assert_eq!(socket_path_from(None, None), default_socket_path());
+    fn socket_default_reports_default_source_and_path() {
+        assert_eq!(
+            socket_path_from(None, None, default_socket_path()),
+            (default_socket_path(), SocketSource::Default)
+        );
     }
     #[test]
-    fn socket_blank_values_fall_back_to_the_next_source() {
+    fn socket_blank_explicit_falls_through_to_alias_source() {
         assert_eq!(
-            socket_path_from(Some(OsStr::new("   ")), Some(OsStr::new("/alias.sock"))),
-            std::path::PathBuf::from("/alias.sock")
+            socket_path_from(
+                Some(OsStr::new("   ")),
+                Some(OsStr::new("/alias.sock")),
+                default_socket_path()
+            ),
+            (
+                std::path::PathBuf::from("/alias.sock"),
+                SocketSource::LegacyAlias
+            )
         );
+    }
+    #[test]
+    fn socket_blank_both_reports_default_source() {
         assert_eq!(
-            socket_path_from(Some(OsStr::new("")), None),
-            default_socket_path()
+            socket_path_from(
+                Some(OsStr::new("")),
+                Some(OsStr::new("\t")),
+                default_socket_path()
+            ),
+            (default_socket_path(), SocketSource::Default)
         );
     }
     fn req() -> Request {
