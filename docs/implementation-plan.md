@@ -85,7 +85,7 @@ Next in this section:
 Later in this section:
 
 - Filename search over stored text plus reported names is implemented and awaits the final rebuilt workspace/runtime gate. Attachment content search, file send/open/download, and old-placeholder recovery remain out of scope. Participant-context search is implemented.
-- Durable encrypted drafts still need a privacy and retention review; undo stays session-only until then.
+- Durable encrypted drafts have a [design](durable-drafts-plan.md): daemon-owned encrypted rows keyed by conversation or new-chat address, optimistic revisions with delete tombstones, bounded retention, and IPC v7. Undo stays session-only until phases 1 to 4 pass.
 - Typed interaction modes to reduce independent flag combinations, but only behind regression coverage for modal transitions, recipient changes, aliases, filters and asynchronous results.
 
 Acceptance: actual PTY tests for long local histories, new arrivals while reading back, search navigation, drawer/focus/mouse paths, unicode cursor behavior and cancel/recovery ownership. Preserve exact body whitespace and uncertain-send policy.
