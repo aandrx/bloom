@@ -1,6 +1,6 @@
 # Standalone packaging plan
 
-Status: design only. No packaging code exists. Nothing here bundles the engine or claims Cargo alone is sufficient.
+Status: design with phase 1 implemented. `bloom --doctor` is accepted; phases 2 to 4 remain unimplemented. Nothing here bundles the engine or claims Cargo alone is sufficient.
 
 ## What an install must provide today
 
@@ -44,7 +44,7 @@ Each check prints one allowlisted line with pass, fail, and the resolution sourc
 
 ### Remaining phases
 
-1. Doctor command. Launcher-only, synthetic tests with fake binaries and paths, no engine. Reviewed before merge.
+1. Doctor command: accepted. `bloom --doctor` prints one line per check and exits non-zero only when a required check fails. It starts no daemon or engine, runs only a read-only `flatpak info` lookup, and probes the socket with a connect and no request bytes. Extra arguments after `--doctor` are rejected with exit 2 instead of falling through to a client start. Verified with 126 library, 9 binary, and 120 render tests, strict Clippy, formatting, source guard, build, and a real run on this machine that reported nine passing checks. Review found no defects; no packaged install was exercised.
 2. Compiled-in layout fallback in daemon configuration, with fake prefixes and a hidden checkout.
 3. Staging script that copies the three binaries plus an optional sidecar payload into a prefix and prints the required environment without writing secrets. Licensing review before distribution claims.
 4. Authorized real-engine install check: isolated prefix, unrelated working directory, missing-dependency and version-mismatch cases. This is a separate release gate and needs explicit approval.
