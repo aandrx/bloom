@@ -987,7 +987,7 @@ mod tests {
         input.executable = bin.join("bloom");
         let prefix_sidecar = directory
             .path()
-            .join("share/bloom/engine/bloom_engine.dart");
+            .join("share/bloom/engine/bin/bloom_engine.dart");
         fs::create_dir_all(prefix_sidecar.parent().unwrap()).unwrap();
         fs::write(&prefix_sidecar, "// sidecar\n").unwrap();
 

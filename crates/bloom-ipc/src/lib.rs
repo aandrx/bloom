@@ -121,7 +121,7 @@ impl SidecarSource {
 /// Resolve the engine sidecar script for a daemon at `bloomd_exe`.
 ///
 /// Order: a usable `BLOOM_ENGINE_SCRIPT` value, then the installed prefix
-/// (`<bloomd_exe>/../share/bloom/engine/bloom_engine.dart`), then the legacy
+/// (`<bloomd_exe>/../share/bloom/engine/bin/bloom_engine.dart`), then the legacy
 /// sibling (`<bloomd_exe>/bloom-engine/bloom_engine.dart`), then `checkout`.
 /// Only the filesystem candidates must exist as files; an explicit environment
 /// value always wins, including one that does not exist, so configuration errors
@@ -153,7 +153,7 @@ pub fn sidecar_script_with_source(
         .filter(|directory| !directory.as_os_str().is_empty())
     {
         if let Some(prefix) = directory.parent() {
-            let candidate = prefix.join("share/bloom/engine/bloom_engine.dart");
+            let candidate = prefix.join("share/bloom/engine/bin/bloom_engine.dart");
             if candidate.is_file() {
                 return Some((candidate, SidecarSource::Prefix));
             }
@@ -851,7 +851,7 @@ mod tests {
         write_file(&daemon);
         (
             daemon,
-            root.join("share/bloom/engine/bloom_engine.dart"),
+            root.join("share/bloom/engine/bin/bloom_engine.dart"),
             root.join("bin/bloom-engine/bloom_engine.dart"),
         )
     }
