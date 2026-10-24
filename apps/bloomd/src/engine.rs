@@ -497,6 +497,27 @@ enum FrameRead {
 ///
 /// `AsyncBufRead::fill_buf` exposes only the bytes already in the buffer, so an
 /// oversized line is rejected without being accumulated first.
+/// Structural description of a rejected frame. Never includes payload text.
+fn unparsable_frame_summary(line: &str) -> String {
+    let bytes = line.as_bytes();
+    let printable = bytes
+        .iter()
+        .filter(|byte| matches!(byte, 0x20..=0x7e))
+        .count();
+    let ratio = if bytes.is_empty() {
+        0
+    } else {
+        printable * 100 / bytes.len()
+    };
+    format!(
+        "len={} first={:#04x} printable={ratio}% nul={} brace={}",
+        bytes.len(),
+        bytes.first().copied().unwrap_or(0),
+        line.contains('\0'),
+        line.starts_with('{')
+    )
+}
+
 async fn read_frame<R: tokio::io::AsyncBufRead + Unpin>(reader: &mut R) -> FrameRead {
     let mut bytes: Vec<u8> = Vec::with_capacity(4096);
     loop {
@@ -640,7 +661,10 @@ async fn process_frames(stdout: tokio::process::ChildStdout, context: ReadFrameC
         let frame: Value = match serde_json::from_str(&line) {
             Ok(frame) => frame,
             Err(_) => {
-                eprintln!("engine sent an unparsable frame; closing engine connection");
+                eprintln!(
+                    "engine sent an unparsable frame; closing engine connection ({})",
+                    unparsable_frame_summary(&line)
+                );
                 break;
             }
         };
@@ -2130,6 +2154,23 @@ mod tests {
             read_frame(&mut reader).await,
             FrameRead::Failed(_)
         ));
+    }
+
+    #[test]
+    fn unparsable_frame_summary_is_structural_only() {
+        let summary = unparsable_frame_summary("not json with private text");
+        assert!(summary.contains("len=26"), "{summary}");
+        assert!(summary.contains("first=0x6e"), "{summary}");
+        assert!(summary.contains("printable=100%"), "{summary}");
+        assert!(summary.contains("nul=false"), "{summary}");
+        assert!(summary.contains("brace=false"), "{summary}");
+        for leaked in ["not json", "private", "text"] {
+            assert!(!summary.contains(leaked), "leaked payload: {summary}");
+        }
+
+        let brace = unparsable_frame_summary("{\"type\": ");
+        assert!(brace.contains("brace=true"), "{brace}");
+        assert!(!brace.contains("type"), "{brace}");
     }
 
     #[tokio::test]
