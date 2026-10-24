@@ -46,6 +46,29 @@ pub fn default_socket_path() -> std::path::PathBuf {
     base.join("bloom/bloomd.sock")
 }
 
+/// Resolve the daemon socket: `BLOOM_SOCKET_PATH`, then the legacy
+/// `BLOOM_SOCKET` alias, then [`default_socket_path`].
+pub fn socket_path_from_env() -> std::path::PathBuf {
+    socket_path_from(
+        std::env::var_os("BLOOM_SOCKET_PATH").as_deref(),
+        std::env::var_os("BLOOM_SOCKET").as_deref(),
+    )
+}
+
+fn socket_path_from(
+    explicit: Option<&std::ffi::OsStr>,
+    alias: Option<&std::ffi::OsStr>,
+) -> std::path::PathBuf {
+    // Blank values mean "unset", which is how the daemon always treated them.
+    fn usable(value: Option<&std::ffi::OsStr>) -> Option<&std::ffi::OsStr> {
+        value.filter(|value| !value.to_string_lossy().trim().is_empty())
+    }
+    usable(explicit)
+        .or_else(|| usable(alias))
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(default_socket_path)
+}
+
 pub const MAX_FRAME_LEN: usize = 1024 * 1024;
 
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -339,7 +362,40 @@ async fn write_frame<W: AsyncWrite + Unpin, T: Serialize>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::ffi::OsStr;
     use tokio::io::duplex;
+    #[test]
+    fn socket_explicit_path_wins_over_alias() {
+        assert_eq!(
+            socket_path_from(
+                Some(OsStr::new("/explicit.sock")),
+                Some(OsStr::new("/alias.sock"))
+            ),
+            std::path::PathBuf::from("/explicit.sock")
+        );
+    }
+    #[test]
+    fn socket_alias_used_when_only_alias_is_set() {
+        assert_eq!(
+            socket_path_from(None, Some(OsStr::new("/alias.sock"))),
+            std::path::PathBuf::from("/alias.sock")
+        );
+    }
+    #[test]
+    fn socket_default_when_neither_is_set() {
+        assert_eq!(socket_path_from(None, None), default_socket_path());
+    }
+    #[test]
+    fn socket_blank_values_fall_back_to_the_next_source() {
+        assert_eq!(
+            socket_path_from(Some(OsStr::new("   ")), Some(OsStr::new("/alias.sock"))),
+            std::path::PathBuf::from("/alias.sock")
+        );
+        assert_eq!(
+            socket_path_from(Some(OsStr::new("")), None),
+            default_socket_path()
+        );
+    }
     fn req() -> Request {
         Request {
             request_id: 7,

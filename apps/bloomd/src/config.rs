@@ -156,9 +156,7 @@ impl DaemonConfig {
                 hint: "neither XDG_DATA_HOME nor HOME is set".to_owned(),
             })?;
 
-        let socket_path = env("BLOOM_SOCKET_PATH")
-            .map(PathBuf::from)
-            .unwrap_or_else(bloom_ipc::default_socket_path);
+        let socket_path = bloom_ipc::socket_path_from_env();
         let store_path = env("BLOOM_STORE_PATH")
             .map(PathBuf::from)
             .unwrap_or_else(|| PathBuf::from(format!("{data_dir}/bloom/store.db")));

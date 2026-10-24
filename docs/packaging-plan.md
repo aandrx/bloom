@@ -49,7 +49,11 @@ Each check prints one allowlisted line with pass, fail, and the resolution sourc
 3. Staging script that copies the three binaries plus an optional sidecar payload into a prefix and prints the required environment without writing secrets. Licensing review before distribution claims.
 4. Authorized real-engine install check: isolated prefix, unrelated working directory, missing-dependency and version-mismatch cases. This is a separate release gate and needs explicit approval.
 
-## Explicit unknowns and forbiddens
+### Socket environment alignment (implemented)
+
+Observed mismatch: the TUI client and launcher resolved `BLOOM_SOCKET_PATH`, then `BLOOM_SOCKET`, then the runtime default, while the daemon read only `BLOOM_SOCKET_PATH`. Setting only `BLOOM_SOCKET` pointed the client at a socket the daemon never binds.
+
+Decision: one resolver in `bloom_ipc`, used by the daemon, launcher, and TUI. Precedence is `BLOOM_SOCKET_PATH`, then `BLOOM_SOCKET`, then `default_socket_path()`. Blank or whitespace-only values are treated as unset, which matches how the daemon already behaved. The daemon gaining the alias is the only intended behaviour change. The doctor still resolves its socket separately and is a recorded follow-up, so its output can name a socket the daemon would not bind when only the alias is set.\n\n## Explicit unknowns and forbiddens
 
 Unknown: distribution licensing obligations for a packaged sidecar payload, how the Dart runtime is provisioned, and which engine ABI range is supported. The sidecar reports `engine_version` at runtime, but no compatibility matrix exists.
 

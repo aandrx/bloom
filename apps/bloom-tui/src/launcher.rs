@@ -28,10 +28,7 @@ const REPO_SCRIPT: &str = "../../ext/bloom-engine-sidecar/dart/bin/bloom_engine.
 
 /// The socket path, resolved the same way the daemon and TUI resolve it.
 pub fn socket_path() -> PathBuf {
-    std::env::var_os("BLOOM_SOCKET_PATH")
-        .or_else(|| std::env::var_os("BLOOM_SOCKET"))
-        .map(PathBuf::from)
-        .unwrap_or_else(bloom_ipc::default_socket_path)
+    bloom_ipc::socket_path_from_env()
 }
 
 /// True only when a process is listening: a stale socket file from a crashed

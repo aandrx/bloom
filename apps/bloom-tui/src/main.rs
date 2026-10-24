@@ -23,7 +23,7 @@ use crossterm::{
 use ratatui::{backend::CrosstermBackend, Terminal};
 use std::collections::VecDeque;
 use std::io::{Read, Write};
-use std::{io, path::PathBuf, time::Duration};
+use std::{io, time::Duration};
 use tokio::sync::{mpsc, watch};
 
 const FIRST_RETRY: Duration = Duration::from_millis(250);
@@ -217,11 +217,8 @@ impl SettingsSaveState {
 
 /// The same resolution the daemon uses, so an override (including one from .env)
 /// cannot put the UI on a different socket than the daemon.
-fn socket_path() -> PathBuf {
-    std::env::var_os("BLOOM_SOCKET_PATH")
-        .or_else(|| std::env::var_os("BLOOM_SOCKET"))
-        .map(PathBuf::from)
-        .unwrap_or_else(bloom_ipc::default_socket_path)
+fn socket_path() -> std::path::PathBuf {
+    bloom_ipc::socket_path_from_env()
 }
 
 #[tokio::main]
