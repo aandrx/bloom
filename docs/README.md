@@ -24,6 +24,7 @@ Start with [fresh-session handoff](handoff.md). The root [AGENTS.md](../AGENTS.m
 
 | Document | Status / how to use |
 | --- | --- |
+| [Reaction application](reaction-application-plan.md) | Applying inbound reactions to stored messages; design with a sender evidence gate |
 | [Remaining plans](remaining-plans.md) | Packaging tail, launcher profile spike, and gated rich-messaging phases |
 | [Durable drafts plan](durable-drafts-plan.md) | Encrypted daemon-owned drafts, revision guard, retention; design only |
 | [Packaging plan](packaging-plan.md) | Standalone install layout, doctor diagnostics, phases, licensing boundary; design only |
