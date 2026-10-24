@@ -509,12 +509,19 @@ fn unparsable_frame_summary(line: &str) -> String {
     } else {
         printable * 100 / bytes.len()
     };
+    let digits = bytes.iter().filter(|byte| byte.is_ascii_digit()).count();
+    let letters = bytes
+        .iter()
+        .filter(|byte| byte.is_ascii_alphabetic())
+        .count();
+    let spaces = bytes.iter().filter(|byte| **byte == b' ').count();
     format!(
-        "len={} first={:#04x} printable={ratio}% nul={} brace={}",
+        "len={} first={:#04x} printable={ratio}% nul={} brace={} digits={digits} letters={letters} spaces={spaces} all_digits={}",
         bytes.len(),
         bytes.first().copied().unwrap_or(0),
         line.contains('\0'),
-        line.starts_with('{')
+        line.starts_with('{'),
+        !bytes.is_empty() && digits == bytes.len()
     )
 }
 
@@ -2164,6 +2171,8 @@ mod tests {
         assert!(summary.contains("printable=100%"), "{summary}");
         assert!(summary.contains("nul=false"), "{summary}");
         assert!(summary.contains("brace=false"), "{summary}");
+        assert!(summary.contains("digits=0"), "{summary}");
+        assert!(summary.contains("all_digits=false"), "{summary}");
         for leaked in ["not json", "private", "text"] {
             assert!(!summary.contains(leaked), "leaked payload: {summary}");
         }
