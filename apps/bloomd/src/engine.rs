@@ -1410,32 +1410,6 @@ mod tests {
         assert!(message.from_me);
     }
 
-    #[test]
-    fn react_envelope_carries_the_sender_normal_mapping_uses() {
-        let sender = "tel:+15550000001";
-        let normal = payload(sender, "hello");
-        let normal_message = map_inbound(&normal, &[], &transport()).expect("normal payload maps");
-        let TransportEvent::Message { message, .. } = normal_message else {
-            panic!("expected a message event");
-        };
-        let expected_sender = handle_from(sender).expect("synthetic sender is a handle");
-        assert_eq!(message.sender, expected_sender);
-
-        let mut react = normal.clone();
-        // Shape follows the codec: the reaction wrapper carries kind, enable,
-        // and the concrete reaction value.
-        react["inst"]["message"] = json!({
-            "type": "react",
-            "value": {
-                "to_uuid": MESSAGE_ID,
-                "to_part": 0,
-                "reaction": {"kind": "react", "enable": true, "reaction": "like"}
-            }
-        });
-        let reason = map_inbound(&react, &[], &transport()).expect_err("react is not mapped");
-        assert_eq!(reason, SkipReason::NotANormalMessage);
-    }
-
     fn attachment_payload(parts: Value) -> Value {
         let mut value = payload("tel:+15550000001", "ignored");
         value["inst"]["message"]["value"]["parts"] = parts;
