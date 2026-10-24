@@ -17,6 +17,10 @@ use tokio::sync::watch;
 /// Time allowed for a generation's transport to stop during cancellation.
 pub const DRAIN_TIMEOUT: Duration = Duration::from_secs(2);
 
+/// How long a generation must stay up before its success clears the retry budget.
+/// Without this, a crash loop resets the budget on every short-lived restart.
+pub const STABLE_AFTER: Duration = Duration::from_secs(60);
+
 /// Terminal result of one run of [`RecoveryLoop`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Outcome {
@@ -35,6 +39,7 @@ pub struct RecoveryLoop<B> {
     slot: EngineSlot,
     supervisor: Option<Supervisor>,
     policy: RecoveryPolicy,
+    stable_after: Duration,
     build: B,
 }
 
@@ -58,23 +63,54 @@ where
             slot,
             supervisor: Some(supervisor),
             policy,
+            stable_after: STABLE_AFTER,
             build,
         }
+    }
+
+    /// Override how long a generation must stay up before it clears the retry
+    /// budget. Tests use a short window; production keeps [`STABLE_AFTER`].
+    pub fn with_stability(mut self, stable_after: Duration) -> Self {
+        self.stable_after = stable_after;
+        self
     }
 
     /// Wait for the current generation to finish, then replace it until the
     /// policy gives up or `cancel` becomes true.
     pub async fn run(&mut self, cancel: &mut watch::Receiver<bool>) -> Outcome {
         loop {
-            if let Some(supervisor) = self.supervisor.as_mut() {
-                let finished = tokio::select! {
-                    biased;
-                    () = wait_cancelled(cancel) => false,
-                    _ = supervisor.wait_finished() => true,
+            if let Some(mut supervisor) = self.supervisor.take() {
+                // Scoped so the completion future's borrow ends before the
+                // supervisor is stored again.
+                let cancelled = {
+                    let finished = supervisor.wait_finished();
+                    tokio::pin!(finished);
+                    let mut stable = false;
+                    loop {
+                        tokio::select! {
+                            biased;
+                            () = wait_cancelled(cancel) => break true,
+                            _ = &mut finished => break false,
+                            () = tokio::time::sleep(self.stable_after), if !stable => {
+                                stable = true;
+                                // Only a generation that stayed up earns a fresh budget.
+                                self.policy.record_success();
+                            }
+                        }
+                    }
                 };
-                if !finished {
-                    return self.cancel_now().await;
+                if cancelled {
+                    let report =
+                        supervisor
+                            .shutdown(DRAIN_TIMEOUT)
+                            .await
+                            .unwrap_or(ShutdownReport {
+                                discarded_events: 0,
+                                drain_incomplete: true,
+                            });
+                    return Outcome::Cancelled { report };
                 }
+                self.supervisor = Some(supervisor);
             }
 
             // Finish the old generation explicitly before any replacement is
@@ -98,7 +134,6 @@ where
                 Ok(()) => {
                     *self.slot.write().expect("engine slot lock is not poisoned") =
                         Arc::clone(&engine);
-                    self.policy.record_success();
                     self.supervisor = Some(supervisor);
                 }
                 Err(_) => {
@@ -352,6 +387,19 @@ mod tests {
         tokio::sync::watch::Sender<bool>,
         tokio::task::JoinHandle<Outcome>,
     ) {
+        start_loop_with_stability(parts, policy, STABLE_AFTER).await
+    }
+
+    async fn start_loop_with_stability(
+        parts: Arc<Parts>,
+        policy: RecoveryPolicy,
+        stable_after: Duration,
+    ) -> (
+        EngineSlot,
+        Arc<ScriptedTransport>,
+        tokio::sync::watch::Sender<bool>,
+        tokio::task::JoinHandle<Outcome>,
+    ) {
         let (first_transport, mut supervisor, engine) = parts.make_generation();
         supervisor.start().await.unwrap();
         let slot = engine_slot(engine);
@@ -359,7 +407,8 @@ mod tests {
             let parts = Arc::clone(&parts);
             move || parts.make_replacement()
         };
-        let mut recovery = RecoveryLoop::new(slot.clone(), supervisor, policy, builder);
+        let mut recovery = RecoveryLoop::new(slot.clone(), supervisor, policy, builder)
+            .with_stability(stable_after);
         let (cancel_tx, mut cancel_rx) = watch::channel(false);
         let handle = tokio::spawn(async move { recovery.run(&mut cancel_rx).await });
         (slot, first_transport, cancel_tx, handle)
@@ -480,6 +529,36 @@ mod tests {
         })
         .await;
         assert_eq!(parts.stop_total(), 1);
+
+        cancel_tx.send(true).unwrap();
+        let outcome = handle.await.unwrap();
+        assert!(matches!(outcome, Outcome::Cancelled { .. }));
+    }
+
+    #[tokio::test]
+    async fn stable_generation_resets_the_retry_budget() {
+        let parts = Parts::new();
+        let (_, first, cancel_tx, handle) = start_loop_with_stability(
+            Arc::clone(&parts),
+            tiny_policy(1),
+            Duration::from_millis(20),
+        )
+        .await;
+
+        first.close();
+        eventually("one replacement", || {
+            parts.builder_calls.load(Ordering::SeqCst) == 1
+        })
+        .await;
+
+        // Stay up past the stability window so the attempt budget is cleared.
+        tokio::time::sleep(Duration::from_millis(60)).await;
+        let second = parts.transports.lock().unwrap()[1].clone();
+        second.close();
+        eventually("a second replacement", || {
+            parts.builder_calls.load(Ordering::SeqCst) == 2
+        })
+        .await;
 
         cancel_tx.send(true).unwrap();
         let outcome = handle.await.unwrap();

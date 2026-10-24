@@ -85,21 +85,28 @@ impl Supervisor {
 
     /// Awaits the current forwarding generation without stopping the transport.
     ///
-    /// The forwarder is consumed, so a later `finish_generation` or `shutdown`
-    /// sees no forwarder and only reports transport state. A panic in the
+    /// The forwarder handle stays owned by the supervisor until it completes, so
+    /// dropping this future (for example when a cancel wins a race) leaves the
+    /// handle available for `shutdown` to abort and join. A panic in the
     /// forwarder marks the drain incomplete; no forwarder reports zero counts.
     pub async fn wait_finished(&mut self) -> ShutdownReport {
-        let mut drain_incomplete = false;
-        let mut discarded_events = 0;
-        if let Some(task) = self.forwarder.take() {
-            match task.await {
-                Ok(count) => discarded_events = count,
-                Err(_) => drain_incomplete = true,
-            }
-        }
-        ShutdownReport {
-            discarded_events,
-            drain_incomplete,
+        let Some(task) = self.forwarder.as_mut() else {
+            return ShutdownReport {
+                discarded_events: 0,
+                drain_incomplete: false,
+            };
+        };
+        let result = task.await;
+        self.forwarder = None;
+        match result {
+            Ok(count) => ShutdownReport {
+                discarded_events: count,
+                drain_incomplete: false,
+            },
+            Err(_) => ShutdownReport {
+                discarded_events: 0,
+                drain_incomplete: true,
+            },
         }
     }
 
@@ -323,6 +330,44 @@ mod tests {
         async fn send(&self, _: &ConversationId, _: OutgoingBody) -> TransportResult<MessageId> {
             Err(TransportError::TransportUnavailable)
         }
+    }
+
+    #[tokio::test]
+    async fn cancelled_wait_keeps_the_forwarder_for_shutdown() {
+        let (sink, mut received) = mpsc::channel(1);
+        sink.send(TransportEvent::ConversationsChanged)
+            .await
+            .unwrap();
+
+        let transport = Arc::new(ScriptedTransport::new("first"));
+        let mut supervisor = Supervisor::new(transport.clone(), sink);
+        supervisor.start().await.unwrap();
+        transport
+            .emit(TransportEvent::ConversationsChanged)
+            .await
+            .unwrap();
+        transport.wait_until_forwarder_attempts().await;
+
+        // A cancel can win while the wait future is parked on the forwarder.
+        let mut wait = Box::pin(supervisor.wait_finished());
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(20), &mut wait)
+                .await
+                .is_err(),
+            "the forwarder is still blocked on the full sink"
+        );
+        drop(wait);
+
+        // The handle must still be owned, so shutdown can abort and join it.
+        let report = supervisor
+            .shutdown(std::time::Duration::from_millis(20))
+            .await
+            .unwrap();
+        assert!(
+            report.drain_incomplete,
+            "shutdown must report an incomplete drain when it had to abort"
+        );
+        let _ = received.try_recv();
     }
 
     #[tokio::test]

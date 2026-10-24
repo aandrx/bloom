@@ -114,7 +114,20 @@ fn lifecycle_engine(script: PathBuf, dir: &std::path::Path) -> Arc<Engine> {
 }
 
 fn child_running(script: &std::path::Path) -> bool {
-    let pid = fs::read_to_string(script.with_extension("pid")).unwrap();
+    // The fake sidecar writes its pid shortly after spawn. Poll briefly so a
+    // loaded machine cannot fail this check before the file exists.
+    let pid_path = script.with_extension("pid");
+    let deadline = std::time::Instant::now() + Duration::from_secs(2);
+    let pid = loop {
+        match fs::read_to_string(&pid_path) {
+            Ok(pid) => break pid,
+            Err(error) if std::time::Instant::now() < deadline => {
+                let _ = error;
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            Err(error) => panic!("fake sidecar pid file is unreadable: {error}"),
+        }
+    };
     std::process::Command::new("kill")
         .args(["-0", pid.trim()])
         .stdout(std::process::Stdio::null())
