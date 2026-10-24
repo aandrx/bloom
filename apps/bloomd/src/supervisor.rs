@@ -55,6 +55,34 @@ impl Supervisor {
         self.session.send(conversation, body).await
     }
 
+    /// Ends the current forwarding generation without stopping the transport, so a
+    /// replacement session can take over the same sink. Aborts forwarding if the
+    /// producer does not close the event channel within `drain_timeout`.
+    ///
+    /// A second call after a drained generation is a no-op returning zero counts.
+    /// An aborted drain reports `drain_incomplete` only for the call that aborted it;
+    /// that incomplete result is not retained for later calls.
+    pub async fn finish_generation(&mut self, drain_timeout: Duration) -> ShutdownReport {
+        let mut drain_incomplete = false;
+        let mut discarded_events = 0;
+        if let Some(mut task) = self.forwarder.take() {
+            match tokio::time::timeout(drain_timeout, &mut task).await {
+                Ok(Ok(count)) => discarded_events = count,
+                Ok(Err(_)) => drain_incomplete = true,
+                Err(_) => {
+                    drain_incomplete = true;
+                    task.abort();
+                    // Joining drops the sole transport receiver and leaves no live task.
+                    let _ = task.await;
+                }
+            }
+        }
+        ShutdownReport {
+            discarded_events,
+            drain_incomplete,
+        }
+    }
+
     /// Stops the producer while allowing forwarding a bounded drain window. Cancelling the
     /// forwarding receiver releases a producer blocked on its bounded event channel.
     pub async fn shutdown(&mut self, drain_timeout: Duration) -> TransportResult<ShutdownReport> {
@@ -107,6 +135,7 @@ mod tests {
         Capabilities, Conversation, ConversationId, Message, MessageId, OutgoingBody, TransportId,
     };
     use bloom_transport::{testing::FakeTransport, TransportError};
+    use std::sync::atomic::{AtomicBool, Ordering};
     use std::time::Duration;
     use tokio::sync::Notify;
 
@@ -164,6 +193,220 @@ mod tests {
             self.entered.notify_one();
             std::future::pending().await
         }
+    }
+
+    /// FakeTransport cannot close its event channel without stopping, so this variant
+    /// exposes explicit channel closure and records whether `stop` was invoked.
+    struct ScriptedTransport {
+        id: TransportId,
+        capabilities: Capabilities,
+        events: std::sync::Mutex<Option<mpsc::Sender<TransportEvent>>>,
+        capacity: usize,
+        stop_called: Arc<AtomicBool>,
+    }
+
+    impl ScriptedTransport {
+        fn new(name: &str) -> Self {
+            Self {
+                id: TransportId::new(name).unwrap(),
+                capabilities: Capabilities::default(),
+                events: std::sync::Mutex::new(None),
+                capacity: 8,
+                stop_called: Arc::new(AtomicBool::new(false)),
+            }
+        }
+
+        async fn emit(&self, event: TransportEvent) -> TransportResult<()> {
+            let sender = self
+                .events
+                .lock()
+                .unwrap()
+                .clone()
+                .ok_or(TransportError::TransportUnavailable)?;
+            sender
+                .send(event)
+                .await
+                .map_err(|_| TransportError::TransportUnavailable)
+        }
+
+        fn close(&self) {
+            self.events.lock().unwrap().take();
+        }
+
+        async fn receiver_closed(&self) {
+            let sender = self
+                .events
+                .lock()
+                .unwrap()
+                .clone()
+                .expect("event channel was opened");
+            sender.closed().await;
+        }
+
+        fn events_waiting(&self) -> usize {
+            let sender = self
+                .events
+                .lock()
+                .unwrap()
+                .clone()
+                .expect("event channel was opened");
+            sender.max_capacity() - sender.capacity()
+        }
+
+        /// Yield until the forwarder has taken the emitted event, which with a full
+        /// sink means it is now blocked inside `sink.send`.
+        async fn wait_until_forwarder_attempts(&self) {
+            for _ in 0..200 {
+                if self.events_waiting() == 0 {
+                    return;
+                }
+                tokio::task::yield_now().await;
+            }
+            panic!("forwarder did not take the emitted event");
+        }
+    }
+
+    #[async_trait]
+    impl Transport for ScriptedTransport {
+        fn id(&self) -> TransportId {
+            self.id.clone()
+        }
+        fn capabilities(&self) -> Capabilities {
+            self.capabilities.clone()
+        }
+        async fn take_events(&self) -> TransportResult<mpsc::Receiver<TransportEvent>> {
+            let mut events = self.events.lock().unwrap();
+            if events.is_some() {
+                return Err(TransportError::Internal);
+            }
+            let (sender, receiver) = mpsc::channel(self.capacity);
+            *events = Some(sender);
+            Ok(receiver)
+        }
+        async fn start(&self) -> TransportResult<()> {
+            if self.events.lock().unwrap().is_none() {
+                return Err(TransportError::Internal);
+            }
+            Ok(())
+        }
+        async fn stop(&self) -> TransportResult<()> {
+            self.stop_called.store(true, Ordering::SeqCst);
+            self.close();
+            Ok(())
+        }
+        async fn conversations(&self) -> TransportResult<Vec<Conversation>> {
+            Ok(vec![])
+        }
+        async fn history(&self, _: &ConversationId, _: u16) -> TransportResult<Vec<Message>> {
+            Ok(vec![])
+        }
+        async fn send(&self, _: &ConversationId, _: OutgoingBody) -> TransportResult<MessageId> {
+            Err(TransportError::TransportUnavailable)
+        }
+    }
+
+    #[tokio::test]
+    async fn finish_generation_waits_for_a_pending_cross_generation_send() {
+        let (sink, mut received) = mpsc::channel(1);
+        sink.send(TransportEvent::ConversationsChanged)
+            .await
+            .unwrap();
+
+        let first_transport = Arc::new(ScriptedTransport::new("first"));
+        let mut first = Supervisor::new(first_transport.clone(), sink.clone());
+        first.start().await.unwrap();
+        first_transport
+            .emit(TransportEvent::ConversationsChanged)
+            .await
+            .unwrap();
+        first_transport.wait_until_forwarder_attempts().await;
+
+        let finish = first.finish_generation(Duration::from_secs(2));
+        tokio::pin!(finish);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), &mut finish)
+                .await
+                .is_err(),
+            "finish_generation returned while a cross-generation send was still pending"
+        );
+
+        let sentinel = received.recv().await.expect("sink stayed open");
+        let event_a = received.recv().await.expect("sink stayed open");
+        first_transport.close();
+
+        let report = tokio::time::timeout(Duration::from_secs(1), finish)
+            .await
+            .unwrap();
+        assert_eq!(
+            report,
+            ShutdownReport {
+                discarded_events: 0,
+                drain_incomplete: false,
+            }
+        );
+        assert!(!first_transport.stop_called.load(Ordering::SeqCst));
+
+        let second_transport = Arc::new(ScriptedTransport::new("second"));
+        let mut second = Supervisor::new(second_transport.clone(), sink.clone());
+        second.start().await.unwrap();
+        second_transport
+            .emit(TransportEvent::ConversationsChanged)
+            .await
+            .unwrap();
+        second_transport.close();
+
+        let report = second.finish_generation(Duration::from_secs(1)).await;
+        assert_eq!(
+            report,
+            ShutdownReport {
+                discarded_events: 0,
+                drain_incomplete: false,
+            }
+        );
+        assert!(!second_transport.stop_called.load(Ordering::SeqCst));
+
+        let event_b = received.recv().await.expect("sink stayed open");
+        assert!(received.try_recv().is_err(), "sink received extra events");
+        assert!(matches!(sentinel, TransportEvent::ConversationsChanged));
+        assert!(matches!(event_a, TransportEvent::ConversationsChanged));
+        assert!(matches!(event_b, TransportEvent::ConversationsChanged));
+
+        let idle = second.finish_generation(Duration::from_millis(50)).await;
+        assert_eq!(
+            idle,
+            ShutdownReport {
+                discarded_events: 0,
+                drain_incomplete: false,
+            }
+        );
+        assert!(!second_transport.stop_called.load(Ordering::SeqCst));
+        assert!(!first_transport.stop_called.load(Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn finish_generation_times_out_and_aborts_an_open_forwarder() {
+        let transport = Arc::new(ScriptedTransport::new("hanging"));
+        let (sink, _received) = mpsc::channel(1);
+        let mut supervisor = Supervisor::new(transport.clone(), sink);
+        supervisor.start().await.unwrap();
+        transport
+            .emit(TransportEvent::ConversationsChanged)
+            .await
+            .unwrap();
+
+        let report = tokio::time::timeout(
+            Duration::from_millis(250),
+            supervisor.finish_generation(Duration::from_millis(20)),
+        )
+        .await
+        .unwrap();
+        assert!(report.drain_incomplete);
+        assert_eq!(report.discarded_events, 0);
+        assert!(!transport.stop_called.load(Ordering::SeqCst));
+
+        tokio::time::timeout(Duration::from_millis(250), transport.receiver_closed())
+            .await
+            .expect("aborted forwarder still holds the event receiver");
     }
 
     #[tokio::test]
