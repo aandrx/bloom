@@ -90,7 +90,9 @@ Later in this section:
 
 Acceptance: actual PTY tests for long local histories, new arrivals while reading back, search navigation, drawer/focus/mouse paths, unicode cursor behavior and cancel/recovery ownership. Preserve exact body whitespace and uncertain-send policy.
 
-### 4. Standalone runtime packaging and onboarding (design complete)
+### 4. Standalone runtime packaging and onboarding (parked, phase 4 open)
+
+Phases 1 to 3 are accepted. Phase 4 ran eight clean staged-prefix attempts after the only reproduced frame rejection, and the fault has not recurred. The redacted diagnostic is committed, so the next occurrence names the rejected line's structure without printing it. Do not restart the soak without a new lead. See the [packaging plan](packaging-plan.md).
 
 The [packaging plan](packaging-plan.md) records the required runtime pieces, the launcher and daemon discovery rules, the licensing boundary, and four phases. The first is a read-only `bloom --doctor`; bundling the engine and claiming Cargo-only installation remain forbidden.
 
