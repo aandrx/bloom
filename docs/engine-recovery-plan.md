@@ -54,11 +54,17 @@ Source review showed the engine object is single-use and no epoch exists, so tag
 
 The factory takes the existing sink channel as a parameter; it must not create a second sink, because persistence consumes exactly one receiver (`apps/bloomd/src/main.rs:104-111`). Tests build two generations in sequence over that shared sink. Every first-generation event, including its `Session{Disconnected}`, must reach the sink before any second-generation event, with no interleaving. The test also asserts the first forwarder is joined before the second publishes. If the old forwarder is aborted instead of drained, the test must show the resulting loss of its final event rather than pretending ordering held. No restart policy, no death detection, and no IPC change in this unit.
 
+### Unit 4 design (two steps)
+
+Step 4a adds the loop without wiring it into the daemon. A new `apps/bloomd/src/generation.rs` owns the current `Supervisor`, the engine slot, the retry policy, and a builder closure that returns a fresh `(Supervisor, Arc<Engine>)` over the caller's existing sink. `Supervisor` gains `wait_finished`, which consumes and awaits the forwarder without stopping the transport. `RecoveryPolicy` gains a constructor with explicit limits so tests do not sleep for the production schedule. The loop waits for forwarder completion or cancellation. On completion it records the failure, waits a cancellable delay outside any lock, builds and starts the next generation, then writes the new engine into the slot. On `GiveUp` it returns a typed reason. On cancellation it stops the transport and returns the drain report. It never sends, retries, or confirms a message.
+
+Step 4b wires that loop into `main.rs`: an initial start failure stays fatal, a later death restarts, and daemon shutdown cancels the loop and uses its drain report. Step 4b needs its own review because it changes daemon lifetime behaviour.
+
 ### Unit 4: supervised restart after an unexpected death
 
 On `ChildExited` or `StreamFailed` after a successful start, the supervisor joins the reader completion signal and the generation's forwarder, then builds a new generation through the Unit 2 factory after a cancellable delay held outside the lifecycle lock. Initial start failure stays fatal as today; only a death after success is recovered. `GiveUp` leaves the daemon serving IPC with a typed unavailable state. The old generation is dropped, not reused, because its engine object is single-use.
 
-Tests use a synthetic sidecar script that can exit on request and record its own pid: at most one live child at any time (not merely one spawn call), restart after a death, a second death during backoff does not double-spawn, `GiveUp` stops retries, shutdown during backoff reaps any child and finishes inside the budget, an initial start failure remains fatal, and uncertain sends are not replayed.
+Step 4a tests use a scripted transport and a builder closure: one death rebuilds once and swaps the slot to the new engine; two deaths rebuild twice; building happens only after the previous generation is finished; `GiveUp` returns the typed reason and stops building; cancellation during a long delay returns promptly and stops the transport exactly once; no message is sent by the loop. Step 4b adds the synthetic-sidecar checks: at most one live child at any time (not merely one spawn call), an initial start failure stays fatal, and shutdown during backoff reaps any child inside the budget.
 
 ### Unit 5: verify and, only if needed, adjust TUI presentation
 

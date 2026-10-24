@@ -83,6 +83,26 @@ impl Supervisor {
         }
     }
 
+    /// Awaits the current forwarding generation without stopping the transport.
+    ///
+    /// The forwarder is consumed, so a later `finish_generation` or `shutdown`
+    /// sees no forwarder and only reports transport state. A panic in the
+    /// forwarder marks the drain incomplete; no forwarder reports zero counts.
+    pub async fn wait_finished(&mut self) -> ShutdownReport {
+        let mut drain_incomplete = false;
+        let mut discarded_events = 0;
+        if let Some(task) = self.forwarder.take() {
+            match task.await {
+                Ok(count) => discarded_events = count,
+                Err(_) => drain_incomplete = true,
+            }
+        }
+        ShutdownReport {
+            discarded_events,
+            drain_incomplete,
+        }
+    }
+
     /// Stops the producer while allowing forwarding a bounded drain window. Cancelling the
     /// forwarding receiver releases a producer blocked on its bounded event channel.
     pub async fn shutdown(&mut self, drain_timeout: Duration) -> TransportResult<ShutdownReport> {

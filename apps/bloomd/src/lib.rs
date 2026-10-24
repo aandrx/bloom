@@ -3,6 +3,7 @@
 pub mod config;
 pub mod diagnostics;
 pub mod engine;
+pub mod generation;
 pub mod ipc;
 pub mod recovery;
 pub mod service;
