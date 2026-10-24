@@ -4,7 +4,7 @@ Status: design only. Reactions are decoded by the codec but dropped by the daemo
 
 ## Wire evidence
 
-`react` carries `to_uuid`, `to_part`, a wrapper with `kind: react` and `enable`, and a nested reaction that is a plain string for built-in kinds or a string payload for emoji (`payload_codec.dart:118-145`, now covered by a codec test). The reaction body has no sender. Whether the surrounding `inst` envelope carries one is unverified: review found `engine.rs` still declares `reactions: false`. The first unit must prove a real react envelope carries a sender from the same field normal messages use. If it does not, this design stops and the capability stays false.
+`react` carries `to_uuid`, `to_part`, a wrapper with `kind: react` and `enable`, and a nested reaction that is a plain string for built-in kinds or a string payload for emoji (`payload_codec.dart:118-145`, now covered by a codec test). The reaction body has no sender. Whether the surrounding `inst` envelope carries one is unverified: review found `engine.rs` still declares `reactions: false`. The first unit must prove a real react envelope carries a sender from the same field normal messages use. That unit failed and its test was reverted: `map_inbound` rejects any non-normal `type` before reading `inst.sender` (`engine.rs:1024-1028`), so a passing `NotANormalMessage` assertion says nothing about sender availability. The next evidence unit must be a direct, falsifiable extractor: a small function that reads `inst.sender` for a react frame, tested to succeed with the field present and fail with it absent. Only then can the mapper use it. Until that passes, the reaction capability stays false and no store changes start.
 
 ## Rules
 
