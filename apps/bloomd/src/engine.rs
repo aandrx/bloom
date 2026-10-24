@@ -1011,6 +1011,14 @@ pub fn map_inbound(
     map_inbound_with_sequence(payload, my_handles, id, None)
 }
 
+fn envelope_sender(inst: &Value) -> Result<Handle, SkipReason> {
+    let sender = inst
+        .get("sender")
+        .and_then(Value::as_str)
+        .ok_or(SkipReason::MissingSender)?;
+    handle_from(sender).ok_or(SkipReason::InvalidIdentity)
+}
+
 fn map_inbound_with_sequence(
     payload: &Value,
     my_handles: &[String],
@@ -1075,7 +1083,7 @@ fn map_inbound_with_sequence(
         return Err(SkipReason::NoContent);
     }
 
-    let sender_handle = handle_from(sender).ok_or(SkipReason::InvalidIdentity)?;
+    let sender_handle = envelope_sender(inst)?;
     let conversation_id =
         ConversationId::new(id.clone(), chat_guid).map_err(|_| SkipReason::InvalidIdentity)?;
     let message_id =
@@ -1927,6 +1935,61 @@ mod tests {
         assert!(matches!(
             map_inbound(&empty, &[], &transport()),
             Err(SkipReason::NoContent)
+        ));
+    }
+
+    fn react_envelope(sender: &str) -> Value {
+        json!({
+            "variant": "iMessage",
+            "complete": true,
+            "inst": {
+                "id": "11111111-2222-3333-4444-555555555555",
+                "sender": sender,
+                "conversation": {
+                    "participants": [sender],
+                    "sender_guid": "iMessage;-;someone@example.com"
+                },
+                "message": {
+                    "type": "react",
+                    "complete": true,
+                    "to_uuid": "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
+                    "to_part": 0,
+                    "reaction": {"kind": "react", "enable": true, "reaction": "like"},
+                    "to_text": "hello"
+                }
+            }
+        })
+    }
+
+    #[test]
+    fn react_envelope_sender_is_parsed() {
+        let react = react_envelope("tel:+15550000001");
+        assert_eq!(
+            envelope_sender(&react["inst"]).unwrap(),
+            handle_from("tel:+15550000001").unwrap()
+        );
+    }
+
+    #[test]
+    fn react_envelope_without_sender_is_missing_sender() {
+        let mut react = react_envelope("tel:+15550000001");
+        react["inst"].as_object_mut().unwrap().remove("sender");
+        assert!(matches!(
+            envelope_sender(&react["inst"]),
+            Err(SkipReason::MissingSender)
+        ));
+    }
+
+    #[test]
+    fn react_envelope_with_malformed_sender_matches_normal_path() {
+        let react = react_envelope("");
+        assert!(matches!(
+            envelope_sender(&react["inst"]),
+            Err(SkipReason::InvalidIdentity)
+        ));
+        assert!(matches!(
+            map_inbound(&payload("", "hello"), &[], &transport()),
+            Err(SkipReason::InvalidIdentity)
         ));
     }
 
