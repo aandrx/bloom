@@ -6,6 +6,7 @@
 //! stops only the daemon it started. A daemon that was already running is reused
 //! and left alone, so several TUIs can share one owner of the engine state.
 
+use std::ffi::{OsStr, OsString};
 use std::fs::{self, OpenOptions};
 #[cfg(unix)]
 use std::os::fd::AsRawFd;
@@ -20,6 +21,10 @@ pub const START_TIMEOUT: Duration = Duration::from_secs(20);
 pub const STOP_TIMEOUT: Duration = Duration::from_secs(30);
 const TUI_STOP_TIMEOUT: Duration = Duration::from_secs(2);
 const POLL: Duration = Duration::from_millis(100);
+/// Flatpak application id of the engine provider, as used by the daemon.
+const FLATPAK_APP: &str = "app.openbubbles.OpenBubbles";
+/// Sidecar entry point inside the repository, used for development builds.
+const REPO_SCRIPT: &str = "../../ext/bloom-engine-sidecar/dart/bin/bloom_engine.dart";
 
 /// The socket path, resolved the same way the daemon and TUI resolve it.
 pub fn socket_path() -> PathBuf {
@@ -48,20 +53,31 @@ pub fn daemon_answers(socket: &Path) -> bool {
 /// sibling lookup avoids depending on the current working directory. The daemon
 /// still needs the separately configured Dart sidecar and external engine.
 pub fn find_binary(name: &str) -> Option<PathBuf> {
+    let executable = std::env::current_exe().unwrap_or_default();
+    let path_env = std::env::var_os("PATH");
+    find_companion(&executable, path_env.as_deref(), name).map(|found| found.path)
+}
+
+/// Testable companion lookup: the sibling of `executable` first, then `PATH`.
+pub fn find_companion(executable: &Path, path_env: Option<&OsStr>, name: &str) -> Option<Resolved> {
     let file_name = format!("{name}{}", std::env::consts::EXE_SUFFIX);
-    if let Ok(current) = std::env::current_exe() {
-        if let Some(directory) = current.parent() {
-            let sibling = directory.join(&file_name);
-            if is_executable(&sibling) {
-                return Some(sibling);
-            }
+    if let Some(directory) = executable.parent() {
+        let sibling = directory.join(&file_name);
+        if is_executable(&sibling) {
+            return Some(Resolved {
+                path: sibling,
+                source: "next to the launcher",
+            });
         }
     }
-    std::env::var_os("PATH")
-        .into_iter()
-        .flat_map(|value| std::env::split_paths(&value).collect::<Vec<_>>())
+    let path_env = path_env.filter(|value| !value.is_empty())?;
+    std::env::split_paths(path_env)
         .map(|directory| directory.join(&file_name))
         .find(|candidate| is_executable(candidate))
+        .map(|path| Resolved {
+            path,
+            source: "PATH",
+        })
 }
 
 /// Where the daemon's stdout/stderr go when `bloom` starts it.
@@ -330,6 +346,410 @@ fn nonblocking_connect(path: &Path) -> bool {
     result == 0
 }
 
+/// A path with a plain-text description of how it was resolved.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Resolved {
+    pub path: PathBuf,
+    pub source: &'static str,
+}
+
+impl Resolved {
+    fn detail(&self) -> String {
+        format!("{} ({})", self.path.display(), self.source)
+    }
+}
+
+/// One line of `bloom --doctor` output.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DoctorCheck {
+    pub name: String,
+    pub required: bool,
+    pub ok: bool,
+    pub detail: String,
+}
+
+impl DoctorCheck {
+    fn pass(name: impl Into<String>, required: bool, detail: impl Into<String>) -> Self {
+        Self {
+            name: name.into(),
+            required,
+            ok: true,
+            detail: detail.into(),
+        }
+    }
+
+    fn fail(name: impl Into<String>, required: bool, detail: impl Into<String>) -> Self {
+        Self {
+            name: name.into(),
+            required,
+            ok: false,
+            detail: detail.into(),
+        }
+    }
+}
+
+/// Everything the doctor needs, passed explicitly so tests need no real install.
+#[derive(Clone, Debug)]
+pub struct DoctorInput {
+    pub executable: PathBuf,
+    pub path_env: Option<OsString>,
+    pub engine_script: Option<OsString>,
+    pub engine_library: Option<OsString>,
+    pub engine_state: Option<OsString>,
+    pub dart: Option<OsString>,
+    pub socket_env: Option<OsString>,
+    pub default_socket: PathBuf,
+    pub store_env: Option<OsString>,
+    pub data_home: Option<OsString>,
+    pub home: Option<PathBuf>,
+    pub repo_script: PathBuf,
+    pub flatpak_library: Option<PathBuf>,
+}
+
+/// Sidecar entry point: environment, then beside the binary, then the checkout.
+pub fn resolve_sidecar(
+    executable: &Path,
+    script_env: Option<&OsStr>,
+    repo_script: &Path,
+) -> Option<Resolved> {
+    if let Some(value) = script_env.filter(|value| !value.is_empty()) {
+        return Some(Resolved {
+            path: PathBuf::from(value),
+            source: "BLOOM_ENGINE_SCRIPT",
+        });
+    }
+    let sibling = executable.parent()?.join("bloom-engine/bloom_engine.dart");
+    if sibling.is_file() {
+        return Some(Resolved {
+            path: sibling,
+            source: "next to the launcher",
+        });
+    }
+    repo_script.is_file().then(|| Resolved {
+        path: repo_script.to_path_buf(),
+        source: "repository checkout",
+    })
+}
+
+/// Engine library: the environment override, then the installed Flatpak payload.
+pub fn resolve_library(
+    library_env: Option<&OsStr>,
+    flatpak_library: Option<&Path>,
+) -> Option<Resolved> {
+    if let Some(value) = library_env.filter(|value| !value.is_empty()) {
+        return Some(Resolved {
+            path: PathBuf::from(value),
+            source: "BLOOM_ENGINE_LIBRARY",
+        });
+    }
+    flatpak_library
+        .filter(|path| path.is_file())
+        .map(|path| Resolved {
+            path: path.to_path_buf(),
+            source: "installed Flatpak",
+        })
+}
+
+/// Engine state directory: the environment override, then the Flatpak data dir.
+pub fn resolve_state(state_env: Option<&OsStr>, home: Option<&Path>) -> Option<Resolved> {
+    if let Some(value) = state_env.filter(|value| !value.is_empty()) {
+        return Some(Resolved {
+            path: PathBuf::from(value),
+            source: "BLOOM_ENGINE_STATE",
+        });
+    }
+    let candidate = home?
+        .join(".var/app")
+        .join(FLATPAK_APP)
+        .join("data/bluebubbles");
+    candidate.is_dir().then_some(Resolved {
+        path: candidate,
+        source: "default Flatpak state",
+    })
+}
+
+/// Dart executable: the environment override, `PATH`, then a known local SDK.
+pub fn resolve_dart(
+    dart_env: Option<&OsStr>,
+    path_env: Option<&OsStr>,
+    home: Option<&Path>,
+) -> Option<Resolved> {
+    if let Some(value) = dart_env.filter(|value| !value.is_empty()) {
+        return Some(Resolved {
+            path: PathBuf::from(value),
+            source: "BLOOM_DART_EXECUTABLE",
+        });
+    }
+    if let Some(path_env) = path_env.filter(|value| !value.is_empty()) {
+        if let Some(path) = std::env::split_paths(path_env)
+            .map(|directory| directory.join("dart"))
+            .find(|candidate| candidate.is_file())
+        {
+            return Some(Resolved {
+                path,
+                source: "PATH",
+            });
+        }
+    }
+    let home = home?;
+    for relative in [
+        ".cache/dart-sdk/dart-sdk/bin/dart",
+        ".local/share/bloom/dart/bin/dart",
+    ] {
+        let candidate = home.join(relative);
+        if candidate.is_file() {
+            return Some(Resolved {
+                path: candidate,
+                source: "local Dart SDK",
+            });
+        }
+    }
+    None
+}
+
+/// Socket path: the environment override, then the platform default.
+pub fn resolve_socket(socket_env: Option<&OsStr>, default: &Path) -> Resolved {
+    if let Some(value) = socket_env.filter(|value| !value.is_empty()) {
+        return Resolved {
+            path: PathBuf::from(value),
+            source: "BLOOM_SOCKET_PATH",
+        };
+    }
+    Resolved {
+        path: default.to_path_buf(),
+        source: "default runtime path",
+    }
+}
+
+/// Store path: the environment override, then `XDG_DATA_HOME` or `HOME`.
+pub fn resolve_store(
+    store_env: Option<&OsStr>,
+    data_home: Option<&OsStr>,
+    home: Option<&Path>,
+) -> Resolved {
+    if let Some(value) = store_env.filter(|value| !value.is_empty()) {
+        return Resolved {
+            path: PathBuf::from(value),
+            source: "BLOOM_STORE_PATH",
+        };
+    }
+    if let Some(value) = data_home.filter(|value| !value.is_empty()) {
+        return Resolved {
+            path: PathBuf::from(value).join("bloom/store.db"),
+            source: "XDG_DATA_HOME",
+        };
+    }
+    if let Some(home) = home {
+        return Resolved {
+            path: home.join(".local/share/bloom/store.db"),
+            source: "HOME",
+        };
+    }
+    Resolved {
+        path: PathBuf::from("bloom/store.db"),
+        source: "fallback",
+    }
+}
+
+fn is_readable_file(path: &Path) -> bool {
+    fs::metadata(path).is_ok_and(|metadata| metadata.is_file()) && fs::File::open(path).is_ok()
+}
+
+/// Resolve the engine library the same way the daemon does, read-only.
+fn flatpak_engine_library() -> Option<PathBuf> {
+    let output = Command::new("flatpak")
+        .args(["info", "--show-location", FLATPAK_APP])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let root = String::from_utf8(output.stdout).ok()?;
+    let candidate =
+        PathBuf::from(root.trim()).join("files/bluebubbles/lib/librust_lib_bluebubbles.so");
+    candidate.is_file().then_some(candidate)
+}
+
+impl DoctorInput {
+    /// Read the process environment; only paths and executables are inspected.
+    pub fn from_process() -> Self {
+        Self {
+            executable: std::env::current_exe().unwrap_or_default(),
+            path_env: std::env::var_os("PATH"),
+            engine_script: std::env::var_os("BLOOM_ENGINE_SCRIPT"),
+            engine_library: std::env::var_os("BLOOM_ENGINE_LIBRARY"),
+            engine_state: std::env::var_os("BLOOM_ENGINE_STATE"),
+            dart: std::env::var_os("BLOOM_DART_EXECUTABLE"),
+            socket_env: std::env::var_os("BLOOM_SOCKET_PATH")
+                .or_else(|| std::env::var_os("BLOOM_SOCKET")),
+            default_socket: bloom_ipc::default_socket_path(),
+            store_env: std::env::var_os("BLOOM_STORE_PATH"),
+            data_home: std::env::var_os("XDG_DATA_HOME"),
+            home: std::env::var_os("HOME").map(PathBuf::from),
+            repo_script: PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(REPO_SCRIPT),
+            flatpak_library: flatpak_engine_library(),
+        }
+    }
+}
+
+/// Build the doctor checks. Nothing here starts or executes the engine, sidecar,
+/// or daemon; the only process call is a read-only `flatpak info` lookup.
+pub fn doctor_checks(input: &DoctorInput) -> Vec<DoctorCheck> {
+    let mut checks = Vec::new();
+
+    for name in ["bloom-tui", "bloomd"] {
+        let label = format!("companion {name}");
+        match find_companion(&input.executable, input.path_env.as_deref(), name) {
+            Some(found) => checks.push(DoctorCheck::pass(label, true, found.detail())),
+            None => checks.push(DoctorCheck::fail(
+                label,
+                true,
+                "not found next to the launcher or on PATH",
+            )),
+        }
+    }
+
+    let sidecar = resolve_sidecar(
+        &input.executable,
+        input.engine_script.as_deref(),
+        &input.repo_script,
+    );
+    checks.push(match sidecar {
+        Some(found) if is_readable_file(&found.path) => {
+            DoctorCheck::pass("sidecar script", true, found.detail())
+        }
+        Some(found) => DoctorCheck::fail(
+            "sidecar script",
+            true,
+            format!("{} ({}): not a readable file", found.path.display(), found.source),
+        ),
+        None => DoctorCheck::fail(
+            "sidecar script",
+            true,
+            "not found via BLOOM_ENGINE_SCRIPT, next to the launcher, or in the repository checkout",
+        ),
+    });
+
+    let library = resolve_library(
+        input.engine_library.as_deref(),
+        input.flatpak_library.as_deref(),
+    );
+    checks.push(match library {
+        Some(found) if is_readable_file(&found.path) => {
+            DoctorCheck::pass("engine library", true, found.detail())
+        }
+        Some(found) => DoctorCheck::fail(
+            "engine library",
+            true,
+            format!(
+                "{} ({}): not a readable file",
+                found.path.display(),
+                found.source
+            ),
+        ),
+        None => DoctorCheck::fail(
+            "engine library",
+            true,
+            "not found via BLOOM_ENGINE_LIBRARY or the installed Flatpak",
+        ),
+    });
+
+    let state = resolve_state(input.engine_state.as_deref(), input.home.as_deref());
+    checks.push(match state {
+        Some(found) if found.path.is_dir() => {
+            DoctorCheck::pass("engine state", true, found.detail())
+        }
+        Some(found) => DoctorCheck::fail(
+            "engine state",
+            true,
+            format!(
+                "{} ({}): not a directory",
+                found.path.display(),
+                found.source
+            ),
+        ),
+        None => DoctorCheck::fail(
+            "engine state",
+            true,
+            "not found via BLOOM_ENGINE_STATE or the default Flatpak location",
+        ),
+    });
+
+    let dart = resolve_dart(
+        input.dart.as_deref(),
+        input.path_env.as_deref(),
+        input.home.as_deref(),
+    );
+    checks.push(match dart {
+        Some(found) if is_executable(&found.path) => {
+            DoctorCheck::pass("dart executable", true, found.detail())
+        }
+        Some(found) => DoctorCheck::fail(
+            "dart executable",
+            true,
+            format!(
+                "{} ({}): not an executable file",
+                found.path.display(),
+                found.source
+            ),
+        ),
+        None => DoctorCheck::fail(
+            "dart executable",
+            true,
+            "not found via BLOOM_DART_EXECUTABLE, PATH, or a local Dart SDK",
+        ),
+    });
+
+    let socket = resolve_socket(input.socket_env.as_deref(), &input.default_socket);
+    let listening = daemon_answers(&socket.path);
+    let daemon_detail = if listening {
+        format!("a daemon is already listening at {}", socket.path.display())
+    } else {
+        format!(
+            "not listening at {}; bloom would start bloomd",
+            socket.path.display()
+        )
+    };
+    checks.push(DoctorCheck::pass("socket path", false, socket.detail()));
+    checks.push(DoctorCheck::pass("daemon", false, daemon_detail));
+
+    let store = resolve_store(
+        input.store_env.as_deref(),
+        input.data_home.as_deref(),
+        input.home.as_deref(),
+    );
+    checks.push(DoctorCheck::pass("store path", false, store.detail()));
+
+    checks
+}
+
+/// Render one line per check. Only check names, paths, and sources are printed.
+pub fn doctor_report(checks: &[DoctorCheck]) -> String {
+    checks
+        .iter()
+        .map(|check| {
+            format!(
+                "{:<4} {}: {}\n",
+                if check.ok { "ok" } else { "FAIL" },
+                check.name,
+                check.detail
+            )
+        })
+        .collect()
+}
+
+/// Non-zero when any required check fails.
+pub fn doctor_exit_code(checks: &[DoctorCheck]) -> u8 {
+    u8::from(checks.iter().any(|check| check.required && !check.ok))
+}
+
+/// Run the diagnostics and print them, without starting the daemon or engine.
+pub fn doctor() -> ExitCode {
+    let checks = doctor_checks(&DoctorInput::from_process());
+    print!("{}", doctor_report(&checks));
+    ExitCode::from(doctor_exit_code(&checks))
+}
+
 fn secure_log_parent(log: &Path) -> Result<(), String> {
     let Some(parent) = log.parent() else {
         return Err("daemon log has no parent directory".into());
@@ -462,5 +882,127 @@ mod tests {
     #[test]
     fn the_daemon_log_lives_under_a_bloom_directory() {
         assert!(daemon_log_path().ends_with("bloom/bloomd.log"));
+    }
+
+    fn write_executable(path: &Path) {
+        fs::write(path, b"#!/bin/sh\nexit 0\n").unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(path, fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    /// A synthetic prefix with every required piece present.
+    fn complete_input(prefix: &Path) -> DoctorInput {
+        for name in ["bloom", "bloom-tui", "bloomd"] {
+            write_executable(&prefix.join(name));
+        }
+        let sidecar = prefix.join("bloom-engine/bloom_engine.dart");
+        fs::create_dir_all(sidecar.parent().unwrap()).unwrap();
+        fs::write(&sidecar, "// sidecar\n").unwrap();
+        let library = prefix.join("librust_lib_bluebubbles.so");
+        fs::write(&library, "engine library").unwrap();
+        let state = prefix.join("state");
+        fs::create_dir(&state).unwrap();
+        let dart = prefix.join("dart");
+        write_executable(&dart);
+        DoctorInput {
+            executable: prefix.join("bloom"),
+            path_env: None,
+            engine_script: None,
+            engine_library: Some(library.into_os_string()),
+            engine_state: Some(state.into_os_string()),
+            dart: Some(dart.into_os_string()),
+            socket_env: None,
+            default_socket: prefix.join("absent.sock"),
+            store_env: None,
+            data_home: None,
+            home: Some(prefix.to_path_buf()),
+            repo_script: prefix.join("repo/bloom_engine.dart"),
+            flatpak_library: None,
+        }
+    }
+
+    fn check_named<'a>(checks: &'a [DoctorCheck], name: &str) -> &'a DoctorCheck {
+        checks
+            .iter()
+            .find(|check| check.name == name)
+            .unwrap_or_else(|| panic!("no check named {name}"))
+    }
+
+    #[test]
+    fn all_present_prefix_passes() {
+        let directory = tempfile::tempdir().unwrap();
+        let input = complete_input(directory.path());
+        let checks = doctor_checks(&input);
+        assert!(
+            checks.iter().all(|check| check.ok),
+            "unexpected failure: {}",
+            doctor_report(&checks)
+        );
+        let daemon = check_named(&checks, "daemon");
+        assert!(daemon.detail.contains("absent.sock"));
+        assert_eq!(doctor_exit_code(&checks), 0);
+    }
+
+    #[test]
+    fn missing_companion_fails_with_a_named_check() {
+        let directory = tempfile::tempdir().unwrap();
+        let input = complete_input(directory.path());
+        fs::remove_file(directory.path().join("bloomd")).unwrap();
+        let checks = doctor_checks(&input);
+        let companion = check_named(&checks, "companion bloomd");
+        assert!(!companion.ok);
+        assert!(companion.required);
+        assert!(doctor_report(&checks).contains("FAIL companion bloomd"));
+        assert_eq!(doctor_exit_code(&checks), 1);
+    }
+
+    #[test]
+    fn unreadable_sidecar_fails() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut input = complete_input(directory.path());
+        let unreadable = directory.path().join("not-a-file");
+        fs::create_dir(&unreadable).unwrap();
+        input.engine_script = Some(unreadable.into_os_string());
+        let checks = doctor_checks(&input);
+        let sidecar = check_named(&checks, "sidecar script");
+        assert!(!sidecar.ok);
+        assert!(sidecar.detail.contains("not a readable file"));
+        assert_eq!(doctor_exit_code(&checks), 1);
+    }
+
+    #[test]
+    fn missing_engine_state_or_library_fails() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut input = complete_input(directory.path());
+        let absent = directory.path().join("absent");
+        input.engine_state = Some(absent.clone().into_os_string());
+        input.engine_library = Some(absent.into_os_string());
+        let checks = doctor_checks(&input);
+        assert!(!check_named(&checks, "engine state").ok);
+        assert!(!check_named(&checks, "engine library").ok);
+        assert_eq!(doctor_exit_code(&checks), 1);
+    }
+
+    #[test]
+    fn missing_dart_is_reported_and_does_not_pass() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut input = complete_input(directory.path());
+        input.dart = None;
+        input.path_env = Some(OsString::from(directory.path().join("empty-bin")));
+        let checks = doctor_checks(&input);
+        let dart = check_named(&checks, "dart executable");
+        assert!(!dart.ok);
+        assert!(doctor_report(&checks).contains("FAIL dart executable"));
+        assert_eq!(doctor_exit_code(&checks), 1);
+    }
+
+    #[test]
+    fn exit_status_maps_required_checks_only() {
+        let ok = DoctorCheck::pass("required", true, "present");
+        let optional_fail = DoctorCheck::fail("optional", false, "absent");
+        let required_fail = DoctorCheck::fail("required", true, "absent");
+        assert_eq!(doctor_exit_code(std::slice::from_ref(&ok)), 0);
+        assert_eq!(doctor_exit_code(&[ok, optional_fail]), 0);
+        assert_eq!(doctor_exit_code(&[required_fail]), 1);
     }
 }
