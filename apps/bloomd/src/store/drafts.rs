@@ -588,6 +588,20 @@ pub fn load_draft(
     })
 }
 
+fn map_stored(row: &rusqlite::Row<'_>) -> rusqlite::Result<StoredDraft> {
+    Ok(StoredDraft {
+        rowid: row.get(0)?,
+        conversation_id: row.get(1)?,
+        new_chat_transport: row.get(2)?,
+        new_chat_address: row.get(3)?,
+        transport: row.get(4)?,
+        revision: row.get(5)?,
+        deleted: row.get(6)?,
+        updated_at: row.get(7)?,
+        data: row.get(8)?,
+    })
+}
+
 #[cfg(test)]
 pub(crate) fn corrupt_draft_data_for_test(
     store: &EncryptedStore,
@@ -611,20 +625,6 @@ pub(crate) fn corrupt_draft_data_for_test(
     } else {
         Err(StoreError::Schema)
     }
-}
-
-fn map_stored(row: &rusqlite::Row<'_>) -> rusqlite::Result<StoredDraft> {
-    Ok(StoredDraft {
-        rowid: row.get(0)?,
-        conversation_id: row.get(1)?,
-        new_chat_transport: row.get(2)?,
-        new_chat_address: row.get(3)?,
-        transport: row.get(4)?,
-        revision: row.get(5)?,
-        deleted: row.get(6)?,
-        updated_at: row.get(7)?,
-        data: row.get(8)?,
-    })
 }
 
 #[cfg(test)]

@@ -2,12 +2,15 @@
 
 use crate::composer::wrap_draft;
 use crate::daemon::{ConnectionState, Snapshot, HISTORY_LIMIT};
+use crate::drafts::DraftMap;
 use crate::ui::{Hit, HitMap};
 use bloom_domain::{
     Conversation, ConversationId, ConversationKind, Handle, HandleKind, Message, MessageId,
     Participant, TransportId,
 };
-use bloom_ipc::{ConversationSyncStatus, EventKind, MessageSearchHit, ParticipantFilter};
+use bloom_ipc::{
+    ConversationSyncStatus, DraftKey, DurableDraft, EventKind, MessageSearchHit, ParticipantFilter,
+};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEventKind};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::OnceLock;
@@ -196,12 +199,43 @@ pub enum DraftOwner {
     NewChat(Option<String>),
 }
 
+impl DraftOwner {
+    /// Map a composer owner onto the exact durable IPC key it can persist under.
+    /// `openbubbles` is the daemon's current single transport, not a general
+    /// owner-to-transport mapping; multi-transport owners are out of scope.
+    #[doc(hidden)]
+    pub fn durable_key(&self) -> Option<DraftKey> {
+        match self {
+            Self::Conversation(owner) => Some(DraftKey::Conversation {
+                owner: owner.clone(),
+            }),
+            Self::NewChat(Some(address)) => Some(DraftKey::NewChat {
+                transport: TransportId::new("openbubbles").expect("valid transport"),
+                address: address.clone(),
+            }),
+            Self::NewChat(None) => None,
+        }
+    }
+}
+
 #[doc(hidden)]
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct SavedDraft {
     text: String,
     cursor: usize,
     pasted_body: bool,
+    uncertain: bool,
+}
+
+impl SavedDraft {
+    fn durable(&self) -> DurableDraft {
+        DurableDraft {
+            body: self.text.clone(),
+            cursor: self.cursor.min(self.text.graphemes(true).count()),
+            pasted_body: self.pasted_body,
+            uncertain: self.uncertain,
+        }
+    }
 }
 
 /// A composer snapshot captured before an edit. Restoring it keeps text, cursor
@@ -212,6 +246,7 @@ pub struct ComposerSnapshot {
     pub text: String,
     pub cursor: usize,
     pub pasted_body: bool,
+    pub uncertain: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -398,6 +433,9 @@ pub struct App {
     pub draft: String,
     /// Pasted body text is literal even when it starts with a command prefix.
     pub pasted_body: bool,
+    /// The last send outcome was uncertain; kept with the draft until it is sent.
+    #[doc(hidden)]
+    pub draft_uncertain: bool,
     /// Extended-grapheme insertion position in the draft.
     pub draft_cursor: usize,
     #[doc(hidden)]
@@ -600,6 +638,7 @@ impl Default for App {
             syncing: false,
             draft: String::new(),
             pasted_body: false,
+            draft_uncertain: false,
             draft_cursor: 0,
             draft_vertical_column: None,
             drafts: HashMap::new(),
@@ -1043,6 +1082,7 @@ impl App {
                         text: self.draft.clone(),
                         cursor: self.draft_cursor,
                         pasted_body: self.pasted_body,
+                        uncertain: self.draft_uncertain,
                     },
                 );
             }
@@ -1054,6 +1094,7 @@ impl App {
         self.draft = saved.text;
         self.draft_cursor = saved.cursor.min(self.draft.graphemes(true).count());
         self.pasted_body = saved.pasted_body;
+        self.draft_uncertain = saved.uncertain;
         self.draft_vertical_column = None;
         self.command_menu = false;
         self.update_command_menu();
@@ -1068,6 +1109,7 @@ impl App {
         self.draft.clear();
         self.draft_cursor = 0;
         self.pasted_body = false;
+        self.draft_uncertain = false;
         self.draft_vertical_column = None;
         self.command_menu = false;
     }
@@ -1087,6 +1129,93 @@ impl App {
                 snapshot.owner = Some(to_owner);
             }
         }
+    }
+
+    /// The active owner as an exact durable key, if this buffer may be persisted.
+    #[doc(hidden)]
+    pub fn current_persistable_owner(&self) -> Option<DraftKey> {
+        self.active_draft_owner
+            .as_ref()
+            .and_then(DraftOwner::durable_key)
+            .filter(DraftKey::is_valid)
+    }
+
+    /// Every session draft that should exist in the durable store. An absent key
+    /// means delete. The active buffer overrides any parked copy, and a suspended
+    /// modal composition is included while its owner is parked.
+    #[doc(hidden)]
+    pub fn desired_drafts(&self) -> DraftMap {
+        fn merge(map: &mut DraftMap, owner: &DraftOwner, saved: &SavedDraft) {
+            let Some(key) = owner.durable_key().filter(DraftKey::is_valid) else {
+                return;
+            };
+            if saved.text.is_empty() {
+                map.remove(&key);
+            } else {
+                // Keep even invalid content so the coordinator can hold the prior
+                // persisted value instead of mistaking it for a delete intent.
+                map.insert(key, saved.durable());
+            }
+        }
+
+        let mut map = DraftMap::new();
+        for (owner, saved) in &self.drafts {
+            merge(&mut map, owner, saved);
+        }
+        if let Some(owner) = &self.active_draft_owner {
+            merge(
+                &mut map,
+                owner,
+                &SavedDraft {
+                    text: self.draft.clone(),
+                    cursor: self.draft_cursor,
+                    pasted_body: self.pasted_body,
+                    uncertain: self.draft_uncertain,
+                },
+            );
+        }
+        if let Some(snapshot) = &self.suspended_composition {
+            if let Some(owner) = &snapshot.owner {
+                merge(&mut map, owner, &snapshot.saved);
+            }
+        }
+        map
+    }
+
+    /// Apply a loaded draft only to an empty active composer that still owns the
+    /// exact key and has no newer local copy. Returns whether anything changed.
+    #[doc(hidden)]
+    pub fn apply_loaded_draft(&mut self, key: DraftKey, draft: DurableDraft) -> bool {
+        // The active empty buffer is authoritative for saving, but it must not
+        // clobber a newer parked or suspended body for the same owner.
+        let has_local_copy = self.drafts.iter().any(|(owner, saved)| {
+            owner.durable_key().as_ref() == Some(&key) && !saved.text.is_empty()
+        }) || self.suspended_composition.as_ref().is_some_and(|snapshot| {
+            snapshot
+                .owner
+                .as_ref()
+                .and_then(DraftOwner::durable_key)
+                .as_ref()
+                == Some(&key)
+                && !snapshot.saved.text.is_empty()
+        });
+        if self.current_persistable_owner().as_ref() != Some(&key)
+            || !self.draft.is_empty()
+            || !draft.is_valid()
+            || has_local_copy
+            || self.desired_drafts().contains_key(&key)
+        {
+            return false;
+        }
+        self.clear_undo_history();
+        self.draft = draft.body;
+        self.draft_cursor = draft.cursor.min(self.draft.graphemes(true).count());
+        self.pasted_body = draft.pasted_body;
+        self.draft_uncertain = draft.uncertain;
+        self.draft_vertical_column = None;
+        self.command_menu = false;
+        self.update_command_menu();
+        true
     }
 
     /// Restore only the selected identity's draft. A modal never owns message text.
@@ -1118,10 +1247,12 @@ impl App {
                 text: std::mem::take(&mut self.draft),
                 cursor: self.draft_cursor,
                 pasted_body: self.pasted_body,
+                uncertain: self.draft_uncertain,
             },
         });
         self.draft_cursor = 0;
         self.pasted_body = false;
+        self.draft_uncertain = false;
         self.command_menu = false;
     }
 
@@ -1532,6 +1663,7 @@ impl App {
         self.draft.clear();
         self.draft_cursor = 0;
         self.pasted_body = false;
+        self.draft_uncertain = false;
         self.error = None;
     }
 
@@ -1541,6 +1673,7 @@ impl App {
         self.draft.clear();
         self.draft_cursor = 0;
         self.pasted_body = false;
+        self.draft_uncertain = false;
         self.resume_composer_draft();
     }
 
@@ -2273,6 +2406,7 @@ impl App {
         self.draft.clear();
         self.draft_cursor = 0;
         self.pasted_body = false;
+        self.draft_uncertain = false;
         self.resume_composer_draft();
     }
 
@@ -2290,6 +2424,7 @@ impl App {
         self.draft.clear();
         self.draft_cursor = 0;
         self.pasted_body = false;
+        self.draft_uncertain = false;
         self.resume_composer_draft();
     }
 
@@ -2692,6 +2827,7 @@ impl App {
             text: self.draft.clone(),
             cursor: self.draft_cursor,
             pasted_body: self.pasted_body,
+            uncertain: self.draft_uncertain,
         }
     }
 
@@ -2730,6 +2866,7 @@ impl App {
         self.draft = snapshot.text;
         self.draft_cursor = snapshot.cursor.min(self.draft.graphemes(true).count());
         self.pasted_body = snapshot.pasted_body;
+        self.draft_uncertain = snapshot.uncertain;
         self.draft_vertical_column = None;
         // Normalise last: an empty draft must leave literal-paste mode, or a later
         // `/command` would be sent as text.
@@ -3009,6 +3146,7 @@ impl App {
         let trimmed = self.draft.trim_start();
         if self.draft.is_empty() {
             self.pasted_body = false;
+            self.draft_uncertain = false;
         }
         self.command_menu = !self.pasted_body
             && !self.new_conversation
@@ -3396,6 +3534,7 @@ impl App {
         self.draft = recovery.body;
         // A recovered body is always message data, even if it begins with '/'.
         self.pasted_body = true;
+        self.draft_uncertain = recovery.uncertain;
         self.draft_cursor = self.draft.graphemes(true).count();
         self.draft_vertical_column = None;
         self.focus = Focus::Composer;
@@ -3602,6 +3741,7 @@ impl App {
         }
         if self.draft.is_empty() {
             self.pasted_body = false;
+            self.draft_uncertain = false;
         }
         let newline = (key.code == KeyCode::Char('j')
             && key.modifiers.contains(KeyModifiers::CONTROL))
@@ -8029,5 +8169,198 @@ mod tests {
             Some(&(10, newest.id().clone()))
         );
         assert_eq!(reloaded.read_positions.len(), 1);
+    }
+    #[test]
+    fn draft_owner_maps_to_exact_durable_ipc_keys() {
+        let chat = conversation("Exact@Example.test", Some(10));
+        match DraftOwner::Conversation(chat.id.clone()).durable_key() {
+            Some(DraftKey::Conversation { owner }) => assert_eq!(owner, chat.id),
+            other => panic!("unexpected conversation key: {other:?}"),
+        }
+        match DraftOwner::NewChat(Some("Exact@Example.test".into())).durable_key() {
+            Some(DraftKey::NewChat { transport, address }) => {
+                assert_eq!(transport.as_str(), "openbubbles");
+                assert_eq!(address, "Exact@Example.test");
+            }
+            other => panic!("unexpected new-chat key: {other:?}"),
+        }
+        assert_eq!(DraftOwner::NewChat(None).durable_key(), None);
+    }
+
+    #[test]
+    fn uncertainty_survives_retarget_modal_alias_and_recovery() {
+        let first = conversation("uncertain-first@example.test", Some(10));
+        let second = conversation("uncertain-second@example.test", Some(20));
+        let mut app = App::default();
+        app.set_conversations(vec![first.clone(), second.clone()]);
+        app.select(Some(first.id.clone()));
+        app.draft = "uncertain body".into();
+        app.draft_cursor = 4;
+        app.pasted_body = true;
+        app.draft_uncertain = true;
+
+        app.select(Some(second.id.clone()));
+        assert!(!app.draft_uncertain);
+        app.select(Some(first.id.clone()));
+        assert_eq!(app.draft, "uncertain body");
+        assert_eq!(app.draft_cursor, 4);
+        assert!(app.pasted_body);
+        assert!(app.draft_uncertain);
+
+        app.open_search();
+        assert!(app
+            .suspended_composition
+            .as_ref()
+            .is_some_and(|snapshot| snapshot.saved.uncertain));
+        app.close_search();
+        assert!(app.draft_uncertain);
+        assert_eq!(app.draft, "uncertain body");
+
+        let old = app.active_draft_owner.clone().expect("active owner");
+        let replacement = conversation("uncertain-aliased@example.test", Some(30));
+        let new_id = replacement.id.clone();
+        app.migrate_draft_owner(&first.id, &new_id);
+        assert_eq!(
+            app.active_draft_owner,
+            Some(DraftOwner::Conversation(new_id.clone()))
+        );
+        assert_ne!(app.active_draft_owner, Some(old));
+        assert!(app.draft_uncertain);
+
+        app.restore_send_draft(RecoveryDraft {
+            attempt: 1,
+            target: None,
+            origin: Some(new_id),
+            origin_focus: Focus::Composer,
+            address: None,
+            body: "failed body".into(),
+            uncertain: true,
+        });
+        assert_eq!(app.draft, "failed body");
+        assert!(app.pasted_body);
+        assert!(app.draft_uncertain);
+        app.handle_key(KeyEvent::new(KeyCode::Char('!'), KeyModifiers::NONE));
+        assert!(
+            app.draft_uncertain,
+            "editing must not retry or clear uncertainty"
+        );
+    }
+
+    #[test]
+    fn desired_drafts_include_active_parked_and_suspended_copies() {
+        let active = conversation("desired-active@example.test", Some(10));
+        let parked = conversation("desired-parked@example.test", Some(20));
+        let suspended = conversation("desired-suspended@example.test", Some(30));
+        let mut app = App::default();
+        app.set_conversations(vec![active.clone(), parked.clone(), suspended.clone()]);
+        app.select(Some(active.id.clone()));
+        app.draft = "active body".into();
+        app.draft_cursor = 6;
+        app.draft_uncertain = true;
+        app.drafts.insert(
+            DraftOwner::Conversation(parked.id.clone()),
+            SavedDraft {
+                text: "parked body".into(),
+                cursor: 6,
+                pasted_body: true,
+                uncertain: true,
+            },
+        );
+        app.suspended_composition = Some(SuspendedComposition {
+            owner: Some(DraftOwner::Conversation(suspended.id.clone())),
+            saved: SavedDraft {
+                text: "suspended body".into(),
+                cursor: 9,
+                pasted_body: false,
+                uncertain: true,
+            },
+        });
+
+        let desired = app.desired_drafts();
+        assert_eq!(
+            desired
+                .get(&DraftKey::Conversation {
+                    owner: active.id.clone()
+                })
+                .expect("active draft")
+                .body,
+            "active body"
+        );
+        assert_eq!(
+            desired
+                .get(&DraftKey::Conversation {
+                    owner: parked.id.clone()
+                })
+                .expect("parked draft")
+                .body,
+            "parked body"
+        );
+        assert_eq!(
+            desired
+                .get(&DraftKey::Conversation {
+                    owner: suspended.id.clone()
+                })
+                .expect("suspended draft")
+                .body,
+            "suspended body"
+        );
+        assert_eq!(
+            app.current_persistable_owner(),
+            Some(DraftKey::Conversation {
+                owner: active.id.clone()
+            })
+        );
+
+        let active_key = DraftKey::Conversation {
+            owner: active.id.clone(),
+        };
+        app.draft.clear();
+        assert!(!app.desired_drafts().contains_key(&active_key));
+    }
+
+    #[test]
+    fn loaded_draft_restores_only_an_empty_unowned_active_composer() {
+        let chat = conversation("loaded@example.test", Some(10));
+        let other = conversation("loaded-other@example.test", Some(20));
+        let key = DraftKey::Conversation {
+            owner: chat.id.clone(),
+        };
+        let mut app = App::default();
+        app.set_conversations(vec![chat.clone(), other.clone()]);
+        app.select(Some(chat.id.clone()));
+        let loaded = DurableDraft {
+            body: "e\u{301}x".into(),
+            cursor: 2,
+            pasted_body: true,
+            uncertain: true,
+        };
+        assert!(app.apply_loaded_draft(key.clone(), loaded.clone()));
+        assert_eq!(app.draft, "e\u{301}x");
+        assert_eq!(app.draft_cursor, app.draft.graphemes(true).count());
+        assert!(app.pasted_body);
+        assert!(app.draft_uncertain);
+
+        assert!(!app.apply_loaded_draft(key.clone(), loaded.clone()));
+        app.draft = "local wins".into();
+        assert!(!app.apply_loaded_draft(key.clone(), loaded.clone()));
+        assert_eq!(app.draft, "local wins");
+
+        app.draft.clear();
+        app.select(Some(other.id.clone()));
+        assert!(!app.apply_loaded_draft(key.clone(), loaded.clone()));
+        assert!(app.draft.is_empty());
+
+        app.select(Some(chat.id.clone()));
+        app.drafts.insert(
+            DraftOwner::Conversation(chat.id.clone()),
+            SavedDraft {
+                text: "newer local".into(),
+                cursor: 1,
+                pasted_body: false,
+                uncertain: false,
+            },
+        );
+        assert!(!app.apply_loaded_draft(key, loaded));
+        assert!(app.draft.is_empty());
     }
 }

@@ -247,6 +247,20 @@ impl FakeDaemon {
                                     )
                                     .await;
                                 }
+                                RequestKind::DraftSave { .. }
+                                | RequestKind::DraftLoad { .. }
+                                | RequestKind::DraftDelete { .. } => {
+                                    let _ = write_response(
+                                        &mut stream,
+                                        &Response {
+                                            request_id,
+                                            response: ResponseKind::Error {
+                                                error: ProtocolError::Unsupported,
+                                            },
+                                        },
+                                    )
+                                    .await;
+                                }
                                 RequestKind::Subscribe => {
                                     // Register before acknowledging, so an event
                                     // published after the client sees Subscribed

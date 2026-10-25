@@ -3,6 +3,7 @@ pub(crate) mod composer;
 pub mod config;
 pub mod daemon;
 pub mod diagnostics;
+pub mod drafts;
 #[cfg(unix)]
 pub mod launcher;
 pub mod transcript;
