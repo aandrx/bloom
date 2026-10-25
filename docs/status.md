@@ -6,7 +6,7 @@
 
 - Rust daemon serving authenticated local Unix-socket IPC, external Dart engine adapter, encrypted SQLite storage/keychain integration, idempotent message ingestion and persistence before inbound fanout.
 - TUI conversation list, local stored transcript, sender grouping, text composition/sending, existing/new-chat correlation, event-driven delivery labels, uncertain-outcome warnings and explicit failed-draft recovery.
-- Recipient-owned session drafts and modal suspension, literal bracketed paste, grapheme editing/wrapping, exact multiline whitespace, responsive resize, and session-only composer undo/redo that clears when the draft changes owner.
+- Recipient-owned durable drafts (debounced to the daemon's encrypted store over IPC v7, bounded retention, exact-owner restore, delete on send or explicit cancel) and modal suspension, literal bracketed paste, grapheme editing/wrapping, exact multiline whitespace, responsive resize, and session-only composer undo/redo that clears when the draft changes owner.
 - On-demand older-page loading from local storage: reaching the oldest loaded row fetches the previous keyset page, keeps it across reconciliation for chats you paged back, and bounds retained paged history. Chats you never paged still replace wholesale, and no remote history is fetched.
 - Message-owned reading anchors across arrivals/reconciliation/edits/reflow and canonical identities; measured mouse/End Latest action and painted-overlay wheel ownership.
 - Local unread badges and `/unread` or Ctrl+B then `u` navigation over loaded incoming messages. Markers advance only after a successfully displayed latest transcript, migrate across aliases, and persist in private but unencrypted TUI preferences. No marker or loaded history means unknown unread state, not zero. These are not remote read receipts.
@@ -29,7 +29,7 @@
 | Rich messaging | Inbound attachment metadata keeps reported names; inbound built-in reactions render read-only aggregate counts; inbound text edits and whole-body unsends apply transactionally with `Edited` / `Unsent · retained locally` notes; unsupported parts stay generic placeholders; no attachment file send/open/download, outbound reactions/edits/unsend, or partial multipart unsend |
 | Delivery | Labels reflect mapped transport events; presence of a Read enum is not proof of remote read-receipt support |
 | Accounts | Reuses an existing registration; no Bloom sign-in/activation/recovery; renewal unconfirmed |
-| Composition/reading | Session-only drafts and undo in the TUI; the daemon now has encrypted bounded draft storage and typed IPC v7 save/load/delete operations, but TUI debounce/restore/clear is not wired; local unread counts cover only loaded messages with a saved marker; markers have no automatic expiry; no attachment content search |
+| Composition/reading | Debounced durable drafts in the daemon's encrypted store through IPC v7: exact-owner restore, bounded retention, delete on send/cancel, and uncertainty after an unsettled quit. Undo remains session-only; local unread counts cover only loaded messages with a saved marker; markers have no automatic expiry; no attachment content search |
 | Packaging/platforms | Linux/OpenBubbles Flatpak is the documented setup; not a standalone Cargo-only or Windows distribution |
 | Accessibility | Keyboard/grapheme/monochrome/light-theme coverage, not broad terminal/font/screen-reader validation |
 | Future GUI/transport | GPUI not started; independent registration blocked at Gate 0; Matrix remains an excluded proof |
