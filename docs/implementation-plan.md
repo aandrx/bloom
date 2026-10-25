@@ -2,7 +2,7 @@
 
 **Status: active next-work plan, not completed features.** Replaces the obsolete foundation/direct-transport wave list. Read [handoff](handoff.md), [current design](system-design.md), [status](status.md) and [completed iteration](iteration-review.md) first.
 
-**Current user priority: UI/UX quality for the existing chat client.** The [reading/navigation pass](ux-polish-review.md) records its accepted bounded scope, and the [switching-latency follow-up](tui-switching-performance.md) records the lag report, measurements and acceptance. The daily reading loop now has local paging, text search with bounded deep-hit views, participant scope, session undo, and local unread navigation. Backend recovery and historical import remain queued behind that work.
+**Current user priority: consolidate the accepted client before adding features.** The reading/navigation loop, filename search, generation-scoped engine recovery, and inbound reaction display are implemented with synthetic evidence. Documentation has been reconciled and the consolidated universal synthetic gate passes: workspace/all-target and Tokyo tests, strict workspace Clippy, formatting, dependency and source guards, rebuilt binaries, 65 fixture tests, 13 input PTY tests, 4 messaging PTY tests, 16 reading PTY tests, 8 launcher tests, and 58 Dart tests plus format/analyze. Historical import remains blocked, packaging phase 4 remains parked without a diagnostic lead, and no outbound reaction work is planned.
 
 Multi-service integration and workspace/server navigation are deferred. Preserve [multi-service-research.md](multi-service-research.md) as research, not an active implementation instruction.
 
@@ -14,13 +14,13 @@ Rust daemon/domain/IPC/secret-store boundary, encrypted persistence, external Da
 
 The section numbers below group work by area; they are not execution order.
 
-1. Native filename search is implemented on IPC v6 in the working tree and is recorded in the [filename-search contract](filename-search.md). Matcher units pass 118 parent-run daemon tests and static checks; the fixture component passes 61 parent-run tests with 64 golden cases and 468 checked Mc scalars matching pinned Rust; the UI passes parent TUI/Tokyo/static checks, 119 render tests, and rebuilt named-context PTY probes at 100/44/24 columns; the persistent owner/cursor/send case passes the full 15-case reading suite. Parent completed the Rust/static/build checks and the runtime rerun passes all suites. One earlier legacy unread RPC timeout remains unresolved. Final cross-component source review found no confirmed new defect. The filename feature is accepted at the documented synthetic store/IPC/real-TUI boundary, with its limits explicit. Nothing is committed or deployed. The accepted [metadata-preservation prerequisite](attachment-metadata.md) and [baseline gap](attachment-search-gap.md) remain historical records; do not redispatch them. Never search placeholders or infer filenames.
+1. Native filename search is implemented on IPC v6 and is recorded in the [filename-search contract](filename-search.md). Matcher units pass 118 parent-run daemon tests and static checks; the fixture component passes 61 parent-run tests with 64 golden cases and 468 checked Mc scalars matching pinned Rust; the UI passes parent TUI/Tokyo/static checks, 119 render tests, and rebuilt named-context PTY probes at 100/44/24 columns; the persistent owner/cursor/send case passes the full 15-case reading suite. Parent completed the Rust/static/build checks and the runtime rerun passes all suites. One earlier legacy unread RPC timeout remains unresolved. Final cross-component source review found no confirmed new defect. The filename feature is accepted at the documented synthetic store/IPC/real-TUI boundary, with its limits explicit. The feature is committed locally but not deployed. The accepted [metadata-preservation prerequisite](attachment-metadata.md) and [baseline gap](attachment-search-gap.md) remain historical records; do not redispatch them. Never search placeholders or infer filenames.
 2. Participant-context search and deep-hit navigation are accepted with the evidence below. Attachment sending, download/open, content extraction, and remote history remain outside these metadata/search units.
-3. Start generation-scoped engine recovery only when resuming backend work. Historical ingestion, packaging, and rich messaging remain queued.
+3. Generation-scoped engine recovery and inbound reaction display are accepted with synthetic evidence, and the consolidated universal gate passes. No repair is required before choosing another feature. Historical ingestion remains blocked; packaging phase 4 remains parked; inbound edits/unsend are the next optional rich-message correctness unit.
 
 Keep the launcher on debug. Do not add durable drafts, remote read receipts, or multi-service work to this unit.
 
-Local unread navigation is accepted under shipp with synthetic evidence. Workspace all-target tests, Tokyo-timezone TUI tests, strict workspace Clippy, formatting, and source guard pass after the review fixes. Final rebuilt runtime suites pass: 10 fixture, 12 input, 4 messaging, 10 reading/navigation, and 8 launcher tests. The scoped follow-up source review found no confirmed defects in the corrections. Regressions were observed failing before fixes for stranded alias markers, outgoing unread counts, and competing search jumps. The actual PTY flow also proves saved marker advancement after drawing and a first-unread jump distinct from latest. A settings-save defect noted here is fixed in the working tree: a failed save requested no redraw and retried the same failing config on later iterations. The loop now suppresses retries of a config value that already failed, requests a frame on failure, and clears only its own stale message when nothing is pending. Unit tests cover suppression and the pending-change branch, and an actual-PTY case shows the error painting within 1.5 seconds. A red-proof showed that PTY flow also passes without the redraw request, so it bounds visible latency rather than isolating the fix. No live account or engine was accessed.
+Local unread navigation is accepted under shipp with synthetic evidence. Workspace all-target tests, Tokyo-timezone TUI tests, strict workspace Clippy, formatting, and source guard pass after the review fixes. Final rebuilt runtime suites pass: 10 fixture, 12 input, 4 messaging, 10 reading/navigation, and 8 launcher tests. The scoped follow-up source review found no confirmed defects in the corrections. Regressions were observed failing before fixes for stranded alias markers, outgoing unread counts, and competing search jumps. The actual PTY flow also proves saved marker advancement after drawing and a first-unread jump distinct from latest. A settings-save defect noted here is fixed: a failed save requested no redraw and retried the same failing config on later iterations. The loop now suppresses retries of a config value that already failed, requests a frame on failure, and clears only its own stale message when nothing is pending. Unit tests cover suppression and the pending-change branch, and an actual-PTY case shows the error painting within 1.5 seconds. A red-proof showed that PTY flow also passes without the redraw request, so it bounds visible latency rather than isolating the fix. No live account or engine was accessed.
 
 ## Queued backend/product work and acceptance
 
@@ -30,13 +30,7 @@ Historical message ingestion has a [design-only plan](historical-ingestion-plan.
 
 The [engine recovery plan](engine-recovery-plan.md) is implemented and wired. A pure bounded retry policy, a swappable engine slot, a drain-and-join generation seam, an unwired-then-wired restart loop, and TUI outage labels all pass synthetic checks, including a runtime test that kills a real child process and observes a replacement. Crash loops now exhaust the attempt budget because a generation must stay up for a stability window before it resets the budget. Initial start failure stays fatal, uncertain sends are never replayed, and the real Dart sidecar remains live-unverified.
 
-Problem: TUI reconnects to IPC but a dead engine child is not automatically replaced.
-
-Design before implementation: exclusive registration ownership, generation IDs, fresh event channels, stale-event rejection, bounded backoff, stop/cancellation during restart, and failure presentation. Reap the old child before a new owner starts. Uncertain sends are never automatically replayed.
-
-Likely ownership: daemon `engine.rs`, `supervisor.rs`, `session.rs` and service/lifecycle tests. Freeze cross-file contracts before delegation.
-
-Acceptance: fake-sidecar E2E covers crash, malformed output, delayed old-generation events, repeated failure/backoff, shutdown during backoff, queued persistence, single owner and no duplicate send. Authorized live receive/restart is a separate user-approved release gate.
+Accepted boundary: policy, swapping, old-generation drain/join, daemon wiring, stability-window budgeting, shutdown cancellation, TUI outage presentation, and a synthetic real-child replacement test are covered. Authorized live receive/restart against the real Dart sidecar is a separate user-approved release gate. No further recovery implementation is queued before that evidence.
 
 ### 2. Verified historical ingestion (design complete, blocked)
 
@@ -80,11 +74,11 @@ Participant-context search, accepted under shipp with synthetic coverage:
 
 Next in this section:
 
-- Native filename search is implemented in the working tree on IPC v6; see the [filename-search contract](filename-search.md) for the matching, snippet, display and v6 rules. Component checks pass. The rebuilt Rust/static checks and completed runtime rerun pass. Final cross-component source review found no confirmed new defect; the filename feature is accepted with the recorded limits. Do not redispatch the accepted metadata prerequisite. Old unsupported placeholders have no name to recover.
+- Native filename search is implemented and accepted on IPC v6; see the [filename-search contract](filename-search.md) for the matching, snippet, display and v6 rules. Do not redispatch the accepted metadata prerequisite. Old unsupported placeholders have no name to recover.
 
 Later in this section:
 
-- Filename search over stored text plus reported names is implemented and awaits the final rebuilt workspace/runtime gate. Attachment content search, file send/open/download, and old-placeholder recovery remain out of scope. Participant-context search is implemented.
+- Filename search over stored text plus reported names and participant-context search are accepted. Attachment content search, file send/open/download, and old-placeholder recovery remain out of scope.
 - Durable encrypted drafts have a [design](durable-drafts-plan.md): daemon-owned encrypted rows keyed by conversation or new-chat address, optimistic revisions with delete tombstones, bounded retention, and IPC v7. Undo stays session-only until phases 1 to 4 pass.
 - Typed interaction modes to reduce independent flag combinations, but only behind regression coverage for modal transitions, recipient changes, aliases, filters and asynchronous results.
 
@@ -108,7 +102,7 @@ If it is revisited: an isolated install builds and runs both profiles, terminal 
 
 ### 6. Rich messaging and future GUI
 
-Attachments, replies/reactions, edits/unsend, typing/read receipts and group management require transport mapping, persistence, IPC and interaction together. Capability declarations are not enough. GPUI remains deferred; [bookmark](gpui-surface.md) records exploration without scheduling it. Independent registration stays blocked by [Gate 0](ids-validation-gate.md).
+Inbound built-in reactions are accepted through mapping, persistence, fixture parity and read-only TUI display. `Capabilities.reactions` remains false because Bloom has no outbound reaction operation and does not plan to add one for this project scope. If rich-message correctness resumes, inbound edits and unsend are the next bounded design unit. Attachment transfer, replies, typing/read receipts and group management still require transport mapping, persistence, IPC and interaction together; capability declarations alone are not implementation. GPUI remains deferred, and independent registration stays blocked by [Gate 0](ids-validation-gate.md).
 
 ## Universal release gates
 

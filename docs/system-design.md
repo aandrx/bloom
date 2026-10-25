@@ -76,7 +76,7 @@ IPC carries an explicit protocol version byte. It is currently 6. Version 2 adde
 
 The engine adapter rejects malformed/oversized output, fails pending waiters on stream failure and reaps the old child. Clean shutdown drains forwarding and persistence within bounds; it does not simply abort the store consumer. The launcher grants a 30-second daemon stop budget to cover drain stages, then forces termination/reaps if necessary. Signals during startup and active TUI operation clean up owned children. Pre-existing daemons are not terminated by a reusing launcher. Original terminal modes are restored on launcher exit.
 
-There is no automatic engine-generation recovery after child failure. IPC reconnect is not engine restart. Future recovery must reap the old owner before creating a fresh generation, reject stale-generation events and never replay uncertain sends automatically.
+Automatic engine-generation recovery is implemented after a successfully started child fails. The daemon drains and joins the old generation, reaps its child, waits under a bounded retry policy, constructs a fresh generation, and swaps the service's engine slot only after the replacement starts. A generation must remain stable for 60 seconds before the retry budget resets, so crash loops eventually give up. Initial start failure remains fatal, shutdown cancels recovery, and uncertain sends are never replayed. A synthetic real-child test proves replacement; the real Dart sidecar restart path remains live-unverified.
 
 ## UI architecture
 
@@ -91,7 +91,7 @@ There is no automatic engine-generation recovery after child failure. IPC reconn
 - Engine startup reads/writes registration and consumes pushes. Only synthetic fixtures run by default. Live tests require fresh explicit authorization and safe durable capture.
 - No engine binary vendoring or generated-binding hand edits. Matching engine version/content hash is required.
 - No Bloom-owned authentication, registration or account recovery. Current state labels do not prove renewal support.
-- No rich-message UI, authoritative unread totals for all conversations, remote read-state authority, or complete archive support. Local text search and bounded local unread navigation are implemented. Keep product claims aligned with end-to-end implementation.
+- Inbound built-in reactions are mapped, persisted, and rendered as aggregate counts. The transport does not advertise outbound reaction capability and has no reaction send operation. There is no edit/unsend workflow, attachment transfer UI, authoritative unread total for all conversations, remote read-state authority, or complete archive support. Keep product claims aligned with end-to-end implementation.
 
 ## Future surfaces and transports
 

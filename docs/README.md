@@ -24,12 +24,12 @@ Start with [fresh-session handoff](handoff.md). The root [AGENTS.md](../AGENTS.m
 
 | Document | Status / how to use |
 | --- | --- |
-| [Reaction application](reaction-application-plan.md) | Applying inbound reactions to stored messages; design with a sender evidence gate |
+| [Reaction application](reaction-application-plan.md) | Accepted inbound reaction mapping, persistence, fixture parity and TUI display; outbound reactions intentionally unsupported |
 | [Remaining plans](remaining-plans.md) | Packaging tail, launcher profile spike, and gated rich-messaging phases |
 | [Durable drafts plan](durable-drafts-plan.md) | Encrypted daemon-owned drafts, revision guard, retention; design only |
 | [Packaging plan](packaging-plan.md) | Standalone install layout, doctor diagnostics, phases, licensing boundary; design only |
 | [Historical ingestion plan](historical-ingestion-plan.md) | Design-only gate for importing past messages; blocked at the engine boundary |
-| [Engine recovery plan](engine-recovery-plan.md) | Proposed generation-scoped engine restart, invariants, phased units, risks; not implemented |
+| [Engine recovery plan](engine-recovery-plan.md) | Implemented generation-scoped engine restart, synthetic runtime evidence, invariants and live-verification limit |
 | [Attachment filename baseline](attachment-search-gap.md) | Historical ingestion gap, accepted prerequisites, and limits of old unsupported records |
 | [Multi-service research and proposed plan](multi-service-research.md) | Deferred Slack/Discord feasibility, policy/access limits, service-native navigation and staged acceptance gates; not implemented connectors |
 | [Engine-sidecar evidence](engine-sidecar.md) | Historical research/authorized live experiments plus updated integration boundaries; not current-checkout live proof |

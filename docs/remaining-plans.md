@@ -24,12 +24,12 @@ Status: blocked. The release build succeeds, but the probe needs `pyte==0.8.2`, 
 
 Every phase needs an evidence gate first: the sidecar payload must actually carry the variant, and the domain must represent it honestly.
 
-- **6a, inbound reactions.** Gate evidence: the codec defines `react` with `to_uuid`, `to_part`, nested reaction kind, and `enable` (`payload_codec.dart:118-145`), and a Dart test now covers it: the wire form, `enable` removal, and every reaction kind, with all 58 sidecar tests passing. The daemon currently drops it as a skipped non-normal message (`engine.rs:1020-1026`). Domain fields already exist. First units: a Dart codec test for react, then a store-level design for applying a reaction to its target message (dedupe by sender and kind, removal on `enable:false`, ordering by timestamp). Storage changes must not fabricate message rows for unknown targets.
+- **6a, inbound reactions: accepted.** Built-in reactions are decoded, mapped to typed events, applied transactionally without fabricating targets or rewriting message content, preserved by fixture history/context/save/restart, and rendered as aggregate counts in the real TUI PTY at 100/44/24 columns. The transport capability remains false because no outbound operation is supported.
 - **6b, edits and unsent display.** Gate evidence: codec defines `edit` with `tuuid`, `edit_part`, `new_parts` and `unsend` with `tuuid`, `edit_part` (`payload_codec.dart:146-158`), with tests for both. The daemon drops both today. Design must decide whether edit replaces body text in place, records an edit timestamp only, and how unsent rows render while staying in the store.
 - **6c, attachment opening.** Gate: a verified local path and permission model. Opening must never imply download success. This depends on the same blocked source as historical ingestion; do not start it before that gate.
-- **6d, outbound rich sends.** Reactions, edits, unsend, and attachments each need capability negotiation, per-type confirmation, and uncertainty handling. Automatic retry stays forbidden.
+- **6d, outbound rich sends.** Outbound reactions are explicitly unnecessary for this project and remain unsupported. Any future edits, unsend, or attachments would still need an independently proven engine send path, capability negotiation, per-type confirmation, and uncertainty handling. Automatic retry stays forbidden.
 
-Parallelism: 6a and 6b can run together once their payload gates pass. 6c stays blocked. 6d starts only after 6a and 6b are accepted.
+Sequencing: 6a is complete. If rich-message correctness resumes, 6b is the next bounded design unit. 6c stays blocked. 6d is not scheduled.
 
 ## Review points
 

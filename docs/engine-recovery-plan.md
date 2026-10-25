@@ -6,7 +6,9 @@ Status: recovery is implemented, wired, runtime-proven against a synthetic child
 
 The daemon spawns the Dart engine child once. If that child dies after a successful start, IPC keeps serving but sends and events are unusable until the owning launcher restarts the daemon. The TUI sees only its own IPC connection state.
 
-## Current behavior (source facts)
+## Historical pre-implementation behavior (source facts)
+
+The bullets below record the reproduced baseline that motivated the accepted implementation. They are not descriptions of the current tree.
 
 - `Engine::start` spawns the child at `apps/bloomd/src/engine.rs:329`. A spawn error restores the outgoing sender and returns `TransportUnavailable` (`engine.rs:331-336`). If the child exists but its stdout or stdin cannot be taken, the code returns `Internal` without reaping that child, leaves `started` true, and drops the outgoing sender it took, so a later start cannot succeed (`engine.rs:338-340`, with the guard at `318-320`). That is an observed leak and poisoned-state path, repaired by Unit 0.
 - Daemon assembly treats an initial `supervisor.start()` failure as fatal and returns exit code 3 (`apps/bloomd/src/main.rs:105-109`).

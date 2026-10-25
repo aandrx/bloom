@@ -306,7 +306,8 @@ impl Transport for Engine {
     /// The daemon's store-backed send path separately supports plain-text groups.
     fn capabilities(&self) -> Capabilities {
         Capabilities {
-            reactions: true,
+            // Inbound reaction decoding/display does not imply an outbound operation.
+            reactions: false,
             edits: false,
             unsend: false,
             attachments: false,
@@ -1301,6 +1302,18 @@ mod tests {
 
     fn transport() -> TransportId {
         transport_id()
+    }
+
+    #[test]
+    fn engine_does_not_advertise_outbound_reactions() {
+        let engine = Engine::new(EngineConfig {
+            dart_executable: PathBuf::new(),
+            script: PathBuf::new(),
+            state_dir: PathBuf::new(),
+            library: PathBuf::new(),
+            sync_chats: false,
+        });
+        assert!(!engine.capabilities().reactions);
     }
 
     #[test]
