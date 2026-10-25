@@ -809,6 +809,64 @@ class ReadingFlows(unittest.TestCase):
             'wide layout keeps spaced separators',
         )
 
+    def test_edit_and_unsend_notes_render_with_retained_content(self):
+        self.stop_tui()
+        self.fixture.stop_daemon()
+        state = self.fixture.persisted()
+        chat = next(item for item in state['conversations'] if item['id'] == CID)
+        sender = next(participant['handle'] for participant in chat['participants']
+                      if not participant['is_me'])
+        newest = max(item['created_at'] for item in state['messages'])
+
+        def seeded(value, body, created_at, edited_at, unsent_at):
+            return {
+                'id': {'transport': 'openbubbles', 'value': value},
+                'conversation_id': CID,
+                'remote_id': None,
+                'sender': sender,
+                'parts': [{'type': 'text', 'value': body}],
+                'created_at': created_at,
+                'sent_at': None,
+                'delivery': 'delivered',
+                'from_me': False,
+                'edited_at': edited_at,
+                'reactions': [],
+                'unsent_at': unsent_at,
+            }
+
+        state['messages'].append(seeded(
+            'edit-pty-0001', 'EDITED_PTY_MARKER retained revised body',
+            newest + 10, newest + 20, None))
+        state['messages'].append(seeded(
+            'unsent-pty-0001', 'UNSENT_PTY_MARKER retained audit body',
+            newest + 11, None, newest + 21))
+        self.fixture.store_path.write_text(json.dumps(state))
+        self.fixture.start_daemon()
+        self.start_tui()
+
+        def transcript_text():
+            divider = self.screen.display[0].find('│')
+            left = divider + 3 if divider >= 0 else 2
+            return '\n'.join(line[left:] for line in self.screen.display[2:-5])
+
+        for width in (100, 44, 24):
+            self.resize(width, 30)
+            self.wait_for(
+                lambda: 'EDITED_PTY_MARKER' in transcript_text()
+                and 'UNSENT_PTY_MARKER' in transcript_text(),
+                timeout=15,
+            )
+            compact = re.sub(r'\s+', '', transcript_text())
+            self.assertIn('Edited', compact,
+                          f'the edit note must render at {width} columns')
+            self.assertIn('Unsent·retainedlocally', compact,
+                          f'the unsent note must render at {width} columns')
+            self.assertIn('retainedauditbody', compact,
+                          f'unsettled content must stay visible at {width}')
+            self.assertNotIn('deleted', compact.lower(),
+                             f'unsend must not imply deletion at {width}')
+            self.artifact(f'edit-unsend-notes-{width}')
+
 
 if __name__ == '__main__':
     unittest.main(verbosity=2)

@@ -2528,6 +2528,18 @@ impl RenderCache {
     }
 }
 
+/// One dim annotation for an accepted edit or unsend. An unsent message keeps its
+/// locally retained body, so the note says so rather than implying deletion.
+fn mutation_note(message: &Message) -> Option<&'static str> {
+    if message.unsent_at.is_some() {
+        Some("Unsent · retained locally")
+    } else if message.edited_at.is_some() {
+        Some("Edited")
+    } else {
+        None
+    }
+}
+
 /// One aggregate line for a message's reactions: counts per kind, kinds sorted
 /// alphabetically, for example `· heart 2 · like 1`. Sender and time are left
 /// out on purpose; this is a summary, not a ledger. `None` when there are no
@@ -3240,6 +3252,13 @@ fn render_cached_with_mode(
                     }
                 }
                 lines.push(Line::from(body));
+                if let Some(note) = mutation_note(message) {
+                    let mut style = Style::default().fg(palette.muted);
+                    if message.from_me {
+                        style = style.bg(message_surface);
+                    }
+                    lines.push(Line::from(Span::styled(note, style)));
+                }
                 if let Some(summary) = reaction_summary(message) {
                     // Styled as transcript secondary text so it sits under the body
                     // without competing with it, and wrapped by the same paragraph

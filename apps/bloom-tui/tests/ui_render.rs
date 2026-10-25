@@ -5157,3 +5157,51 @@ fn reaction_summary_aggregates_sorts_and_survives_narrow_widths() {
         "unreacted message gained a summary: {transcript:?}"
     );
 }
+
+#[test]
+fn edited_and_unsent_notes_are_truthful_and_survive_narrow_widths() {
+    let chat = conversation("Mutations", 2, 1);
+    let mut edited = message(&chat, "edited", 10, "revised body", false);
+    edited.edited_at = Some(20);
+    let mut unsent = message(&chat, "unsent", 11, "retained body", false);
+    unsent.unsent_at = Some(21);
+    let mut app = App {
+        selected: Some(chat.id.clone()),
+        ..Default::default()
+    };
+    app.set_conversations(vec![chat.clone()]);
+    app.upsert(chat.id.clone(), edited);
+    app.upsert(chat.id.clone(), unsent);
+
+    for width in [100u16, 44, 24] {
+        let (buffer, hits) = cached_frame(&app, width, 18, &mut ui::RenderCache::default());
+        let transcript = transcript_flat(&buffer, &hits);
+        let compact: String = transcript.chars().filter(|c| !c.is_whitespace()).collect();
+        assert!(
+            compact.contains("revisedbody") && compact.contains("Edited"),
+            "width {width} lost the edited note: {transcript:?}"
+        );
+        assert!(
+            compact.contains("retainedbody") && compact.contains("Unsent·retainedlocally"),
+            "width {width} lost the unsent note or body: {transcript:?}"
+        );
+        assert!(
+            !transcript.contains("deleted"),
+            "width {width} implied deletion: {transcript:?}"
+        );
+    }
+
+    // A plain message must gain no annotation.
+    let mut app = App {
+        selected: Some(chat.id.clone()),
+        ..Default::default()
+    };
+    app.set_conversations(vec![chat.clone()]);
+    app.upsert(
+        chat.id.clone(),
+        message(&chat, "plain", 12, "plain body", false),
+    );
+    let (buffer, hits) = cached_frame(&app, 44, 18, &mut ui::RenderCache::default());
+    let transcript = transcript_flat(&buffer, &hits);
+    assert!(!transcript.contains("Edited") && !transcript.contains("Unsent"));
+}

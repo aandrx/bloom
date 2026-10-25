@@ -450,6 +450,47 @@ class Tests(unittest.TestCase):
         self.start()
         observed()
 
+    def test_seeded_edit_and_unsend_state_survives_history_context_and_restart(self):
+        self.stop()
+        canonical = identity("alice@example.invalid")
+        with open(self.store, encoding="utf-8") as stream:
+            state = json.load(stream)
+        builder = runpy.run_path(FAKE)["message"]
+        edited = builder("placeholder@example.invalid", "edited-0001",
+                         1_650_000_000_000, "revised fixture body", False)
+        edited["conversation_id"] = copy.deepcopy(canonical)
+        edited["edited_at"] = 1_650_000_000_500
+        unsent = builder("placeholder@example.invalid", "unsent-0001",
+                         1_650_000_000_100, "retained fixture body", False)
+        unsent["conversation_id"] = copy.deepcopy(canonical)
+        unsent["unsent_at"] = 1_650_000_000_600
+        state["messages"].extend([copy.deepcopy(edited), copy.deepcopy(unsent)])
+        with open(self.store, "w", encoding="utf-8") as stream:
+            json.dump(state, stream, ensure_ascii=False)
+        self.start()
+
+        def observed():
+            history = request(self.sock, "history", conversation_id=canonical, limit=5)
+            rows = {row["id"]["value"]: row for row in history["messages"]}
+            self.assertEqual(rows["edited-0001"]["edited_at"], edited["edited_at"])
+            self.assertIsNone(rows["edited-0001"]["unsent_at"])
+            self.assertEqual(rows["unsent-0001"]["unsent_at"], unsent["unsent_at"])
+            self.assertEqual(rows["unsent-0001"]["parts"], unsent["parts"])
+            context = request(self.sock, "message_context", conversation_id=canonical,
+                              message_id=edited["id"], limit=5)
+            target = next(row for row in context["messages"]
+                          if row["id"]["value"] == "edited-0001")
+            self.assertEqual(target["edited_at"], edited["edited_at"])
+            self.assertEqual(target["parts"], edited["parts"])
+
+        observed()
+        saved = request(self.sock, "send", conversation_id=identity("bob@example.invalid"),
+                        body={"parts": [{"type": "text", "value": "mutation save checkpoint"}]})
+        self.assertEqual(saved["result"], "send")
+        self.stop()
+        self.start()
+        observed()
+
     def test_search_messages_returns_snippet_and_ignores_empty_query(self):
         conversation = {"transport": "openbubbles", "value": "alice@example.invalid"}
         prefix = "0123456789" * 4
