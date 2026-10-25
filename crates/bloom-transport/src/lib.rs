@@ -115,6 +115,9 @@ pub enum TransportEvent {
     Message {
         conversation: Conversation,
         message: Message,
+        /// Optional engine part index for each entry in `message.parts`, aligned
+        /// by position. `None` means the engine did not provide one.
+        part_ids: Vec<Option<u64>>,
         push_sequence: Option<u64>,
     },
     MessageUpdated {

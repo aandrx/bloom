@@ -11,6 +11,24 @@ fn message_id(id: &MessageId) -> Result<String, StoreError> {
     serde_json::to_string(id).map_err(|_| StoreError::Schema)
 }
 
+/// Preserve mutation state accepted from edit, unsend, and reaction updates when a
+/// normal message replay arrives without it. Identity, delivery, sender, creation
+/// time, and conversation stay owned by the caller and are not merged.
+fn merge_mutation_state(existing: &Message, incoming: &Message) -> Message {
+    let mut merged = incoming.clone();
+    if existing.edited_at.is_some() && existing.edited_at >= incoming.edited_at {
+        merged.parts = existing.parts.clone();
+        merged.edited_at = existing.edited_at;
+    }
+    if existing.unsent_at.is_some() && existing.unsent_at >= incoming.unsent_at {
+        merged.unsent_at = existing.unsent_at;
+    }
+    if !existing.reactions.is_empty() && incoming.reactions.is_empty() {
+        merged.reactions = existing.reactions.clone();
+    }
+    merged
+}
+
 /// Insert or update one message row inside an existing transaction.
 fn upsert_message_row(
     tx: &rusqlite::Transaction<'_>,
@@ -28,17 +46,20 @@ fn upsert_message_row(
             |r| Ok((r.get(0)?, r.get(1)?)),
         )
         .optional()?;
+    let mut data = data.to_vec();
     if let Some((owner, old_data)) = previous.as_ref() {
+        let old_message: Message =
+            serde_json::from_slice(old_data).map_err(|_| StoreError::Schema)?;
         if owner != conversation_key {
             if !aliases.contains(owner) {
                 return Err(StoreError::MessageConversationMismatch);
             }
-            let old_message: Message =
-                serde_json::from_slice(old_data).map_err(|_| StoreError::Schema)?;
             let remapped = super::messages::remap_message(&old_message, conversation)?;
             let new_message: Message =
-                serde_json::from_slice(data).map_err(|_| StoreError::Schema)?;
-            let outcome = if remapped == new_message {
+                serde_json::from_slice(&data).map_err(|_| StoreError::Schema)?;
+            let merged = merge_mutation_state(&remapped, &new_message);
+            data = serde_json::to_vec(&merged).map_err(|_| StoreError::Schema)?;
+            let outcome = if remapped == merged {
                 MessageUpsertOutcome::Unchanged
             } else {
                 MessageUpsertOutcome::Updated
@@ -49,6 +70,9 @@ fn upsert_message_row(
             )?;
             return Ok(outcome);
         }
+        let new_message: Message = serde_json::from_slice(&data).map_err(|_| StoreError::Schema)?;
+        let merged = merge_mutation_state(&old_message, &new_message);
+        data = serde_json::to_vec(&merged).map_err(|_| StoreError::Schema)?;
     }
     Ok(match previous {
         None => {
@@ -151,12 +175,31 @@ pub fn ingest_inbound(
     conversation: &Conversation,
     message: &Message,
 ) -> Result<(MessageUpsertOutcome, bool), StoreError> {
+    ingest_inbound_with_parts(store, conversation, message, &[])
+}
+
+/// Ingest one inbound message and, when supplied, persist its engine part identity
+/// map in the same transaction. Empty metadata leaves any existing map untouched.
+pub fn ingest_inbound_with_parts(
+    store: &mut EncryptedStore,
+    conversation: &Conversation,
+    message: &Message,
+    part_ids: &[Option<u64>],
+) -> Result<(MessageUpsertOutcome, bool), StoreError> {
     if conversation.id != *message.conversation_id() {
         return Err(StoreError::MessageConversationMismatch);
+    }
+    if !part_ids.is_empty() && part_ids.len() != message.parts.len() {
+        return Err(StoreError::Schema);
     }
     let conversation_key = conversation_id(&conversation.id)?;
     let message_key = message_id(message.id())?;
     let data = serde_json::to_vec(message).map_err(|_| StoreError::Schema)?;
+    let encoded_part_ids = if part_ids.is_empty() {
+        None
+    } else {
+        Some(serde_json::to_vec(part_ids).map_err(|_| StoreError::Schema)?)
+    };
     let tx = store._connection.transaction()?;
 
     let existing_blob: Option<Vec<u8>> = tx
@@ -209,9 +252,46 @@ pub fn ingest_inbound(
         &aliases,
         &merged.id,
     )?;
+    if let Some(encoded) = &encoded_part_ids {
+        // A replay after an accepted edit may preserve stored edited parts instead
+        // of the replay's original body. Update the map only when it still aligns
+        // with the message that the transaction actually stored.
+        let stored: Vec<u8> = tx.query_row(
+            "SELECT data FROM messages WHERE id=?1",
+            [&message_key],
+            |row| row.get(0),
+        )?;
+        let stored: Message = serde_json::from_slice(&stored).map_err(|_| StoreError::Schema)?;
+        if stored.parts.len() == part_ids.len() {
+            tx.execute(
+                "INSERT INTO message_part_maps(message_id, data) VALUES (?1, ?2)
+                 ON CONFLICT(message_id) DO UPDATE SET data=excluded.data",
+                params![&message_key, encoded],
+            )?;
+        }
+    }
     refresh_summary(&tx, &conversation_key, merged)?;
     tx.commit()?;
     Ok((outcome, created))
+}
+
+/// Read the stored engine part identity map for one message.
+#[cfg(test)]
+fn get_message_part_map(
+    store: &EncryptedStore,
+    message: &MessageId,
+) -> Result<Option<Vec<Option<u64>>>, StoreError> {
+    let key = message_id(message)?;
+    let data: Option<Vec<u8>> = store
+        ._connection
+        .query_row(
+            "SELECT data FROM message_part_maps WHERE message_id=?1",
+            [key],
+            |r| r.get(0),
+        )
+        .optional()?;
+    data.map(|data| serde_json::from_slice(&data).map_err(|_| StoreError::Schema))
+        .transpose()
 }
 
 pub fn update_delivery(
@@ -269,7 +349,7 @@ pub fn update_delivery(
 mod tests {
     use super::*;
     use crate::store::{get_conversation, get_message, list_conversations, KEY_BYTES};
-    use bloom_domain::{ConversationKind, Handle, HandleKind, MessagePart, TransportId};
+    use bloom_domain::{ConversationKind, Handle, HandleKind, MessagePart, Reaction, TransportId};
     use std::fs;
 
     fn fixture() -> (tempfile::TempDir, EncryptedStore, ConversationId) {
@@ -445,5 +525,99 @@ mod tests {
             )
             .unwrap();
         assert_eq!(indexed, Some(40));
+    }
+
+    #[test]
+    fn normal_replay_preserves_accepted_mutation_state() {
+        let (_dir, mut store, cid) = fixture();
+        let conversation = get_conversation(&store, &cid).unwrap().unwrap();
+        let mut accepted = message(&cid, "stable", 10, "original", DeliveryState::Delivered);
+        accepted.parts = vec![MessagePart::Text("edited-body".into())];
+        accepted.edited_at = Some(30);
+        accepted.unsent_at = Some(40);
+        accepted.reactions = vec![Reaction {
+            sender: Handle::new(HandleKind::Opaque, "reactor").unwrap(),
+            kind: "like".into(),
+            remote_id: None,
+            part: Some(0),
+            timestamp: Some(35),
+        }];
+        ingest_inbound_with_parts(&mut store, &conversation, &accepted, &[Some(0)]).unwrap();
+
+        let replay = message(&cid, "stable", 10, "original", DeliveryState::Delivered);
+        let (outcome, _) = ingest_inbound(&mut store, &conversation, &replay).unwrap();
+        assert_eq!(outcome, MessageUpsertOutcome::Unchanged);
+
+        let stored = get_message(&store, accepted.id()).unwrap().unwrap();
+        assert_eq!(stored.parts(), &[MessagePart::Text("edited-body".into())]);
+        assert_eq!(stored.edited_at, Some(30));
+        assert_eq!(stored.unsent_at, Some(40));
+        assert_eq!(stored.reactions, accepted.reactions);
+    }
+
+    #[test]
+    fn part_metadata_must_align_and_empty_metadata_never_erases() {
+        let (_dir, mut store, cid) = fixture();
+        let conversation = get_conversation(&store, &cid).unwrap().unwrap();
+        let first = message(&cid, "aligned", 10, "body", DeliveryState::Delivered);
+        assert!(matches!(
+            ingest_inbound_with_parts(&mut store, &conversation, &first, &[Some(0), Some(1)]),
+            Err(StoreError::Schema)
+        ));
+        assert_eq!(get_message_part_map(&store, first.id()).unwrap(), None);
+
+        ingest_inbound_with_parts(&mut store, &conversation, &first, &[Some(7)]).unwrap();
+        ingest_inbound(&mut store, &conversation, &first).unwrap();
+        assert_eq!(
+            get_message_part_map(&store, first.id()).unwrap(),
+            Some(vec![Some(7)])
+        );
+    }
+
+    #[test]
+    fn replay_with_an_edited_part_count_cannot_overwrite_the_map() {
+        let (_dir, mut store, cid) = fixture();
+        let conversation = get_conversation(&store, &cid).unwrap().unwrap();
+        let original = message(&cid, "changed-count", 10, "body", DeliveryState::Delivered);
+        let mut edited = original.clone();
+        edited.parts = vec![
+            MessagePart::Text("one".into()),
+            MessagePart::Text("two".into()),
+        ];
+        edited.edited_at = Some(20);
+        ingest_inbound_with_parts(&mut store, &conversation, &edited, &[Some(7), Some(7)]).unwrap();
+
+        ingest_inbound_with_parts(&mut store, &conversation, &original, &[Some(9)]).unwrap();
+        assert_eq!(
+            get_message_part_map(&store, original.id()).unwrap(),
+            Some(vec![Some(7), Some(7)])
+        );
+        assert_eq!(
+            get_message(&store, original.id()).unwrap().unwrap().parts(),
+            edited.parts()
+        );
+    }
+
+    #[test]
+    fn part_map_survives_replay_and_restart() {
+        let (dir, mut store, cid) = fixture();
+        let conversation = get_conversation(&store, &cid).unwrap().unwrap();
+        let first = message(&cid, "persisted", 10, "body", DeliveryState::Delivered);
+        ingest_inbound_with_parts(&mut store, &conversation, &first, &[Some(7)]).unwrap();
+        let replay = message(&cid, "persisted", 10, "body", DeliveryState::Delivered);
+        ingest_inbound(&mut store, &conversation, &replay).unwrap();
+        assert_eq!(
+            get_message_part_map(&store, first.id()).unwrap(),
+            Some(vec![Some(7)])
+        );
+
+        drop(store);
+        let store =
+            EncryptedStore::open_with_key(dir.path().join("private/store.db"), &[73; KEY_BYTES])
+                .unwrap();
+        assert_eq!(
+            get_message_part_map(&store, first.id()).unwrap(),
+            Some(vec![Some(7)])
+        );
     }
 }

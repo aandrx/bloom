@@ -485,6 +485,7 @@ async fn exact_direct_identity_reconciles_split_histories_at_the_service_boundar
         .persist(&TransportEvent::Message {
             conversation: engine.clone(),
             message: live,
+            part_ids: Vec::new(),
             push_sequence: None,
         })
         .unwrap());
@@ -531,6 +532,7 @@ async fn exact_direct_identity_reconciles_split_histories_at_the_service_boundar
         service.persist(&TransportEvent::Message {
             conversation: engine,
             message: mismatched,
+            part_ids: Vec::new(),
             push_sequence: None,
         }),
         Err(store::StoreError::MessageConversationMismatch)

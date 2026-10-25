@@ -1120,30 +1120,41 @@ fn map_inbound_with_sequence(
     let from_me = my_handles.iter().any(|handle| handle == sender);
 
     let mut parts = Vec::new();
+    let mut part_ids = Vec::new();
     if let Some(list) = normal.get("parts").and_then(Value::as_array) {
         for (position, entry) in list.iter().enumerate() {
             let part = match entry.get("part") {
                 Some(part) => part,
                 None => continue,
             };
-            match part.get("type").and_then(Value::as_str) {
-                Some("text") => {
-                    if let Some(text) = part.get("text").and_then(Value::as_str) {
-                        if !text.is_empty() {
-                            parts.push(MessagePart::Text(text.to_owned()));
-                        }
-                    }
-                }
-                Some("attachment") => parts.push(attachment_part(part, id, message_id, position)),
-                Some(kind) => parts.push(MessagePart::Unsupported {
+            let idx = entry.get("idx").and_then(Value::as_u64);
+            let mapped = match part.get("type").and_then(Value::as_str) {
+                Some("text") => part
+                    .get("text")
+                    .and_then(Value::as_str)
+                    .filter(|text| !text.is_empty())
+                    .map(|text| MessagePart::Text(text.to_owned())),
+                Some("attachment") => Some(attachment_part(part, id, message_id, position)),
+                Some(kind) => Some(MessagePart::Unsupported {
                     kind: kind.to_owned(),
                 }),
-                None => {}
+                None => None,
+            };
+            if let Some(mapped) = mapped {
+                parts.push(mapped);
+                part_ids.push(idx);
             }
         }
     }
     if parts.is_empty() {
         return Err(SkipReason::NoContent);
+    }
+    if matches!(parts.as_slice(), [MessagePart::Text(_)]) {
+        if let [slot] = part_ids.as_mut_slice() {
+            if slot.is_none() {
+                *slot = Some(0);
+            }
+        }
     }
 
     let sender_handle = envelope_sender(inst)?;
@@ -1231,6 +1242,7 @@ fn map_inbound_with_sequence(
     Ok(TransportEvent::Message {
         conversation,
         message,
+        part_ids,
         push_sequence,
     })
 }
@@ -1506,6 +1518,61 @@ mod tests {
             panic!("expected a message event");
         };
         message
+    }
+
+    fn mapped_part_ids(value: &Value) -> (Vec<Option<u64>>, usize) {
+        let TransportEvent::Message {
+            message, part_ids, ..
+        } = map_inbound(value, &[], &transport()).expect("payload maps")
+        else {
+            panic!("expected a message event");
+        };
+        (part_ids, message.parts().len())
+    }
+
+    #[test]
+    fn preserves_explicit_engine_part_ids() {
+        let value = attachment_payload(json!([
+            {"idx": 4, "part": {"type": "text", "text": "a"}},
+            {"idx": 9, "part": {"type": "text", "text": "b"}}
+        ]));
+        let (part_ids, part_count) = mapped_part_ids(&value);
+        assert_eq!(part_ids, vec![Some(4), Some(9)]);
+        assert_eq!(part_ids.len(), part_count);
+    }
+
+    #[test]
+    fn skipped_entries_do_not_misalign_part_ids() {
+        let value = attachment_payload(json!([
+            {"idx": 1, "part": {"type": "text", "text": "a"}},
+            {"idx": 2, "part": {"type": "text", "text": ""}},
+            {"idx": 3},
+            {"idx": 5, "part": {"type": "text", "text": "b"}}
+        ]));
+        let (part_ids, part_count) = mapped_part_ids(&value);
+        assert_eq!(part_count, 2, "empty and malformed entries are skipped");
+        assert_eq!(part_ids, vec![Some(1), Some(5)]);
+        assert_eq!(part_ids.len(), part_count);
+    }
+
+    #[test]
+    fn normalizes_a_single_plain_part_to_zero() {
+        let value = attachment_payload(json!([
+            {"part": {"type": "text", "text": "plain"}}
+        ]));
+        let (part_ids, part_count) = mapped_part_ids(&value);
+        assert_eq!(part_count, 1);
+        assert_eq!(part_ids, vec![Some(0)]);
+    }
+
+    #[test]
+    fn does_not_invent_an_id_for_a_single_attachment() {
+        let value = attachment_payload(json!([
+            {"part": {"type": "attachment", "name": "one.bin"}}
+        ]));
+        let (part_ids, part_count) = mapped_part_ids(&value);
+        assert_eq!(part_count, 1);
+        assert_eq!(part_ids, vec![None]);
     }
 
     fn first_attachment(message: &Message) -> &AttachmentRef {

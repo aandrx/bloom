@@ -64,12 +64,13 @@ impl Service {
             TransportEvent::Message {
                 conversation,
                 message,
+                part_ids,
                 push_sequence,
-            } => self.persist_message(conversation, message, *push_sequence),
+            } => self.persist_message(conversation, message, part_ids, *push_sequence),
             TransportEvent::MessageUpdated {
                 conversation,
                 message,
-            } => self.persist_message(conversation, message, None),
+            } => self.persist_message(conversation, message, &[], None),
             TransportEvent::DeliveryChanged {
                 conversation,
                 message,
@@ -182,6 +183,7 @@ impl Service {
         &self,
         conversation: &Conversation,
         message: &Message,
+        part_ids: &[Option<u64>],
         push_sequence: Option<u64>,
     ) -> Result<bool, store::StoreError> {
         let persistence_started = Instant::now();
@@ -197,7 +199,8 @@ impl Service {
                 return Err(store::StoreError::MessageConversationMismatch);
             }
             let message = store::remap_message(message, &canonical.id)?;
-            let (outcome, _) = store::ingest_inbound(&mut store, &canonical, &message)?;
+            let (outcome, _) =
+                store::ingest_inbound_with_parts(&mut store, &canonical, &message, part_ids)?;
             (outcome, canonical, message)
         };
         if crate::diagnostics::enabled() {

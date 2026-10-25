@@ -10,7 +10,7 @@ pub use conversations::{
 };
 pub(crate) use identity::direct_conversation_matches;
 pub use identity::{reconcile_direct_conversation, reconcile_stored_direct_conversations};
-pub use ingest::{ingest_inbound, ingest_message, update_delivery};
+pub use ingest::{ingest_inbound, ingest_inbound_with_parts, ingest_message, update_delivery};
 pub use messages::{
     get_message, history, history_before, message_context, search_messages,
     search_messages_with_participant, upsert_message, MessageUpsertOutcome,
@@ -291,6 +291,7 @@ impl EncryptedStore {
              CREATE TABLE IF NOT EXISTS messages (id TEXT PRIMARY KEY, conversation_id TEXT NOT NULL REFERENCES conversations(id), created_at INTEGER NOT NULL, data BLOB NOT NULL);
              CREATE INDEX IF NOT EXISTS messages_conversation_history ON messages(conversation_id, created_at DESC, id DESC);
              CREATE INDEX IF NOT EXISTS messages_recent_order ON messages(created_at DESC, id DESC);
+             CREATE TABLE IF NOT EXISTS message_part_maps (message_id TEXT PRIMARY KEY REFERENCES messages(id), data BLOB NOT NULL);
              COMMIT;"
         ).map_err(|_| StoreError::Schema)?;
         restrict_permissions(&path, false)?;
