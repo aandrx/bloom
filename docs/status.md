@@ -17,6 +17,7 @@
 - Installed `bloom` command with sibling/PATH companions, owned-child cleanup, reused-daemon preservation, bounded drain and terminal restoration. Cargo installs binaries only; the sidecar/Dart/engine/registration remain external runtime prerequisites.
 - Generation-scoped engine recovery after a successful start: old generations drain and join before bounded replacement, crash-loop budgets reset only after a 60-second stable window, and uncertain sends are never replayed. A synthetic real-child test proves replacement; the real Dart sidecar path is live-unverified.
 - Inbound built-in reactions map to typed events, update only a stored target's reaction list, fan out through the existing update event, survive fixture history/context/restart, and render as sorted aggregate counts in the real TUI PTY. Outbound reaction capability remains false and no send operation exists.
+- Inbound edits and unsends preserve engine part identity in the encrypted store, require target/sender/conversation/part/timestamp evidence, apply in one transaction, and reject ambiguous legacy rows rather than guessing. An edit replaces only its evidenced part group with nonempty text; a whole-body unsend retains content and reactions. Display is truthful and PTY-proven at 100/44/24 columns. Partial multipart unsend and edits after unsend are explicitly unsupported.
 
 ## Partial or missing
 
@@ -25,7 +26,7 @@
 | History | Only Bloom's stored messages; the transcript opens the newest 200, loads earlier pages on demand (bounded session budget) and searches stored message text plus explicitly reported attachment file names locally, opening a separate bounded exact-context view for unloaded hits; no remote/app historical import and no attachment content search |
 | Live service | Automatic generation-scoped recovery has synthetic real-child coverage; current real-Dart-sidecar restart behavior is not live-revalidated |
 | Groups | Existing group text conditional on recipient-list capability; no group-management workflow |
-| Rich messaging | Inbound attachment metadata keeps reported names and inbound built-in reactions render read-only aggregate counts; unsupported parts stay generic placeholders; no attachment file send/open/download, outbound reactions, edits or unsend UI |
+| Rich messaging | Inbound attachment metadata keeps reported names; inbound built-in reactions render read-only aggregate counts; inbound text edits and whole-body unsends apply transactionally with `Edited` / `Unsent · retained locally` notes; unsupported parts stay generic placeholders; no attachment file send/open/download, outbound reactions/edits/unsend, or partial multipart unsend |
 | Delivery | Labels reflect mapped transport events; presence of a Read enum is not proof of remote read-receipt support |
 | Accounts | Reuses an existing registration; no Bloom sign-in/activation/recovery; renewal unconfirmed |
 | Composition/reading | Session-only drafts and undo; local unread counts cover only loaded messages with a saved marker; markers have no automatic expiry; no attachment content search or reviewed encrypted durable drafts |

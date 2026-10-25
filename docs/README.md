@@ -25,6 +25,7 @@ Start with [fresh-session handoff](handoff.md). The root [AGENTS.md](../AGENTS.m
 | Document | Status / how to use |
 | --- | --- |
 | [Reaction application](reaction-application-plan.md) | Accepted inbound reaction mapping, persistence, fixture parity and TUI display; outbound reactions intentionally unsupported |
+| [Inbound edit and unsend](edit-unsend-plan.md) | Accepted inbound part-targeted text edits and whole-body unsends: evidence, phases, display and limits |
 | [Remaining plans](remaining-plans.md) | Packaging tail, launcher profile spike, and gated rich-messaging phases |
 | [Durable drafts plan](durable-drafts-plan.md) | Encrypted daemon-owned drafts, revision guard, retention; design only |
 | [Packaging plan](packaging-plan.md) | Standalone install layout, doctor diagnostics, phases, licensing boundary; design only |

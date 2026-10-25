@@ -102,7 +102,7 @@ If it is revisited: an isolated install builds and runs both profiles, terminal 
 
 ### 6. Rich messaging and future GUI
 
-Inbound built-in reactions are accepted through mapping, persistence, fixture parity and read-only TUI display. `Capabilities.reactions` remains false because Bloom has no outbound reaction operation and does not plan to add one for this project scope. If rich-message correctness resumes, inbound edits and unsend are the next bounded design unit. Attachment transfer, replies, typing/read receipts and group management still require transport mapping, persistence, IPC and interaction together; capability declarations alone are not implementation. GPUI remains deferred, and independent registration stays blocked by [Gate 0](ids-validation-gate.md).
+Inbound built-in reactions are accepted through mapping, persistence, fixture parity and read-only TUI display. Inbound text edits and whole-body unsends are also accepted: part identities are preserved, mutations are transactional and evidence-gated, and display is PTY-proven. `Capabilities.reactions`, `edits`, and `unsend` remain false because Bloom has no outbound operation for them and does not plan to add one for this project scope. Partial multipart unsend, attachment/mention replacement, and mutation of ambiguous legacy rows remain unsupported. Attachment transfer, replies, typing/read receipts and group management still require transport mapping, persistence, IPC and interaction together; capability declarations alone are not implementation. GPUI remains deferred, and independent registration stays blocked by [Gate 0](ids-validation-gate.md).
 
 ## Universal release gates
 

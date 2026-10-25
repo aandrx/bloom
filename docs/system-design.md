@@ -91,7 +91,7 @@ Automatic engine-generation recovery is implemented after a successfully started
 - Engine startup reads/writes registration and consumes pushes. Only synthetic fixtures run by default. Live tests require fresh explicit authorization and safe durable capture.
 - No engine binary vendoring or generated-binding hand edits. Matching engine version/content hash is required.
 - No Bloom-owned authentication, registration or account recovery. Current state labels do not prove renewal support.
-- Inbound built-in reactions are mapped, persisted, and rendered as aggregate counts. The transport does not advertise outbound reaction capability and has no reaction send operation. There is no edit/unsend workflow, attachment transfer UI, authoritative unread total for all conversations, remote read-state authority, or complete archive support. Keep product claims aligned with end-to-end implementation.
+- Inbound built-in reactions are mapped, persisted, and rendered as aggregate counts. Inbound text edits and whole-body unsends are also mapped and applied transactionally, using engine part identities persisted in the encrypted store; ambiguous legacy rows and partial multipart unsends are skipped. The transport advertises no outbound reaction, edit, or unsend capability and has no send operation for them. There is no attachment transfer UI, authoritative unread total for all conversations, remote read-state authority, or complete archive support.
 
 ## Future surfaces and transports
 
