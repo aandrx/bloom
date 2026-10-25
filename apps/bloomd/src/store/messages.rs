@@ -17,8 +17,6 @@ pub enum MessageUpsertOutcome {
     Unchanged,
 }
 
-// Wired into the service in the next unit; tests exercise it until then.
-#[allow(dead_code)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ReactionOutcome {
     Applied,
@@ -79,7 +77,6 @@ pub fn upsert_message(
 /// Applies one reaction change to the stored message, touching only its
 /// `reactions` field. The read and optional write share one transaction so a
 /// concurrent upsert cannot interleave between them.
-#[allow(dead_code)]
 pub fn apply_reaction(
     store: &mut EncryptedStore,
     target: &MessageId,
@@ -144,6 +141,22 @@ pub fn apply_reaction(
     )?;
     tx.commit()?;
     Ok(ReactionOutcome::Applied)
+}
+
+impl EncryptedStore {
+    /// Applies a reaction and returns the reloaded stored message only when the
+    /// reaction changed it. `None` covers a duplicate delivery and an absent target.
+    pub fn apply_reaction(
+        &mut self,
+        target: &MessageId,
+        reaction: &Reaction,
+        active: bool,
+    ) -> Result<Option<Message>, StoreError> {
+        if self::apply_reaction(self, target, reaction, active)? != ReactionOutcome::Applied {
+            return Ok(None);
+        }
+        get_message(self, target)
+    }
 }
 
 pub fn get_message(store: &EncryptedStore, id: &MessageId) -> Result<Option<Message>, StoreError> {

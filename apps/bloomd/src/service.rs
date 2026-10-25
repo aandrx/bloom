@@ -11,7 +11,7 @@ use crate::{
 };
 use bloom_domain::{
     Conversation, ConversationId, ConversationKind, DeliveryState, Handle, HandleKind, Message,
-    MessageId, OutgoingBody, Participant,
+    MessageId, OutgoingBody, Participant, Reaction,
 };
 use bloom_ipc::{
     Event, EventKind, HistoryCursor, MessageSearchHit, ParticipantFilter, ProtocolError,
@@ -131,19 +131,41 @@ impl Service {
                 });
                 Ok(true)
             }
-            // Reaction application lands in the next unit. Until then the event
-            // is accepted without inventing a message or rewriting content, and
-            // no subscriber sees a fabricated update. Warn once so the drop is
-            // visible without flooding the log.
-            TransportEvent::ReactionChanged { .. } => {
-                use std::sync::atomic::{AtomicBool, Ordering};
-                static WARNED: AtomicBool = AtomicBool::new(false);
-                if !WARNED.swap(true, Ordering::Relaxed) {
-                    eprintln!(
-                        "bloomd: reaction events are mapped but store application is pending; dropping them"
-                    );
-                }
-                Ok(false)
+            TransportEvent::ReactionChanged {
+                conversation_id,
+                message_id,
+                sender,
+                kind,
+                active,
+                part,
+                at,
+            } => {
+                let (canonical_id, stored) = {
+                    let mut store = self.store.lock().unwrap();
+                    let Some(conversation) = store::get_conversation(&store, conversation_id)?
+                    else {
+                        return Ok(false);
+                    };
+                    let reaction = Reaction {
+                        sender: sender.clone(),
+                        kind: kind.clone(),
+                        remote_id: None,
+                        part: *part,
+                        timestamp: *at,
+                    };
+                    let stored = store.apply_reaction(message_id, &reaction, *active)?;
+                    (conversation.id, stored)
+                };
+                let Some(message) = stored else {
+                    return Ok(false);
+                };
+                self.hub.publish(Event {
+                    event: EventKind::Update {
+                        conversation_id: canonical_id,
+                        message,
+                    },
+                });
+                Ok(true)
             }
         }
     }
@@ -909,6 +931,153 @@ mod preview_tests {
                 false
             )),
             "[attachment] caption"
+        );
+    }
+}
+
+#[cfg(test)]
+mod reaction_service_tests {
+    use super::*;
+    use crate::engine::EngineConfig;
+    use bloom_domain::{MessagePart, TransportId};
+    use std::{os::unix::fs::PermissionsExt, path::PathBuf, time::Duration};
+
+    fn harness() -> (tempfile::TempDir, Arc<Mutex<EncryptedStore>>, Arc<Service>) {
+        let directory = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(directory.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        let store = Arc::new(Mutex::new(
+            EncryptedStore::open_with_key(directory.path().join("store.db"), &[7; 32]).unwrap(),
+        ));
+        let engine = Arc::new(Engine::new(EngineConfig {
+            dart_executable: PathBuf::from("dart"),
+            script: PathBuf::from("engine.dart"),
+            state_dir: directory.path().join("state"),
+            library: PathBuf::from("engine.dylib"),
+            sync_chats: false,
+        }));
+        let service = Arc::new(Service::new(store.clone(), engine, SubscriptionHub::new(4)));
+        (directory, store, service)
+    }
+
+    fn fixtures() -> (Conversation, Message) {
+        let transport = TransportId::new("openbubbles").unwrap();
+        let sender = Handle::new(HandleKind::Opaque, "sender@example.invalid").unwrap();
+        let conversation = Conversation {
+            id: ConversationId::new(transport.clone(), "c1").unwrap(),
+            remote_id: "chat-c1".into(),
+            kind: ConversationKind::Direct,
+            title: None,
+            participants: vec![Participant {
+                handle: sender.clone(),
+                display_name: None,
+                is_me: false,
+            }],
+            created_at: 1,
+            last_message_at: None,
+            aliases: Vec::new(),
+            preview: None,
+        };
+        let message = Message::new(
+            MessageId::new(transport, "m1").unwrap(),
+            conversation.id.clone(),
+            None,
+            sender,
+            vec![MessagePart::Text("hello".into())],
+            1,
+            None,
+            DeliveryState::Delivered,
+            false,
+            None,
+            Vec::new(),
+            None,
+        )
+        .unwrap();
+        (conversation, message)
+    }
+
+    fn reaction_event(conversation_id: ConversationId, message_id: MessageId) -> TransportEvent {
+        TransportEvent::ReactionChanged {
+            conversation_id,
+            message_id,
+            sender: Handle::new(HandleKind::Opaque, "sender@example.invalid").unwrap(),
+            kind: "like".into(),
+            active: true,
+            part: Some(0),
+            at: Some(9),
+        }
+    }
+
+    #[tokio::test]
+    async fn applied_reaction_publishes_one_update_and_is_idempotent() {
+        let (_directory, store, service) = harness();
+        let (conversation, message) = fixtures();
+        let (conversation_id, message_id) = (conversation.id.clone(), message.id().clone());
+        {
+            let mut guard = store.lock().unwrap();
+            store::upsert_conversation(&mut guard, &conversation).unwrap();
+            store::upsert_message(&mut guard, &message).unwrap();
+        }
+        let mut subscriber = service.hub.subscribe();
+        let event = reaction_event(conversation_id.clone(), message_id.clone());
+
+        assert!(service.persist(&event).unwrap());
+        let published = tokio::time::timeout(Duration::from_millis(100), subscriber.recv())
+            .await
+            .expect("update event published")
+            .unwrap();
+        match published.event {
+            EventKind::Update {
+                conversation_id: published_conversation,
+                message: published_message,
+            } => {
+                assert_eq!(published_conversation, conversation_id);
+                assert_eq!(published_message.id(), &message_id);
+                assert!(published_message.reactions.iter().any(|reaction| {
+                    reaction.sender
+                        == Handle::new(HandleKind::Opaque, "sender@example.invalid").unwrap()
+                        && reaction.kind == "like"
+                        && reaction.part == Some(0)
+                }));
+            }
+            _ => panic!("unexpected event kind"),
+        }
+        let stored = {
+            let guard = store.lock().unwrap();
+            store::get_message(&guard, &message_id).unwrap().unwrap()
+        };
+        assert_eq!(stored.reactions.len(), 1);
+
+        assert!(!service.persist(&event).unwrap());
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), subscriber.recv())
+                .await
+                .is_err(),
+            "duplicate reaction must not publish another event"
+        );
+    }
+
+    #[tokio::test]
+    async fn reaction_for_missing_conversation_changes_nothing() {
+        let (_directory, store, service) = harness();
+        let (_conversation, message) = fixtures();
+        let (conversation_id, message_id) =
+            (message.conversation_id().clone(), message.id().clone());
+        let mut subscriber = service.hub.subscribe();
+
+        let changed = service
+            .persist(&reaction_event(conversation_id, message_id.clone()))
+            .unwrap();
+        assert!(!changed);
+        {
+            let guard = store.lock().unwrap();
+            assert!(store::list_conversations(&guard).unwrap().is_empty());
+            assert!(store::get_message(&guard, &message_id).unwrap().is_none());
+        }
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), subscriber.recv())
+                .await
+                .is_err(),
+            "missing conversation must not publish an event"
         );
     }
 }
