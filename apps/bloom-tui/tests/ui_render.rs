@@ -6,7 +6,7 @@
 
 use bloom_domain::{
     AttachmentRef, Conversation, ConversationId, ConversationKind, DeliveryState, Handle,
-    HandleKind, Message, MessageId, MessagePart, Participant, TransportId,
+    HandleKind, Message, MessageId, MessagePart, Participant, Reaction, TransportId,
 };
 use bloom_ipc::{MessageSearchHit, ParticipantFilter};
 use bloom_tui::{
@@ -5093,5 +5093,67 @@ fn same_message_id_filename_update_repaints_a_reused_transcript_cache() {
     assert!(
         cache.transcript_layout_builds() >= 2,
         "the second frame must rebuild the layout after the message changed"
+    );
+}
+
+#[test]
+fn reaction_summary_aggregates_sorts_and_survives_narrow_widths() {
+    let chat = conversation("Reactions", 2, 1);
+    let sender = chat.participants[1].handle.clone();
+    let reaction = |kind: &str, part: Option<u32>| Reaction {
+        sender: sender.clone(),
+        kind: kind.into(),
+        remote_id: None,
+        part,
+        timestamp: None,
+    };
+    let mut with_reactions = message_with_parts(
+        &chat,
+        "reacted",
+        10,
+        vec![MessagePart::Text("body".into())],
+        false,
+    );
+    with_reactions.reactions = vec![
+        reaction("like", None),
+        reaction("heart", Some(0)),
+        reaction("heart", None),
+    ];
+    let mut app = App {
+        selected: Some(chat.id.clone()),
+        ..Default::default()
+    };
+    app.set_conversations(vec![chat.clone()]);
+    app.upsert(chat.id.clone(), with_reactions);
+
+    for width in [24u16, 44, 100] {
+        let (buffer, hits) = cached_frame(&app, width, 14, &mut ui::RenderCache::default());
+        let transcript = transcript_flat(&buffer, &hits);
+        let compact: String = transcript.chars().filter(|c| !c.is_whitespace()).collect();
+        assert!(
+            compact.contains("·heart2·like1"),
+            "width {width} lost the sorted summary: {transcript:?}"
+        );
+    }
+
+    // No reactions must add no summary line.
+    let plain = message_with_parts(
+        &chat,
+        "plain",
+        20,
+        vec![MessagePart::Text("plain body".into())],
+        false,
+    );
+    let mut app = App {
+        selected: Some(chat.id.clone()),
+        ..Default::default()
+    };
+    app.set_conversations(vec![chat.clone()]);
+    app.upsert(chat.id.clone(), plain);
+    let (buffer, hits) = cached_frame(&app, 44, 14, &mut ui::RenderCache::default());
+    let transcript = transcript_flat(&buffer, &hits);
+    assert!(
+        !transcript.contains('·'),
+        "unreacted message gained a summary: {transcript:?}"
     );
 }

@@ -2528,6 +2528,27 @@ impl RenderCache {
     }
 }
 
+/// One aggregate line for a message's reactions: counts per kind, kinds sorted
+/// alphabetically, for example `· heart 2 · like 1`. Sender and time are left
+/// out on purpose; this is a summary, not a ledger. `None` when there are no
+/// reactions, so an unreacted message renders exactly as before.
+fn reaction_summary(message: &Message) -> Option<String> {
+    if message.reactions.is_empty() {
+        return None;
+    }
+    let mut counts: std::collections::BTreeMap<&str, usize> = std::collections::BTreeMap::new();
+    for reaction in &message.reactions {
+        *counts.entry(reaction.kind.as_str()).or_default() += 1;
+    }
+    Some(
+        counts
+            .into_iter()
+            .map(|(kind, count)| format!("· {kind} {count}"))
+            .collect::<Vec<_>>()
+            .join(" "),
+    )
+}
+
 fn transcript_window(
     layout: &TranscriptLayout,
     scroll: u16,
@@ -3219,6 +3240,16 @@ fn render_cached_with_mode(
                     }
                 }
                 lines.push(Line::from(body));
+                if let Some(summary) = reaction_summary(message) {
+                    // Styled as transcript secondary text so it sits under the body
+                    // without competing with it, and wrapped by the same paragraph
+                    // pass as every other body row.
+                    let mut style = Style::default().fg(palette.muted);
+                    if message.from_me {
+                        style = style.bg(message_surface);
+                    }
+                    lines.push(Line::from(Span::styled(summary, style)));
+                }
             }
         }
         // Show the newest messages by default and let the user scroll back. Rows are
