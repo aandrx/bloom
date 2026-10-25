@@ -6,9 +6,9 @@ use bloom_domain::{
     Conversation, ConversationId, ConversationKind, DeliveryState, Handle, HandleKind, Message,
     MessageId, MessagePart, Participant, TransportId,
 };
-use bloom_ipc::{EventKind, MessageSearchHit, ParticipantFilter};
+use bloom_ipc::{DraftKey, EventKind, MessageSearchHit, ParticipantFilter};
 use bloom_tui::{
-    app::{Action, App, SendPhase, UnreadCount},
+    app::{Action, App, DraftOwner, SendPhase, UnreadCount},
     daemon::Snapshot,
     KeyCode, KeyEvent, KeyModifiers,
 };
@@ -1015,6 +1015,35 @@ fn new_chat_completion_does_not_steal_changed_context_or_match_unrelated_message
 }
 
 #[test]
+fn rejected_send_retry_submits_the_body_once() {
+    let mut app = App::default();
+    let target = conversation("retry-once", 1);
+    app.selected = Some(target.id.clone());
+    app.active_draft_owner = Some(DraftOwner::Conversation(target.id.clone()));
+    app.draft = "RetryBody".into();
+    app.draft_cursor = app.draft.chars().count();
+    let Action::SendMessage {
+        attempt,
+        conversation,
+        body,
+    } = app.handle_key(key(KeyCode::Enter))
+    else {
+        panic!("send expected")
+    };
+    assert_eq!(body, "RetryBody");
+    app.begin_send(attempt, Some(conversation.clone()));
+    app.finish_send(attempt, Some(conversation), Err("rejected".into()));
+    assert_eq!(app.draft, "RetryBody");
+    let Action::SendMessage { body, .. } = app.handle_key(key(KeyCode::Enter)) else {
+        panic!("retry expected")
+    };
+    assert_eq!(
+        body, "RetryBody",
+        "retry must not duplicate the recovered body"
+    );
+}
+
+#[test]
 fn failed_send_recovers_draft_and_success_retires_it() {
     let mut app = App::default();
     let target = Some(conversation("recover-send", 1).id);
@@ -1036,6 +1065,50 @@ fn failed_send_recovers_draft_and_success_retires_it() {
     app.begin_send(attempt, target.clone());
     app.finish_send(attempt, target, Ok(()));
     assert!(app.recoverable_send.is_none());
+}
+
+#[test]
+fn pending_send_parks_one_durable_copy_and_failure_clears_it() {
+    let mut app = App::default();
+    let target = conversation("parked-send", 1);
+    let draft_key = DraftKey::Conversation {
+        owner: target.id.clone(),
+    };
+    app.selected = Some(target.id.clone());
+    app.active_draft_owner = Some(DraftOwner::Conversation(target.id.clone()));
+    app.draft = "parked body".into();
+    app.draft_cursor = app.draft.chars().count();
+    let Action::SendMessage {
+        attempt,
+        conversation,
+        ..
+    } = app.handle_key(key(KeyCode::Enter))
+    else {
+        panic!("send expected")
+    };
+    app.begin_send(attempt, Some(conversation.clone()));
+    assert!(app.draft.is_empty(), "the composer retires after submit");
+    let desired = app.desired_drafts();
+    assert_eq!(
+        desired.get(&draft_key).expect("parked copy").body,
+        "parked body"
+    );
+    assert_eq!(
+        desired.len(),
+        1,
+        "the parked body is not duplicated in the composer"
+    );
+
+    app.finish_send(attempt, Some(conversation), Err("rejected".into()));
+    assert!(app.parked_send.is_none(), "failure clears the parked copy");
+    assert_eq!(app.draft, "parked body", "recovery keeps the text editable");
+    assert_eq!(
+        app.desired_drafts()
+            .get(&draft_key)
+            .expect("recovered copy")
+            .body,
+        "parked body"
+    );
 }
 
 #[test]

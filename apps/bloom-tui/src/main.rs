@@ -10,6 +10,7 @@ use bloom_tui::app::{App, SendFailure, Theme, OLDER_PAGE_LIMIT, SEARCH_RESULT_LI
 use bloom_tui::config::Config;
 use bloom_tui::daemon::{self, ConnectionState, Snapshot};
 use bloom_tui::diagnostics::{self, Stage};
+use bloom_tui::drafts::{DraftCoordinator, DraftOperation, DraftResult};
 use bloom_tui::ui;
 use bloom_tui::RedrawScheduler;
 use crossterm::{
@@ -23,7 +24,10 @@ use crossterm::{
 use ratatui::{backend::CrosstermBackend, Terminal};
 use std::collections::VecDeque;
 use std::io::{Read, Write};
-use std::{io, time::Duration};
+use std::{
+    io,
+    time::{Duration, Instant},
+};
 use tokio::sync::{mpsc, watch};
 
 const FIRST_RETRY: Duration = Duration::from_millis(250);
@@ -31,6 +35,134 @@ const MAX_RETRY: Duration = Duration::from_secs(8);
 /// How long a quiet inbound stream must last before catch-up is complete.
 const SYNC_IDLE: Duration = Duration::from_millis(2000);
 const OSC_TIMEOUT: Duration = Duration::from_millis(200);
+/// How often durable draft work is considered, independent of input events.
+const DRAFT_TICK: Duration = Duration::from_millis(100);
+/// A quit may wait at most this long for ready draft writes to finish.
+const DRAFT_QUIT_BUDGET: Duration = Duration::from_secs(1);
+
+async fn execute_draft(client: &BloomClient, operation: DraftOperation) -> DraftResult {
+    match operation {
+        DraftOperation::Load { request, key } => {
+            let result = client.draft_load(key.clone()).await;
+            DraftResult::Load {
+                request,
+                key,
+                result,
+            }
+        }
+        DraftOperation::Save {
+            request,
+            key,
+            revision,
+            draft,
+        } => {
+            let result = client.draft_save(key.clone(), draft, revision).await;
+            DraftResult::Save {
+                request,
+                key,
+                revision,
+                result,
+            }
+        }
+        DraftOperation::Delete {
+            request,
+            key,
+            revision,
+        } => {
+            let result = client.draft_delete(key.clone(), revision).await;
+            DraftResult::Delete {
+                request,
+                key,
+                revision,
+                result,
+            }
+        }
+    }
+}
+
+fn spawn_draft(
+    client: BloomClient,
+    results: mpsc::UnboundedSender<DraftResult>,
+    operation: DraftOperation,
+) {
+    tokio::spawn(async move {
+        let _ = results.send(execute_draft(&client, operation).await);
+    });
+}
+
+fn observe_drafts(app: &App, coordinator: &mut DraftCoordinator) {
+    coordinator.observe(
+        app.current_persistable_owner(),
+        app.desired_drafts(),
+        Instant::now(),
+    );
+}
+
+fn surface_draft_error(app: &mut App, coordinator: &mut DraftCoordinator) -> bool {
+    match coordinator.take_error() {
+        Some(error) => {
+            app.error = Some(error);
+            true
+        }
+        None => false,
+    }
+}
+
+/// Drain ready draft work for at most one second. The debounce is forced so a
+/// just-typed draft is not lost, while any in-flight response is awaited within
+/// the same budget. No automatic send or retry happens here.
+async fn drain_drafts(
+    client: &BloomClient,
+    app: &mut App,
+    coordinator: &mut DraftCoordinator,
+    in_flight: &mut bool,
+    results: &mut mpsc::UnboundedReceiver<DraftResult>,
+) {
+    let deadline = Instant::now() + DRAFT_QUIT_BUDGET;
+    loop {
+        while let Ok(result) = results.try_recv() {
+            *in_flight = false;
+            if let Some(candidate) = coordinator.apply_result(result) {
+                app.apply_loaded_draft(candidate.key, candidate.draft);
+            }
+        }
+        observe_drafts(app, coordinator);
+        let _ = surface_draft_error(app, coordinator);
+        let forced_now = Instant::now() + bloom_tui::drafts::DEBOUNCE;
+        if let Some(operation) = coordinator.take_ready(forced_now) {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            let Ok(result) =
+                tokio::time::timeout(remaining, execute_draft(client, operation)).await
+            else {
+                break;
+            };
+            if let Some(candidate) = coordinator.apply_result(result) {
+                app.apply_loaded_draft(candidate.key, candidate.draft);
+            }
+            if Instant::now() >= deadline {
+                break;
+            }
+            continue;
+        }
+        if Instant::now() >= deadline {
+            break;
+        }
+        if *in_flight {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            match tokio::time::timeout(remaining, results.recv()).await {
+                Ok(Some(result)) => {
+                    *in_flight = false;
+                    if let Some(candidate) = coordinator.apply_result(result) {
+                        app.apply_loaded_draft(candidate.key, candidate.draft);
+                    }
+                    continue;
+                }
+                _ => break,
+            }
+        }
+        break;
+    }
+}
 
 fn parse_osc11_reply(reply: Option<&[u8]>) -> Option<(u8, u8, u8)> {
     let bytes = reply?;
@@ -269,6 +401,7 @@ async fn main() -> Result<()> {
         Option<bloom_domain::ConversationId>,
         Result<MessageId, SendFailure>,
     )>();
+    let (draft_tx, mut draft_rx) = mpsc::unbounded_channel::<DraftResult>();
     let (conversation_tx, mut conversation_rx) =
         mpsc::unbounded_channel::<Vec<bloom_domain::Conversation>>();
     let (sync_tx, mut sync_rx) = mpsc::unbounded_channel();
@@ -346,9 +479,19 @@ async fn main() -> Result<()> {
     // The daemon has no explicit catch-up completion frame, so treat a burst of
     // inbound events as syncing until the stream has been quiet for a moment.
     let mut last_sync_activity: Option<std::time::Instant> = None;
+    let mut drafts = DraftCoordinator::new();
+    let mut draft_in_flight = false;
+    let mut draft_tick_due = false;
     redraw.request();
     let mut next_animation = tokio::time::Instant::now();
+    let mut next_draft_tick = tokio::time::Instant::now();
     loop {
+        // Owner and modal changes can arrive through any branch, so capture them
+        // before painting rather than only after the next key press.
+        observe_drafts(&app, &mut drafts);
+        if surface_draft_error(&mut app, &mut drafts) {
+            redraw.request();
+        }
         if redraw.take_due(std::time::Instant::now()) {
             app.set_terminal_width(terminal.size()?.width);
             // Rendering returns the hitboxes it drew, so mouse input is resolved
@@ -426,6 +569,21 @@ async fn main() -> Result<()> {
                     std::future::pending::<()>().await;
                 }
             } => {}
+            _ = tokio::time::sleep_until(next_draft_tick) => {
+                next_draft_tick = tokio::time::Instant::now() + DRAFT_TICK;
+                draft_tick_due = true;
+            }
+            Some(result) = draft_rx.recv() => {
+                draft_in_flight = false;
+                if let Some(candidate) = drafts.apply_result(result) {
+                    if app.apply_loaded_draft(candidate.key, candidate.draft) {
+                        redraw.request();
+                    }
+                }
+                if surface_draft_error(&mut app, &mut drafts) {
+                    redraw.request();
+                }
+            }
             Some(snapshot) = snapshot_rx.recv() => {
                 app.thread_loading = false;
                 app.apply_snapshot(snapshot);
@@ -574,7 +732,31 @@ async fn main() -> Result<()> {
                     _ => bloom_tui::app::Action::None,
                 };
                 match action {
-                    bloom_tui::app::Action::Quit => break,
+                    bloom_tui::app::Action::Quit => {
+                        // Give an in-flight send a bounded chance to settle before
+                        // flushing drafts, so restart cannot resend a delivered body.
+                        if app.pending_send_attempt.is_some() {
+                            let settle = tokio::time::timeout(
+                                Duration::from_secs(1),
+                                send_rx.recv(),
+                            )
+                            .await;
+                            if let Ok(Some((attempt, conversation, result))) = settle {
+                                app.finish_send_receipt(attempt, conversation, result);
+                            } else if app.pending_send_attempt.is_some() {
+                                app.mark_pending_send_uncertain();
+                            }
+                        }
+                        drain_drafts(
+                            &client,
+                            &mut app,
+                            &mut drafts,
+                            &mut draft_in_flight,
+                            &mut draft_rx,
+                        )
+                        .await;
+                        break;
+                    }
                     bloom_tui::app::Action::SendMessage { attempt, conversation, body } => {
                         let target = Some(conversation.clone());
                         app.begin_send(attempt, target.clone());
@@ -654,6 +836,17 @@ async fn main() -> Result<()> {
                 );
                 redraw.request();
                 next_animation = tokio::time::Instant::now() + Duration::from_millis(33);
+            }
+        }
+        if draft_tick_due {
+            draft_tick_due = false;
+            observe_drafts(&app, &mut drafts);
+            if let Some(operation) = drafts.take_ready(Instant::now()) {
+                draft_in_flight = true;
+                spawn_draft(client.clone(), draft_tx.clone(), operation);
+            }
+            if surface_draft_error(&mut app, &mut drafts) {
+                redraw.request();
             }
         }
         // Async acknowledgments, live events and metadata can also select a thread.

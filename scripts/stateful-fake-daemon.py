@@ -380,6 +380,8 @@ def handle_draft(state, args, op, body):
     key = _draft_key(body.get("key"))
     if key is None:
         return {"result": "error", "error": "invalid_request"}
+    if op == "draft_save" and getattr(args, "fail_draft_saves", False):
+        return {"result": "error", "error": "internal"}
     key_id = _draft_key_id(key)
     if op == "draft_load":
         with LOCK:
@@ -684,6 +686,7 @@ def main():
     parser.add_argument("--store", required=True)
     parser.add_argument("--reject-first-send", action="store_true")
     parser.add_argument("--reject-first-start", action="store_true")
+    parser.add_argument("--fail-draft-saves", action="store_true")
     parser.add_argument("--delay", type=float, default=0)
     parser.add_argument("--sync-delay", type=float, default=0)
     parser.add_argument("--session-state", choices=['active', 'failed', 'blocked', 'disconnected'], default='active')

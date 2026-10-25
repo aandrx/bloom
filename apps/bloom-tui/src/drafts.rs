@@ -389,7 +389,9 @@ impl DraftCoordinator {
             // the local desired map was already empty (for example after load).
             let clears_baseline =
                 new.is_none() && self.baselines.get(&key).is_some_and(|base| base.is_some());
-            if (old == new && !clears_baseline) || invalid.contains(&key) {
+            let already_scheduled =
+                self.dirty.contains(&key) || self.pending_writes.contains_key(&key);
+            if (old == new && (!clears_baseline || already_scheduled)) || invalid.contains(&key) {
                 continue;
             }
             if self.matches_baseline(&key, new) {

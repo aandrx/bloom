@@ -137,6 +137,7 @@ class MessagingFlows(unittest.TestCase):
 
         # Use a fresh isolated fixture for a continuous rejection -> retry user flow.
         self.stop_daemon()
+        self.store_path.unlink(missing_ok=True)
         self.start_daemon("--reject-first-send")
         self.capture("text:RecoverAliceDraft enter enter")
         messages = self.persisted()["messages"]
@@ -171,6 +172,49 @@ class MessagingFlows(unittest.TestCase):
         self.assertNotEqual(state["messages"][0]["id"], state["messages"][1]["id"])
         self.assertEqual(state["messages"][1]["parts"], [{"type": "text", "value": "SecondCarolBody"}])
 
+    def test_draft_is_restored_only_to_its_own_chat_after_restart(self):
+        self.start_daemon()
+        self.capture("text:AliceDurableDraft")
+        drafts = [entry for entry in self.persisted().get("drafts", [])
+                  if not entry["deleted"]]
+        self.assertTrue(any(entry["draft"]["body"] == "AliceDurableDraft"
+                            for entry in drafts),
+                        "a debounced draft must remain in the daemon store")
+        text = self.capture("")
+        self.assertIn("AliceDurableDraft", text,
+                      "Restart must restore the draft to the selected chat")
+        switched = self.capture("ctrl-b n")
+        self.assertNotIn("AliceDurableDraft", switched,
+                         "Another chat must not inherit the draft")
+
+    def test_send_does_not_resurrect_a_draft_after_restart(self):
+        self.start_daemon()
+        self.capture("text:SendOnceDraft enter ctrl-c")
+        self.assertEqual(len(self.persisted()["messages"]), 1)
+        self.capture("")
+        self.capture("enter")
+        self.assertEqual(len(self.persisted()["messages"]), 1,
+                         "A sent draft must not return and send twice")
+
+    def test_cancel_removes_the_stored_draft(self):
+        self.start_daemon()
+        self.capture("text:CancelMeDraft esc ctrl-c")
+        self.capture("enter")
+        self.assertEqual(self.persisted()["messages"], [])
+        drafts = [entry for entry in self.persisted().get("drafts", [])
+                  if not entry["deleted"]]
+        self.assertFalse(any(entry["draft"]["body"] == "CancelMeDraft"
+                             for entry in drafts),
+                         "Explicit cancel must leave a delete intent")
+
+    def test_failed_draft_save_keeps_text_and_shows_generic_error(self):
+        self.start_daemon("--fail-draft-saves")
+        text = self.capture("text:RetainAfterDraftError")
+        self.assertIn("RetainAfterDraftError", text,
+                      "A failed save must not remove the composer text")
+        self.assertIn("Draft sync failed", text,
+                      "A failed save must surface the generic draft error")
+
     def test_rejected_new_conversation_recovers_recipient_and_body(self):
         self.start_daemon("--reject-first-start")
         text = self.capture(
@@ -183,6 +227,7 @@ class MessagingFlows(unittest.TestCase):
         self.assertIn("RecoverCarolDraft", text)
         self.assertNotIn("Message sent.", text)
         self.stop_daemon()
+        self.store_path.unlink(missing_ok=True)
         self.start_daemon("--reject-first-start")
         self.capture(
             "text:/new enter text:carol@example.invalid enter text:RecoverCarolDraft enter enter"

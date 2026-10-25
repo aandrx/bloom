@@ -4185,6 +4185,12 @@ fn render_footer_row(frame: &mut Frame<'_>, area: Rect, message: &str, color: Co
 /// Precedence: an error, then a notice, then send feedback, then the reading-back
 /// cue. Hints are always rendered on their own row when two rows are available.
 fn composer_feedback(app: &App, palette: &Palette, back: usize) -> Option<(String, Color)> {
+    if app.draft_uncertain && app.error.is_none() && app.notice.is_none() {
+        return Some((
+            "Outcome uncertain; verify the conversation before retrying.".into(),
+            palette.yellow,
+        ));
+    }
     if let Some(message) = app.error.as_deref() {
         let message = if app.deferred_sends.is_empty() {
             message.to_owned()

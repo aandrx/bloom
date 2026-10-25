@@ -6,8 +6,9 @@ use bloom_domain::{
     MessageId, MessagePart, Participant, TransportId,
 };
 use bloom_ipc::{
-    client::ClientError, read_request, write_event, write_response, ConversationSyncStatus, Event,
-    EventKind, ProtocolError, RequestKind, Response, ResponseKind,
+    client::ClientError, read_request, write_event, write_response, ConversationSyncStatus,
+    DraftKey, DraftWriteOutcome, DurableDraft, Event, EventKind, ProtocolError, RequestKind,
+    Response, ResponseKind,
 };
 use bloom_tui::daemon::{
     pump_session, pump_session_with_interval, snapshot, ConnectionState, Snapshot,
@@ -64,6 +65,8 @@ fn message(conversation: &Conversation, id: &str, at: i64, text: &str) -> Messag
     .unwrap()
 }
 
+type StoredDraft = (DraftKey, u64, Option<DurableDraft>);
+
 struct FakeDaemon {
     path: PathBuf,
     events: broadcast::Sender<Event>,
@@ -72,6 +75,8 @@ struct FakeDaemon {
     history_delay: Arc<Mutex<Duration>>,
     list_delay: Arc<Mutex<Duration>>,
     list_failure: Arc<Mutex<bool>>,
+    drafts: Arc<Mutex<Vec<StoredDraft>>>,
+    draft_failure: Arc<Mutex<bool>>,
     timeline: Arc<Mutex<Vec<String>>>,
     accept: tokio::task::JoinHandle<()>,
     _dir: tempfile::TempDir,
@@ -96,6 +101,8 @@ impl FakeDaemon {
         let history_delay = Arc::new(Mutex::new(Duration::ZERO));
         let list_delay = Arc::new(Mutex::new(Duration::ZERO));
         let list_failure = Arc::new(Mutex::new(false));
+        let drafts = Arc::new(Mutex::new(Vec::new()));
+        let draft_failure = Arc::new(Mutex::new(false));
         let timeline = Arc::new(Mutex::new(Vec::new()));
 
         let accept = {
@@ -105,6 +112,8 @@ impl FakeDaemon {
             let history_delay = history_delay.clone();
             let list_delay = list_delay.clone();
             let list_failure = list_failure.clone();
+            let drafts = drafts.clone();
+            let draft_failure = draft_failure.clone();
             let timeline = timeline.clone();
             tokio::spawn(async move {
                 loop {
@@ -117,6 +126,8 @@ impl FakeDaemon {
                     let history_delay = history_delay.clone();
                     let list_delay = list_delay.clone();
                     let list_failure = list_failure.clone();
+                    let drafts = drafts.clone();
+                    let draft_failure = draft_failure.clone();
                     let timeline = timeline.clone();
                     let conversations = conversations.clone();
                     tokio::spawn(async move {
@@ -247,16 +258,102 @@ impl FakeDaemon {
                                     )
                                     .await;
                                 }
-                                RequestKind::DraftSave { .. }
-                                | RequestKind::DraftLoad { .. }
-                                | RequestKind::DraftDelete { .. } => {
+                                RequestKind::DraftSave {
+                                    key,
+                                    draft,
+                                    revision,
+                                } => {
+                                    let response = if *draft_failure.lock().unwrap() {
+                                        ResponseKind::Error {
+                                            error: ProtocolError::Internal,
+                                        }
+                                    } else {
+                                        let mut stored = drafts.lock().unwrap();
+                                        let existing = stored
+                                            .iter()
+                                            .position(|(candidate, _, _)| candidate == &key);
+                                        if existing.is_some_and(|index| revision <= stored[index].1)
+                                        {
+                                            ResponseKind::DraftSave {
+                                                outcome: DraftWriteOutcome::Stale,
+                                            }
+                                        } else {
+                                            if let Some(index) = existing {
+                                                stored[index] = (key, revision, Some(draft));
+                                            } else {
+                                                stored.push((key, revision, Some(draft)));
+                                            }
+                                            ResponseKind::DraftSave {
+                                                outcome: DraftWriteOutcome::Applied,
+                                            }
+                                        }
+                                    };
                                     let _ = write_response(
                                         &mut stream,
                                         &Response {
                                             request_id,
-                                            response: ResponseKind::Error {
-                                                error: ProtocolError::Unsupported,
+                                            response,
+                                        },
+                                    )
+                                    .await;
+                                }
+                                RequestKind::DraftLoad { key } => {
+                                    let (draft, revision_floor) = {
+                                        let stored = drafts.lock().unwrap();
+                                        match stored
+                                            .iter()
+                                            .find(|(candidate, _, _)| candidate == &key)
+                                        {
+                                            Some((_, revision, draft)) => {
+                                                (draft.clone(), *revision)
+                                            }
+                                            None => (None, 0),
+                                        }
+                                    };
+                                    let _ = write_response(
+                                        &mut stream,
+                                        &Response {
+                                            request_id,
+                                            response: ResponseKind::DraftLoad {
+                                                draft,
+                                                revision_floor,
+                                                corrupt_deleted: false,
                                             },
+                                        },
+                                    )
+                                    .await;
+                                }
+                                RequestKind::DraftDelete { key, revision } => {
+                                    let response = if *draft_failure.lock().unwrap() {
+                                        ResponseKind::Error {
+                                            error: ProtocolError::Internal,
+                                        }
+                                    } else {
+                                        let mut stored = drafts.lock().unwrap();
+                                        let existing = stored
+                                            .iter()
+                                            .position(|(candidate, _, _)| candidate == &key);
+                                        if existing.is_some_and(|index| revision <= stored[index].1)
+                                        {
+                                            ResponseKind::DraftDelete {
+                                                outcome: DraftWriteOutcome::Stale,
+                                            }
+                                        } else {
+                                            if let Some(index) = existing {
+                                                stored[index] = (key, revision, None);
+                                            } else {
+                                                stored.push((key, revision, None));
+                                            }
+                                            ResponseKind::DraftDelete {
+                                                outcome: DraftWriteOutcome::Applied,
+                                            }
+                                        }
+                                    };
+                                    let _ = write_response(
+                                        &mut stream,
+                                        &Response {
+                                            request_id,
+                                            response,
                                         },
                                     )
                                     .await;
@@ -301,6 +398,8 @@ impl FakeDaemon {
             history_delay,
             list_delay,
             list_failure,
+            drafts,
+            draft_failure,
             timeline,
             accept,
             _dir: dir,
@@ -333,6 +432,35 @@ impl FakeDaemon {
 
     fn timeline(&self) -> Vec<String> {
         self.timeline.lock().unwrap().clone()
+    }
+
+    fn seed_draft(&self, key: DraftKey, draft: DurableDraft, revision: u64) {
+        self.drafts
+            .lock()
+            .unwrap()
+            .push((key, revision, Some(draft)));
+    }
+
+    fn draft(&self, key: &DraftKey) -> Option<DurableDraft> {
+        self.drafts
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|(candidate, _, _)| candidate == key)
+            .and_then(|(_, _, draft)| draft.clone())
+    }
+
+    fn draft_revision(&self, key: &DraftKey) -> Option<u64> {
+        self.drafts
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|(candidate, _, _)| candidate == key)
+            .map(|(_, revision, _)| *revision)
+    }
+
+    fn fail_drafts(&self) {
+        *self.draft_failure.lock().unwrap() = true;
     }
 
     fn receive_without_event(&self, conversation: &Conversation) {
@@ -686,4 +814,357 @@ async fn a_lost_subscription_surfaces_as_an_error_so_the_caller_can_reconnect() 
         result.is_err(),
         "a dropped subscription must be reported so the caller resyncs"
     );
+}
+
+mod durable_drafts {
+    use super::*;
+    use bloom_tui::app::{Action, App};
+    use bloom_tui::drafts::{
+        DraftCoordinator, DraftOperation, DraftResult, RestoreCandidate, SYNC_ERROR,
+    };
+    use bloom_tui::{KeyCode, KeyEvent, KeyModifiers};
+    use std::time::Instant;
+
+    fn draft_key(conversation: &Conversation) -> DraftKey {
+        DraftKey::Conversation {
+            owner: conversation.id.clone(),
+        }
+    }
+
+    fn durable(body: &str) -> DurableDraft {
+        DurableDraft {
+            body: body.into(),
+            cursor: body.chars().count(),
+            pasted_body: false,
+            uncertain: false,
+        }
+    }
+
+    async fn execute(
+        client: &bloom_ipc::client::BloomClient,
+        operation: DraftOperation,
+    ) -> DraftResult {
+        match operation {
+            DraftOperation::Load { request, key } => DraftResult::Load {
+                request,
+                key: key.clone(),
+                result: client.draft_load(key).await,
+            },
+            DraftOperation::Save {
+                request,
+                key,
+                revision,
+                draft,
+            } => DraftResult::Save {
+                request,
+                key: key.clone(),
+                revision,
+                result: client.draft_save(key, draft, revision).await,
+            },
+            DraftOperation::Delete {
+                request,
+                key,
+                revision,
+            } => DraftResult::Delete {
+                request,
+                key: key.clone(),
+                revision,
+                result: client.draft_delete(key, revision).await,
+            },
+        }
+    }
+
+    async fn apply_operation(
+        app: &mut App,
+        coordinator: &mut DraftCoordinator,
+        client: &bloom_ipc::client::BloomClient,
+        operation: DraftOperation,
+    ) -> Option<RestoreCandidate> {
+        let candidate = coordinator.apply_result(execute(client, operation).await);
+        if let Some(candidate) = &candidate {
+            app.apply_loaded_draft(candidate.key.clone(), candidate.draft.clone());
+        }
+        if let Some(error) = coordinator.take_error() {
+            app.error = Some(error);
+        }
+        candidate
+    }
+
+    async fn step(
+        app: &mut App,
+        coordinator: &mut DraftCoordinator,
+        client: &bloom_ipc::client::BloomClient,
+        now: Instant,
+    ) -> Option<RestoreCandidate> {
+        coordinator.observe(app.current_persistable_owner(), app.desired_drafts(), now);
+        let operation = coordinator.take_ready(now)?;
+        apply_operation(app, coordinator, client, operation).await
+    }
+
+    #[tokio::test]
+    async fn load_restore_debounced_save_and_clear_delete_round_trip() {
+        let daemon = FakeDaemon::start(false);
+        let client = bloom_ipc::client::BloomClient::new(daemon.socket());
+        let chat = conversation("first@example.com", 20);
+        let key = draft_key(&chat);
+        daemon.seed_draft(key.clone(), durable("stored body"), 4);
+
+        let mut app = App::default();
+        app.set_conversations(vec![chat.clone()]);
+        app.select(Some(chat.id.clone()));
+        let mut coordinator = DraftCoordinator::new();
+        let start = Instant::now();
+
+        assert!(step(&mut app, &mut coordinator, &client, start)
+            .await
+            .is_some());
+        assert_eq!(app.draft, "stored body");
+        assert_eq!(coordinator.known_floor(&key), Some(4));
+
+        app.draft = "debounced local body".into();
+        app.draft_cursor = app.draft.chars().count();
+        coordinator.observe(
+            app.current_persistable_owner(),
+            app.desired_drafts(),
+            start + Duration::from_millis(10),
+        );
+        assert!(coordinator
+            .take_ready(start + Duration::from_millis(309))
+            .is_none());
+        let save = coordinator
+            .take_ready(start + Duration::from_millis(310))
+            .expect("save after debounce");
+        apply_operation(&mut app, &mut coordinator, &client, save).await;
+        assert_eq!(
+            daemon.draft(&key).expect("stored save").body,
+            "debounced local body"
+        );
+        assert_eq!(daemon.draft_revision(&key), Some(5));
+
+        app.draft.clear();
+        app.draft_cursor = 0;
+        coordinator.observe(
+            app.current_persistable_owner(),
+            app.desired_drafts(),
+            start + Duration::from_millis(320),
+        );
+        let delete = coordinator
+            .take_ready(start + Duration::from_millis(620))
+            .expect("delete after debounce");
+        assert!(matches!(delete, DraftOperation::Delete { .. }));
+        apply_operation(&mut app, &mut coordinator, &client, delete).await;
+        assert_eq!(daemon.draft(&key), None);
+    }
+
+    #[tokio::test]
+    async fn owner_switches_keep_drafts_isolated_and_ignore_a_late_load() {
+        let daemon = FakeDaemon::start(false);
+        let client = bloom_ipc::client::BloomClient::new(daemon.socket());
+        let first = conversation("first@example.com", 20);
+        let second = conversation("second@example.com", 10);
+        let first_key = draft_key(&first);
+        let second_key = draft_key(&second);
+        daemon.seed_draft(first_key.clone(), durable("first stored"), 2);
+        let mut app = App::default();
+        app.set_conversations(vec![first.clone(), second.clone()]);
+        app.select(Some(first.id.clone()));
+        let mut coordinator = DraftCoordinator::new();
+        let start = Instant::now();
+
+        coordinator.observe(app.current_persistable_owner(), app.desired_drafts(), start);
+        let late = coordinator.take_ready(start).expect("first load");
+        app.select(Some(second.id.clone()));
+        coordinator.observe(
+            app.current_persistable_owner(),
+            app.desired_drafts(),
+            start + Duration::from_millis(1),
+        );
+        let result = execute(&client, late).await;
+        assert!(coordinator.apply_result(result).is_none());
+        assert!(
+            app.draft.is_empty(),
+            "late first-chat load must not restore"
+        );
+        assert!(step(
+            &mut app,
+            &mut coordinator,
+            &client,
+            start + Duration::from_millis(2)
+        )
+        .await
+        .is_none());
+
+        app.draft = "second local".into();
+        coordinator.observe(
+            app.current_persistable_owner(),
+            app.desired_drafts(),
+            start + Duration::from_millis(3),
+        );
+        let operation = coordinator
+            .take_ready(start + Duration::from_millis(303))
+            .expect("second save");
+        apply_operation(&mut app, &mut coordinator, &client, operation).await;
+        assert_eq!(
+            daemon.draft(&second_key).expect("second saved").body,
+            "second local"
+        );
+        assert_eq!(
+            daemon.draft(&first_key).expect("first untouched").body,
+            "first stored"
+        );
+
+        app.select(Some(first.id.clone()));
+        coordinator.observe(
+            app.current_persistable_owner(),
+            app.desired_drafts(),
+            start + Duration::from_millis(303),
+        );
+        assert!(app.desired_drafts().contains_key(&second_key));
+        assert!(
+            !app.desired_drafts().contains_key(&first_key),
+            "the first chat's empty composer overrides no other owner"
+        );
+        assert!(step(
+            &mut app,
+            &mut coordinator,
+            &client,
+            start + Duration::from_millis(304)
+        )
+        .await
+        .is_some());
+        assert_eq!(app.draft, "first stored");
+        assert_ne!(first_key, second_key);
+    }
+
+    #[tokio::test]
+    async fn send_success_deletes_the_parked_draft() {
+        let daemon = FakeDaemon::start(false);
+        let client = bloom_ipc::client::BloomClient::new(daemon.socket());
+        let chat = conversation("first@example.com", 20);
+        let key = draft_key(&chat);
+        let mut app = App::default();
+        app.set_conversations(vec![chat.clone()]);
+        app.select(Some(chat.id.clone()));
+        let mut coordinator = DraftCoordinator::new();
+        let start = Instant::now();
+        step(&mut app, &mut coordinator, &client, start).await;
+
+        app.draft = "send body".into();
+        app.draft_cursor = app.draft.chars().count();
+        let Action::SendMessage {
+            attempt,
+            conversation: target,
+            ..
+        } = app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+        else {
+            panic!("send action expected");
+        };
+        app.begin_send(attempt, Some(target.clone()));
+        step(
+            &mut app,
+            &mut coordinator,
+            &client,
+            start + Duration::from_millis(10),
+        )
+        .await;
+        let save = coordinator
+            .take_ready(start + Duration::from_millis(310))
+            .expect("parked save");
+        apply_operation(&mut app, &mut coordinator, &client, save).await;
+        assert_eq!(daemon.draft(&key).expect("parked stored").body, "send body");
+
+        app.finish_send(attempt, Some(target), Ok(()));
+        assert!(app.parked_send.is_none());
+        coordinator.observe(
+            app.current_persistable_owner(),
+            app.desired_drafts(),
+            start + Duration::from_millis(320),
+        );
+        let delete = coordinator
+            .take_ready(start + Duration::from_millis(620))
+            .expect("send success delete");
+        assert!(matches!(delete, DraftOperation::Delete { .. }));
+        apply_operation(&mut app, &mut coordinator, &client, delete).await;
+        assert_eq!(daemon.draft(&key), None);
+    }
+
+    #[tokio::test]
+    async fn send_failure_clears_parked_copy_and_restores_recovery_text() {
+        let daemon = FakeDaemon::start(false);
+        let client = bloom_ipc::client::BloomClient::new(daemon.socket());
+        let chat = conversation("first@example.com", 20);
+        let key = draft_key(&chat);
+        let mut app = App::default();
+        app.set_conversations(vec![chat.clone()]);
+        app.select(Some(chat.id.clone()));
+        let mut coordinator = DraftCoordinator::new();
+        let start = Instant::now();
+        step(&mut app, &mut coordinator, &client, start).await;
+
+        app.draft = "failed send body".into();
+        app.draft_cursor = app.draft.chars().count();
+        let Action::SendMessage {
+            attempt,
+            conversation: target,
+            ..
+        } = app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+        else {
+            panic!("send action expected");
+        };
+        app.begin_send(attempt, Some(target.clone()));
+        step(
+            &mut app,
+            &mut coordinator,
+            &client,
+            start + Duration::from_millis(10),
+        )
+        .await;
+        let save = coordinator
+            .take_ready(start + Duration::from_millis(310))
+            .expect("parked save");
+        apply_operation(&mut app, &mut coordinator, &client, save).await;
+        assert!(daemon.draft(&key).is_some());
+
+        app.finish_send(attempt, Some(target), Err("rejected".into()));
+        assert!(app.parked_send.is_none());
+        assert_eq!(app.draft, "failed send body");
+        assert!(app.desired_drafts().contains_key(&key));
+        assert_eq!(
+            app.desired_drafts()
+                .get(&key)
+                .expect("recovery desired")
+                .body,
+            "failed send body"
+        );
+    }
+
+    #[tokio::test]
+    async fn daemon_failure_keeps_text_and_surfaces_the_generic_error() {
+        let daemon = FakeDaemon::start(false);
+        let client = bloom_ipc::client::BloomClient::new(daemon.socket());
+        let chat = conversation("first@example.com", 20);
+        let mut app = App::default();
+        app.set_conversations(vec![chat.clone()]);
+        app.select(Some(chat.id.clone()));
+        let mut coordinator = DraftCoordinator::new();
+        let start = Instant::now();
+        step(&mut app, &mut coordinator, &client, start).await;
+
+        app.draft = "kept despite failure".into();
+        app.draft_cursor = app.draft.chars().count();
+        daemon.fail_drafts();
+        step(
+            &mut app,
+            &mut coordinator,
+            &client,
+            start + Duration::from_millis(10),
+        )
+        .await;
+        let save = coordinator
+            .take_ready(start + Duration::from_millis(310))
+            .expect("failed save");
+        apply_operation(&mut app, &mut coordinator, &client, save).await;
+        assert_eq!(app.draft, "kept despite failure");
+        assert_eq!(app.error.as_deref(), Some(SYNC_ERROR));
+    }
 }

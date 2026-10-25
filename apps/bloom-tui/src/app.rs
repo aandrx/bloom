@@ -74,6 +74,16 @@ pub struct RecoveryDraft {
     pub uncertain: bool,
 }
 
+/// A durable copy of a submitted body kept until its send is acknowledged. It
+/// belongs to the original owner, not to whatever composer is active afterwards.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[doc(hidden)]
+pub struct ParkedSendDraft {
+    pub owner: DraftOwner,
+    pub attempt: u64,
+    pub saved: SavedDraft,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SendFailure {
     pub message: String,
@@ -479,6 +489,9 @@ pub struct App {
     pub sync_in_flight: bool,
     pub send_feedback: Option<SendFeedback>,
     pub recoverable_send: Option<RecoveryDraft>,
+    /// Durable draft for an in-flight send, keyed by its original owner.
+    #[doc(hidden)]
+    pub parked_send: Option<ParkedSendDraft>,
     pub deferred_sends: VecDeque<RecoveryDraft>,
     pub next_send_attempt: u64,
     pub pending_send_attempt: Option<u64>,
@@ -661,6 +674,7 @@ impl Default for App {
             sync_in_flight: false,
             send_feedback: None,
             recoverable_send: None,
+            parked_send: None,
             deferred_sends: VecDeque::new(),
             next_send_attempt: 1,
             pending_send_attempt: None,
@@ -1100,6 +1114,49 @@ impl App {
         self.update_command_menu();
     }
 
+    /// Keep the submitted body durable until the send result arrives. The active
+    /// buffer is retired separately, so the parked copy cannot look like a delete.
+    fn park_send_draft(&mut self, owner: DraftOwner, body: String, attempt: u64) {
+        // A deferred failure keeps its own parked copy. Move it into the normal
+        // draft map before this send parks, so a later send cannot overwrite it.
+        if let Some(previous) = self.parked_send.take() {
+            if !previous.saved.text.is_empty() {
+                self.drafts.entry(previous.owner).or_insert(previous.saved);
+            }
+        }
+        self.parked_send = Some(ParkedSendDraft {
+            owner,
+            attempt,
+            saved: SavedDraft {
+                cursor: body.graphemes(true).count(),
+                text: body,
+                pasted_body: self.pasted_body,
+                uncertain: self.draft_uncertain,
+            },
+        });
+    }
+
+    /// A quit that could not settle a send leaves the parked draft marked
+    /// uncertain, so a restored composer never implies confirmed delivery.
+    pub fn mark_pending_send_uncertain(&mut self) {
+        if self.pending_send_attempt.is_some() {
+            if let Some(parked) = self.parked_send.as_mut() {
+                parked.saved.uncertain = true;
+            }
+            self.draft_uncertain = true;
+        }
+    }
+
+    fn clear_parked_send(&mut self, attempt: u64) {
+        if self
+            .parked_send
+            .as_ref()
+            .is_some_and(|parked| parked.attempt == attempt)
+        {
+            self.parked_send = None;
+        }
+    }
+
     /// Retire the active buffer and its saved copy, e.g. after a message is sent.
     fn retire_active_draft(&mut self) {
         self.clear_undo_history();
@@ -1157,27 +1214,59 @@ impl App {
                 map.insert(key, saved.durable());
             }
         }
+        fn merge_if_present(map: &mut DraftMap, owner: &DraftOwner, saved: &SavedDraft) {
+            let Some(key) = owner.durable_key().filter(DraftKey::is_valid) else {
+                return;
+            };
+            if !saved.text.is_empty() && !map.contains_key(&key) {
+                map.insert(key, saved.durable());
+            }
+        }
 
         let mut map = DraftMap::new();
         for (owner, saved) in &self.drafts {
             merge(&mut map, owner, saved);
         }
         if let Some(owner) = &self.active_draft_owner {
-            merge(
-                &mut map,
-                owner,
-                &SavedDraft {
-                    text: self.draft.clone(),
-                    cursor: self.draft_cursor,
-                    pasted_body: self.pasted_body,
-                    uncertain: self.draft_uncertain,
-                },
-            );
+            // An empty active buffer is an explicit clear, but it must not erase a
+            // parked copy for the same owner while its send is still in flight.
+            if self.draft.is_empty() {
+                if !self
+                    .parked_send
+                    .as_ref()
+                    .is_some_and(|parked| parked.owner == *owner)
+                {
+                    merge(
+                        &mut map,
+                        owner,
+                        &SavedDraft {
+                            text: self.draft.clone(),
+                            cursor: self.draft_cursor,
+                            pasted_body: self.pasted_body,
+                            uncertain: self.draft_uncertain,
+                        },
+                    );
+                }
+            } else {
+                merge(
+                    &mut map,
+                    owner,
+                    &SavedDraft {
+                        text: self.draft.clone(),
+                        cursor: self.draft_cursor,
+                        pasted_body: self.pasted_body,
+                        uncertain: self.draft_uncertain,
+                    },
+                );
+            }
         }
         if let Some(snapshot) = &self.suspended_composition {
             if let Some(owner) = &snapshot.owner {
                 merge(&mut map, owner, &snapshot.saved);
             }
+        }
+        if let Some(parked) = &self.parked_send {
+            merge_if_present(&mut map, &parked.owner, &parked.saved);
         }
         map
     }
@@ -3485,6 +3574,7 @@ impl App {
         let recovery = self.recoverable_send.take();
         match result {
             Ok(()) => {
+                self.clear_parked_send(attempt);
                 self.error = None;
                 self.notice = None;
                 self.send_feedback = Some(SendFeedback {
@@ -3496,6 +3586,8 @@ impl App {
                 self.send_feedback = None;
                 let mut message = error.message;
                 if let Some(mut recovery) = recovery.filter(|r| r.attempt == attempt) {
+                    // Keep the parked copy while recovery is deferred; only a
+                    // restored composer (or a later send) retires it.
                     recovery.uncertain = error.uncertain;
                     if recovery.target == conversation
                         && self.selected == recovery.origin
@@ -3504,6 +3596,7 @@ impl App {
                         && self.recovery_prompt_available()
                         && self.draft.is_empty()
                     {
+                        self.clear_parked_send(attempt);
                         self.restore_send_draft(recovery);
                     } else {
                         self.deferred_sends.push_back(recovery);
@@ -3530,6 +3623,7 @@ impl App {
     }
 
     fn restore_send_draft(&mut self, recovery: RecoveryDraft) {
+        self.clear_parked_send(recovery.attempt);
         self.clear_undo_history();
         self.draft = recovery.body;
         // A recovered body is always message data, even if it begins with '/'.
@@ -4198,9 +4292,14 @@ impl App {
                         CompositionIntent::SendMessage(body) => {
                             match (self.selected.clone(), body.is_empty()) {
                                 (Some(conversation), false) => {
-                                    self.retire_active_draft();
                                     let attempt = self.next_send_attempt;
                                     self.next_send_attempt += 1;
+                                    self.park_send_draft(
+                                        DraftOwner::Conversation(conversation.clone()),
+                                        body.clone(),
+                                        attempt,
+                                    );
+                                    self.retire_active_draft();
                                     self.recoverable_send = Some(RecoveryDraft {
                                         attempt,
                                         target: Some(conversation.clone()),
@@ -4223,9 +4322,14 @@ impl App {
                             if address.is_empty() || body.is_empty() {
                                 Action::None
                             } else {
-                                self.retire_active_draft();
                                 let attempt = self.next_send_attempt;
                                 self.next_send_attempt += 1;
+                                self.park_send_draft(
+                                    DraftOwner::NewChat(Some(address.clone())),
+                                    body.clone(),
+                                    attempt,
+                                );
+                                self.retire_active_draft();
                                 self.recoverable_send = Some(RecoveryDraft {
                                     attempt,
                                     target: None,
