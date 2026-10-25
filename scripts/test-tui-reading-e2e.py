@@ -761,5 +761,54 @@ class ReadingFlows(unittest.TestCase):
         self.artifact('filename-alice-sent')
 
 
+    def test_reaction_summary_renders_at_three_widths(self):
+        self.stop_tui()
+        self.fixture.stop_daemon()
+        state = self.fixture.persisted()
+        chat = next(item for item in state['conversations'] if item['id'] == CID)
+        sender = next(participant['handle'] for participant in chat['participants']
+                      if not participant['is_me'])
+        newest = max(item['created_at'] for item in state['messages'])
+        reaction = lambda kind, part: {
+            'sender': sender, 'kind': kind, 'remote_id': None,
+            'part': part, 'timestamp': None,
+        }
+        state['messages'].append({
+            'id': {'transport': 'openbubbles', 'value': 'reaction-pty-0001'},
+            'conversation_id': CID,
+            'remote_id': None,
+            'sender': sender,
+            'parts': [{'type': 'text', 'value': 'REACTION_PTY_MARKER synthetic body'}],
+            'created_at': newest + 10,
+            'sent_at': None,
+            'delivery': 'delivered',
+            'from_me': False,
+            'edited_at': None,
+            'reactions': [reaction('heart', 0), reaction('like', None),
+                          reaction('heart', None)],
+            'unsent_at': None,
+        })
+        self.fixture.store_path.write_text(json.dumps(state))
+        self.fixture.start_daemon()
+        self.start_tui()
+        def transcript_text():
+            divider = self.screen.display[0].find('│')
+            left = divider + 3 if divider >= 0 else 2
+            return '\n'.join(line[left:] for line in self.screen.display[2:-5])
+
+        for width in (100, 44, 24):
+            self.resize(width, 30)
+            self.wait_for(lambda: 'REACTION_PTY_MARKER' in transcript_text(), timeout=15)
+            compact = re.sub(r'\s+', '', transcript_text())
+            self.assertIn('·heart2·like1', compact,
+                          f'the sorted aggregate must render at {width} columns')
+            self.artifact(f'reaction-summary-{width}')
+        self.assertIn(
+            '· heart 2 · like 1',
+            re.sub(r'\s+', ' ', transcript_text()),
+            'wide layout keeps spaced separators',
+        )
+
+
 if __name__ == '__main__':
     unittest.main(verbosity=2)
