@@ -131,6 +131,10 @@ impl Service {
                 });
                 Ok(true)
             }
+            // Reaction application lands in the next unit. Until then the event
+            // is accepted without inventing a message or rewriting content, and
+            // no subscriber sees a fabricated update.
+            TransportEvent::ReactionChanged { .. } => Ok(false),
         }
     }
 

@@ -878,6 +878,8 @@ pub enum SkipReason {
     MissingChatGuid,
     MissingMessageId,
     MissingSender,
+    MissingReactionTarget,
+    UnsupportedReaction,
     InvalidIdentity,
     NoContent,
 }
@@ -890,6 +892,8 @@ impl std::fmt::Display for SkipReason {
             Self::MissingChatGuid => "payload has no chat guid",
             Self::MissingMessageId => "payload has no message id",
             Self::MissingSender => "payload has no sender",
+            Self::MissingReactionTarget => "reaction payload has no usable target message id",
+            Self::UnsupportedReaction => "reaction payload carried an unsupported kind",
             Self::InvalidIdentity => "payload identity was rejected by the domain model",
             Self::NoContent => "payload carried no representable content",
         })
@@ -1019,6 +1023,56 @@ fn envelope_sender(inst: &Value) -> Result<Handle, SkipReason> {
     handle_from(sender).ok_or(SkipReason::InvalidIdentity)
 }
 
+fn map_reaction(
+    inst: &Value,
+    message_value: &Value,
+    id: &TransportId,
+) -> Result<TransportEvent, SkipReason> {
+    let chat_guid = inst
+        .get("conversation")
+        .and_then(|conversation| conversation.get("sender_guid"))
+        .and_then(Value::as_str)
+        .ok_or(SkipReason::MissingChatGuid)?;
+    let sender = envelope_sender(inst)?;
+    let target = message_value
+        .get("to_uuid")
+        .and_then(Value::as_str)
+        .ok_or(SkipReason::MissingReactionTarget)?;
+    let conversation_id =
+        ConversationId::new(id.clone(), chat_guid).map_err(|_| SkipReason::InvalidIdentity)?;
+    let message_id =
+        MessageId::new(id.clone(), target).map_err(|_| SkipReason::MissingReactionTarget)?;
+
+    let wrapper = message_value
+        .get("reaction")
+        .ok_or(SkipReason::UnsupportedReaction)?;
+    let active = wrapper
+        .get("enable")
+        .and_then(Value::as_bool)
+        .ok_or(SkipReason::UnsupportedReaction)?;
+    let kind = wrapper
+        .get("reaction")
+        .and_then(Value::as_str)
+        .filter(|kind| !kind.is_empty())
+        .ok_or(SkipReason::UnsupportedReaction)?
+        .to_owned();
+    let part = message_value
+        .get("to_part")
+        .and_then(Value::as_u64)
+        .and_then(|part| u32::try_from(part).ok());
+    let at = inst.get("sent_timestamp_ms").and_then(Value::as_i64);
+
+    Ok(TransportEvent::ReactionChanged {
+        conversation_id,
+        message_id,
+        sender,
+        kind,
+        active,
+        part,
+        at,
+    })
+}
+
 fn map_inbound_with_sequence(
     payload: &Value,
     my_handles: &[String],
@@ -1030,7 +1084,11 @@ fn map_inbound_with_sequence(
     }
     let inst = payload.get("inst").ok_or(SkipReason::NotAnInboundMessage)?;
     let message_value = inst.get("message").ok_or(SkipReason::NotANormalMessage)?;
-    if message_value.get("type").and_then(Value::as_str) != Some("normal") {
+    let message_type = message_value.get("type").and_then(Value::as_str);
+    if message_type == Some("react") {
+        return map_reaction(inst, message_value, id);
+    }
+    if message_type != Some("normal") {
         return Err(SkipReason::NotANormalMessage);
     }
     let normal = message_value
@@ -1991,6 +2049,76 @@ mod tests {
             map_inbound(&payload("", "hello"), &[], &transport()),
             Err(SkipReason::InvalidIdentity)
         ));
+    }
+
+    #[test]
+    fn react_maps_to_a_reaction_event() {
+        let mut react = react_envelope("tel:+15550000001");
+        react["inst"]["sent_timestamp_ms"] = json!(1_700_000_000_000i64);
+        let event = map_inbound(&react, &[], &transport()).expect("react maps");
+        let TransportEvent::ReactionChanged {
+            conversation_id,
+            message_id,
+            sender,
+            kind,
+            active,
+            part,
+            at,
+        } = event
+        else {
+            panic!("expected a reaction event");
+        };
+        assert_eq!(
+            conversation_id,
+            ConversationId::new(transport(), "iMessage;-;someone@example.com").unwrap()
+        );
+        assert_eq!(
+            message_id,
+            MessageId::new(transport(), "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee").unwrap()
+        );
+        assert_eq!(sender, handle_from("tel:+15550000001").unwrap());
+        assert_eq!(kind, "like");
+        assert!(active);
+        assert_eq!(part, Some(0));
+        assert_eq!(at, Some(1_700_000_000_000));
+    }
+
+    #[test]
+    fn emoji_object_reaction_is_unsupported() {
+        let mut react = react_envelope("tel:+15550000001");
+        react["inst"]["message"]["reaction"]["reaction"] =
+            json!({"emoji": "\u{1f600}", "payload": "x"});
+        assert!(matches!(
+            map_inbound(&react, &[], &transport()),
+            Err(SkipReason::UnsupportedReaction)
+        ));
+
+        let mut empty = react_envelope("tel:+15550000001");
+        empty["inst"]["message"]["reaction"]["reaction"] = json!("");
+        assert!(matches!(
+            map_inbound(&empty, &[], &transport()),
+            Err(SkipReason::UnsupportedReaction)
+        ));
+    }
+
+    #[test]
+    fn react_without_a_target_is_missing_reaction_target() {
+        let mut react = react_envelope("tel:+15550000001");
+        react["inst"]["message"]
+            .as_object_mut()
+            .unwrap()
+            .remove("to_uuid");
+        assert!(matches!(
+            map_inbound(&react, &[], &transport()),
+            Err(SkipReason::MissingReactionTarget)
+        ));
+    }
+
+    #[test]
+    fn normal_message_is_unaffected_by_the_react_arm() {
+        let event = map_inbound(&payload("tel:+15550000001", "hello"), &[], &transport())
+            .expect("normal payload maps");
+        assert!(matches!(event, TransportEvent::Message { .. }));
     }
 
     #[test]

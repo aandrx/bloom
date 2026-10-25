@@ -1,8 +1,8 @@
 //! Transport-neutral asynchronous interface shared by transport implementations.
 use async_trait::async_trait;
 use bloom_domain::{
-    Capabilities, Conversation, ConversationId, DeliveryState, Message, MessageId, MessagePart,
-    OutgoingBody, SessionState, TransportId,
+    Capabilities, Conversation, ConversationId, DeliveryState, Handle, Message, MessageId,
+    MessagePart, OutgoingBody, SessionState, TransportId,
 };
 use std::{
     error::Error,
@@ -126,6 +126,17 @@ pub enum TransportEvent {
         message: MessageId,
         delivery: DeliveryState,
     },
+    /// A reaction was added to or removed from an existing message. Carries no
+    /// message body and never creates a message.
+    ReactionChanged {
+        conversation_id: ConversationId,
+        message_id: MessageId,
+        sender: Handle,
+        kind: String,
+        active: bool,
+        part: Option<u32>,
+        at: Option<i64>,
+    },
     Session {
         state: SessionState,
         reason: Option<SessionReason>,
@@ -140,6 +151,7 @@ impl fmt::Debug for TransportEvent {
             Self::Message { .. } => "TransportEvent::Message([REDACTED])",
             Self::MessageUpdated { .. } => "TransportEvent::MessageUpdated([REDACTED])",
             Self::DeliveryChanged { .. } => "TransportEvent::DeliveryChanged([REDACTED])",
+            Self::ReactionChanged { .. } => "TransportEvent::ReactionChanged([REDACTED])",
             Self::Session { .. } => "TransportEvent::Session([REDACTED])",
         })
     }
