@@ -29,7 +29,7 @@ Status: design only. Reactions are decoded by the codec but dropped by the daemo
 
 1. Domain field plus serde default test: done. `Reaction.part` round-trips and legacy rows without the field load as `None`; workspace all-target tests, strict Clippy, formatting, and source checks pass.
 2. Mapper test with a synthetic react payload reaching a typed event, including skip accounting for an unknown target id: done. The mapper now emits `TransportEvent::ReactionChanged` with a redacting `Debug`, accepts only six evidence-backed kinds (`heart`, `like`, `dislike`, `laugh`, `emphasize`, `question`), and skips a bare emoji string, an object reaction, a nonempty unknown kind, and a missing target. Review caught that any string was previously accepted; that is fixed. Until the store applies reactions, the service accepts the event, warns once that it is dropping them, and publishes nothing fabricated.
-3. `apply_reaction` store tests: add, repeat-add no-op, remove, wrong transport, missing target, part handling, ordering.
+3. `apply_reaction` store tests: done. Add, repeat-add no-op, remove, remove-missing, missing target, part identity, ordering, and a preservation test over every non-reaction field. Review found ordering was not total because `Handle`'s Debug is redacted; it now compares the sender's serialized form, which includes kind and value. `apply_reaction` and `ReactionOutcome` carry a temporary dead-code allowance until the service wires them in the next unit.
 4. Service wiring and a subscriber-visible update test.
 5. TUI rendering at 24, 44, and 100 columns with long emoji sets.
 6. Fixture-side parity in the synthetic daemons.
