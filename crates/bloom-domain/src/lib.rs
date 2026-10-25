@@ -443,6 +443,10 @@ pub struct Reaction {
     pub sender: Handle,
     pub kind: String,
     pub remote_id: Option<String>,
+    /// Message part this reaction targets, when the transport reports one.
+    /// Older stored reactions deserialize with `None`.
+    #[serde(default)]
+    pub part: Option<u32>,
     pub timestamp: Option<Timestamp>,
 }
 impl fmt::Debug for Reaction {
@@ -661,6 +665,31 @@ mod tests {
         .unwrap();
         assert_eq!(restored.file_name(), None);
     }
+    #[test]
+    fn reaction_part_round_trips_and_defaults_to_none() {
+        let sender = Handle::new(HandleKind::Email, "friend@example.invalid").unwrap();
+        let reaction = Reaction {
+            sender: sender.clone(),
+            kind: "like".into(),
+            remote_id: None,
+            part: Some(2),
+            timestamp: Some(1_700_000_000_000),
+        };
+        let json = serde_json::to_value(&reaction).unwrap();
+        assert_eq!(json["part"], 2);
+        let restored: Reaction = serde_json::from_value(json).unwrap();
+        assert_eq!(restored, reaction);
+
+        // Older stored rows have no part field and must still load.
+        let legacy = format!(
+            r#"{{"sender":{},"kind":"like","remote_id":null,"timestamp":null}}"#,
+            serde_json::to_string(&sender).unwrap()
+        );
+        let restored: Reaction = serde_json::from_str(&legacy).unwrap();
+        assert_eq!(restored.part, None);
+        assert_eq!(restored.kind, "like");
+    }
+
     #[test]
     fn empty_attachment_id_rejected_constructor_and_part_json() {
         assert!(AttachmentRef::new(" \t", None, None, None).is_err());

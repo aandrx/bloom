@@ -27,7 +27,7 @@ Status: design only. Reactions are decoded by the codec but dropped by the daemo
 
 ## Phases
 
-1. Domain field plus serde default test.
+1. Domain field plus serde default test: done. `Reaction.part` round-trips and legacy rows without the field load as `None`; workspace all-target tests, strict Clippy, formatting, and source checks pass.
 2. Mapper test with a synthetic react payload reaching a typed event, including skip accounting for an unknown target id.
 3. `apply_reaction` store tests: add, repeat-add no-op, remove, wrong transport, missing target, part handling, ordering.
 4. Service wiring and a subscriber-visible update test.
