@@ -133,8 +133,18 @@ impl Service {
             }
             // Reaction application lands in the next unit. Until then the event
             // is accepted without inventing a message or rewriting content, and
-            // no subscriber sees a fabricated update.
-            TransportEvent::ReactionChanged { .. } => Ok(false),
+            // no subscriber sees a fabricated update. Warn once so the drop is
+            // visible without flooding the log.
+            TransportEvent::ReactionChanged { .. } => {
+                use std::sync::atomic::{AtomicBool, Ordering};
+                static WARNED: AtomicBool = AtomicBool::new(false);
+                if !WARNED.swap(true, Ordering::Relaxed) {
+                    eprintln!(
+                        "bloomd: reaction events are mapped but store application is pending; dropping them"
+                    );
+                }
+                Ok(false)
+            }
         }
     }
 

@@ -1023,6 +1023,10 @@ fn envelope_sender(inst: &Value) -> Result<Handle, SkipReason> {
     handle_from(sender).ok_or(SkipReason::InvalidIdentity)
 }
 
+/// Reaction kinds this mapper has evidence for. Anything else, including a
+/// free-form string or an emoji object, is skipped rather than guessed.
+const KNOWN_REACTIONS: [&str; 6] = ["heart", "like", "dislike", "laugh", "emphasize", "question"];
+
 fn map_reaction(
     inst: &Value,
     message_value: &Value,
@@ -1053,7 +1057,7 @@ fn map_reaction(
     let kind = wrapper
         .get("reaction")
         .and_then(Value::as_str)
-        .filter(|kind| !kind.is_empty())
+        .filter(|kind| KNOWN_REACTIONS.contains(kind))
         .ok_or(SkipReason::UnsupportedReaction)?
         .to_owned();
     let part = message_value
@@ -2092,13 +2096,22 @@ mod tests {
             map_inbound(&react, &[], &transport()),
             Err(SkipReason::UnsupportedReaction)
         ));
-
-        let mut empty = react_envelope("tel:+15550000001");
-        empty["inst"]["message"]["reaction"]["reaction"] = json!("");
+        // A bare emoji string is not one of the mapper's evidence-backed kinds.
+        let mut bare = react_envelope("tel:+15550000001");
+        bare["inst"]["message"]["reaction"]["reaction"] = json!("\u{1f600}");
         assert!(matches!(
-            map_inbound(&empty, &[], &transport()),
+            map_inbound(&bare, &[], &transport()),
             Err(SkipReason::UnsupportedReaction)
         ));
+
+        for unsupported in [json!(""), json!("unknown-kind"), json!("😀")] {
+            let mut react = react_envelope("tel:+15550000001");
+            react["inst"]["message"]["reaction"]["reaction"] = unsupported;
+            assert!(matches!(
+                map_inbound(&react, &[], &transport()),
+                Err(SkipReason::UnsupportedReaction)
+            ));
+        }
     }
 
     #[test]
