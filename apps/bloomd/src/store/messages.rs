@@ -1,5 +1,5 @@
 use super::{EncryptedStore, StoreError};
-use bloom_domain::{ConversationId, Message, MessageId, MessagePart, Reaction};
+use bloom_domain::{ConversationId, Handle, Message, MessageId, MessagePart, Reaction};
 use rusqlite::{params, OptionalExtension};
 use std::collections::HashSet;
 
@@ -22,6 +22,29 @@ pub enum ReactionOutcome {
     Applied,
     Unchanged,
     NotFound,
+}
+
+/// Result of a transactional edit or unsend application.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MutationOutcome {
+    /// The stored message changed.
+    Applied,
+    /// The event was a duplicate or strictly older than the stored state.
+    Unchanged,
+    /// No message row exists for the target.
+    NotFound,
+    /// The target cannot be mutated safely with the stored data.
+    Unsupported,
+}
+
+/// Identity, ownership, part and timestamp shared by edit and unsend application.
+pub struct MutationTarget<'a> {
+    pub message_id: &'a MessageId,
+    pub conversation_id: &'a ConversationId,
+    pub aliases: &'a [ConversationId],
+    pub sender: &'a Handle,
+    pub part: u64,
+    pub at: i64,
 }
 
 fn stable_id(id: &MessageId) -> Result<String, StoreError> {
@@ -156,6 +179,201 @@ impl EncryptedStore {
             return Ok(None);
         }
         get_message(self, target)
+    }
+}
+
+enum MutationLookup {
+    Ready(Box<Message>, Vec<Option<u64>>),
+    Rejected(MutationOutcome),
+}
+
+/// Load and validate the stored mutation target inside the caller's transaction.
+/// A missing row is `NotFound`; every unsafe or ambiguous shape is `Unsupported`.
+fn load_mutation_target(
+    tx: &rusqlite::Transaction<'_>,
+    target: &MessageId,
+    conversation: &ConversationId,
+    aliases: &[ConversationId],
+    sender: &Handle,
+) -> Result<MutationLookup, StoreError> {
+    let key = stable_id(target)?;
+    let row: Option<(Vec<u8>, Option<Vec<u8>>)> = tx
+        .query_row(
+            "SELECT messages.data, message_part_maps.data FROM messages
+             LEFT JOIN message_part_maps ON message_part_maps.message_id = messages.id
+             WHERE messages.id=?1",
+            params![key],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()?;
+    let Some((data, map)) = row else {
+        return Ok(MutationLookup::Rejected(MutationOutcome::NotFound));
+    };
+    let message: Message = serde_json::from_slice(&data).map_err(|_| StoreError::Schema)?;
+    if message.conversation_id() != conversation && !aliases.contains(message.conversation_id()) {
+        return Ok(MutationLookup::Rejected(MutationOutcome::Unsupported));
+    }
+    if &message.sender != sender {
+        return Ok(MutationLookup::Rejected(MutationOutcome::Unsupported));
+    }
+    let Some(map) = map else {
+        return Ok(MutationLookup::Rejected(MutationOutcome::Unsupported));
+    };
+    let part_ids: Vec<Option<u64>> =
+        serde_json::from_slice(&map).map_err(|_| StoreError::Schema)?;
+    if part_ids.len() != message.parts.len() {
+        return Ok(MutationLookup::Rejected(MutationOutcome::Unsupported));
+    }
+    Ok(MutationLookup::Ready(Box::new(message), part_ids))
+}
+
+/// Write the mutated message and its aligned part map in the caller's transaction.
+fn write_mutation(
+    tx: &rusqlite::Transaction<'_>,
+    key: &str,
+    message: &Message,
+    part_ids: &[Option<u64>],
+) -> Result<(), StoreError> {
+    let data = serde_json::to_vec(message).map_err(|_| StoreError::Schema)?;
+    let map = serde_json::to_vec(part_ids).map_err(|_| StoreError::Schema)?;
+    tx.execute(
+        "UPDATE messages SET data=?2 WHERE id=?1",
+        params![key, data],
+    )?;
+    tx.execute(
+        "UPDATE message_part_maps SET data=?2 WHERE message_id=?1",
+        params![key, map],
+    )?;
+    Ok(())
+}
+
+/// Applies one edit event to a stored message. Every stored part mapped to the
+/// target part is replaced, in place, by the replacement text parts, and the
+/// replacement parts take over that target map identity. All other parts and
+/// fields are preserved. The read and write share one transaction.
+pub fn apply_edit(
+    store: &mut EncryptedStore,
+    target: &MutationTarget<'_>,
+    replacements: &[MessagePart],
+) -> Result<MutationOutcome, StoreError> {
+    if replacements.is_empty()
+        || replacements
+            .iter()
+            .any(|part| !matches!(part, MessagePart::Text(text) if !text.is_empty()))
+    {
+        return Ok(MutationOutcome::Unsupported);
+    }
+    let key = stable_id(target.message_id)?;
+    let tx = store._connection.transaction()?;
+    let (message, part_ids) = match load_mutation_target(
+        &tx,
+        target.message_id,
+        target.conversation_id,
+        target.aliases,
+        target.sender,
+    )? {
+        MutationLookup::Ready(message, part_ids) => (message, part_ids),
+        MutationLookup::Rejected(outcome) => return Ok(outcome),
+    };
+    let mut message = *message;
+    if message.unsent_at.is_some() {
+        return Ok(MutationOutcome::Unsupported);
+    }
+    let original_at = message.sent_at.unwrap_or(message.created_at);
+    if target.at < original_at {
+        return Ok(MutationOutcome::Unsupported);
+    }
+    if !part_ids.contains(&Some(target.part)) {
+        return Ok(MutationOutcome::Unsupported);
+    }
+    if message
+        .edited_at
+        .is_some_and(|previous| target.at <= previous)
+    {
+        return Ok(MutationOutcome::Unchanged);
+    }
+    let mut parts = Vec::with_capacity(message.parts.len());
+    let mut ids = Vec::with_capacity(part_ids.len());
+    let mut replaced = false;
+    for (index, stored) in message.parts.iter().enumerate() {
+        if part_ids[index] == Some(target.part) {
+            if !replaced {
+                for replacement in replacements {
+                    parts.push(replacement.clone());
+                    ids.push(Some(target.part));
+                }
+                replaced = true;
+            }
+        } else {
+            parts.push(stored.clone());
+            ids.push(part_ids[index]);
+        }
+    }
+    message.parts = parts;
+    message.edited_at = Some(target.at);
+    write_mutation(&tx, &key, &message, &ids)?;
+    tx.commit()?;
+    Ok(MutationOutcome::Applied)
+}
+
+/// Applies one unsend event to a stored message. Only a target part that owns
+/// the whole stored body is accepted; content, reactions, and every other field
+/// are retained for local audit. Repeated unsends are no-ops.
+pub fn apply_unsend(
+    store: &mut EncryptedStore,
+    target: &MutationTarget<'_>,
+) -> Result<MutationOutcome, StoreError> {
+    let key = stable_id(target.message_id)?;
+    let tx = store._connection.transaction()?;
+    let (message, part_ids) = match load_mutation_target(
+        &tx,
+        target.message_id,
+        target.conversation_id,
+        target.aliases,
+        target.sender,
+    )? {
+        MutationLookup::Ready(message, part_ids) => (message, part_ids),
+        MutationLookup::Rejected(outcome) => return Ok(outcome),
+    };
+    let mut message = *message;
+    if message.unsent_at.is_some() {
+        return Ok(MutationOutcome::Unchanged);
+    }
+    let original_at = message.sent_at.unwrap_or(message.created_at);
+    if target.at < original_at {
+        return Ok(MutationOutcome::Unsupported);
+    }
+    if part_ids.is_empty() || !part_ids.iter().all(|stored| *stored == Some(target.part)) {
+        return Ok(MutationOutcome::Unsupported);
+    }
+    message.unsent_at = Some(target.at);
+    write_mutation(&tx, &key, &message, &part_ids)?;
+    tx.commit()?;
+    Ok(MutationOutcome::Applied)
+}
+
+impl EncryptedStore {
+    /// Applies an edit and returns the reloaded stored message only on `Applied`.
+    pub fn apply_edit(
+        &mut self,
+        target: &MutationTarget<'_>,
+        replacements: &[MessagePart],
+    ) -> Result<Option<Message>, StoreError> {
+        if self::apply_edit(self, target, replacements)? != MutationOutcome::Applied {
+            return Ok(None);
+        }
+        get_message(self, target.message_id)
+    }
+
+    /// Applies an unsend and returns the reloaded stored message only on `Applied`.
+    pub fn apply_unsend(
+        &mut self,
+        target: &MutationTarget<'_>,
+    ) -> Result<Option<Message>, StoreError> {
+        if self::apply_unsend(self, target)? != MutationOutcome::Applied {
+            return Ok(None);
+        }
+        get_message(self, target.message_id)
     }
 }
 
@@ -2706,5 +2924,352 @@ mod tests {
         assert_eq!(stored.edited_at, message.edited_at);
         assert_eq!(stored.unsent_at, message.unsent_at);
         assert_eq!(stored.reactions, vec![reaction]);
+    }
+
+    fn store_part_map(store: &EncryptedStore, id: &MessageId, map: &[Option<u64>]) {
+        let data = serde_json::to_vec(map).unwrap();
+        store
+            ._connection
+            .execute(
+                "INSERT INTO message_part_maps(message_id, data) VALUES (?1, ?2)
+                 ON CONFLICT(message_id) DO UPDATE SET data=excluded.data",
+                params![stable_id(id).unwrap(), data],
+            )
+            .unwrap();
+    }
+
+    fn raw_part_map(store: &EncryptedStore, id: &MessageId) -> Option<Vec<u8>> {
+        store
+            ._connection
+            .query_row(
+                "SELECT data FROM message_part_maps WHERE message_id=?1",
+                params![stable_id(id).unwrap()],
+                |row| row.get(0),
+            )
+            .optional()
+            .unwrap()
+    }
+
+    fn edit(
+        store: &mut EncryptedStore,
+        message: &Message,
+        part: u64,
+        replacements: &[MessagePart],
+        at: i64,
+    ) -> MutationOutcome {
+        apply_edit(
+            store,
+            &MutationTarget {
+                message_id: message.id(),
+                conversation_id: message.conversation_id(),
+                aliases: &[],
+                sender: &message.sender,
+                part,
+                at,
+            },
+            replacements,
+        )
+        .unwrap()
+    }
+
+    fn unsend(
+        store: &mut EncryptedStore,
+        message: &Message,
+        part: u64,
+        at: i64,
+    ) -> MutationOutcome {
+        apply_unsend(
+            store,
+            &MutationTarget {
+                message_id: message.id(),
+                conversation_id: message.conversation_id(),
+                aliases: &[],
+                sender: &message.sender,
+                part,
+                at,
+            },
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn edit_replaces_only_the_target_part_group_and_preserves_everything_else() {
+        let (_temp, mut store, conversation) = setup();
+        let reaction = fixture_reaction("alice", "heart", Some(0), Some(5));
+        let message = Message::new(
+            message_id("alpha", "m1"),
+            conversation,
+            Some("remote-1".into()),
+            Handle::new(HandleKind::Opaque, "synthetic-sender").unwrap(),
+            vec![
+                MessagePart::Text("a".into()),
+                MessagePart::Text("b".into()),
+                MessagePart::Text("c".into()),
+                fixture_attachment("attachment-1", Some("file.txt")),
+            ],
+            10,
+            Some(11),
+            DeliveryState::Delivered,
+            true,
+            None,
+            vec![reaction.clone()],
+            None,
+        )
+        .unwrap();
+        upsert_message(&mut store, &message).unwrap();
+        store_part_map(&store, message.id(), &[Some(0), Some(1), None, Some(1)]);
+
+        assert_eq!(
+            edit(
+                &mut store,
+                &message,
+                1,
+                &[MessagePart::Text("x".into()), MessagePart::Text("y".into())],
+                20,
+            ),
+            MutationOutcome::Applied
+        );
+        let stored = get_message(&store, message.id()).unwrap().unwrap();
+        assert_eq!(
+            stored.parts,
+            vec![
+                MessagePart::Text("a".into()),
+                MessagePart::Text("x".into()),
+                MessagePart::Text("y".into()),
+                MessagePart::Text("c".into()),
+            ]
+        );
+        assert_eq!(
+            raw_part_map(&store, message.id()),
+            Some(serde_json::to_vec(&[Some(0), Some(1), Some(1), None]).unwrap())
+        );
+        assert_eq!(stored.id(), message.id());
+        assert_eq!(stored.conversation_id(), message.conversation_id());
+        assert_eq!(stored.remote_id, message.remote_id);
+        assert_eq!(stored.sender, message.sender);
+        assert_eq!(stored.created_at, message.created_at);
+        assert_eq!(stored.sent_at, message.sent_at);
+        assert_eq!(stored.delivery, message.delivery);
+        assert_eq!(stored.from_me, message.from_me);
+        assert_eq!(stored.edited_at, Some(20));
+        assert_eq!(stored.reactions, vec![reaction]);
+        assert_eq!(stored.unsent_at, None);
+    }
+
+    #[test]
+    fn duplicate_and_older_edits_are_unchanged_and_empty_replacements_rejected() {
+        let (_temp, mut store, _conversation) = setup();
+        let message = fixture_message("alpha", "m1", "room", 1, "body", DeliveryState::Sent);
+        upsert_message(&mut store, &message).unwrap();
+        store_part_map(&store, message.id(), &[Some(0)]);
+        let replacement = [MessagePart::Text("first".into())];
+        assert_eq!(
+            edit(&mut store, &message, 0, &replacement, 10),
+            MutationOutcome::Applied
+        );
+        let before = raw_message_data(&store, message.id());
+        assert_eq!(
+            edit(&mut store, &message, 0, &replacement, 10),
+            MutationOutcome::Unchanged
+        );
+        assert_eq!(
+            edit(&mut store, &message, 0, &replacement, 9),
+            MutationOutcome::Unchanged
+        );
+        assert_eq!(
+            edit(&mut store, &message, 0, &[], 20),
+            MutationOutcome::Unsupported
+        );
+        assert_eq!(
+            edit(
+                &mut store,
+                &message,
+                0,
+                &[MessagePart::Text(String::new())],
+                20,
+            ),
+            MutationOutcome::Unsupported
+        );
+        assert_eq!(
+            edit(
+                &mut store,
+                &message,
+                0,
+                &[fixture_attachment("replacement", Some("file.bin"))],
+                20,
+            ),
+            MutationOutcome::Unsupported
+        );
+        assert_eq!(
+            edit(&mut store, &message, 0, &replacement, 0),
+            MutationOutcome::Unsupported
+        );
+        assert_eq!(raw_message_data(&store, message.id()), before);
+    }
+
+    #[test]
+    fn missing_or_misaligned_maps_are_unsupported_and_write_nothing() {
+        let (_temp, mut store, _conversation) = setup();
+        let no_map = fixture_message("alpha", "m1", "room", 1, "body", DeliveryState::Sent);
+        let misaligned = fixture_message("alpha", "m2", "room", 2, "body", DeliveryState::Sent);
+        upsert_message(&mut store, &no_map).unwrap();
+        upsert_message(&mut store, &misaligned).unwrap();
+        store_part_map(&store, misaligned.id(), &[Some(0), Some(0)]);
+        let replacement = [MessagePart::Text("edited".into())];
+        for target in [&no_map, &misaligned] {
+            let before = raw_message_data(&store, target.id());
+            assert_eq!(
+                edit(&mut store, target, 0, &replacement, 10),
+                MutationOutcome::Unsupported
+            );
+            assert_eq!(raw_message_data(&store, target.id()), before);
+            assert_eq!(
+                unsend(&mut store, target, 0, 10),
+                MutationOutcome::Unsupported
+            );
+            assert_eq!(raw_message_data(&store, target.id()), before);
+        }
+        assert_eq!(raw_part_map(&store, no_map.id()), None);
+    }
+
+    #[test]
+    fn wrong_sender_or_conversation_is_unsupported_and_unknown_target_is_not_found() {
+        let (_temp, mut store, _conversation) = setup();
+        let message = fixture_message("alpha", "m1", "room", 1, "body", DeliveryState::Sent);
+        upsert_message(&mut store, &message).unwrap();
+        store_part_map(&store, message.id(), &[Some(0)]);
+        let replacement = [MessagePart::Text("edited".into())];
+        let before = raw_message_data(&store, message.id());
+        let wrong_sender = Handle::new(HandleKind::Opaque, "other-sender").unwrap();
+        assert_eq!(
+            apply_edit(
+                &mut store,
+                &MutationTarget {
+                    message_id: message.id(),
+                    conversation_id: message.conversation_id(),
+                    aliases: &[],
+                    sender: &wrong_sender,
+                    part: 0,
+                    at: 10,
+                },
+                &replacement,
+            )
+            .unwrap(),
+            MutationOutcome::Unsupported
+        );
+        let wrong_conversation =
+            ConversationId::new(TransportId::new("beta").unwrap(), "room").unwrap();
+        assert_eq!(
+            apply_unsend(
+                &mut store,
+                &MutationTarget {
+                    message_id: message.id(),
+                    conversation_id: &wrong_conversation,
+                    aliases: &[],
+                    sender: &message.sender,
+                    part: 0,
+                    at: 10,
+                },
+            )
+            .unwrap(),
+            MutationOutcome::Unsupported
+        );
+        assert_eq!(
+            apply_unsend(
+                &mut store,
+                &MutationTarget {
+                    message_id: &message_id("alpha", "missing"),
+                    conversation_id: message.conversation_id(),
+                    aliases: &[],
+                    sender: &message.sender,
+                    part: 0,
+                    at: 10,
+                },
+            )
+            .unwrap(),
+            MutationOutcome::NotFound
+        );
+        assert_eq!(raw_message_data(&store, message.id()), before);
+        assert!(get_message(&store, &message_id("alpha", "missing"))
+            .unwrap()
+            .is_none());
+    }
+
+    #[test]
+    fn whole_body_unsend_retains_content_and_reactions_and_is_idempotent() {
+        let (_temp, mut store, _conversation) = setup();
+        let reaction = fixture_reaction("alice", "heart", Some(0), Some(5));
+        let message = fixture_message_parts(
+            "m1",
+            "room",
+            1,
+            vec![
+                MessagePart::Text("first".into()),
+                MessagePart::Text("second".into()),
+            ],
+        );
+        let mut message = message;
+        message.reactions = vec![reaction.clone()];
+        upsert_message(&mut store, &message).unwrap();
+        store_part_map(&store, message.id(), &[Some(0), Some(0)]);
+        assert_eq!(
+            unsend(&mut store, &message, 0, 0),
+            MutationOutcome::Unsupported
+        );
+        assert_eq!(
+            unsend(&mut store, &message, 0, 20),
+            MutationOutcome::Applied
+        );
+        let stored = get_message(&store, message.id()).unwrap().unwrap();
+        assert_eq!(stored.parts, message.parts);
+        assert_eq!(stored.reactions, vec![reaction]);
+        assert_eq!(stored.unsent_at, Some(20));
+        assert_eq!(stored.edited_at, None);
+        let before = raw_message_data(&store, message.id());
+        assert_eq!(
+            unsend(&mut store, &message, 0, 21),
+            MutationOutcome::Unchanged
+        );
+        assert_eq!(
+            unsend(&mut store, &message, 0, 19),
+            MutationOutcome::Unchanged
+        );
+        assert_eq!(
+            edit(
+                &mut store,
+                &message,
+                0,
+                &[MessagePart::Text("too late".into())],
+                30,
+            ),
+            MutationOutcome::Unsupported
+        );
+        assert_eq!(raw_message_data(&store, message.id()), before);
+    }
+
+    #[test]
+    fn partial_multipart_unsend_is_unsupported_and_writes_nothing() {
+        let (_temp, mut store, _conversation) = setup();
+        let message = fixture_message_parts(
+            "m1",
+            "room",
+            1,
+            vec![
+                MessagePart::Text("first".into()),
+                MessagePart::Text("second".into()),
+            ],
+        );
+        upsert_message(&mut store, &message).unwrap();
+        store_part_map(&store, message.id(), &[Some(0), Some(1)]);
+        let before = raw_message_data(&store, message.id());
+        assert_eq!(
+            unsend(&mut store, &message, 0, 20),
+            MutationOutcome::Unsupported
+        );
+        assert_eq!(
+            unsend(&mut store, &message, 1, 20),
+            MutationOutcome::Unsupported
+        );
+        assert_eq!(raw_message_data(&store, message.id()), before);
     }
 }

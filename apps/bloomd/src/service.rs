@@ -18,10 +18,7 @@ use bloom_ipc::{
 };
 use bloom_transport::{TransportError, TransportEvent};
 use std::{
-    sync::{
-        atomic::{AtomicBool, Ordering},
-        Arc, Mutex,
-    },
+    sync::{Arc, Mutex},
     time::Instant,
 };
 
@@ -29,9 +26,6 @@ pub struct Service {
     store: Arc<Mutex<EncryptedStore>>,
     engine: EngineSlot,
     hub: SubscriptionHub,
-    /// At most one redacted warning per process: inbound mutations are typed but
-    /// their persistence is not wired yet.
-    mutation_warning_emitted: AtomicBool,
 }
 
 impl Service {
@@ -44,7 +38,6 @@ impl Service {
             store,
             engine: engine_slot(engine),
             hub,
-            mutation_warning_emitted: AtomicBool::new(false),
         }
     }
 
@@ -55,12 +48,7 @@ impl Service {
         engine: EngineSlot,
         hub: SubscriptionHub,
     ) -> Self {
-        Self {
-            store,
-            engine,
-            hub,
-            mutation_warning_emitted: AtomicBool::new(false),
-        }
+        Self { store, engine, hub }
     }
 
     /// Clone the current engine out of the slot. The lock is released here, so no
@@ -188,13 +176,76 @@ impl Service {
                 });
                 Ok(true)
             }
-            TransportEvent::MessageEdited { .. } | TransportEvent::MessageUnsent { .. } => {
-                if !self.mutation_warning_emitted.swap(true, Ordering::Relaxed) {
-                    eprintln!(
-                        "engine sent an edit or unsend event; mutation persistence is not wired yet"
-                    );
-                }
-                Ok(false)
+            TransportEvent::MessageEdited {
+                conversation_id,
+                message_id,
+                sender,
+                part,
+                replacement_parts,
+                at,
+            } => {
+                let (canonical_id, stored) = {
+                    let mut store = self.store.lock().unwrap();
+                    let Some(conversation) = store::get_conversation(&store, conversation_id)?
+                    else {
+                        return Ok(false);
+                    };
+                    let target = store::MutationTarget {
+                        message_id,
+                        conversation_id: &conversation.id,
+                        aliases: &conversation.aliases,
+                        sender,
+                        part: *part,
+                        at: *at,
+                    };
+                    let stored = store.apply_edit(&target, replacement_parts)?;
+                    (conversation.id, stored)
+                };
+                let Some(message) = stored else {
+                    return Ok(false);
+                };
+                self.hub.publish(Event {
+                    event: EventKind::Update {
+                        conversation_id: canonical_id,
+                        message,
+                    },
+                });
+                Ok(true)
+            }
+            TransportEvent::MessageUnsent {
+                conversation_id,
+                message_id,
+                sender,
+                part,
+                at,
+            } => {
+                let (canonical_id, stored) = {
+                    let mut store = self.store.lock().unwrap();
+                    let Some(conversation) = store::get_conversation(&store, conversation_id)?
+                    else {
+                        return Ok(false);
+                    };
+                    let target = store::MutationTarget {
+                        message_id,
+                        conversation_id: &conversation.id,
+                        aliases: &conversation.aliases,
+                        sender,
+                        part: *part,
+                        at: *at,
+                    };
+                    let stored = store.apply_unsend(&target)?;
+                    (conversation.id, stored)
+                };
+                let Some(message) = stored else {
+                    return Ok(false);
+                };
+                self.hub.publish(Event {
+                    event: EventKind::Update {
+                        conversation_id: canonical_id,
+                        message,
+                    },
+                });
+                Ok(true)
             }
         }
     }
@@ -1038,50 +1089,194 @@ mod reaction_service_tests {
         }
     }
 
+    fn edit_event(
+        conversation_id: ConversationId,
+        message_id: MessageId,
+        at: i64,
+    ) -> TransportEvent {
+        edit_event_from(
+            Handle::new(HandleKind::Opaque, "sender@example.invalid").unwrap(),
+            conversation_id,
+            message_id,
+            at,
+        )
+    }
+
+    fn edit_event_from(
+        sender: Handle,
+        conversation_id: ConversationId,
+        message_id: MessageId,
+        at: i64,
+    ) -> TransportEvent {
+        TransportEvent::MessageEdited {
+            conversation_id,
+            message_id,
+            sender,
+            part: 0,
+            replacement_parts: vec![MessagePart::Text("edited".into())],
+            at,
+        }
+    }
+
+    fn unsend_event(
+        conversation_id: ConversationId,
+        message_id: MessageId,
+        at: i64,
+    ) -> TransportEvent {
+        TransportEvent::MessageUnsent {
+            conversation_id,
+            message_id,
+            sender: Handle::new(HandleKind::Opaque, "sender@example.invalid").unwrap(),
+            part: 0,
+            at,
+        }
+    }
+
+    /// Store a message with an aligned engine part map so mutations are eligible.
+    fn seed_mapped(
+        store: &Arc<Mutex<EncryptedStore>>,
+        conversation: &Conversation,
+        message: &Message,
+    ) {
+        let mut guard = store.lock().unwrap();
+        store::upsert_conversation(&mut guard, conversation).unwrap();
+        store::ingest_inbound_with_parts(&mut guard, conversation, message, &[Some(0)]).unwrap();
+    }
+
+    async fn next_update(
+        subscriber: &mut tokio::sync::broadcast::Receiver<Event>,
+    ) -> (ConversationId, Message) {
+        let published = tokio::time::timeout(Duration::from_millis(100), subscriber.recv())
+            .await
+            .expect("update event published")
+            .unwrap();
+        match published.event {
+            EventKind::Update {
+                conversation_id,
+                message,
+            } => (conversation_id, message),
+            _ => panic!("unexpected event kind"),
+        }
+    }
+
     #[tokio::test]
-    async fn unwired_edit_and_unsend_change_nothing_and_publish_nothing() {
+    async fn applied_edit_publishes_one_canonical_update_and_is_idempotent() {
         let (_directory, store, service) = harness();
         let (conversation, message) = fixtures();
         let (conversation_id, message_id) = (conversation.id.clone(), message.id().clone());
-        {
-            let mut guard = store.lock().unwrap();
-            store::upsert_conversation(&mut guard, &conversation).unwrap();
-            store::upsert_message(&mut guard, &message).unwrap();
-        }
+        seed_mapped(&store, &conversation, &message);
         let mut subscriber = service.hub.subscribe();
-        let sender = message.sender.clone();
-        let events = [
-            TransportEvent::MessageEdited {
-                conversation_id: conversation_id.clone(),
-                message_id: message_id.clone(),
-                sender: sender.clone(),
-                part: 0,
-                replacement_parts: vec![MessagePart::Text("edited".into())],
-                at: 10,
-            },
-            TransportEvent::MessageUnsent {
-                conversation_id,
-                message_id: message_id.clone(),
-                sender,
-                part: 0,
-                at: 11,
-            },
-        ];
-        for event in &events {
-            assert!(!service.persist(event).unwrap());
-        }
-        assert_eq!(
-            store::get_message(&store.lock().unwrap(), &message_id)
-                .unwrap()
-                .unwrap(),
-            message
-        );
+        let event = edit_event(conversation_id.clone(), message_id.clone(), 10);
+
+        assert!(service.persist(&event).unwrap());
+        let (published_conversation, published) = next_update(&mut subscriber).await;
+        assert_eq!(published_conversation, conversation_id);
+        assert_eq!(published.id(), &message_id);
+        assert_eq!(published.parts, vec![MessagePart::Text("edited".into())]);
+        assert_eq!(published.edited_at, Some(10));
+
+        assert!(!service.persist(&event).unwrap());
         assert!(
             tokio::time::timeout(Duration::from_millis(20), subscriber.recv())
                 .await
                 .is_err(),
-            "unwired mutations must not publish"
+            "duplicate edit must not publish"
         );
+    }
+
+    #[tokio::test]
+    async fn applied_unsend_publishes_one_canonical_update_and_is_idempotent() {
+        let (_directory, store, service) = harness();
+        let (conversation, message) = fixtures();
+        let (conversation_id, message_id) = (conversation.id.clone(), message.id().clone());
+        seed_mapped(&store, &conversation, &message);
+        let mut subscriber = service.hub.subscribe();
+        let event = unsend_event(conversation_id.clone(), message_id.clone(), 11);
+
+        assert!(service.persist(&event).unwrap());
+        let (published_conversation, published) = next_update(&mut subscriber).await;
+        assert_eq!(published_conversation, conversation_id);
+        assert_eq!(published.id(), &message_id);
+        assert_eq!(published.parts, message.parts);
+        assert_eq!(published.unsent_at, Some(11));
+
+        assert!(!service.persist(&event).unwrap());
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), subscriber.recv())
+                .await
+                .is_err(),
+            "duplicate unsend must not publish"
+        );
+    }
+
+    #[tokio::test]
+    async fn mutation_for_a_missing_target_or_sender_publishes_nothing() {
+        let (_directory, store, service) = harness();
+        let (conversation, message) = fixtures();
+        let (conversation_id, message_id) = (conversation.id.clone(), message.id().clone());
+        seed_mapped(&store, &conversation, &message);
+        let mut subscriber = service.hub.subscribe();
+
+        let missing_id =
+            MessageId::new(TransportId::new("openbubbles").unwrap(), "missing").unwrap();
+        assert!(!service
+            .persist(&edit_event(conversation_id.clone(), missing_id, 10))
+            .unwrap());
+
+        let wrong_sender = edit_event_from(
+            Handle::new(HandleKind::Opaque, "other@example.invalid").unwrap(),
+            conversation_id,
+            message_id.clone(),
+            12,
+        );
+        assert!(!service.persist(&wrong_sender).unwrap());
+
+        let stored = {
+            let guard = store.lock().unwrap();
+            store::get_message(&guard, &message_id).unwrap().unwrap()
+        };
+        assert_eq!(stored, message);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), subscriber.recv())
+                .await
+                .is_err(),
+            "rejected mutations must not publish"
+        );
+    }
+
+    #[tokio::test]
+    async fn edit_via_an_alias_conversation_publishes_the_canonical_id() {
+        let (_directory, store, service) = harness();
+        let transport = TransportId::new("openbubbles").unwrap();
+        let alias = ConversationId::new(transport.clone(), "alias").unwrap();
+        let canonical = ConversationId::new(transport.clone(), "canonical").unwrap();
+        let alias_row = conversation_with_id(alias.clone());
+        let mut canonical_conversation = conversation_with_id(canonical.clone());
+        canonical_conversation.aliases = vec![alias.clone()];
+        let message = message_in(
+            &canonical_conversation,
+            MessageId::new(transport, "message-canonical").unwrap(),
+        );
+        let message_id = message.id().clone();
+        seed_mapped(&store, &canonical_conversation, &message);
+        {
+            let mut guard = store.lock().unwrap();
+            store::upsert_conversation(&mut guard, &alias_row).unwrap();
+        }
+        let mut subscriber = service.hub.subscribe();
+
+        assert!(service
+            .persist(&edit_event(alias, message_id.clone(), 10))
+            .unwrap());
+        let (published_conversation, published) = next_update(&mut subscriber).await;
+        assert_eq!(published_conversation, canonical);
+        assert_eq!(published.id(), &message_id);
+        assert_eq!(published.parts, vec![MessagePart::Text("edited".into())]);
+        let stored = {
+            let guard = store.lock().unwrap();
+            store::get_message(&guard, &message_id).unwrap().unwrap()
+        };
+        assert_eq!(stored.edited_at, Some(10));
     }
 
     #[tokio::test]
