@@ -27,8 +27,8 @@ An edited message keeps its body and gains a dim `Edited` annotation. A wholly u
 
 ## Phases
 
-1. Preserve engine part identity internally. Add aligned part ids to the daemon-only `TransportEvent::Message`, persist them transactionally in an encrypted store table, normalize only an unambiguous single plain part to zero, and ensure normal replays preserve accepted mutation fields. No edit/unsend event yet.
-2. Add redacted typed edit/unsend transport events and mapper tests, with explicit skip reasons for missing target, part, timestamp, unsupported replacement content, and malformed identity.
+1. Preserve engine part identity internally: done in `907ced5`. `TransportEvent::Message` carries aligned part ids, the encrypted store persists them transactionally, only a lone plain-text part normalizes to zero, and normal replays preserve accepted mutation fields and cannot replace a map that no longer aligns with stored edited parts. Scoped tests, strict Clippy, formatting, source guard, and independent review pass.
+2. Add redacted typed edit/unsend transport events and mapper tests: done. The mapper requires target, part, sender, conversation, and timestamp; edit accepts only a nonempty all-text replacement list and rejects mixed or malformed content atomically. The Dart codec test pins the wire shape. Until phase 3, the service writes and publishes nothing and emits one generic warning per service instance. Rust and all 58 Dart tests, strict scoped Clippy, formatting, source guard, and independent review pass.
 3. Add transactional store application and service fanout tests: unknown/mismatched/ambiguous targets change nothing; aliases work; duplicates and older events publish nothing; unrelated fields and part mappings are preserved.
 4. Add fixture parity, headless rendering, and rebuilt PTY acceptance at 100, 44, and 24 columns, including replay/restart and retained-content wording.
 5. Independent review and universal synthetic gate. Real-engine edit/unsend receipt remains a separately authorized live gate.

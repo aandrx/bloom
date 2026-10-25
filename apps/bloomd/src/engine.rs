@@ -880,6 +880,10 @@ pub enum SkipReason {
     MissingMessageId,
     MissingSender,
     MissingReactionTarget,
+    MissingMutationTarget,
+    MissingMutationPart,
+    MissingMutationTimestamp,
+    UnsupportedEditContent,
     UnsupportedReaction,
     InvalidIdentity,
     NoContent,
@@ -894,6 +898,12 @@ impl std::fmt::Display for SkipReason {
             Self::MissingMessageId => "payload has no message id",
             Self::MissingSender => "payload has no sender",
             Self::MissingReactionTarget => "reaction payload has no usable target message id",
+            Self::MissingMutationTarget => "edit or unsend payload has no usable target message id",
+            Self::MissingMutationPart => "edit or unsend payload has no usable part index",
+            Self::MissingMutationTimestamp => "edit or unsend payload has no timestamp",
+            Self::UnsupportedEditContent => {
+                "edit payload carried replacement content outside plain text"
+            }
             Self::UnsupportedReaction => "reaction payload carried an unsupported kind",
             Self::InvalidIdentity => "payload identity was rejected by the domain model",
             Self::NoContent => "payload carried no representable content",
@@ -1078,6 +1088,88 @@ fn map_reaction(
     })
 }
 
+/// Replacement content for an edit. Only a nonempty list of nonempty text parts
+/// is accepted; anything else rejects the whole list rather than partially applying it.
+fn replacement_text_parts(message_value: &Value) -> Result<Vec<MessagePart>, SkipReason> {
+    let list = message_value
+        .get("new_parts")
+        .and_then(Value::as_array)
+        .filter(|list| !list.is_empty())
+        .ok_or(SkipReason::UnsupportedEditContent)?;
+    let mut parts = Vec::with_capacity(list.len());
+    for entry in list {
+        let part = entry
+            .get("part")
+            .ok_or(SkipReason::UnsupportedEditContent)?;
+        if part.get("type").and_then(Value::as_str) != Some("text") {
+            return Err(SkipReason::UnsupportedEditContent);
+        }
+        let text = part
+            .get("text")
+            .and_then(Value::as_str)
+            .filter(|text| !text.is_empty())
+            .ok_or(SkipReason::UnsupportedEditContent)?;
+        parts.push(MessagePart::Text(text.to_owned()));
+    }
+    Ok(parts)
+}
+
+/// Map an inbound edit or unsend payload. Both name one existing message part;
+/// only an edit carries replacement content. The target is never created here.
+fn map_mutation(
+    inst: &Value,
+    message_value: &Value,
+    id: &TransportId,
+    edit: bool,
+) -> Result<TransportEvent, SkipReason> {
+    let chat_guid = inst
+        .get("conversation")
+        .and_then(|conversation| conversation.get("sender_guid"))
+        .and_then(Value::as_str)
+        .filter(|guid| !guid.is_empty())
+        .ok_or(SkipReason::MissingChatGuid)?;
+    let sender = envelope_sender(inst)?;
+    let at = inst
+        .get("sent_timestamp_ms")
+        .and_then(Value::as_i64)
+        .ok_or(SkipReason::MissingMutationTimestamp)?;
+    let target = message_value
+        .get("tuuid")
+        .and_then(Value::as_str)
+        .filter(|target| !target.is_empty())
+        .ok_or(SkipReason::MissingMutationTarget)?;
+    let part = message_value
+        .get("edit_part")
+        .and_then(Value::as_u64)
+        .ok_or(SkipReason::MissingMutationPart)?;
+    let replacement_parts = if edit {
+        Some(replacement_text_parts(message_value)?)
+    } else {
+        None
+    };
+    let conversation_id =
+        ConversationId::new(id.clone(), chat_guid).map_err(|_| SkipReason::InvalidIdentity)?;
+    let message_id =
+        MessageId::new(id.clone(), target).map_err(|_| SkipReason::MissingMutationTarget)?;
+    Ok(match replacement_parts {
+        Some(replacement_parts) => TransportEvent::MessageEdited {
+            conversation_id,
+            message_id,
+            sender,
+            part,
+            replacement_parts,
+            at,
+        },
+        None => TransportEvent::MessageUnsent {
+            conversation_id,
+            message_id,
+            sender,
+            part,
+            at,
+        },
+    })
+}
+
 fn map_inbound_with_sequence(
     payload: &Value,
     my_handles: &[String],
@@ -1090,8 +1182,11 @@ fn map_inbound_with_sequence(
     let inst = payload.get("inst").ok_or(SkipReason::NotAnInboundMessage)?;
     let message_value = inst.get("message").ok_or(SkipReason::NotANormalMessage)?;
     let message_type = message_value.get("type").and_then(Value::as_str);
-    if message_type == Some("react") {
-        return map_reaction(inst, message_value, id);
+    match message_type {
+        Some("react") => return map_reaction(inst, message_value, id),
+        Some("edit") => return map_mutation(inst, message_value, id, true),
+        Some("unsend") => return map_mutation(inst, message_value, id, false),
+        _ => {}
     }
     if message_type != Some("normal") {
         return Err(SkipReason::NotANormalMessage);
@@ -2205,6 +2300,202 @@ mod tests {
             map_inbound(&react, &[], &transport()),
             Err(SkipReason::MissingReactionTarget)
         ));
+    }
+
+    fn mutation_envelope(kind: &str) -> Value {
+        let mut value = json!({
+            "variant": "iMessage",
+            "complete": true,
+            "inst": {
+                "id": "11111111-2222-3333-4444-555555555555",
+                "sender": "tel:+15550000001",
+                "sent_timestamp_ms": 1_700_000_000_000i64,
+                "conversation": {
+                    "participants": ["tel:+15550000001"],
+                    "sender_guid": "iMessage;-;someone@example.com"
+                },
+                "message": {
+                    "type": kind,
+                    "complete": true,
+                    "tuuid": "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
+                    "edit_part": 1
+                }
+            }
+        });
+        if kind == "edit" {
+            value["inst"]["message"]["new_parts"] = json!([
+                {"idx": 0, "part": {"type": "text", "text": "first"}},
+                {"idx": 5, "part": {"type": "text", "text": "second"}}
+            ]);
+        }
+        value
+    }
+
+    #[test]
+    fn edit_maps_to_a_typed_mutation_event_in_order() {
+        let event = map_inbound(&mutation_envelope("edit"), &[], &transport()).expect("edit maps");
+        let TransportEvent::MessageEdited {
+            conversation_id,
+            message_id,
+            sender,
+            part,
+            replacement_parts,
+            at,
+        } = event
+        else {
+            panic!("expected an edit event");
+        };
+        assert_eq!(
+            conversation_id,
+            ConversationId::new(transport(), "iMessage;-;someone@example.com").unwrap()
+        );
+        assert_eq!(
+            message_id,
+            MessageId::new(transport(), "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee").unwrap()
+        );
+        assert_eq!(sender, handle_from("tel:+15550000001").unwrap());
+        assert_eq!(part, 1);
+        assert_eq!(
+            replacement_parts,
+            vec![
+                MessagePart::Text("first".into()),
+                MessagePart::Text("second".into())
+            ]
+        );
+        assert_eq!(at, 1_700_000_000_000);
+    }
+
+    #[test]
+    fn unsend_maps_to_a_typed_mutation_event() {
+        let event =
+            map_inbound(&mutation_envelope("unsend"), &[], &transport()).expect("unsend maps");
+        let TransportEvent::MessageUnsent {
+            conversation_id,
+            message_id,
+            sender,
+            part,
+            at,
+        } = event
+        else {
+            panic!("expected an unsend event");
+        };
+        assert_eq!(
+            conversation_id,
+            ConversationId::new(transport(), "iMessage;-;someone@example.com").unwrap()
+        );
+        assert_eq!(
+            message_id,
+            MessageId::new(transport(), "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee").unwrap()
+        );
+        assert_eq!(sender, handle_from("tel:+15550000001").unwrap());
+        assert_eq!(part, 1);
+        assert_eq!(at, 1_700_000_000_000);
+    }
+
+    #[test]
+    fn mutation_identity_fields_are_required() {
+        for kind in ["edit", "unsend"] {
+            let mut missing_target = mutation_envelope(kind);
+            missing_target["inst"]["message"]
+                .as_object_mut()
+                .unwrap()
+                .remove("tuuid");
+            assert!(matches!(
+                map_inbound(&missing_target, &[], &transport()),
+                Err(SkipReason::MissingMutationTarget)
+            ));
+
+            let mut empty_target = mutation_envelope(kind);
+            empty_target["inst"]["message"]["tuuid"] = json!("");
+            assert!(matches!(
+                map_inbound(&empty_target, &[], &transport()),
+                Err(SkipReason::MissingMutationTarget)
+            ));
+
+            let mut missing_part = mutation_envelope(kind);
+            missing_part["inst"]["message"]
+                .as_object_mut()
+                .unwrap()
+                .remove("edit_part");
+            assert!(matches!(
+                map_inbound(&missing_part, &[], &transport()),
+                Err(SkipReason::MissingMutationPart)
+            ));
+
+            let mut missing_timestamp = mutation_envelope(kind);
+            missing_timestamp["inst"]
+                .as_object_mut()
+                .unwrap()
+                .remove("sent_timestamp_ms");
+            assert!(matches!(
+                map_inbound(&missing_timestamp, &[], &transport()),
+                Err(SkipReason::MissingMutationTimestamp)
+            ));
+
+            let mut malformed_sender = mutation_envelope(kind);
+            malformed_sender["inst"]["sender"] = json!("");
+            assert!(matches!(
+                map_inbound(&malformed_sender, &[], &transport()),
+                Err(SkipReason::InvalidIdentity)
+            ));
+
+            let mut empty_guid = mutation_envelope(kind);
+            empty_guid["inst"]["conversation"]["sender_guid"] = json!("");
+            assert!(matches!(
+                map_inbound(&empty_guid, &[], &transport()),
+                Err(SkipReason::MissingChatGuid)
+            ));
+        }
+    }
+
+    #[test]
+    fn edit_replacement_content_must_be_nonempty_text_only() {
+        let unsupported = [
+            json!([]),
+            json!([{"idx": 0, "part": {"type": "text", "text": ""}}]),
+            json!([{"idx": 0, "part": {"type": "attachment", "name": "x"}}]),
+            json!([{"idx": 0, "part": {"type": "text", "text": "ok"}},
+                   {"idx": 1, "part": {"type": "attachment", "name": "x"}}]),
+            json!([{"idx": 0, "part": {"type": "text", "text": "ok"}},
+                   {"idx": 1, "part": {"type": "mention"}}]),
+            json!([{"idx": 0}]),
+            json!("text"),
+        ];
+        for new_parts in unsupported {
+            let mut value = mutation_envelope("edit");
+            value["inst"]["message"]["new_parts"] = new_parts.clone();
+            assert!(
+                matches!(
+                    map_inbound(&value, &[], &transport()),
+                    Err(SkipReason::UnsupportedEditContent)
+                ),
+                "unexpected result for {new_parts}"
+            );
+        }
+
+        let mut absent = mutation_envelope("edit");
+        absent["inst"]["message"]
+            .as_object_mut()
+            .unwrap()
+            .remove("new_parts");
+        assert!(matches!(
+            map_inbound(&absent, &[], &transport()),
+            Err(SkipReason::UnsupportedEditContent)
+        ));
+    }
+
+    #[test]
+    fn mutation_debug_output_is_redacted() {
+        let edited = map_inbound(&mutation_envelope("edit"), &[], &transport()).unwrap();
+        assert_eq!(
+            format!("{edited:?}"),
+            "TransportEvent::MessageEdited([REDACTED])"
+        );
+        let unsent = map_inbound(&mutation_envelope("unsend"), &[], &transport()).unwrap();
+        assert_eq!(
+            format!("{unsent:?}"),
+            "TransportEvent::MessageUnsent([REDACTED])"
+        );
     }
 
     #[test]

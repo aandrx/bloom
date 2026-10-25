@@ -325,6 +325,7 @@ void main() {
       final unsendMessage = messageBody(unsend);
       expect(unsendMessage['type'], 'unsend');
       expect(unsendMessage['tuuid'], 't');
+      expect(unsendMessage['edit_part'], 1);
       expect(unsendMessage['complete'], isTrue);
 
       final edit = encodePushMessage(
@@ -347,8 +348,25 @@ void main() {
       expectCompleteOrMarked(edit);
       final editMessage = messageBody(edit);
       expect(editMessage['type'], 'edit');
+      expect(editMessage['tuuid'], 't');
+      expect(editMessage['edit_part'], 1);
       expect(editMessage['complete'], isTrue);
-      expect(jsonEncode(editMessage), contains('edited'));
+      expect(editMessage['new_parts'], <Object?>[
+        <String, Object?>{
+          'idx': 0,
+          'part': <String, Object?>{
+            'type': 'text',
+            'text': 'edited',
+            'format': <String, Object?>{
+              'type': 'flags',
+              'bold': false,
+              'italic': false,
+              'underline': false,
+              'strikethrough': false,
+            },
+          },
+        },
+      ]);
     });
 
     test('react encodes its target, part and reaction state', () {

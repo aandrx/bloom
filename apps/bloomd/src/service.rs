@@ -18,7 +18,10 @@ use bloom_ipc::{
 };
 use bloom_transport::{TransportError, TransportEvent};
 use std::{
-    sync::{Arc, Mutex},
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc, Mutex,
+    },
     time::Instant,
 };
 
@@ -26,6 +29,9 @@ pub struct Service {
     store: Arc<Mutex<EncryptedStore>>,
     engine: EngineSlot,
     hub: SubscriptionHub,
+    /// At most one redacted warning per process: inbound mutations are typed but
+    /// their persistence is not wired yet.
+    mutation_warning_emitted: AtomicBool,
 }
 
 impl Service {
@@ -38,6 +44,7 @@ impl Service {
             store,
             engine: engine_slot(engine),
             hub,
+            mutation_warning_emitted: AtomicBool::new(false),
         }
     }
 
@@ -48,7 +55,12 @@ impl Service {
         engine: EngineSlot,
         hub: SubscriptionHub,
     ) -> Self {
-        Self { store, engine, hub }
+        Self {
+            store,
+            engine,
+            hub,
+            mutation_warning_emitted: AtomicBool::new(false),
+        }
     }
 
     /// Clone the current engine out of the slot. The lock is released here, so no
@@ -175,6 +187,14 @@ impl Service {
                     },
                 });
                 Ok(true)
+            }
+            TransportEvent::MessageEdited { .. } | TransportEvent::MessageUnsent { .. } => {
+                if !self.mutation_warning_emitted.swap(true, Ordering::Relaxed) {
+                    eprintln!(
+                        "engine sent an edit or unsend event; mutation persistence is not wired yet"
+                    );
+                }
+                Ok(false)
             }
         }
     }
@@ -1016,6 +1036,52 @@ mod reaction_service_tests {
             part: Some(0),
             at: Some(9),
         }
+    }
+
+    #[tokio::test]
+    async fn unwired_edit_and_unsend_change_nothing_and_publish_nothing() {
+        let (_directory, store, service) = harness();
+        let (conversation, message) = fixtures();
+        let (conversation_id, message_id) = (conversation.id.clone(), message.id().clone());
+        {
+            let mut guard = store.lock().unwrap();
+            store::upsert_conversation(&mut guard, &conversation).unwrap();
+            store::upsert_message(&mut guard, &message).unwrap();
+        }
+        let mut subscriber = service.hub.subscribe();
+        let sender = message.sender.clone();
+        let events = [
+            TransportEvent::MessageEdited {
+                conversation_id: conversation_id.clone(),
+                message_id: message_id.clone(),
+                sender: sender.clone(),
+                part: 0,
+                replacement_parts: vec![MessagePart::Text("edited".into())],
+                at: 10,
+            },
+            TransportEvent::MessageUnsent {
+                conversation_id,
+                message_id: message_id.clone(),
+                sender,
+                part: 0,
+                at: 11,
+            },
+        ];
+        for event in &events {
+            assert!(!service.persist(event).unwrap());
+        }
+        assert_eq!(
+            store::get_message(&store.lock().unwrap(), &message_id)
+                .unwrap()
+                .unwrap(),
+            message
+        );
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), subscriber.recv())
+                .await
+                .is_err(),
+            "unwired mutations must not publish"
+        );
     }
 
     #[tokio::test]

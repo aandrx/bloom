@@ -140,6 +140,24 @@ pub enum TransportEvent {
         part: Option<u32>,
         at: Option<i64>,
     },
+    /// An edit of one existing message part. Carries only the replacement text
+    /// parts and no unrelated message body.
+    MessageEdited {
+        conversation_id: ConversationId,
+        message_id: MessageId,
+        sender: Handle,
+        part: u64,
+        replacement_parts: Vec<MessagePart>,
+        at: i64,
+    },
+    /// An unsend of one existing message part. Carries no message body.
+    MessageUnsent {
+        conversation_id: ConversationId,
+        message_id: MessageId,
+        sender: Handle,
+        part: u64,
+        at: i64,
+    },
     Session {
         state: SessionState,
         reason: Option<SessionReason>,
@@ -155,6 +173,8 @@ impl fmt::Debug for TransportEvent {
             Self::MessageUpdated { .. } => "TransportEvent::MessageUpdated([REDACTED])",
             Self::DeliveryChanged { .. } => "TransportEvent::DeliveryChanged([REDACTED])",
             Self::ReactionChanged { .. } => "TransportEvent::ReactionChanged([REDACTED])",
+            Self::MessageEdited { .. } => "TransportEvent::MessageEdited([REDACTED])",
+            Self::MessageUnsent { .. } => "TransportEvent::MessageUnsent([REDACTED])",
             Self::Session { .. } => "TransportEvent::Session([REDACTED])",
         })
     }
