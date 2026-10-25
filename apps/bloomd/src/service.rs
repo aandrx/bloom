@@ -14,7 +14,9 @@ use bloom_domain::{
     MessageId, OutgoingBody, Participant, Reaction,
 };
 use bloom_ipc::{
-    Event, EventKind, HistoryCursor, MessageSearchHit, ParticipantFilter, ProtocolError,
+    DraftKey as IpcDraftKey, DraftLoad as IpcDraftLoad, DraftWriteOutcome as IpcDraftWriteOutcome,
+    DurableDraft as IpcDurableDraft, Event, EventKind, HistoryCursor, MessageSearchHit,
+    ParticipantFilter, ProtocolError,
 };
 use bloom_transport::{TransportError, TransportEvent};
 use std::{
@@ -657,6 +659,93 @@ impl RequestHandler for Service {
             Ok(message_id)
         })
     }
+
+    fn draft_save(
+        &self,
+        key: IpcDraftKey,
+        draft: IpcDurableDraft,
+        revision: u64,
+    ) -> HandlerFuture<'_, IpcDraftWriteOutcome> {
+        Box::pin(async move {
+            let key = store_draft_key(key);
+            let draft = store_draft(draft);
+            let updated_at = draft_now_millis()?;
+            let mut store = self.store.lock().unwrap();
+            store::save_draft(&mut store, &key, &draft, revision, updated_at)
+                .map_err(map_draft_store_error)
+                .map(ipc_draft_outcome)
+        })
+    }
+
+    fn draft_load(&self, key: IpcDraftKey) -> HandlerFuture<'_, IpcDraftLoad> {
+        Box::pin(async move {
+            let key = store_draft_key(key);
+            let now = draft_now_millis()?;
+            let mut store = self.store.lock().unwrap();
+            let loaded = store::load_draft(&mut store, &key, now).map_err(map_draft_store_error)?;
+            Ok(IpcDraftLoad {
+                draft: loaded.draft.map(ipc_draft),
+                revision_floor: loaded.revision_floor,
+                corrupt_deleted: loaded.corrupt_deleted,
+            })
+        })
+    }
+
+    fn draft_delete(
+        &self,
+        key: IpcDraftKey,
+        revision: u64,
+    ) -> HandlerFuture<'_, IpcDraftWriteOutcome> {
+        Box::pin(async move {
+            let key = store_draft_key(key);
+            let updated_at = draft_now_millis()?;
+            let mut store = self.store.lock().unwrap();
+            store::delete_draft(&mut store, &key, revision, updated_at)
+                .map_err(map_draft_store_error)
+                .map(ipc_draft_outcome)
+        })
+    }
+}
+
+fn store_draft_key(key: IpcDraftKey) -> store::DraftKey {
+    match key {
+        IpcDraftKey::Conversation { owner } => store::DraftKey::Conversation(owner),
+        IpcDraftKey::NewChat { transport, address } => {
+            store::DraftKey::NewChat { transport, address }
+        }
+    }
+}
+
+fn store_draft(draft: IpcDurableDraft) -> store::DurableDraft {
+    store::DurableDraft {
+        body: draft.body,
+        cursor: draft.cursor,
+        pasted_body: draft.pasted_body,
+        uncertain: draft.uncertain,
+    }
+}
+
+fn ipc_draft(draft: store::DurableDraft) -> IpcDurableDraft {
+    IpcDurableDraft {
+        body: draft.body,
+        cursor: draft.cursor,
+        pasted_body: draft.pasted_body,
+        uncertain: draft.uncertain,
+    }
+}
+
+fn ipc_draft_outcome(outcome: store::DraftWriteOutcome) -> IpcDraftWriteOutcome {
+    match outcome {
+        store::DraftWriteOutcome::Applied => IpcDraftWriteOutcome::Applied,
+        store::DraftWriteOutcome::Stale => IpcDraftWriteOutcome::Stale,
+    }
+}
+
+fn map_draft_store_error(error: store::StoreError) -> ProtocolError {
+    match error {
+        store::StoreError::InvalidDraft => ProtocolError::InvalidRequest,
+        _ => ProtocolError::Internal,
+    }
 }
 
 fn log_identity_links(linked: usize) {
@@ -752,6 +841,14 @@ pub fn rust_handle(handle: &Handle) -> String {
         HandleKind::Tel => format!("tel:{}", handle.value()),
         HandleKind::Opaque => handle.value().to_owned(),
     }
+}
+
+fn draft_now_millis() -> Result<i64, ProtocolError> {
+    let now = now_millis();
+    if now <= 0 {
+        return Err(ProtocolError::Internal);
+    }
+    Ok(now)
 }
 
 fn now_millis() -> i64 {
@@ -921,6 +1018,215 @@ mod sync_barrier_tests {
             1
         );
         persistence.await.unwrap();
+    }
+}
+
+#[cfg(test)]
+mod draft_service_tests {
+    use super::*;
+    use crate::engine::EngineConfig;
+    use crate::ipc::RequestHandler;
+    use bloom_domain::TransportId;
+    use std::{os::unix::fs::PermissionsExt, path::PathBuf};
+
+    fn harness() -> (tempfile::TempDir, Arc<Service>) {
+        let directory = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(directory.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        let store = Arc::new(Mutex::new(
+            EncryptedStore::open_with_key(directory.path().join("store.db"), &[9; 32]).unwrap(),
+        ));
+        let engine = Arc::new(Engine::new(EngineConfig {
+            dart_executable: PathBuf::from("dart"),
+            script: PathBuf::from("engine.dart"),
+            state_dir: directory.path().join("state"),
+            library: PathBuf::from("engine.dylib"),
+            sync_chats: false,
+        }));
+        let service = Arc::new(Service::new(store, engine, SubscriptionHub::new(4)));
+        (directory, service)
+    }
+
+    fn conversation_key(value: &str) -> IpcDraftKey {
+        IpcDraftKey::Conversation {
+            owner: ConversationId::new(TransportId::new("relay").unwrap(), value).unwrap(),
+        }
+    }
+
+    fn draft(body: &str, cursor: usize) -> IpcDurableDraft {
+        IpcDurableDraft {
+            body: body.to_owned(),
+            cursor,
+            pasted_body: false,
+            uncertain: false,
+        }
+    }
+
+    #[test]
+    fn draft_wire_and_store_limits_stay_equal() {
+        assert_eq!(bloom_ipc::MAX_DRAFT_BYTES, store::MAX_DRAFT_BYTES);
+    }
+
+    #[tokio::test]
+    async fn drafts_round_trip_exactly_and_reject_stale_writes() {
+        let (_directory, service) = harness();
+        let conversation = conversation_key("exact-conversation");
+        let chat = IpcDraftKey::NewChat {
+            transport: TransportId::new("relay").unwrap(),
+            address: "Exact@Example.test".into(),
+        };
+        let other_chat = IpcDraftKey::NewChat {
+            transport: TransportId::new("relay").unwrap(),
+            address: "exact@example.test".into(),
+        };
+        assert_eq!(
+            service
+                .draft_save(conversation.clone(), draft("conversation body", 4), 1)
+                .await
+                .unwrap(),
+            IpcDraftWriteOutcome::Applied
+        );
+        assert_eq!(
+            service
+                .draft_save(chat.clone(), draft("exact body", 0), 1)
+                .await
+                .unwrap(),
+            IpcDraftWriteOutcome::Applied
+        );
+        assert_eq!(
+            service
+                .draft_save(other_chat.clone(), draft("lower body", 0), 1)
+                .await
+                .unwrap(),
+            IpcDraftWriteOutcome::Applied
+        );
+        let loaded = service.draft_load(conversation.clone()).await.unwrap();
+        assert_eq!(loaded.draft.as_ref().unwrap().body, "conversation body");
+        assert_eq!(loaded.draft.as_ref().unwrap().cursor, 4);
+        assert_eq!(loaded.revision_floor, 1);
+        assert!(!loaded.corrupt_deleted);
+        assert_eq!(
+            service
+                .draft_load(chat.clone())
+                .await
+                .unwrap()
+                .draft
+                .unwrap()
+                .body,
+            "exact body"
+        );
+        assert_eq!(
+            service
+                .draft_save(conversation.clone(), draft("stale body", 0), 1)
+                .await
+                .unwrap(),
+            IpcDraftWriteOutcome::Stale
+        );
+        assert_eq!(
+            service
+                .draft_load(conversation.clone())
+                .await
+                .unwrap()
+                .draft
+                .unwrap()
+                .body,
+            "conversation body"
+        );
+    }
+
+    #[tokio::test]
+    async fn delete_leaves_a_tombstone_that_blocks_late_saves() {
+        let (_directory, service) = harness();
+        let key = conversation_key("tombstone");
+        service
+            .draft_save(key.clone(), draft("live", 0), 1)
+            .await
+            .unwrap();
+        assert_eq!(
+            service.draft_delete(key.clone(), 2).await.unwrap(),
+            IpcDraftWriteOutcome::Applied
+        );
+        let deleted = service.draft_load(key.clone()).await.unwrap();
+        assert_eq!(deleted.draft, None);
+        assert_eq!(deleted.revision_floor, 2);
+        assert!(!deleted.corrupt_deleted);
+        assert_eq!(
+            service
+                .draft_save(key.clone(), draft("late", 0), 2)
+                .await
+                .unwrap(),
+            IpcDraftWriteOutcome::Stale
+        );
+        assert_eq!(service.draft_load(key).await.unwrap().revision_floor, 2);
+    }
+
+    #[tokio::test]
+    async fn corrupt_draft_load_reports_notice_and_preserves_revision_floor() {
+        let (_directory, service) = harness();
+        let key = conversation_key("corrupt-wire");
+        assert_eq!(
+            service
+                .draft_save(key.clone(), draft("private", 0), 4)
+                .await
+                .unwrap(),
+            IpcDraftWriteOutcome::Applied
+        );
+        let store_key = store_draft_key(key.clone());
+        store::corrupt_draft_data_for_test(&service.store.lock().unwrap(), &store_key, b"not json")
+            .unwrap();
+        let loaded = service.draft_load(key).await.unwrap();
+        assert_eq!(loaded.draft, None);
+        assert_eq!(loaded.revision_floor, 4);
+        assert!(loaded.corrupt_deleted);
+    }
+
+    #[tokio::test]
+    async fn invalid_drafts_map_to_invalid_request_and_errors_stay_redacted() {
+        let (_directory, service) = harness();
+        let blank = IpcDraftKey::NewChat {
+            transport: TransportId::new("relay").unwrap(),
+            address: "   ".into(),
+        };
+        assert_eq!(
+            service
+                .draft_save(blank.clone(), draft("must not persist", 0), 1)
+                .await
+                .unwrap_err(),
+            ProtocolError::InvalidRequest
+        );
+        assert_eq!(
+            service.draft_load(blank.clone()).await.unwrap_err(),
+            ProtocolError::InvalidRequest
+        );
+        assert_eq!(
+            service.draft_delete(blank, 1).await.unwrap_err(),
+            ProtocolError::InvalidRequest
+        );
+        let key = conversation_key("invalid");
+        assert_eq!(
+            service
+                .draft_save(key.clone(), draft("abc", 4), 1)
+                .await
+                .unwrap_err(),
+            ProtocolError::InvalidRequest
+        );
+        assert_eq!(
+            service
+                .draft_save(key.clone(), draft("abc", 0), u64::MAX)
+                .await
+                .unwrap_err(),
+            ProtocolError::InvalidRequest
+        );
+        assert_eq!(
+            service
+                .draft_save(
+                    key,
+                    draft(&"x".repeat(bloom_ipc::MAX_DRAFT_BYTES + 1), 0),
+                    1
+                )
+                .await
+                .unwrap_err(),
+            ProtocolError::InvalidRequest
+        );
     }
 }
 

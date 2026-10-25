@@ -9,6 +9,7 @@ bloom-domain = { path = "../bloom-domain" }
 serde = { workspace = true }
 serde_json = { workspace = true }
 libc = "0.2"
+unicode-segmentation = "1"
 tokio = { workspace = true, features = ["io-util", "net", "time", "fs"] }
 
 [dev-dependencies]

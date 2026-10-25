@@ -37,7 +37,7 @@ IPC v7 adds `draft_save`, `draft_load`, and `draft_delete` with typed responses.
 ## Phases
 
 1. Schema, store functions, and tests: done. An additive table under schema v1 stores only in the encrypted daemon database. Exact conversation/new-chat keys, grapheme cursor validation, revision-rejected stale saves, delete tombstones, corruption tombstoning, 30-day expiry, a deterministic 100-row per-transport cap, encrypted reopen, and non-destructive existing-v1 upgrade are covered. Save/delete prune transactionally and protect their own row from cap eviction; load captures the requested revision floor before pruning. 15 focused and 200 daemon library tests, strict daemon Clippy, formatting, source guard, and independent review pass. No IPC or TUI behavior changed.
-2. IPC v7 operations, dispatch validation, and round-trip tests.
+2. IPC v7 operations, dispatch validation, and round-trip tests: done. Strict v7 framing adds typed draft save/load/delete DTOs and client methods. The daemon converts exact owner identities to store keys, supplies wall-clock timestamps, maps invalid drafts to `InvalidRequest`, returns stale/applied outcomes and corruption notices, and never logs draft bodies or keys. Both synthetic fixtures implement v7 draft parity; stateful drafts survive restart. Current evidence: 36 IPC tests, 206 daemon library tests, 68 fixture tests, strict scoped Clippy, formatting, source guard, and diff check. The TUI does not call these operations yet, so drafts remain session-only to users.
 3. TUI debounce, restore, clear, and actual-PTY coverage across recipient switches and restart.
 4. Retention and privacy review, then docs and acceptance.
 

@@ -39,7 +39,7 @@ def oversized_response(limit):
 
 def send(client, obj):
     payload = json.dumps(obj).encode()
-    client.sendall(b"\x06" + struct.pack(">I", len(payload)) + payload)
+    client.sendall(b"\x07" + struct.pack(">I", len(payload)) + payload)
 
 
 def recv_exact(client, size):
@@ -55,7 +55,7 @@ def recv_exact(client, size):
 def recv(client):
     header = recv_exact(client, 5)
     version, size = struct.unpack(">BI", header)
-    if version != 6 or not 0 < size <= 1048576:
+    if version != 7 or not 0 < size <= 1048576:
         raise AssertionError("invalid response frame")
     return json.loads(recv_exact(client, size))
 
@@ -534,6 +534,165 @@ class Tests(unittest.TestCase):
                          ["typed-filename"])
         self.assertEqual(response["hits"][0]["snippet"],
                          "Filename: r\u00e9sum\u00e9-needle.pdf")
+
+
+    def test_drafts_round_trip_and_survive_restart(self):
+        conversation = {"kind": "conversation",
+                        "owner": identity("draft-conversation")}
+        chat = {"kind": "new_chat", "transport": "openbubbles",
+                "address": "Exact@Example.invalid"}
+        other = {"kind": "new_chat", "transport": "openbubbles",
+                 "address": "exact@example.invalid"}
+        body = "a\U0001f469\u200d\U0001f469\u200d\U0001f467\u200d\U0001f466e\u0301"
+        draft = {"body": body, "cursor": 3, "pasted_body": True, "uncertain": True}
+        response = request(self.sock, "draft_save", key=conversation, draft=draft, revision=1)
+        self.assertEqual(response, {"result": "draft_save", "outcome": "applied"})
+        self.assertEqual(
+            request(self.sock, "draft_save", key=chat, draft=draft, revision=1),
+            {"result": "draft_save", "outcome": "applied"},
+        )
+        self.assertEqual(
+            request(self.sock, "draft_save", key=other,
+                    draft={"body": "other", "cursor": 0, "pasted_body": False,
+                           "uncertain": False}, revision=1),
+            {"result": "draft_save", "outcome": "applied"},
+        )
+        self.assertEqual(
+            request(self.sock, "draft_save", key=conversation, draft=draft, revision=1),
+            {"result": "draft_save", "outcome": "stale"},
+        )
+        invalid = request(self.sock, "draft_save", key=conversation,
+                          draft={**draft, "cursor": 4}, revision=2)
+        self.assertEqual(invalid, {"result": "error", "error": "invalid_request"})
+        leading = {"body": "\u0301", "cursor": 1,
+                   "pasted_body": False, "uncertain": False}
+        self.assertEqual(
+            request(self.sock, "draft_save",
+                    key={"kind": "new_chat", "transport": "openbubbles",
+                         "address": "leading@example.invalid"},
+                    draft=leading, revision=1),
+            {"result": "draft_save", "outcome": "applied"},
+        )
+        too_large = request(self.sock, "draft_save", key=conversation,
+                            draft={**draft, "body": "x" * 65537, "cursor": 0}, revision=2)
+        self.assertEqual(too_large, {"result": "error", "error": "invalid_request"})
+        blank = request(self.sock, "draft_save",
+                        key={"kind": "new_chat", "transport": "openbubbles", "address": "   "},
+                        draft=draft, revision=1)
+        self.assertEqual(blank, {"result": "error", "error": "invalid_request"})
+        self.assertEqual(
+            request(self.sock, "draft_delete", key=conversation, revision=2),
+            {"result": "draft_delete", "outcome": "applied"},
+        )
+        self.assertEqual(
+            request(self.sock, "draft_save", key=conversation, draft=draft, revision=2),
+            {"result": "draft_save", "outcome": "stale"},
+        )
+
+        self.stop()
+        self.start()
+        loaded = request(self.sock, "draft_load", key=conversation)
+        self.assertEqual(loaded["draft"], None)
+        self.assertEqual(loaded["revision_floor"], 2)
+        self.assertFalse(loaded["corrupt_deleted"])
+        loaded_chat = request(self.sock, "draft_load", key=chat)
+        self.assertEqual(loaded_chat["draft"], draft)
+        self.assertEqual(loaded_chat["revision_floor"], 1)
+        self.assertEqual(request(self.sock, "draft_load", key=other)["draft"]["body"], "other")
+        self.assertEqual(
+            request(self.sock, "draft_load",
+                    key={"kind": "new_chat", "transport": "openbubbles",
+                         "address": "exact@example.invalid"})["draft"]["body"],
+            "other",
+        )
+
+
+class FakeDraftRPC(unittest.TestCase):
+    def setUp(self):
+        self.module = runpy.run_path(FAKE)
+        self.module["DRAFTS"].clear()
+        self.client, self.server = socket.socketpair()
+        self.client.settimeout(TIMEOUT)
+        self.thread = threading.Thread(
+            target=self.module["serve_client"], args=(self.server,), daemon=True
+        )
+        self.thread.start()
+
+    def tearDown(self):
+        self.client.close()
+        self.thread.join(timeout=2)
+        if self.thread.is_alive():
+            self.server.close()
+            self.thread.join(timeout=2)
+        self.assertFalse(self.thread.is_alive())
+        self.server.close()
+
+    def rpc(self, op, **kwargs):
+        send(self.client, {"request_id": 1, "request": {"op": op, **kwargs}})
+        return recv(self.client)["response"]
+
+    def test_save_load_delete_and_validation(self):
+        conversation = {"kind": "conversation", "owner": identity("draft-conversation")}
+        chat = {"kind": "new_chat", "transport": "openbubbles",
+                "address": "Exact@Example.invalid"}
+        body = "a\U0001f469\u200d\U0001f469\u200d\U0001f467\u200d\U0001f466e\u0301"
+        draft = {"body": body, "cursor": 3, "pasted_body": True, "uncertain": False}
+        self.assertEqual(
+            self.rpc("draft_save", key=conversation, draft=draft, revision=1),
+            {"result": "draft_save", "outcome": "applied"},
+        )
+        self.assertEqual(
+            self.rpc("draft_save", key=chat, draft=draft, revision=1),
+            {"result": "draft_save", "outcome": "applied"},
+        )
+        self.assertEqual(
+            self.rpc("draft_save", key=conversation, draft=draft, revision=1),
+            {"result": "draft_save", "outcome": "stale"},
+        )
+        self.assertEqual(
+            self.rpc("draft_save", key=conversation,
+                     draft={**draft, "cursor": 4}, revision=2),
+            {"result": "error", "error": "invalid_request"},
+        )
+        self.assertEqual(
+            self.rpc(
+                "draft_save",
+                key={"kind": "new_chat", "transport": "openbubbles",
+                     "address": "leading@example.invalid"},
+                draft={"body": "\u0301", "cursor": 1,
+                       "pasted_body": False, "uncertain": False},
+                revision=1,
+            ),
+            {"result": "draft_save", "outcome": "applied"},
+        )
+        self.assertEqual(
+            self.rpc("draft_save", key=conversation,
+                     draft={**draft, "body": "x" * 65537, "cursor": 0}, revision=2),
+            {"result": "error", "error": "invalid_request"},
+        )
+        self.assertEqual(
+            self.rpc("draft_save",
+                     key={"kind": "new_chat", "transport": "openbubbles",
+                          "address": "  "}, draft=draft, revision=1),
+            {"result": "error", "error": "invalid_request"},
+        )
+        loaded = self.rpc("draft_load", key=conversation)
+        self.assertEqual(loaded, {"result": "draft_load", "draft": draft,
+                                  "revision_floor": 1, "corrupt_deleted": False})
+        self.assertEqual(
+            self.rpc("draft_delete", key=conversation, revision=2),
+            {"result": "draft_delete", "outcome": "applied"},
+        )
+        self.assertEqual(
+            self.rpc("draft_load", key=conversation),
+            {"result": "draft_load", "draft": None, "revision_floor": 2,
+             "corrupt_deleted": False},
+        )
+        self.assertEqual(
+            self.rpc("draft_save", key=conversation, draft=draft, revision=2),
+            {"result": "draft_save", "outcome": "stale"},
+        )
+        self.assertEqual(self.rpc("draft_load", key=chat)["draft"], draft)
 
 
 def context_state():
@@ -1145,10 +1304,10 @@ class FrameSerialization(unittest.TestCase):
             module["frame"](event)
 
     def test_fake_daemon_frames_stay_within_limit(self):
-        self.check_fixture(FAKE, 6)
+        self.check_fixture(FAKE, 7)
 
     def test_stateful_fake_daemon_frames_stay_within_limit(self):
-        self.check_fixture(DAEMON, 6)
+        self.check_fixture(DAEMON, 7)
 
 
 class FrameHeaderParity(unittest.TestCase):
@@ -1179,13 +1338,13 @@ class FrameHeaderParity(unittest.TestCase):
             server.close()
         return outcome
 
-    def test_valid_v6_frame_parses_in_both_fixtures(self):
+    def test_valid_v7_frame_parses_in_both_fixtures(self):
         payload = {"request_id": 3, "request": {"op": "echo", "who": identity("me@example.invalid")}}
         for path in (DAEMON, FAKE):
             with self.subTest(fixture=os.path.basename(path)):
                 module = runpy.run_path(path)
                 frame_version, body, size = parse_frame(module["frame"](payload))
-                self.assertEqual(frame_version, 6)
+                self.assertEqual(frame_version, 7)
                 self.assertEqual(size, len(json.dumps(body, separators=(",", ":"), ensure_ascii=False).encode()))
                 outcome = self.call_read_frame(module, module["frame"](payload))
                 self.assertNotIn("error", outcome)
@@ -1195,9 +1354,10 @@ class FrameHeaderParity(unittest.TestCase):
         limit = runpy.run_path(FAKE)["MAX_FRAME"]
         cases = {
             "version 5": (5, 2),
+            "version 6": (6, 2),
             "version 99": (99, 2),
-            "zero length": (6, 0),
-            "oversized length": (6, limit + 1),
+            "zero length": (7, 0),
+            "oversized length": (7, limit + 1),
         }
         for label, (version, length) in cases.items():
             outcomes = []
@@ -1213,7 +1373,7 @@ class FrameHeaderParity(unittest.TestCase):
 
 
 class StaticServeClientInvalidHeader(unittest.TestCase):
-    def test_v5_request_closes_without_response(self):
+    def test_v6_request_closes_without_response(self):
         module = runpy.run_path(FAKE)
         client, server = socket.socketpair()
         thread = None
@@ -1223,7 +1383,7 @@ class StaticServeClientInvalidHeader(unittest.TestCase):
             client.settimeout(TIMEOUT)
             thread = threading.Thread(target=module["serve_client"], args=(server,), daemon=True)
             thread.start()
-            client.sendall(b"\x05" + struct.pack(">I", len(payload)) + payload)
+            client.sendall(b"\x06" + struct.pack(">I", len(payload)) + payload)
             received = bytearray()
             while True:
                 try:

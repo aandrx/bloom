@@ -48,7 +48,7 @@ This section covers reading and composition. Reading anchors, the measured Lates
 
 Shipped in this loop so far:
 
-- Keyset local pagination end to end. The store and IPC page backwards from a known message (currently protocol version 6), and the transcript loads the previous page when the reader reaches the oldest loaded row, keeps paged history across reconciliation for that chat, and stops at a bounded retained budget instead of repeating a discarded request.
+- Keyset local pagination end to end. The store and IPC page backwards from a known message (currently protocol version 7), and the transcript loads the previous page when the reader reaches the oldest loaded row, keeps paged history across reconciliation for that chat, and stops at a bounded retained budget instead of repeating a discarded request.
 - Local message search end to end. `search_messages` matches stored text parts case-insensitively, newest first, with char-boundary-safe snippets and canonical conversation ids. Ctrl+F or `/search` opens a modal that lists hits with chat identity and snippet, and opening a loaded hit anchors directly. Unloaded hits use the exact-context view described below.
 - Failure and identity handling around paging: page failures stay readable until the next interaction, alias reconciliation carries paged history and unions caches, and leaving a chat releases the in-flight page slot.
 - Session-only composer undo/redo and completed-search result counts, committed in `f85ce33`. Undo is bounded and recipient-owned; durable drafts are not implemented. A search at its result cap says "may be more" rather than claiming completeness.
@@ -68,7 +68,7 @@ Deep-hit navigation, accepted under shipp with synthetic coverage:
 
 Participant-context search, accepted under shipp with synthetic coverage:
 
-- [Its design and acceptance record](participant-search.md) defines current local chat membership, not sender filtering or historical group membership. Participant scope was introduced in IPC v5 and carries transport plus exact handle; the current protocol is v6. Filtering happens before the result limit within the existing global newest-20,000-row scan bound; plain queries stay literal.
+- [Its design and acceptance record](participant-search.md) defines current local chat membership, not sender filtering or historical group membership. Participant scope was introduced in IPC v5 and carries transport plus exact handle; the current protocol is v7. Filtering happens before the result limit within the existing global newest-20,000-row scan bound; plain queries stay literal.
 - Ctrl+P inside Search opens **Chats with**. Exact identity-bearing rows, All chats, nested cancel, and request invalidation preserve the body query and recipient-owned draft. Narrow pickers own the full frame and wrap identities instead of silently hiding distinguishing text.
 - Final workspace and timezone tests, strict Clippy, formatting, source guard, and rebuilt runtime suites pass: 28 fixture, 14 reading/navigation, 12 input, 4 messaging, and 8 launcher tests. Scoped independent source reviews and parent runtime/capture inspection informed acceptance. The final presentation rereview found no remaining confirmed defects in its scope. No live account or engine was accessed.
 

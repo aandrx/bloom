@@ -3,8 +3,8 @@ use std::{future::Future, pin::Pin, time::Duration};
 
 use bloom_domain::{Conversation, ConversationId, Message, MessageId, OutgoingBody};
 use bloom_ipc::{
-    HistoryCursor, MessageSearchHit, ParticipantFilter, ProtocolError, RequestKind, Response,
-    ResponseKind,
+    DraftKey, DraftLoad, DraftWriteOutcome, DurableDraft, HistoryCursor, MessageSearchHit,
+    ParticipantFilter, ProtocolError, RequestKind, Response, ResponseKind,
 };
 use tokio::{io::AsyncWrite, time::timeout};
 
@@ -67,6 +67,20 @@ pub trait RequestHandler: Send + Sync {
         address: String,
         body: OutgoingBody,
     ) -> HandlerFuture<'_, MessageId>;
+    fn draft_save(
+        &self,
+        _key: DraftKey,
+        _draft: DurableDraft,
+        _revision: u64,
+    ) -> HandlerFuture<'_, DraftWriteOutcome> {
+        Box::pin(async { Err(ProtocolError::Unsupported) })
+    }
+    fn draft_load(&self, _key: DraftKey) -> HandlerFuture<'_, DraftLoad> {
+        Box::pin(async { Err(ProtocolError::Unsupported) })
+    }
+    fn draft_delete(&self, _key: DraftKey, _revision: u64) -> HandlerFuture<'_, DraftWriteOutcome> {
+        Box::pin(async { Err(ProtocolError::Unsupported) })
+    }
 }
 
 /// Serve sequential requests. Codec errors and idle timeouts close this connection.
@@ -201,6 +215,53 @@ async fn serve_inner<H: RequestHandler>(
                         .await
                     {
                         Ok(messages) => ResponseKind::MessageContext { messages },
+                        Err(error) => ResponseKind::Error { error },
+                    }
+                }
+            }
+            RequestKind::DraftSave {
+                key,
+                draft,
+                revision,
+            } => {
+                if !key.is_valid()
+                    || !draft.is_valid()
+                    || !bloom_ipc::draft_revision_is_valid(revision)
+                {
+                    ResponseKind::Error {
+                        error: ProtocolError::InvalidRequest,
+                    }
+                } else {
+                    match handler.draft_save(key, draft, revision).await {
+                        Ok(outcome) => ResponseKind::DraftSave { outcome },
+                        Err(error) => ResponseKind::Error { error },
+                    }
+                }
+            }
+            RequestKind::DraftLoad { key } => {
+                if !key.is_valid() {
+                    ResponseKind::Error {
+                        error: ProtocolError::InvalidRequest,
+                    }
+                } else {
+                    match handler.draft_load(key).await {
+                        Ok(load) => ResponseKind::DraftLoad {
+                            draft: load.draft,
+                            revision_floor: load.revision_floor,
+                            corrupt_deleted: load.corrupt_deleted,
+                        },
+                        Err(error) => ResponseKind::Error { error },
+                    }
+                }
+            }
+            RequestKind::DraftDelete { key, revision } => {
+                if !key.is_valid() || !bloom_ipc::draft_revision_is_valid(revision) {
+                    ResponseKind::Error {
+                        error: ProtocolError::InvalidRequest,
+                    }
+                } else {
+                    match handler.draft_delete(key, revision).await {
+                        Ok(outcome) => ResponseKind::DraftDelete { outcome },
                         Err(error) => ResponseKind::Error { error },
                     }
                 }
@@ -355,6 +416,217 @@ mod tests {
         fn start_conversation(&self, _: String, _: OutgoingBody) -> HandlerFuture<'_, MessageId> {
             Box::pin(async { Err(ProtocolError::Internal) })
         }
+    }
+
+    struct DraftHandler(Arc<AtomicUsize>);
+    impl RequestHandler for DraftHandler {
+        fn list_conversations(&self) -> HandlerFuture<'_, Vec<Conversation>> {
+            Box::pin(async { Ok(vec![]) })
+        }
+        fn sync_conversations(
+            &self,
+        ) -> HandlerFuture<'_, (bloom_ipc::ConversationSyncStatus, u32)> {
+            Box::pin(async { Ok((bloom_ipc::ConversationSyncStatus::Complete, 0)) })
+        }
+        fn history(&self, _: ConversationId, _: u16) -> HandlerFuture<'_, Vec<Message>> {
+            Box::pin(async { Ok(vec![]) })
+        }
+        fn history_before(
+            &self,
+            _: ConversationId,
+            _: u16,
+            _: HistoryCursor,
+        ) -> HandlerFuture<'_, Vec<Message>> {
+            Box::pin(async { Ok(vec![]) })
+        }
+        fn search_messages(&self, _: String, _: u16) -> HandlerFuture<'_, Vec<MessageSearchHit>> {
+            Box::pin(async { Ok(vec![]) })
+        }
+        fn send(&self, _: ConversationId, _: OutgoingBody) -> HandlerFuture<'_, MessageId> {
+            Box::pin(async { Err(ProtocolError::Unsupported) })
+        }
+        fn start_conversation(&self, _: String, _: OutgoingBody) -> HandlerFuture<'_, MessageId> {
+            Box::pin(async { Err(ProtocolError::Unsupported) })
+        }
+        fn draft_save(
+            &self,
+            _: DraftKey,
+            _: DurableDraft,
+            _: u64,
+        ) -> HandlerFuture<'_, DraftWriteOutcome> {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            Box::pin(async { Ok(DraftWriteOutcome::Applied) })
+        }
+        fn draft_load(&self, _: DraftKey) -> HandlerFuture<'_, DraftLoad> {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            Box::pin(async {
+                Ok(DraftLoad {
+                    draft: None,
+                    revision_floor: 4,
+                    corrupt_deleted: true,
+                })
+            })
+        }
+        fn draft_delete(&self, _: DraftKey, _: u64) -> HandlerFuture<'_, DraftWriteOutcome> {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            Box::pin(async { Ok(DraftWriteOutcome::Stale) })
+        }
+    }
+
+    #[tokio::test]
+    async fn draft_requests_are_validated_and_answered_with_typed_results() {
+        let (_dir, listener, path) = socket();
+        let handled = Arc::new(AtomicUsize::new(0));
+        let server_handled = handled.clone();
+        let server = tokio::spawn(async move {
+            serve(
+                listener.accept().await.unwrap(),
+                &DraftHandler(server_handled),
+            )
+            .await;
+        });
+        let mut client = UnixStream::connect(path).await.unwrap();
+        let key = DraftKey::Conversation {
+            owner: ConversationId::new(TransportId::new("fake").unwrap(), "exact").unwrap(),
+        };
+        let draft = DurableDraft {
+            body: "body".into(),
+            cursor: 4,
+            pasted_body: false,
+            uncertain: false,
+        };
+        let requests = [
+            (
+                31,
+                RequestKind::DraftSave {
+                    key: key.clone(),
+                    draft: draft.clone(),
+                    revision: 1,
+                },
+                ResponseKind::DraftSave {
+                    outcome: DraftWriteOutcome::Applied,
+                },
+            ),
+            (
+                32,
+                RequestKind::DraftSave {
+                    key: key.clone(),
+                    draft: DurableDraft {
+                        body: "x".repeat(bloom_ipc::MAX_DRAFT_BYTES + 1),
+                        cursor: 0,
+                        pasted_body: false,
+                        uncertain: false,
+                    },
+                    revision: 1,
+                },
+                ResponseKind::Error {
+                    error: ProtocolError::InvalidRequest,
+                },
+            ),
+            (
+                33,
+                RequestKind::DraftSave {
+                    key: key.clone(),
+                    draft: DurableDraft {
+                        body: "abc".into(),
+                        cursor: 4,
+                        pasted_body: false,
+                        uncertain: false,
+                    },
+                    revision: 1,
+                },
+                ResponseKind::Error {
+                    error: ProtocolError::InvalidRequest,
+                },
+            ),
+            (
+                34,
+                RequestKind::DraftSave {
+                    key: DraftKey::NewChat {
+                        transport: TransportId::new("fake").unwrap(),
+                        address: "   ".into(),
+                    },
+                    draft: draft.clone(),
+                    revision: 1,
+                },
+                ResponseKind::Error {
+                    error: ProtocolError::InvalidRequest,
+                },
+            ),
+            (
+                35,
+                RequestKind::DraftSave {
+                    key: key.clone(),
+                    draft: draft.clone(),
+                    revision: u64::MAX,
+                },
+                ResponseKind::Error {
+                    error: ProtocolError::InvalidRequest,
+                },
+            ),
+            (
+                36,
+                RequestKind::DraftLoad { key: key.clone() },
+                ResponseKind::DraftLoad {
+                    draft: None,
+                    revision_floor: 4,
+                    corrupt_deleted: true,
+                },
+            ),
+            (
+                37,
+                RequestKind::DraftLoad {
+                    key: DraftKey::NewChat {
+                        transport: TransportId::new("fake").unwrap(),
+                        address: " ".into(),
+                    },
+                },
+                ResponseKind::Error {
+                    error: ProtocolError::InvalidRequest,
+                },
+            ),
+            (
+                38,
+                RequestKind::DraftDelete {
+                    key: key.clone(),
+                    revision: 2,
+                },
+                ResponseKind::DraftDelete {
+                    outcome: DraftWriteOutcome::Stale,
+                },
+            ),
+            (
+                39,
+                RequestKind::DraftDelete {
+                    key,
+                    revision: u64::MAX,
+                },
+                ResponseKind::Error {
+                    error: ProtocolError::InvalidRequest,
+                },
+            ),
+        ];
+        for (request_id, request, expected) in requests {
+            write_request(
+                &mut client,
+                &Request {
+                    request_id,
+                    request,
+                },
+            )
+            .await
+            .unwrap();
+            let response = read_response(&mut client).await.unwrap();
+            assert_eq!(response.request_id, request_id);
+            assert!(response.response == expected);
+        }
+        drop(client);
+        server.await.unwrap();
+        assert_eq!(
+            handled.load(Ordering::SeqCst),
+            3,
+            "only valid draft requests reach the handler"
+        );
     }
 
     #[tokio::test]
@@ -939,29 +1211,30 @@ mod tests {
 
     #[tokio::test]
     async fn malformed_frame_and_idle_first_request_close_connection() {
-        let (_dir, listener, path) = socket();
-        let server = tokio::spawn(async move {
-            let stream = listener.accept().await.unwrap();
-            serve(
-                stream,
-                &FakeHandler(
-                    Arc::new(AtomicUsize::new(0)),
-                    Arc::new(AtomicUsize::new(0)),
-                    Arc::new(AtomicUsize::new(0)),
-                ),
-            )
-            .await;
-        });
-        let mut client = UnixStream::connect(path).await.unwrap();
-        client.write_all(&[99, 0, 0, 0, 0]).await.unwrap();
-        let mut byte = [0];
-        // Linux may reset when closing a socket with unread malformed frame bytes.
-        match client.read(&mut byte).await {
-            Ok(0) => {}
-            Err(error) if error.kind() == std::io::ErrorKind::ConnectionReset => {}
-            other => panic!("expected closed connection, got {other:?}"),
+        for version in [6, 99] {
+            let (_dir, listener, path) = socket();
+            let server = tokio::spawn(async move {
+                serve(
+                    listener.accept().await.unwrap(),
+                    &FakeHandler(
+                        Arc::new(AtomicUsize::new(0)),
+                        Arc::new(AtomicUsize::new(0)),
+                        Arc::new(AtomicUsize::new(0)),
+                    ),
+                )
+                .await;
+            });
+            let mut client = UnixStream::connect(path).await.unwrap();
+            client.write_all(&[version, 0, 0, 0, 0]).await.unwrap();
+            let mut byte = [0];
+            // Linux may reset when closing a socket with unread malformed frame bytes.
+            match client.read(&mut byte).await {
+                Ok(0) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::ConnectionReset => {}
+                other => panic!("expected closed connection, got {other:?}"),
+            }
+            server.await.unwrap();
         }
-        server.await.unwrap();
 
         let (_dir, listener, path) = socket();
         let server = tokio::spawn(async move {
@@ -978,6 +1251,7 @@ mod tests {
             .await;
         });
         let mut client = UnixStream::connect(path).await.unwrap();
+        let mut byte = [0];
         assert_eq!(
             tokio::time::timeout(Duration::from_secs(1), client.read(&mut byte))
                 .await

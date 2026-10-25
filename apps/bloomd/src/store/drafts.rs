@@ -588,6 +588,31 @@ pub fn load_draft(
     })
 }
 
+#[cfg(test)]
+pub(crate) fn corrupt_draft_data_for_test(
+    store: &EncryptedStore,
+    key: &DraftKey,
+    data: &[u8],
+) -> Result<(), StoreError> {
+    let changed = match key {
+        DraftKey::Conversation(id) => store._connection.execute(
+            "UPDATE drafts SET data=?2 WHERE conversation_id=?1",
+            params![conversation_owner(id)?, data],
+        )?,
+        DraftKey::NewChat { transport, address } => store._connection.execute(
+            "UPDATE drafts SET data=?3
+             WHERE conversation_id IS NULL
+               AND new_chat_transport=?1 AND new_chat_address=?2",
+            params![transport.as_str(), address, data],
+        )?,
+    };
+    if changed == 1 {
+        Ok(())
+    } else {
+        Err(StoreError::Schema)
+    }
+}
+
 fn map_stored(row: &rusqlite::Row<'_>) -> rusqlite::Result<StoredDraft> {
     Ok(StoredDraft {
         rowid: row.get(0)?,

@@ -9,6 +9,8 @@ pub use bloom_ipc::MessageSearchHit;
 pub use conversations::{
     get_conversation, list_conversations, merge_conversation, upsert_conversation,
 };
+#[cfg(test)]
+pub(crate) use drafts::corrupt_draft_data_for_test;
 pub use drafts::{
     delete_draft, load_draft, save_draft, DraftKey, DraftLoad, DraftWriteOutcome, DurableDraft,
     MAX_DRAFT_AGE_MS, MAX_DRAFT_BYTES, MAX_DRAFT_ROWS_PER_TRANSPORT,

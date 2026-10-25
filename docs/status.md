@@ -29,7 +29,7 @@
 | Rich messaging | Inbound attachment metadata keeps reported names; inbound built-in reactions render read-only aggregate counts; inbound text edits and whole-body unsends apply transactionally with `Edited` / `Unsent · retained locally` notes; unsupported parts stay generic placeholders; no attachment file send/open/download, outbound reactions/edits/unsend, or partial multipart unsend |
 | Delivery | Labels reflect mapped transport events; presence of a Read enum is not proof of remote read-receipt support |
 | Accounts | Reuses an existing registration; no Bloom sign-in/activation/recovery; renewal unconfirmed |
-| Composition/reading | Session-only drafts and undo; local unread counts cover only loaded messages with a saved marker; markers have no automatic expiry; no attachment content search or reviewed encrypted durable drafts |
+| Composition/reading | Session-only drafts and undo in the TUI; the daemon now has encrypted bounded draft storage and typed IPC v7 save/load/delete operations, but TUI debounce/restore/clear is not wired; local unread counts cover only loaded messages with a saved marker; markers have no automatic expiry; no attachment content search |
 | Packaging/platforms | Linux/OpenBubbles Flatpak is the documented setup; not a standalone Cargo-only or Windows distribution |
 | Accessibility | Keyboard/grapheme/monochrome/light-theme coverage, not broad terminal/font/screen-reader validation |
 | Future GUI/transport | GPUI not started; independent registration blocked at Gate 0; Matrix remains an excluded proof |

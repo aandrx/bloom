@@ -18,13 +18,16 @@ use bloom_domain::{
 use serde::{Deserialize, Serialize};
 use std::{fmt, io};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use unicode_segmentation::UnicodeSegmentation;
 
-/// Bumped to 6 because local search now covers both the stored message body
-/// and the reported filename. Searches never read file contents from disk.
-pub const PROTOCOL_VERSION: u16 = 6;
+/// Bumped to 7 for daemon-owned durable drafts. Version 6 peers are rejected
+/// at the frame byte, so they cannot silently ignore draft operations.
+pub const PROTOCOL_VERSION: u16 = 7;
 /// Largest accepted `message_context` limit. Dispatch rejects larger limits
 /// instead of clamping them.
 pub const MAX_MESSAGE_CONTEXT_LIMIT: u32 = 200;
+/// Largest accepted draft body, measured in UTF-8 bytes.
+pub const MAX_DRAFT_BYTES: usize = 65_536;
 /// Default daemon socket, shared by the daemon and its clients so both sides
 /// agree without configuration.
 pub fn default_socket_path() -> std::path::PathBuf {
@@ -202,6 +205,79 @@ pub struct ParticipantFilter {
     pub transport: TransportId,
     pub handle: Handle,
 }
+/// Exact owner of a draft. This mirrors the daemon store type but is serialized
+/// on the wire. The `owner` conversation is never normalized or aliased.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum DraftKey {
+    Conversation {
+        owner: ConversationId,
+    },
+    NewChat {
+        transport: TransportId,
+        address: String,
+    },
+}
+impl fmt::Debug for DraftKey {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Conversation { .. } => f.write_str("DraftKey::Conversation([REDACTED])"),
+            Self::NewChat { .. } => f.write_str("DraftKey::NewChat([REDACTED])"),
+        }
+    }
+}
+impl DraftKey {
+    /// Whether this key can be persisted. A blank new-chat address is session-only.
+    pub fn is_valid(&self) -> bool {
+        match self {
+            Self::Conversation { .. } => true,
+            Self::NewChat { transport, address } => {
+                !transport.as_str().trim().is_empty() && !address.trim().is_empty()
+            }
+        }
+    }
+}
+/// A draft body plus the composer state needed to restore it.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DurableDraft {
+    pub body: String,
+    /// Grapheme index into `body`.
+    pub cursor: usize,
+    pub pasted_body: bool,
+    pub uncertain: bool,
+}
+impl fmt::Debug for DurableDraft {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("DurableDraft")
+            .field("body", &"[REDACTED]")
+            .field("cursor", &self.cursor)
+            .field("pasted_body", &self.pasted_body)
+            .field("uncertain", &self.uncertain)
+            .finish()
+    }
+}
+impl DurableDraft {
+    /// Whether the body size and grapheme cursor are acceptable to the store.
+    pub fn is_valid(&self) -> bool {
+        self.body.len() <= MAX_DRAFT_BYTES && self.cursor <= self.body.graphemes(true).count()
+    }
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DraftWriteOutcome {
+    Applied,
+    Stale,
+}
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DraftLoad {
+    pub draft: Option<DurableDraft>,
+    pub revision_floor: u64,
+    pub corrupt_deleted: bool,
+}
+/// Revisions travel as unsigned integers but the store stores a signed value.
+pub fn draft_revision_is_valid(revision: u64) -> bool {
+    revision <= i64::MAX as u64
+}
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "op", rename_all = "snake_case")]
 pub enum RequestKind {
@@ -245,6 +321,18 @@ pub enum RequestKind {
         message_id: MessageId,
         limit: u32,
     },
+    DraftSave {
+        key: DraftKey,
+        draft: DurableDraft,
+        revision: u64,
+    },
+    DraftLoad {
+        key: DraftKey,
+    },
+    DraftDelete {
+        key: DraftKey,
+        revision: u64,
+    },
 }
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Response {
@@ -273,6 +361,17 @@ pub enum ResponseKind {
     },
     MessageContext {
         messages: Vec<Message>,
+    },
+    DraftSave {
+        outcome: DraftWriteOutcome,
+    },
+    DraftLoad {
+        draft: Option<DurableDraft>,
+        revision_floor: u64,
+        corrupt_deleted: bool,
+    },
+    DraftDelete {
+        outcome: DraftWriteOutcome,
     },
     Error {
         error: ProtocolError,
@@ -693,7 +792,122 @@ mod tests {
             ResponseKind::MessageContext { messages } => assert_eq!(messages, vec![message]),
             _ => panic!("expected message context"),
         }
-        assert_eq!(PROTOCOL_VERSION, 6);
+        assert_eq!(PROTOCOL_VERSION, 7);
+    }
+
+    #[test]
+    fn draft_dtos_use_exact_keys_redacted_debug_and_typed_outcomes() {
+        let transport = TransmissionForTests::transport();
+        let conversation = ConversationId::new(transport.clone(), "exact-conversation").unwrap();
+        let key = DraftKey::Conversation {
+            owner: conversation.clone(),
+        };
+        let encoded = serde_json::to_value(&key).unwrap();
+        assert_eq!(encoded["kind"], "conversation");
+        assert_eq!(
+            encoded["owner"],
+            serde_json::to_value(&conversation).unwrap()
+        );
+        let chat = DraftKey::NewChat {
+            transport,
+            address: "Exact@Example.test".into(),
+        };
+        let encoded = serde_json::to_value(&chat).unwrap();
+        assert_eq!(encoded["kind"], "new_chat");
+        assert_eq!(encoded["address"], "Exact@Example.test");
+        assert!(!format!("{key:?}").contains("exact-conversation"));
+        assert!(!format!("{chat:?}").contains("Exact@Example.test"));
+
+        let draft = DurableDraft {
+            body: "draft body sentinel".into(),
+            cursor: 2,
+            pasted_body: true,
+            uncertain: true,
+        };
+        let debug = format!("{draft:?}");
+        assert!(debug.contains("[REDACTED]"));
+        assert!(!debug.contains("draft body sentinel"));
+        let request = Request {
+            request_id: 20,
+            request: RequestKind::DraftSave {
+                key: key.clone(),
+                draft: draft.clone(),
+                revision: 3,
+            },
+        };
+        assert!(
+            serde_json::from_slice::<Request>(&serde_json::to_vec(&request).unwrap())
+                .unwrap()
+                .request
+                == request.request
+        );
+        let response = Response {
+            request_id: 20,
+            response: ResponseKind::DraftSave {
+                outcome: DraftWriteOutcome::Applied,
+            },
+        };
+        let encoded = serde_json::to_value(&response).unwrap();
+        assert_eq!(encoded["response"]["result"], "draft_save");
+        assert_eq!(encoded["response"]["outcome"], "applied");
+        let loaded = DraftLoad {
+            draft: Some(draft.clone()),
+            revision_floor: 3,
+            corrupt_deleted: true,
+        };
+        assert_eq!(
+            serde_json::from_slice::<DraftLoad>(&serde_json::to_vec(&loaded).unwrap()).unwrap(),
+            loaded
+        );
+        assert!(key.is_valid());
+        assert!(!DraftKey::NewChat {
+            transport: TransmissionForTests::transport(),
+            address: "   ".into(),
+        }
+        .is_valid());
+        let unicode = DurableDraft {
+            body: "a\u{1f469}\u{200d}\u{1f469}\u{200d}\u{1f467}\u{200d}\u{1f466}e\u{301}".into(),
+            cursor: 3,
+            pasted_body: false,
+            uncertain: false,
+        };
+        assert!(unicode.is_valid());
+        assert!(!DurableDraft {
+            cursor: 4,
+            ..unicode
+        }
+        .is_valid());
+        assert!(!DurableDraft {
+            body: "x".repeat(MAX_DRAFT_BYTES + 1),
+            cursor: 0,
+            pasted_body: false,
+            uncertain: false,
+        }
+        .is_valid());
+        assert!(draft_revision_is_valid(i64::MAX as u64));
+        assert!(!draft_revision_is_valid(i64::MAX as u64 + 1));
+
+        let largest = Request {
+            request_id: 21,
+            request: RequestKind::DraftSave {
+                key,
+                draft: DurableDraft {
+                    body: "\\\"".repeat(MAX_DRAFT_BYTES / 2),
+                    cursor: MAX_DRAFT_BYTES,
+                    pasted_body: false,
+                    uncertain: false,
+                },
+                revision: 4,
+            },
+        };
+        assert!(serde_json::to_vec(&largest).unwrap().len() <= MAX_FRAME_LEN);
+    }
+
+    struct TransmissionForTests;
+    impl TransmissionForTests {
+        fn transport() -> TransportId {
+            TransportId::new("test").unwrap()
+        }
     }
 
     #[tokio::test]
@@ -735,18 +949,19 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn rejects_v5_request_and_response_before_header_or_payload() {
-        let old = [5u8];
-        let mut request_input = old.as_slice();
-        assert_eq!(
-            read_request(&mut request_input).await.err().unwrap(),
-            CodecError::WrongVersion
-        );
-        let mut response_input = old.as_slice();
-        assert_eq!(
-            read_response(&mut response_input).await.err().unwrap(),
-            CodecError::WrongVersion
-        );
+    async fn rejects_v5_and_v6_request_and_response_before_header_or_payload() {
+        for old in [[5u8], [6u8]] {
+            let mut request_input = old.as_slice();
+            assert_eq!(
+                read_request(&mut request_input).await.err().unwrap(),
+                CodecError::WrongVersion
+            );
+            let mut response_input = old.as_slice();
+            assert_eq!(
+                read_response(&mut response_input).await.err().unwrap(),
+                CodecError::WrongVersion
+            );
+        }
     }
 
     #[tokio::test]

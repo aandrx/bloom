@@ -12,8 +12,9 @@ import time
 import unicodedata
 import uuid
 
-VERSION = 6
+VERSION = 7
 MAX_FRAME = 1024 * 1024
+MAX_DRAFT_BYTES = 65_536
 SEARCH_SCAN_LIMIT = 20_000
 SNIPPET_CONTEXT_CHARS = 30
 ELLIPSIS = "\u2026"
@@ -292,6 +293,125 @@ def search_messages(state, query, limit, participant=None):
     return hits
 
 
+def _draft_grapheme_count(text):
+    """Approximate extended grapheme clusters for the draft cursor check."""
+    count = 0
+    join_next = False
+    regional_pending = False
+    for character in text:
+        codepoint = ord(character)
+        if codepoint == 0x200D:
+            join_next = True
+            continue
+        if join_next:
+            join_next = False
+            continue
+        if (_is_grapheme_extended(character)
+                or 0xFE00 <= codepoint <= 0xFE0F
+                or 0xE0100 <= codepoint <= 0xE01EF
+                or 0x1F3FB <= codepoint <= 0x1F3FF):
+            # unicode-segmentation treats a leading combining run as one cluster.
+            if count == 0:
+                count = 1
+            continue
+        if 0x1F1E6 <= codepoint <= 0x1F1FF:
+            if regional_pending:
+                regional_pending = False
+                continue
+            regional_pending = True
+            count += 1
+            continue
+        regional_pending = False
+        count += 1
+    return count
+
+
+def _draft_key(raw):
+    if not isinstance(raw, dict):
+        return None
+    kind = raw.get("kind")
+    if kind == "conversation":
+        owner = raw.get("owner")
+        if (not isinstance(owner, dict)
+                or not isinstance(owner.get("transport"), str)
+                or not isinstance(owner.get("value"), str)):
+            return None
+        return {"kind": "conversation", "owner": copy.deepcopy(owner)}
+    if kind == "new_chat":
+        transport = raw.get("transport")
+        address = raw.get("address")
+        if (not isinstance(transport, str) or not isinstance(address, str)
+                or not transport.strip() or not address.strip()):
+            return None
+        return {"kind": "new_chat", "transport": transport, "address": address}
+    return None
+
+
+def _draft_key_id(key):
+    return json.dumps(key, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+
+
+def _draft_value(raw):
+    if not isinstance(raw, dict):
+        return None
+    body = raw.get("body")
+    cursor = raw.get("cursor")
+    pasted_body = raw.get("pasted_body")
+    uncertain = raw.get("uncertain")
+    if (not isinstance(body, str)
+            or not isinstance(cursor, int) or isinstance(cursor, bool) or cursor < 0
+            or not isinstance(pasted_body, bool) or not isinstance(uncertain, bool)
+            or len(body.encode("utf-8")) > MAX_DRAFT_BYTES
+            or cursor > _draft_grapheme_count(body)):
+        return None
+    return {"body": body, "cursor": cursor, "pasted_body": pasted_body,
+            "uncertain": uncertain}
+
+
+def _draft_revision(raw):
+    if not isinstance(raw, int) or isinstance(raw, bool):
+        return None
+    if raw < 0 or raw > 2**63 - 1:
+        return None
+    return raw
+
+
+def handle_draft(state, args, op, body):
+    key = _draft_key(body.get("key"))
+    if key is None:
+        return {"result": "error", "error": "invalid_request"}
+    key_id = _draft_key_id(key)
+    if op == "draft_load":
+        with LOCK:
+            stored = next((item for item in state.setdefault("drafts", [])
+                           if _draft_key_id(item["key"]) == key_id), None)
+            if stored is None:
+                return {"result": "draft_load", "draft": None, "revision_floor": 0,
+                        "corrupt_deleted": False}
+            return {"result": "draft_load",
+                    "draft": copy.deepcopy(None if stored["deleted"] else stored["draft"]),
+                    "revision_floor": stored["revision"], "corrupt_deleted": False}
+    revision = _draft_revision(body.get("revision"))
+    if revision is None:
+        return {"result": "error", "error": "invalid_request"}
+    draft = None if op == "draft_delete" else _draft_value(body.get("draft"))
+    if op == "draft_save" and draft is None:
+        return {"result": "error", "error": "invalid_request"}
+    with LOCK:
+        drafts = state.setdefault("drafts", [])
+        stored = next((item for item in drafts if _draft_key_id(item["key"]) == key_id), None)
+        if stored is not None and revision <= stored["revision"]:
+            return {"result": op, "outcome": "stale"}
+        entry = {"key": key, "revision": revision, "deleted": op == "draft_delete",
+                 "draft": draft, "updated_at": int(time.time() * 1000)}
+        if stored is None:
+            drafts.append(entry)
+        else:
+            drafts[drafts.index(stored)] = entry
+        save(state, args.store)
+    return {"result": op, "outcome": "applied"}
+
+
 def save(state, path):
     tmp = path + ".tmp"
     with open(tmp, "w", encoding="utf-8") as stream:
@@ -310,7 +430,7 @@ def initial():
                 {"handle": {"kind": "email", "value": address}, "display_name": title, "is_me": False},
             ], "created_at": 1700000000000, "last_message_at": None, "aliases": [], "preview": None,
         })
-    return {"conversations": chats, "messages": []}
+    return {"conversations": chats, "messages": [], "drafts": []}
 
 
 def normalize_address(raw):
@@ -393,7 +513,9 @@ def serve(client, args, state):
                     )
                 continue
             try:
-                if op == "fixture_append_message":
+                if op in ("draft_save", "draft_load", "draft_delete"):
+                    response = handle_draft(state, args, op, body)
+                elif op == "fixture_append_message":
                     # Test-only persistence without fanout. This proves that the
                     # real TUI's periodic history reconciliation ran.
                     cid = body.get("conversation_id", {})
@@ -575,6 +697,7 @@ def main():
     else:
         state = initial()
         save(state, args.store)
+    state.setdefault("drafts", [])
     try:
         os.unlink(args.socket)
     except FileNotFoundError:

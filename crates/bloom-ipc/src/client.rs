@@ -1,6 +1,7 @@
 use crate::{
-    read_event, read_response, write_request, CodecError, ConversationSyncStatus, Event,
-    HistoryCursor, MessageSearchHit, ParticipantFilter, Request, RequestKind, ResponseKind,
+    read_event, read_response, write_request, CodecError, ConversationSyncStatus, DraftKey,
+    DraftLoad, DraftWriteOutcome, DurableDraft, Event, HistoryCursor, MessageSearchHit,
+    ParticipantFilter, Request, RequestKind, ResponseKind,
 };
 use bloom_domain::{Conversation, ConversationId, Message, MessageId, OutgoingBody};
 use std::{
@@ -242,6 +243,54 @@ impl BloomClient {
         }
     }
 
+    pub async fn draft_save(
+        &self,
+        key: DraftKey,
+        draft: DurableDraft,
+        revision: u64,
+    ) -> Result<DraftWriteOutcome, ClientError> {
+        match self
+            .request(RequestKind::DraftSave {
+                key,
+                draft,
+                revision,
+            })
+            .await?
+        {
+            ResponseKind::DraftSave { outcome } => Ok(outcome),
+            _ => Err(ClientError::UnexpectedResponse),
+        }
+    }
+
+    pub async fn draft_load(&self, key: DraftKey) -> Result<DraftLoad, ClientError> {
+        match self.request(RequestKind::DraftLoad { key }).await? {
+            ResponseKind::DraftLoad {
+                draft,
+                revision_floor,
+                corrupt_deleted,
+            } => Ok(DraftLoad {
+                draft,
+                revision_floor,
+                corrupt_deleted,
+            }),
+            _ => Err(ClientError::UnexpectedResponse),
+        }
+    }
+
+    pub async fn draft_delete(
+        &self,
+        key: DraftKey,
+        revision: u64,
+    ) -> Result<DraftWriteOutcome, ClientError> {
+        match self
+            .request(RequestKind::DraftDelete { key, revision })
+            .await?
+        {
+            ResponseKind::DraftDelete { outcome } => Ok(outcome),
+            _ => Err(ClientError::UnexpectedResponse),
+        }
+    }
+
     pub async fn send(
         &self,
         conversation_id: ConversationId,
@@ -439,6 +488,128 @@ mod tests {
             .await
             .unwrap()
             .is_empty());
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn draft_calls_round_trip_typed_values() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("drafts");
+        let listener = UnixListener::bind(&path).unwrap();
+        let key = DraftKey::Conversation {
+            owner: ConversationId::new(TransportId::new("fake").unwrap(), "exact").unwrap(),
+        };
+        let draft = DurableDraft {
+            body: "restored body".into(),
+            cursor: 4,
+            pasted_body: true,
+            uncertain: false,
+        };
+        let expected_key = key.clone();
+        let expected_draft = draft.clone();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let request = crate::read_request(&mut stream).await.unwrap();
+            assert!(matches!(
+                &request.request,
+                RequestKind::DraftSave { key, draft, revision }
+                    if key == &expected_key && draft == &expected_draft && *revision == 8
+            ));
+            write_response(
+                &mut stream,
+                &Response {
+                    request_id: request.request_id,
+                    response: ResponseKind::DraftSave {
+                        outcome: DraftWriteOutcome::Applied,
+                    },
+                },
+            )
+            .await
+            .unwrap();
+
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let request = crate::read_request(&mut stream).await.unwrap();
+            assert!(matches!(
+                &request.request,
+                RequestKind::DraftLoad { key } if key == &expected_key
+            ));
+            write_response(
+                &mut stream,
+                &Response {
+                    request_id: request.request_id,
+                    response: ResponseKind::DraftLoad {
+                        draft: Some(expected_draft.clone()),
+                        revision_floor: 8,
+                        corrupt_deleted: false,
+                    },
+                },
+            )
+            .await
+            .unwrap();
+
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let request = crate::read_request(&mut stream).await.unwrap();
+            assert!(matches!(
+                &request.request,
+                RequestKind::DraftDelete { key, revision } if key == &expected_key && *revision == 9
+            ));
+            write_response(
+                &mut stream,
+                &Response {
+                    request_id: request.request_id,
+                    response: ResponseKind::DraftDelete {
+                        outcome: DraftWriteOutcome::Stale,
+                    },
+                },
+            )
+            .await
+            .unwrap();
+        });
+
+        let client = BloomClient::new(&path);
+        assert_eq!(
+            client.draft_save(key.clone(), draft, 8).await.unwrap(),
+            DraftWriteOutcome::Applied
+        );
+        let loaded = client.draft_load(key.clone()).await.unwrap();
+        assert_eq!(loaded.draft.as_ref().unwrap().body, "restored body");
+        assert_eq!(loaded.revision_floor, 8);
+        assert!(!loaded.corrupt_deleted);
+        assert_eq!(
+            client.draft_delete(key, 9).await.unwrap(),
+            DraftWriteOutcome::Stale
+        );
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn draft_calls_reject_a_mismatched_response_variant() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("mismatch");
+        let listener = UnixListener::bind(&path).unwrap();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let request = crate::read_request(&mut stream).await.unwrap();
+            write_response(
+                &mut stream,
+                &Response {
+                    request_id: request.request_id,
+                    response: ResponseKind::DraftDelete {
+                        outcome: DraftWriteOutcome::Applied,
+                    },
+                },
+            )
+            .await
+            .unwrap();
+        });
+        let key = DraftKey::NewChat {
+            transport: TransportId::new("fake").unwrap(),
+            address: "exact@example.test".into(),
+        };
+        assert_eq!(
+            BloomClient::new(path).draft_load(key).await.unwrap_err(),
+            ClientError::UnexpectedResponse
+        );
         server.await.unwrap();
     }
 
