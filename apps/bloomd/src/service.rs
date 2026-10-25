@@ -146,6 +146,14 @@ impl Service {
                     else {
                         return Ok(false);
                     };
+                    let Some(message) = store::get_message(&store, message_id)? else {
+                        return Ok(false);
+                    };
+                    if message.conversation_id() != &conversation.id
+                        && !conversation.aliases.contains(message.conversation_id())
+                    {
+                        return Ok(false);
+                    }
                     let reaction = Reaction {
                         sender: sender.clone(),
                         kind: kind.clone(),
@@ -1054,6 +1062,163 @@ mod reaction_service_tests {
                 .is_err(),
             "duplicate reaction must not publish another event"
         );
+    }
+
+    fn conversation_with_id(id: ConversationId) -> Conversation {
+        let sender = Handle::new(HandleKind::Opaque, "sender@example.invalid").unwrap();
+        Conversation {
+            id,
+            remote_id: "chat".into(),
+            kind: ConversationKind::Direct,
+            title: None,
+            participants: vec![Participant {
+                handle: sender,
+                display_name: None,
+                is_me: false,
+            }],
+            created_at: 1,
+            last_message_at: None,
+            aliases: Vec::new(),
+            preview: None,
+        }
+    }
+
+    fn message_in(conversation: &Conversation, id: MessageId) -> Message {
+        Message::new(
+            id,
+            conversation.id.clone(),
+            None,
+            Handle::new(HandleKind::Opaque, "sender@example.invalid").unwrap(),
+            vec![MessagePart::Text("hello".into())],
+            1,
+            None,
+            DeliveryState::Delivered,
+            false,
+            None,
+            Vec::new(),
+            None,
+        )
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn reaction_for_a_missing_message_publishes_nothing() {
+        let (_directory, store, service) = harness();
+        let transport = TransportId::new("openbubbles").unwrap();
+        let conversation =
+            conversation_with_id(ConversationId::new(transport.clone(), "c1").unwrap());
+        let conversation_id = conversation.id.clone();
+        {
+            let mut guard = store.lock().unwrap();
+            store::upsert_conversation(&mut guard, &conversation).unwrap();
+        }
+        let message_id = MessageId::new(transport, "missing").unwrap();
+        let mut subscriber = service.hub.subscribe();
+
+        let changed = service
+            .persist(&reaction_event(conversation_id, message_id.clone()))
+            .unwrap();
+        assert!(!changed);
+        {
+            let guard = store.lock().unwrap();
+            assert_eq!(store::list_conversations(&guard).unwrap().len(), 1);
+            assert!(store::get_message(&guard, &message_id).unwrap().is_none());
+        }
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), subscriber.recv())
+                .await
+                .is_err(),
+            "missing message must not publish an event"
+        );
+    }
+
+    #[tokio::test]
+    async fn reaction_for_a_mismatched_conversation_publishes_nothing() {
+        let (_directory, store, service) = harness();
+        let transport = TransportId::new("openbubbles").unwrap();
+        let conversation_a =
+            conversation_with_id(ConversationId::new(transport.clone(), "a").unwrap());
+        let conversation_b =
+            conversation_with_id(ConversationId::new(transport.clone(), "b").unwrap());
+        let message = message_in(
+            &conversation_b,
+            MessageId::new(transport, "message-b").unwrap(),
+        );
+        let (conversation_a_id, message_id) = (conversation_a.id.clone(), message.id().clone());
+        {
+            let mut guard = store.lock().unwrap();
+            store::upsert_conversation(&mut guard, &conversation_a).unwrap();
+            store::upsert_conversation(&mut guard, &conversation_b).unwrap();
+            store::upsert_message(&mut guard, &message).unwrap();
+        }
+        let mut subscriber = service.hub.subscribe();
+
+        let changed = service
+            .persist(&reaction_event(conversation_a_id, message_id.clone()))
+            .unwrap();
+        assert!(!changed);
+        {
+            let guard = store.lock().unwrap();
+            let stored = store::get_message(&guard, &message_id).unwrap().unwrap();
+            assert!(stored.reactions.is_empty());
+        }
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), subscriber.recv())
+                .await
+                .is_err(),
+            "mismatched conversation must not publish an event"
+        );
+    }
+
+    #[tokio::test]
+    async fn reaction_via_an_alias_conversation_applies_to_the_canonical_message() {
+        let (_directory, store, service) = harness();
+        let transport = TransportId::new("openbubbles").unwrap();
+        let alias = ConversationId::new(transport.clone(), "alias").unwrap();
+        let canonical = ConversationId::new(transport.clone(), "canonical").unwrap();
+        let alias_row = conversation_with_id(alias.clone());
+        let mut canonical_conversation = conversation_with_id(canonical.clone());
+        canonical_conversation.aliases = vec![alias.clone()];
+        let message = message_in(
+            &canonical_conversation,
+            MessageId::new(transport, "message-canonical").unwrap(),
+        );
+        let message_id = message.id().clone();
+        {
+            let mut guard = store.lock().unwrap();
+            store::upsert_conversation(&mut guard, &alias_row).unwrap();
+            store::upsert_conversation(&mut guard, &canonical_conversation).unwrap();
+            store::upsert_message(&mut guard, &message).unwrap();
+        }
+        let mut subscriber = service.hub.subscribe();
+
+        let changed = service
+            .persist(&reaction_event(alias, message_id.clone()))
+            .unwrap();
+        assert!(changed);
+        let published = tokio::time::timeout(Duration::from_millis(100), subscriber.recv())
+            .await
+            .expect("update event published")
+            .unwrap();
+        match published.event {
+            EventKind::Update {
+                conversation_id: published_conversation,
+                message: published_message,
+            } => {
+                assert_eq!(published_conversation, canonical);
+                assert_eq!(published_message.id(), &message_id);
+                assert!(published_message
+                    .reactions
+                    .iter()
+                    .any(|reaction| reaction.kind == "like" && reaction.part == Some(0)));
+            }
+            _ => panic!("unexpected event kind"),
+        }
+        let stored = {
+            let guard = store.lock().unwrap();
+            store::get_message(&guard, &message_id).unwrap().unwrap()
+        };
+        assert_eq!(stored.reactions.len(), 1);
     }
 
     #[tokio::test]
