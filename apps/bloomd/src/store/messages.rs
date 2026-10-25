@@ -1,5 +1,5 @@
 use super::{EncryptedStore, StoreError};
-use bloom_domain::{ConversationId, Message, MessageId, MessagePart};
+use bloom_domain::{ConversationId, Message, MessageId, MessagePart, Reaction};
 use rusqlite::{params, OptionalExtension};
 use std::collections::HashSet;
 
@@ -15,6 +15,15 @@ pub enum MessageUpsertOutcome {
     Inserted,
     Updated,
     Unchanged,
+}
+
+// Wired into the service in the next unit; tests exercise it until then.
+#[allow(dead_code)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ReactionOutcome {
+    Applied,
+    Unchanged,
+    NotFound,
 }
 
 fn stable_id(id: &MessageId) -> Result<String, StoreError> {
@@ -65,6 +74,70 @@ pub fn upsert_message(
     };
     tx.commit()?;
     Ok(outcome)
+}
+
+/// Applies one reaction change to the stored message, touching only its
+/// `reactions` field. The read and optional write share one transaction so a
+/// concurrent upsert cannot interleave between them.
+#[allow(dead_code)]
+pub fn apply_reaction(
+    store: &mut EncryptedStore,
+    target: &MessageId,
+    reaction: &Reaction,
+    active: bool,
+) -> Result<ReactionOutcome, StoreError> {
+    let key = stable_id(target)?;
+    let tx = store._connection.transaction()?;
+    let data: Option<Vec<u8>> = tx
+        .query_row(
+            "SELECT data FROM messages WHERE id=?1",
+            params![key],
+            |row| row.get(0),
+        )
+        .optional()?;
+    let Some(data) = data else {
+        return Ok(ReactionOutcome::NotFound);
+    };
+    let mut message: Message = serde_json::from_slice(&data).map_err(|_| StoreError::Schema)?;
+    let matches = |existing: &Reaction| {
+        existing.sender == reaction.sender
+            && existing.kind == reaction.kind
+            && existing.part == reaction.part
+    };
+    let changed = if active {
+        if message.reactions.iter().any(matches) {
+            false
+        } else {
+            message.reactions.push(reaction.clone());
+            true
+        }
+    } else {
+        let before = message.reactions.len();
+        message.reactions.retain(|existing| !matches(existing));
+        message.reactions.len() != before
+    };
+    if !changed {
+        return Ok(ReactionOutcome::Unchanged);
+    }
+    message.reactions.sort_by(|left, right| {
+        let time = |reaction: &Reaction| {
+            let timestamp = reaction.timestamp;
+            (timestamp.is_none(), timestamp.unwrap_or_default())
+        };
+        time(left)
+            .cmp(&time(right))
+            .then_with(|| left.kind.cmp(&right.kind))
+            .then_with(|| format!("{:?}", left.sender).cmp(&format!("{:?}", right.sender)))
+            .then_with(|| left.sender.value().cmp(right.sender.value()))
+            .then_with(|| left.part.cmp(&right.part))
+    });
+    let updated = serde_json::to_vec(&message).map_err(|_| StoreError::Schema)?;
+    tx.execute(
+        "UPDATE messages SET data=?2 WHERE id=?1",
+        params![key, updated],
+    )?;
+    tx.commit()?;
+    Ok(ReactionOutcome::Applied)
 }
 
 pub fn get_message(store: &EncryptedStore, id: &MessageId) -> Result<Option<Message>, StoreError> {
@@ -545,7 +618,7 @@ mod tests {
     use crate::store::KEY_BYTES;
     use bloom_domain::{
         AttachmentRef, Conversation, ConversationKind, DeliveryState, Handle, HandleKind,
-        MessagePart, Participant, TransportId,
+        MessagePart, Participant, Reaction, TransportId,
     };
     use std::fs;
 
@@ -2394,5 +2467,225 @@ mod tests {
                 .iter()
                 .all(|message| message.conversation_id() == &conversation));
         }
+    }
+
+    fn fixture_reaction(
+        sender: &str,
+        kind: &str,
+        part: Option<u32>,
+        timestamp: Option<i64>,
+    ) -> Reaction {
+        Reaction {
+            sender: Handle::new(HandleKind::Opaque, sender).unwrap(),
+            kind: kind.into(),
+            remote_id: None,
+            part,
+            timestamp,
+        }
+    }
+
+    fn raw_message_data(store: &EncryptedStore, id: &MessageId) -> Option<Vec<u8>> {
+        store
+            ._connection
+            .query_row(
+                "SELECT data FROM messages WHERE id=?1",
+                params![stable_id(id).unwrap()],
+                |row| row.get(0),
+            )
+            .optional()
+            .unwrap()
+    }
+
+    #[test]
+    fn apply_reaction_adds_and_repeating_add_is_unchanged() {
+        let (_temp, mut store, _conversation) = setup();
+        let message = fixture_message("alpha", "m1", "room", 1, "body", DeliveryState::Sent);
+        upsert_message(&mut store, &message).unwrap();
+        let reaction = fixture_reaction("alice", "heart", None, Some(5));
+        assert_eq!(
+            apply_reaction(&mut store, message.id(), &reaction, true).unwrap(),
+            ReactionOutcome::Applied
+        );
+        assert_eq!(
+            get_message(&store, message.id())
+                .unwrap()
+                .unwrap()
+                .reactions,
+            vec![reaction.clone()]
+        );
+        assert_eq!(
+            apply_reaction(&mut store, message.id(), &reaction, true).unwrap(),
+            ReactionOutcome::Unchanged
+        );
+        assert_eq!(
+            get_message(&store, message.id())
+                .unwrap()
+                .unwrap()
+                .reactions,
+            vec![reaction]
+        );
+    }
+
+    #[test]
+    fn apply_reaction_removes_exactly_the_matching_tuple_only() {
+        let (_temp, mut store, _conversation) = setup();
+        let message = fixture_message("alpha", "m1", "room", 1, "body", DeliveryState::Sent);
+        upsert_message(&mut store, &message).unwrap();
+        let removed = fixture_reaction("alice", "heart", Some(0), Some(5));
+        let kept_by_sender = fixture_reaction("bob", "heart", Some(0), Some(6));
+        let kept_by_kind = fixture_reaction("alice", "like", Some(0), Some(7));
+        let kept_by_part = fixture_reaction("alice", "heart", Some(1), Some(8));
+        for reaction in [&removed, &kept_by_sender, &kept_by_kind, &kept_by_part] {
+            apply_reaction(&mut store, message.id(), reaction, true).unwrap();
+        }
+        assert_eq!(
+            apply_reaction(&mut store, message.id(), &removed, false).unwrap(),
+            ReactionOutcome::Applied
+        );
+        let reactions = get_message(&store, message.id())
+            .unwrap()
+            .unwrap()
+            .reactions;
+        assert_eq!(reactions.len(), 3);
+        assert!(!reactions.contains(&removed));
+        assert!(reactions.contains(&kept_by_sender));
+        assert!(reactions.contains(&kept_by_kind));
+        assert!(reactions.contains(&kept_by_part));
+    }
+
+    #[test]
+    fn apply_reaction_removing_missing_tuple_is_unchanged() {
+        let (_temp, mut store, _conversation) = setup();
+        let message = fixture_message("alpha", "m1", "room", 1, "body", DeliveryState::Sent);
+        upsert_message(&mut store, &message).unwrap();
+        let stored = fixture_reaction("alice", "heart", Some(0), Some(5));
+        apply_reaction(&mut store, message.id(), &stored, true).unwrap();
+        let before = raw_message_data(&store, message.id());
+        let absent = fixture_reaction("alice", "heart", Some(1), Some(5));
+        assert_eq!(
+            apply_reaction(&mut store, message.id(), &absent, false).unwrap(),
+            ReactionOutcome::Unchanged
+        );
+        assert_eq!(raw_message_data(&store, message.id()), before);
+    }
+
+    #[test]
+    fn apply_reaction_missing_or_wrong_target_is_not_found_and_writes_nothing() {
+        let (_temp, mut store, _conversation) = setup();
+        let message = fixture_message("alpha", "m1", "room", 1, "body", DeliveryState::Sent);
+        upsert_message(&mut store, &message).unwrap();
+        let before = raw_message_data(&store, message.id());
+        let reaction = fixture_reaction("alice", "heart", None, Some(5));
+        for target in [message_id("alpha", "missing"), message_id("beta", "m1")] {
+            assert_eq!(
+                apply_reaction(&mut store, &target, &reaction, true).unwrap(),
+                ReactionOutcome::NotFound
+            );
+        }
+        assert_eq!(raw_message_data(&store, message.id()), before);
+        assert!(get_message(&store, &message_id("alpha", "missing"))
+            .unwrap()
+            .is_none());
+    }
+
+    #[test]
+    fn apply_reaction_part_distinguishes_otherwise_identical_reactions() {
+        let (_temp, mut store, _conversation) = setup();
+        let message = fixture_message("alpha", "m1", "room", 1, "body", DeliveryState::Sent);
+        upsert_message(&mut store, &message).unwrap();
+        let whole = fixture_reaction("alice", "heart", None, Some(5));
+        let part_zero = fixture_reaction("alice", "heart", Some(0), Some(5));
+        assert_eq!(
+            apply_reaction(&mut store, message.id(), &whole, true).unwrap(),
+            ReactionOutcome::Applied
+        );
+        assert_eq!(
+            apply_reaction(&mut store, message.id(), &part_zero, true).unwrap(),
+            ReactionOutcome::Applied
+        );
+        let reactions = get_message(&store, message.id())
+            .unwrap()
+            .unwrap()
+            .reactions;
+        assert_eq!(reactions.len(), 2);
+        assert!(reactions.contains(&whole));
+        assert!(reactions.contains(&part_zero));
+    }
+
+    #[test]
+    fn apply_reaction_ordering_is_deterministic_across_inserted_order() {
+        let (_temp_a, mut first, _conversation_a) = setup();
+        let (_temp_b, mut second, _conversation_b) = setup();
+        let first_message = fixture_message("alpha", "m1", "room", 1, "body", DeliveryState::Sent);
+        let second_message = first_message.clone();
+        upsert_message(&mut first, &first_message).unwrap();
+        upsert_message(&mut second, &second_message).unwrap();
+        let early_alice = fixture_reaction("alice", "heart", None, Some(5));
+        let early_bob = fixture_reaction("bob", "heart", None, Some(5));
+        let late = fixture_reaction("alice", "laugh", None, Some(10));
+        let undated = fixture_reaction("alice", "like", None, None);
+        for reaction in [&early_bob, &undated, &late, &early_alice] {
+            apply_reaction(&mut first, first_message.id(), reaction, true).unwrap();
+        }
+        for reaction in [&early_alice, &late, &early_bob, &undated] {
+            apply_reaction(&mut second, second_message.id(), reaction, true).unwrap();
+        }
+        let expected = vec![early_alice, early_bob, late, undated];
+        assert_eq!(
+            get_message(&first, first_message.id())
+                .unwrap()
+                .unwrap()
+                .reactions,
+            expected
+        );
+        assert_eq!(
+            get_message(&second, second_message.id())
+                .unwrap()
+                .unwrap()
+                .reactions,
+            expected
+        );
+    }
+
+    #[test]
+    fn apply_reaction_preserves_every_non_reaction_field() {
+        let (_temp, mut store, conversation) = setup();
+        let message = Message::new(
+            message_id("alpha", "m1"),
+            conversation,
+            Some("remote-1".into()),
+            Handle::new(HandleKind::Opaque, "sender-1").unwrap(),
+            vec![
+                MessagePart::Text("body".into()),
+                fixture_attachment("attachment-1", Some("file.txt")),
+            ],
+            10,
+            Some(11),
+            DeliveryState::Delivered,
+            true,
+            Some(12),
+            vec![],
+            Some(13),
+        )
+        .unwrap();
+        upsert_message(&mut store, &message).unwrap();
+        let reaction = fixture_reaction("alice", "heart", Some(0), Some(5));
+        assert_eq!(
+            apply_reaction(&mut store, message.id(), &reaction, true).unwrap(),
+            ReactionOutcome::Applied
+        );
+        let stored = get_message(&store, message.id()).unwrap().unwrap();
+        assert_eq!(stored.id(), message.id());
+        assert_eq!(stored.conversation_id(), message.conversation_id());
+        assert_eq!(stored.remote_id, message.remote_id);
+        assert_eq!(stored.sender, message.sender);
+        assert_eq!(stored.parts, message.parts);
+        assert_eq!(stored.created_at, message.created_at);
+        assert_eq!(stored.sent_at, message.sent_at);
+        assert_eq!(stored.delivery, message.delivery);
+        assert_eq!(stored.from_me, message.from_me);
+        assert_eq!(stored.edited_at, message.edited_at);
+        assert_eq!(stored.unsent_at, message.unsent_at);
+        assert_eq!(stored.reactions, vec![reaction]);
     }
 }
