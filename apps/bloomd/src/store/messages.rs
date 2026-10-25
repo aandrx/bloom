@@ -127,8 +127,14 @@ pub fn apply_reaction(
         time(left)
             .cmp(&time(right))
             .then_with(|| left.kind.cmp(&right.kind))
-            .then_with(|| format!("{:?}", left.sender).cmp(&format!("{:?}", right.sender)))
-            .then_with(|| left.sender.value().cmp(right.sender.value()))
+            // Handle's Debug is redacted, so compare its serialized form, which
+            // includes the kind and value and is total.
+            .then_with(|| {
+                let key = |reaction: &Reaction| {
+                    serde_json::to_string(&reaction.sender).unwrap_or_default()
+                };
+                key(left).cmp(&key(right))
+            })
             .then_with(|| left.part.cmp(&right.part))
     });
     let updated = serde_json::to_vec(&message).map_err(|_| StoreError::Schema)?;
