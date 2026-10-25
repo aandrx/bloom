@@ -306,7 +306,7 @@ impl Transport for Engine {
     /// The daemon's store-backed send path separately supports plain-text groups.
     fn capabilities(&self) -> Capabilities {
         Capabilities {
-            reactions: false,
+            reactions: true,
             edits: false,
             unsend: false,
             attachments: false,

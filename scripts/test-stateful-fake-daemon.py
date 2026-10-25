@@ -407,6 +407,49 @@ class Tests(unittest.TestCase):
                                 body={"parts": [{"type": "text", "value": "synthetic save checkpoint"}]})
                 self.assertEqual(saved["result"], "send")
 
+    def test_seeded_reactions_survive_history_and_context_unchanged(self):
+        self.stop()
+        canonical = identity("alice@example.invalid")
+        with open(self.store, encoding="utf-8") as stream:
+            state = json.load(stream)
+        builder = runpy.run_path(FAKE)["message"]
+        expected = builder("placeholder@example.invalid", "reaction-0001",
+                            1_650_000_000_000, "reaction fixture body", False)
+        expected["conversation_id"] = copy.deepcopy(canonical)
+        expected["reactions"] = [
+            {"sender": {"kind": "email", "value": "alice@example.invalid"},
+             "kind": "heart", "remote_id": "reaction-remote-1", "part": 2,
+             "timestamp": 1_650_000_000_100},
+            {"sender": {"kind": "email", "value": "bob@example.invalid"},
+             "kind": "like", "remote_id": None, "part": None, "timestamp": None},
+            {"sender": {"kind": "email", "value": "alice@example.invalid"},
+             "kind": "heart", "remote_id": "reaction-remote-3", "part": None,
+             "timestamp": 1_650_000_000_300},
+        ]
+        state["messages"].append(copy.deepcopy(expected))
+        with open(self.store, "w", encoding="utf-8") as stream:
+            json.dump(state, stream, ensure_ascii=False)
+        self.start()
+
+        def observed():
+            history = request(self.sock, "history", conversation_id=canonical, limit=5)
+            self.assertEqual([m["id"] for m in history["messages"]], [expected["id"]])
+            self.assertEqual(history["messages"][0]["reactions"], expected["reactions"])
+            context = request(self.sock, "message_context", conversation_id=canonical,
+                              message_id=expected["id"], limit=5)
+            self.assertEqual([m["id"] for m in context["messages"]], [expected["id"]])
+            self.assertEqual(context["messages"][0]["reactions"], expected["reactions"])
+
+        observed()
+        # Force the daemon's own save path, then prove a fresh load keeps every
+        # reaction field, including the part-bearing and partless entries.
+        saved = request(self.sock, "send", conversation_id=identity("bob@example.invalid"),
+                        body={"parts": [{"type": "text", "value": "reaction save checkpoint"}]})
+        self.assertEqual(saved["result"], "send")
+        self.stop()
+        self.start()
+        observed()
+
     def test_search_messages_returns_snippet_and_ignores_empty_query(self):
         conversation = {"transport": "openbubbles", "value": "alice@example.invalid"}
         prefix = "0123456789" * 4
