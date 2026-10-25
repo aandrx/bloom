@@ -16,6 +16,7 @@ bloom-secrets = { path = "../../crates/bloom-secrets" }
 serde_json = { workspace = true }
 rusqlite = { version = "0.40.2", features = ["bundled-sqlcipher-vendored-openssl"] }
 zeroize = "1"
+unicode-segmentation = "1"
 
 [dev-dependencies]
 async-trait = "0.1"

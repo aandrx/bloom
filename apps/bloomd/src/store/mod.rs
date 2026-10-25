@@ -1,12 +1,17 @@
 //! Encrypted-at-rest SQLite store.
 
 mod conversations;
+mod drafts;
 mod identity;
 mod ingest;
 mod messages;
 pub use bloom_ipc::MessageSearchHit;
 pub use conversations::{
     get_conversation, list_conversations, merge_conversation, upsert_conversation,
+};
+pub use drafts::{
+    delete_draft, load_draft, save_draft, DraftKey, DraftLoad, DraftWriteOutcome, DurableDraft,
+    MAX_DRAFT_AGE_MS, MAX_DRAFT_BYTES, MAX_DRAFT_ROWS_PER_TRANSPORT,
 };
 pub(crate) use identity::direct_conversation_matches;
 pub use identity::{reconcile_direct_conversation, reconcile_stored_direct_conversations};
@@ -71,6 +76,7 @@ pub enum StoreError {
     KeySetup,
     DecryptFailed,
     Schema,
+    InvalidDraft,
     MessageConversationMismatch,
     IdentityConflict,
     UnsupportedSchemaVersion,
@@ -93,6 +99,7 @@ impl fmt::Debug for StoreError {
             Self::KeySetup => "StoreError::KeySetup",
             Self::DecryptFailed => "StoreError::DecryptFailed",
             Self::Schema => "StoreError::Schema",
+            Self::InvalidDraft => "StoreError::InvalidDraft",
             Self::MessageConversationMismatch => "StoreError::MessageConversationMismatch",
             Self::IdentityConflict => "StoreError::IdentityConflict",
             Self::UnsupportedSchemaVersion => "StoreError::UnsupportedSchemaVersion",
@@ -118,6 +125,7 @@ impl fmt::Display for StoreError {
             Self::KeySetup => f.write_str("encrypted store key setup failed"),
             Self::DecryptFailed => f.write_str("encrypted store authentication failed"),
             Self::Schema => f.write_str("encrypted store schema setup failed"),
+            Self::InvalidDraft => f.write_str("draft is invalid"),
             Self::MessageConversationMismatch => {
                 f.write_str("message belongs to a different conversation")
             }
@@ -293,6 +301,29 @@ impl EncryptedStore {
              CREATE INDEX IF NOT EXISTS messages_conversation_history ON messages(conversation_id, created_at DESC, id DESC);
              CREATE INDEX IF NOT EXISTS messages_recent_order ON messages(created_at DESC, id DESC);
              CREATE TABLE IF NOT EXISTS message_part_maps (message_id TEXT PRIMARY KEY REFERENCES messages(id), data BLOB NOT NULL);
+             CREATE TABLE IF NOT EXISTS drafts (
+                 conversation_id TEXT,
+                 new_chat_transport TEXT,
+                 new_chat_address TEXT,
+                 transport TEXT NOT NULL,
+                 revision INTEGER NOT NULL,
+                 deleted INTEGER NOT NULL,
+                 updated_at INTEGER NOT NULL,
+                 data BLOB,
+                 CHECK (revision >= 0),
+                 CHECK (deleted IN (0, 1)),
+                 CHECK (
+                     (deleted = 0 AND data IS NOT NULL)
+                     OR (deleted = 1 AND data IS NULL)
+                 ),
+                 CHECK (
+                     (conversation_id IS NOT NULL AND new_chat_transport IS NULL AND new_chat_address IS NULL)
+                     OR (conversation_id IS NULL AND new_chat_transport IS NOT NULL AND new_chat_address IS NOT NULL AND length(trim(new_chat_address)) > 0)
+                 )
+             );
+             CREATE UNIQUE INDEX IF NOT EXISTS drafts_conversation_key ON drafts(conversation_id) WHERE conversation_id IS NOT NULL;
+             CREATE UNIQUE INDEX IF NOT EXISTS drafts_new_chat_key ON drafts(new_chat_transport, new_chat_address) WHERE conversation_id IS NULL;
+             CREATE INDEX IF NOT EXISTS drafts_transport_retention ON drafts(transport, updated_at, revision);
              COMMIT;"
         ).map_err(|_| StoreError::Schema)?;
         restrict_permissions(&path, false)?;

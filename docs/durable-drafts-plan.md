@@ -1,13 +1,13 @@
 # Durable drafts plan
 
-Status: design only. Drafts are session-only today; nothing here is implemented.
+Status: phase 1 store support is implemented and accepted. Drafts remain session-only to users until IPC and TUI phases are complete.
 
 ## Rules
 
 - A draft stays bound to its owner: transport plus exact handle, and to its conversation when one exists. Restoring must never move text to another recipient.
 - Nothing is sent, retried, or confirmed by a restore. A draft saved while a send outcome was uncertain returns marked uncertain.
 - Drafts live only in the daemon's encrypted store. Never in `tui.json`, logs, diagnostics, or plaintext temp files.
-- Retention is bounded and explicit: one row per owner and conversation, an age limit, and a byte cap. Clearing deletes the row.
+- Retention is bounded and explicit: one row per exact owner, 65,536 UTF-8 body bytes, 30 days, and at most 100 active rows or tombstones per exact transport/account in this database. Clearing writes a tombstone; expiry or cap eviction eventually removes it, so stale-write protection is bounded to the retained tombstone lifetime.
 - Failures fail closed: an unreadable or corrupt row is skipped with a notice and deleted, so later saves to that key are not blocked forever.
 - A save must be newer than what the store holds. Each draft carries a client revision; the store rejects a revision that is not greater, and a delete leaves a tombstone with a revision so a late save cannot resurrect it.
 
@@ -36,7 +36,7 @@ IPC v7 adds `draft_save`, `draft_load`, and `draft_delete` with typed responses.
 
 ## Phases
 
-1. Schema, store functions, and tests: save, load, revision-rejected stale save, delete tombstone, expiry purge, per-owner cap, corrupt-row delete. No IPC.
+1. Schema, store functions, and tests: done. An additive table under schema v1 stores only in the encrypted daemon database. Exact conversation/new-chat keys, grapheme cursor validation, revision-rejected stale saves, delete tombstones, corruption tombstoning, 30-day expiry, a deterministic 100-row per-transport cap, encrypted reopen, and non-destructive existing-v1 upgrade are covered. Save/delete prune transactionally and protect their own row from cap eviction; load captures the requested revision floor before pruning. 15 focused and 200 daemon library tests, strict daemon Clippy, formatting, source guard, and independent review pass. No IPC or TUI behavior changed.
 2. IPC v7 operations, dispatch validation, and round-trip tests.
 3. TUI debounce, restore, clear, and actual-PTY coverage across recipient switches and restart.
 4. Retention and privacy review, then docs and acceptance.
