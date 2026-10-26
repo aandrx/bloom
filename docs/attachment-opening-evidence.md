@@ -49,6 +49,26 @@ The API-availability gate **passes**: a real download path exists through the ow
 
 The end-to-end opening gate **does not pass**: Bloom has no verified way to retain the engine attachment object, request a download safely, choose a destination, bound the result, or open it. A live download against the installed engine has not been run and would require an explicit authorized test with a real inbound attachment.
 
+## C1b implementation evidence
+
+The sidecar-only registry and cache are implemented in
+`ext/bloom-engine-sidecar/dart/lib/attachment_cache.dart`:
+
+- opaque 16-byte hex tokens with a 128-entry bounded registry, retaining only the
+  message ID, physical part index and engine attachment;
+- a private root under `XDG_CACHE_HOME/bloom/attachments`, symlink-root refusal,
+  per-attempt temporary names and atomic `<token>.bin` rename;
+- 64 MiB per file, 512 MiB total, 30-day age, 128-entry and 120-second timeout
+  bounds, with per-token request deduplication and stale-part cleanup;
+- reported engine size treated as an upper bound rather than an exact content
+  assertion, because MMCS attachments may sum multiple variants;
+- content-free failure types and redacted metadata/debug strings.
+
+81 Dart tests pass, including fake-downloader atomicity, concurrency, timeout,
+size and quota cases, plus format and analysis. The registry/cache is not wired
+into the sidecar command loop, no IPC/daemon/store/TUI change exists, and no real
+download has run.
+
 ## Required design before implementation
 
 1. **Retain only in the sidecar.** Keep a bounded map from a random opaque attachment token to the original `Attachment`/`MMCSFile` for the current sidecar generation. Do not send keys, signatures, URLs, or object IDs to the daemon, store, logs, IPC, or preferences. Clear the map on restart; a missing token is a clean "fetch again later" failure.

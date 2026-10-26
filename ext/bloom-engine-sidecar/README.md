@@ -74,6 +74,18 @@ which means no asynchronous completion is pending; the sidecar then confirms
 `accepted: false` plus `error` when the push reports one). Interpreting the
 synchronous `false` as a rejection is the bug this coordinator prevents.
 
+## Attachment registry and cache (C1b)
+
+`dart/lib/attachment_cache.dart` adds a sidecar-only attachment registry and
+private cache writer. Tokens are opaque 16-byte hex values retained in memory for
+one sidecar generation; the cache chooses its own root under
+`XDG_CACHE_HOME/bloom/attachments` (or `~/.cache/bloom/attachments`), rejects a
+symlink root, writes `<token>.bin` atomically from a per-attempt `.<token>.<attempt>.part`
+temporary file, and enforces 64 MiB per file, 512 MiB total, 30-day age, 128
+entries and a 120-second timeout. Reported engine size is an upper bound because
+MMCS attachments can contain multiple variants. No IPC, daemon, store, TUI or protocol change is included, and no live
+engine download has been proven.
+
 ## Formatting caveat
 
 Run `dart pub get` before checking formatting. The formatter selects its style from
