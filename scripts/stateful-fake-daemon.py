@@ -541,6 +541,13 @@ def serve(client, args, state):
                         candidate["last_message_at"] = now
                         save(state, args.store)
                     response = {"result": "fixture_append_message", "message_id": message["id"]}
+                elif op == "fetch_attachment":
+                    token = body.get("token")
+                    if not isinstance(token, str) or not re.fullmatch(r"[0-9a-f]{32}", token):
+                        response = {"result": "error", "error": "invalid_request"}
+                    else:
+                        response = {"result": "attachment_fetched",
+                                    "path": f"/tmp/bloom-fixture-{token}.bin", "bytes": 42}
                 elif op in ("send", "start_conversation"):
                     is_start = op == "start_conversation"
                     parts = body.get("body", {}).get("parts", [])

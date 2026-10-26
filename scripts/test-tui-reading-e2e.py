@@ -867,6 +867,47 @@ class ReadingFlows(unittest.TestCase):
                              f'unsend must not imply deletion at {width}')
             self.artifact(f'edit-unsend-notes-{width}')
 
+    def test_attachment_command_saves_newest_loaded_attachment(self):
+        self.stop_tui()
+        self.fixture.stop_daemon()
+        state = self.fixture.persisted()
+        chat = next(item for item in state['conversations'] if item['id'] == CID)
+        sender = next(participant['handle'] for participant in chat['participants']
+                      if not participant['is_me'])
+        newest = max(item['created_at'] for item in state['messages'])
+        token = 'abcdef0123456789abcdef0123456789'
+        state['messages'].append({
+            'id': {'transport': 'openbubbles', 'value': 'attachment-pty-0001'},
+            'conversation_id': CID,
+            'remote_id': None,
+            'sender': sender,
+            'parts': [{'type': 'attachment', 'value': {
+                'id': 'local-metadata:attachment-pty',
+                'mime_type': 'image/jpeg',
+                'file_name': 'photo.jpg',
+                'byte_len': 42,
+                'fetch_token': token,
+            }}],
+            'created_at': newest + 10,
+            'sent_at': None,
+            'delivery': 'delivered',
+            'from_me': False,
+            'edited_at': None,
+            'reactions': [],
+            'unsent_at': None,
+        })
+        self.fixture.store_path.write_text(json.dumps(state))
+        self.fixture.start_daemon()
+        self.start_tui()
+        self.resize(100, 30)
+        self.wait_for(lambda: 'photo.jpg' in self.text())
+        self.key(b'/attachment')
+        self.key(b'\r')
+        self.wait_for(lambda: 'Attachment saved to' in self.text())
+        self.assertIn('bloom-fixture-', self.text(), 'the saved path must be visible')
+        self.artifact('attachment-saved')
+
+
 
 if __name__ == '__main__':
     unittest.main(verbosity=2)

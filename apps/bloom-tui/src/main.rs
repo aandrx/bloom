@@ -417,6 +417,8 @@ async fn main() -> Result<()> {
         MessageId,
         Result<Vec<bloom_domain::Message>, ClientError>,
     )>();
+    let (attachment_tx, mut attachment_rx) =
+        mpsc::unbounded_channel::<(String, Result<(String, u64), ClientError>)>();
     let (visible_tx, visible_rx) = watch::channel::<Option<bloom_domain::ConversationId>>(None);
 
     {
@@ -687,6 +689,17 @@ async fn main() -> Result<()> {
                 }
                 redraw.request();
             },
+            Some((token, result)) = attachment_rx.recv() => {
+                let result = result.map_err(|error| match error {
+                    ClientError::Server(ProtocolError::InvalidRequest)
+                    | ClientError::Server(ProtocolError::Unsupported) => {
+                        "Attachment is no longer available. Ask the sender to resend it.".to_owned()
+                    }
+                    _ => "Attachment could not be saved.".to_owned(),
+                });
+                app.finish_attachment_fetch(&token, result);
+                redraw.request();
+            },
             Some((generation, conversation, target, result)) = context_rx.recv() => {
                 match result {
                     Ok(messages) => {
@@ -795,6 +808,14 @@ async fn main() -> Result<()> {
                         tokio::spawn(async move {
                             let result = client.search_messages_with_participant(&query, SEARCH_RESULT_LIMIT, participant).await;
                             let _ = tx.send((request, result));
+                        });
+                    }
+                    bloom_tui::app::Action::FetchAttachment { token } => {
+                        let client = client.clone();
+                        let tx = attachment_tx.clone();
+                        tokio::spawn(async move {
+                            let result = client.fetch_attachment(token.clone()).await;
+                            let _ = tx.send((token, result));
                         });
                     }
                     bloom_tui::app::Action::SyncConversations => {

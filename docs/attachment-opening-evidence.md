@@ -70,6 +70,20 @@ downloaded from the live engine, and fixture daemons do not implement a fetch
 result. Token identity is generation-scoped and becomes invalid after sidecar
 restart.
 
+## C1d implementation evidence
+
+The TUI now has one explicit save action. `/attachment` selects the newest loaded
+attachment in the current chat that carries a valid sidecar token, sends the v8
+fetch request, and displays `Attachment saved to <path> (<bytes> bytes).` It does
+not automatically download, open, reveal, or retry. A missing token, a stale
+generation, or a daemon failure becomes a plain notice or error; no path is
+written to logs or preferences. The command is listed in `/help` and the user
+guide. Actual-PTY coverage seeds an attachment with a token, invokes
+`/attachment`, and observes the saved-path result against the stateful fixture.
+
+No TUI action opens the saved file externally, and no live attachment has been
+downloaded. C1e remains the authorized live gate.
+
 ## C1b implementation evidence
 
 The sidecar-only registry and cache are implemented in

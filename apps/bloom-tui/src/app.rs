@@ -55,6 +55,9 @@ pub enum Action {
         query: String,
         participant: Option<ParticipantFilter>,
     },
+    FetchAttachment {
+        token: String,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -486,6 +489,10 @@ pub struct App {
     pub error: Option<String>,
     pub notice: Option<String>,
     pub sync_requested: bool,
+    /// Newest attachment token selected by `/attachment`, consumed by the shell.
+    pub pending_attachment: Option<String>,
+    /// Token currently awaiting a fetch result, used to ignore stale replies.
+    pub attachment_in_flight: Option<String>,
     pub sync_in_flight: bool,
     pub send_feedback: Option<SendFeedback>,
     pub recoverable_send: Option<RecoveryDraft>,
@@ -671,6 +678,8 @@ impl Default for App {
             error: None,
             notice: None,
             sync_requested: false,
+            pending_attachment: None,
+            attachment_in_flight: None,
             sync_in_flight: false,
             send_feedback: None,
             recoverable_send: None,
@@ -3262,6 +3271,7 @@ impl App {
             ("/unhide", "Restore chats hidden with Close"),
             ("/unread", "Jump to the first unread message"),
             ("/cancel", "Close the composer"),
+            ("/attachment", "Save the newest attachment in this chat"),
         ]
         .into_iter()
         .filter(|(name, _)| name.starts_with(token) || token == *name)
@@ -3296,6 +3306,67 @@ impl App {
             self.draft_cursor = self.draft.graphemes(true).count();
         }
         self.command_menu = false;
+    }
+
+    /// Select the newest loaded attachment that carries a sidecar fetch token.
+    /// The action is explicit: `/attachment` never downloads on its own.
+    fn begin_attachment_fetch(&mut self) {
+        if self.pending_attachment.is_some() || self.attachment_in_flight.is_some() {
+            self.notice = Some("Attachment fetch is already in progress.".into());
+            self.draft.clear();
+            self.draft_cursor = 0;
+            return;
+        }
+        let Some(conversation_id) = self.selected.as_ref() else {
+            self.error = Some("Open a chat before fetching an attachment.".into());
+            self.notice = None;
+            self.draft.clear();
+            self.draft_cursor = 0;
+            return;
+        };
+        let newest = self
+            .messages
+            .get(conversation_id)
+            .into_iter()
+            .flatten()
+            .flat_map(|message| {
+                message.parts().iter().filter_map(move |part| {
+                    let bloom_domain::MessagePart::Attachment(attachment) = part else {
+                        return None;
+                    };
+                    let token = attachment.fetch_token()?;
+                    Some((message.created_at, token.to_owned()))
+                })
+            })
+            .max_by_key(|(created_at, _)| *created_at);
+        let Some((_, token)) = newest else {
+            self.error = Some("No fetchable attachment is loaded in this chat.".into());
+            self.draft.clear();
+            self.draft_cursor = 0;
+            return;
+        };
+        self.error = None;
+        self.notice = Some("Fetching the newest attachment...".into());
+        self.draft.clear();
+        self.draft_cursor = 0;
+        self.pending_attachment = Some(token);
+    }
+
+    pub fn finish_attachment_fetch(&mut self, token: &str, result: Result<(String, u64), String>) {
+        if self.attachment_in_flight.as_deref() != Some(token) {
+            return;
+        }
+        self.attachment_in_flight = None;
+        match result {
+            Ok((path, bytes)) => {
+                self.error = None;
+                self.notice = Some(format!("Attachment saved to {path} ({bytes} bytes)."));
+            }
+            Err(message) => {
+                self.notice = None;
+                self.error = Some(message);
+            }
+        }
     }
 
     fn execute_search_command(&mut self) {
@@ -3415,6 +3486,7 @@ impl App {
             }
             ["/nickname", ..] => self.execute_nickname_command(),
             ["/search", ..] => self.execute_search_command(),
+            ["/attachment"] => self.begin_attachment_fetch(),
             ["/new"] => {
                 self.error = None;
                 self.retire_active_draft();
@@ -3448,7 +3520,10 @@ impl App {
     }
 
     fn take_pending_action(&mut self) -> Action {
-        if let Some((request, query, participant)) = self.pending_search.take() {
+        if let Some(token) = self.pending_attachment.take() {
+            self.attachment_in_flight = Some(token.clone());
+            Action::FetchAttachment { token }
+        } else if let Some((request, query, participant)) = self.pending_search.take() {
             Action::Search {
                 request,
                 query,
@@ -5827,6 +5902,54 @@ mod tests {
         ];
         assert_eq!(chat_name(&group), "One, two, three +1");
         assert_eq!(conversation_subtitle(&group), "5 people");
+    }
+
+    #[test]
+    fn attachment_command_fetches_only_the_newest_token_and_reports_the_path() {
+        const OLD: &str = "0123456789abcdef0123456789abcdef";
+        const NEW: &str = "fedcba9876543210fedcba9876543210";
+        let chat = conversation("attachment@example.test", Some(20));
+        let attachment = |token: &str| {
+            bloom_domain::MessagePart::Attachment(
+                bloom_domain::AttachmentRef::new(
+                    format!("local-metadata:{token}"),
+                    Some("image/jpeg".into()),
+                    Some("photo.jpg".into()),
+                    Some(3),
+                )
+                .unwrap()
+                .with_fetch_token(Some(token.into()))
+                .unwrap(),
+            )
+        };
+        let mut older = message(&chat, "older", 10, "older");
+        older.parts = vec![attachment(OLD)];
+        let mut newer = message(&chat, "newer", 20, "newer");
+        newer.parts = vec![attachment(NEW)];
+        let mut app = App {
+            selected: Some(chat.id.clone()),
+            ..Default::default()
+        };
+        app.messages.insert(chat.id.clone(), vec![older, newer]);
+        app.draft = "/attachment".into();
+        assert_eq!(
+            app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+            Action::FetchAttachment { token: NEW.into() }
+        );
+        app.finish_attachment_fetch(NEW, Ok(("/tmp/photo.jpg".into(), 3)));
+        assert!(app
+            .notice
+            .as_deref()
+            .is_some_and(|text| text.contains("photo.jpg")));
+        assert!(app.error.is_none());
+        app.finish_attachment_fetch(NEW, Err("stale".into()));
+        assert!(app.error.is_none(), "a duplicate result must be ignored");
+        app.attachment_in_flight = Some(NEW.into());
+        app.finish_attachment_fetch(NEW, Err("unavailable".into()));
+        assert!(app
+            .error
+            .as_deref()
+            .is_some_and(|text| text.contains("unavailable")));
     }
 
     #[test]

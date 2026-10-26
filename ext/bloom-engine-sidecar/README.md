@@ -47,6 +47,7 @@ Daemon to sidecar:
 - `{"version":1,"type":"send","request_id":N,"recipients":["..."],"text":"..."}`
 - A single-recipient send also includes the legacy `recipient` scalar for direct-send compatibility. Group sends are only issued when the sidecar advertises `capabilities.recipient_lists: true` in `ready`; an older sidecar therefore cannot silently downgrade a group to one target. A newer sidecar rejects scalar-only requests from an older daemon with a correlated negative send confirmation; update the daemon and sidecar together to enable group sends.
 - `{"version":1,"type":"sync_conversations","request_id":N}` for conversation metadata, not historical messages
+- `{"version":1,"type":"attachment_fetch","request_id":N,"token":"<32 lowercase hex>"}` for one explicit cached attachment; the token is generation-scoped
 - `{"version":1,"type":"shutdown","request_id":N}`
 
 Sidecar to daemon:
@@ -57,6 +58,7 @@ Sidecar to daemon:
 - `shutdown_ack` - `request_id`
 - `conversation` - one listed conversation's metadata (`sequence`, `conversation`)
 - `sync_result` - correlated metadata result (`request_id`, `status`: complete/limited/failed, `conversations`)
+- `attachment_fetched` - correlated local cache `path` and `bytes`; the path is never logged
 - `history_message` and `history_complete` - legacy/future protocol definitions; not emitted as a working remote-message import
 - `session_state` - `state` plus an optional `reason`
 - `error` - bounded `code`, `retryable`, optional `request_id`
