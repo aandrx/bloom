@@ -65,10 +65,9 @@ C1c connects the path without adding a TUI action:
 - no key, signature, URL, object ID, raw content, or path is logged.
 
 Rust workspace tests, strict Clippy, formatting, source guard, 86 Dart tests and
-68 fixture tests pass. No TUI action calls the operation, no attachment has been
-downloaded from the live engine, and fixture daemons do not implement a fetch
-result. Token identity is generation-scoped and becomes invalid after sidecar
-restart.
+68 fixture tests pass. No TUI action calls the operation, and fixture daemons do
+not implement a fetch result. Token identity is generation-scoped and becomes
+invalid after sidecar restart.
 
 ## C1d implementation evidence
 
@@ -81,8 +80,8 @@ written to logs or preferences. The command is listed in `/help` and the user
 guide. Actual-PTY coverage seeds an attachment with a token, invokes
 `/attachment`, and observes the saved-path result against the stateful fixture.
 
-No TUI action opens the saved file externally, and no live attachment has been
-downloaded. C1e remains the authorized live gate.
+No TUI action opens the saved file externally. C1e, the authorized live gate,
+now passes; see below.
 
 ## C1e live gate
 
@@ -160,9 +159,50 @@ Both process checks must print nothing. The temporary store, cache and probe roo
 are deleted; do not copy them. The probe was exercised against a fake daemon. The
 first authorized live run found an attachment token and issued the fetch, but the
 daemon did not return `attachment_fetched`; the probe removed its temporary log,
-so the sidecar failure code was not captured. A rerun now prints only bounded
-`attachment fetch`/`engine reported error` diagnostic lines before cleanup. C1e
-remains not passed until a live rerun returns `"result": "passed"`.
+so the sidecar failure code was not captured.
+
+### C1e result
+
+A live run passed on 2026-10-26 against the real registration and OpenBubbles
+state. The printed summary contained only structural fields:
+
+```json
+{
+  "messages_seen": 30,
+  "bytes": 325019,
+  "file_mode": "0o600",
+  "start_seconds": 0.1,
+  "fetch_seconds": 0.47,
+  "result": "passed"
+}
+```
+
+Post-run checks printed no `bloomd` process, no `bloom_engine.dart` process and no
+remaining `/tmp/bloom-live-attachment-*` root. The retained `summary.json` is mode
+`0600` and carries no path, token, filename, MIME type or content. The downloaded
+bytes were verified structurally only; nothing was opened, displayed or shared.
+
+Two earlier live attempts failed with `download_failed` before any engine request.
+Bounded sidecar diagnostics identified the stage as stream construction and the
+cause as a disposed opaque handle: `dupDaemonDesk` encodes every opaque field of
+the restored state with `Auto_Owned`, so it takes ownership of the restored
+`ApsConnection` and the Dart handle is disposed afterwards. The sidecar had kept
+passing that stale `push.conn`; it now passes `deskState.conn` from the state
+`dupDaemonDesk` returns, which matches how the upstream app holds its connection.
+No download was attempted against Apple with the stale handle.
+
+The diagnostic line is bounded and content-free. Failures report a fixed stage
+(`size`, `reuse_empty`, `reuse_oversized`, `temp_create`, `temp_stat`,
+`size_mismatch`, `filesystem`, `progress_negative`, `progress_over_total`,
+`size_threw`, `construct`, `listen`, `stream`) and either an allowlisted engine
+cause token (`mmcs_get_failed`, `not_connected`, `resource_timeout`, `auth`,
+`http`, `io`, and similar) or `unclassified_<RuntimeType>` for anything else.
+Engine error text is scanned only to pick a token and is never logged, so object
+identifiers, signatures, URLs and attachment names cannot reach the daemon log.
+Current gates after the fix: 91 Dart tests pass and `dart analyze` reports no
+issues for `bin`, `lib/attachment_cache.dart` and `test`. The vendored generated
+bindings still report 24 pre-existing analyzer warnings, unchanged by this work.
+No Rust source changed for C1e.
 
 ## C1b implementation evidence
 
@@ -200,7 +240,7 @@ download has run.
 2. **C1b:** sidecar attachment registry, opaque tokens, private-path writer, bounds, and fake-bridge tests. No IPC/UI.
 3. **C1c:** typed IPC fetch/open protocol and daemon dispatch, with no-store secret handling.
 4. **C1d:** TUI explicit save/open action plus PTY failure/success states against a synthetic fixture.
-5. **C1e:** one authorized live inbound attachment download; otherwise remain display-only.
+5. **C1e:** one authorized live inbound attachment download; otherwise remain display-only. **Passed** on 2026-10-26: 325,019 bytes, mode `0600`, `"result": "passed"`.
 
 ## Exclusions
 

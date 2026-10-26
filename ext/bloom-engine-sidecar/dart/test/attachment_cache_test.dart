@@ -633,4 +633,111 @@ void main() {
       expect(registry.toString(), isNot(contains('secret-name')));
     });
   });
+
+  group('download failure diagnostics', () {
+    late Directory temp;
+    late Directory root;
+    late AttachmentRegistry registry;
+
+    setUp(() async {
+      temp = await Directory.systemTemp.createTemp('bloom-attachment-diag-');
+      root = Directory('${temp.path}/cache');
+      registry = AttachmentRegistry(tokenFactory: _tokens());
+    });
+
+    tearDown(() async {
+      await temp.delete(recursive: true);
+    });
+
+    String register() => registry.register(
+          messageId: 'message-1',
+          partIndex: 0,
+          attachment: _attachment(),
+        );
+
+    Future<AttachmentDownloadFailure> failureOf(
+      AttachmentDownloader downloader, {
+      AttachmentSizeResolver? sizeResolver,
+    }) async {
+      final cache = AttachmentCache(
+        root: root,
+        registry: registry,
+        downloader: downloader,
+        sizeResolver: sizeResolver ?? (_) async => 3,
+      );
+      final token = register();
+      try {
+        await _fetch(cache, token);
+      } on AttachmentDownloadFailure catch (failure) {
+        return failure;
+      }
+      fail('expected a download failure');
+    }
+
+    test('classifies engine stream errors without keeping their text',
+        () async {
+      final failure = await failureOf(
+        (_, __, ___) => Stream<api.TransferProgress>.error(
+          Exception('MMCS GET failed Some("obj/sig https://example.invalid")'),
+        ),
+      );
+
+      expect(failure.stage, 'stream');
+      expect(failure.cause, 'mmcs_get_failed');
+      expect(failure.toString(), isNot(contains('obj/sig')));
+      expect(failure.toString(), isNot(contains('example.invalid')));
+    });
+
+    test('maps connection and authentication errors to fixed tokens', () async {
+      final notConnected = await failureOf(
+        (_, __, ___) =>
+            Stream<api.TransferProgress>.error(Exception('Not Connected')),
+      );
+      expect(notConnected.cause, 'not_connected');
+
+      final auth = await failureOf(
+        (_, __, ___) => Stream<api.TransferProgress>.error(
+          Exception(
+              'Failed to authenticate. Try logging in to account.apple.com'),
+        ),
+      );
+      expect(auth.cause, 'auth');
+    });
+
+    test('tags a progress violation by stage', () async {
+      final failure = await failureOf(
+        (_, __, ___) async* {
+          yield const api.TransferProgress(prog: 4, total: 3);
+        },
+      );
+
+      expect(failure.stage, 'progress_over_total');
+      expect(failure.cause, isNull);
+    });
+
+    test('tags a throwing size resolver and keeps its cause bounded', () async {
+      final failure = await failureOf(
+        (_, __, path) async* {
+          await File(path).writeAsBytes([1, 2, 3]);
+          yield const api.TransferProgress(prog: 3, total: 3);
+        },
+        sizeResolver: (_) async => throw Exception('Resource Timeout'),
+      );
+
+      expect(failure.stage, 'size_threw');
+      expect(failure.cause, 'resource_timeout');
+    });
+
+    test('unknown causes keep only the bounded error type', () async {
+      final failure = await failureOf(
+        (_, __, ___) => Stream<api.TransferProgress>.error(
+          StateError('/home/someone/private-photo.jpg'),
+        ),
+      );
+
+      expect(failure.stage, 'stream');
+      expect(failure.cause, 'unclassified_StateError');
+      expect(failure.toString(), isNot(contains('private-photo')));
+    });
+  });
 }

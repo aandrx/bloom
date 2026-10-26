@@ -43,7 +43,64 @@ class AttachmentTimeoutFailure extends AttachmentFailure {
 }
 
 class AttachmentDownloadFailure extends AttachmentFailure {
-  const AttachmentDownloadFailure() : super('download_failed');
+  const AttachmentDownloadFailure([this.stage = 'download', this.cause])
+      : super('download_failed');
+
+  /// Fixed tag for the failing step, so a live attempt is diagnosable without
+  /// logging error text, paths or attachment metadata.
+  final String stage;
+
+  /// Allowlisted engine error token, or null when the step has no engine error.
+  final String? cause;
+}
+
+/// Engine error prefixes mapped to fixed, content-free diagnostic tokens.
+///
+/// Engine errors can embed object identifiers, signatures or URLs, so only the
+/// mapped token is ever reported; the scanned text is discarded.
+const Map<String, String> downloadCauseTokens = {
+  'MMCS GET failed': 'mmcs_get_failed',
+  'MMCS Upload failed': 'mmcs_upload_failed',
+  'Not Connected': 'not_connected',
+  'Resource Timeout': 'resource_timeout',
+  'Resource Panic': 'resource_panic',
+  'ConnectionClosed': 'connection_closed',
+  'Aps connection failed': 'aps_connect',
+  'Your iMessage access is temporarily disabled': 'imessage_disabled',
+  'Failed to authenticate': 'auth',
+  'Bad auth cert': 'auth_invalid',
+  'HTTP error': 'http',
+  'IO error': 'io',
+  'TLS error': 'tls',
+  'Send timeout': 'send_timeout',
+  'Could not deliver message': 'no_valid_targets',
+  'Other side hung up': 'aps_send',
+  'Keyed archive error': 'keyed_archive',
+  'Plist parsing error': 'plist_parse',
+};
+
+/// Classifies a downloader error into a fixed token without keeping its text.
+String downloadErrorCause(Object error) {
+  final text = error.toString();
+  for (final entry in downloadCauseTokens.entries) {
+    if (text.contains(entry.key)) {
+      return entry.value;
+    }
+  }
+  return 'unclassified_${errorTypeToken(error)}';
+}
+
+/// Runtime type reduced to a bounded identifier, since Dart and FFI errors
+/// carry no attachment data in their type name.
+String errorTypeToken(Object error) {
+  final safe = error.runtimeType.toString().replaceAll(
+        RegExp(r'[^A-Za-z0-9_]'),
+        '',
+      );
+  if (safe.isEmpty) {
+    return 'unknown';
+  }
+  return safe.length <= 40 ? safe : safe.substring(0, 40);
 }
 
 class AttachmentUnsafeRootFailure extends AttachmentFailure {
@@ -266,7 +323,7 @@ class AttachmentCache {
       throw const AttachmentTooLargeFailure();
     }
     if (knownSize < 0) {
-      throw const AttachmentDownloadFailure();
+      throw const AttachmentDownloadFailure('size');
     }
 
     final finalType = await FileSystemEntity.type(
@@ -285,11 +342,11 @@ class AttachmentCache {
           // A zero-byte cached file cannot be a completed non-empty attachment.
           if (knownSize > 0 && stat.size == 0) {
             await finalFile.delete();
-            throw const AttachmentDownloadFailure();
+            throw const AttachmentDownloadFailure('reuse_empty');
           }
           if (stat.size > knownSize) {
             await finalFile.delete();
-            throw const AttachmentDownloadFailure();
+            throw const AttachmentDownloadFailure('reuse_oversized');
           }
           await _setMode(finalFile.path, '600');
           await _evict(protect: finalFile.path);
@@ -302,18 +359,18 @@ class AttachmentCache {
       } on AttachmentFailure {
         rethrow;
       } on FileSystemException {
-        throw const AttachmentDownloadFailure();
+        throw const AttachmentDownloadFailure('reuse_stat');
       }
     }
     if (finalType != FileSystemEntityType.notFound) {
-      throw const AttachmentDownloadFailure();
+      throw const AttachmentDownloadFailure('cache_entry');
     }
 
     await _removeTemp(tempFile);
     try {
       await tempFile.create(exclusive: true);
     } on FileSystemException {
-      throw const AttachmentDownloadFailure();
+      throw const AttachmentDownloadFailure('temp_create');
     }
 
     try {
@@ -322,7 +379,7 @@ class AttachmentCache {
 
       final stat = await tempFile.stat();
       if (stat.type != FileSystemEntityType.file) {
-        throw const AttachmentDownloadFailure();
+        throw const AttachmentDownloadFailure('temp_stat');
       }
       if (stat.size > maxFileBytes) {
         throw const AttachmentTooLargeFailure();
@@ -332,7 +389,7 @@ class AttachmentCache {
       // never as an exact-content assertion; zero bytes for a positive report
       // is still a failed transfer.
       if (stat.size > knownSize || (knownSize > 0 && stat.size == 0)) {
-        throw const AttachmentDownloadFailure();
+        throw const AttachmentDownloadFailure('size_mismatch');
       }
 
       await _setMode(tempFile.path, '600');
@@ -353,7 +410,7 @@ class AttachmentCache {
     } on AttachmentFailure {
       rethrow;
     } on FileSystemException {
-      throw const AttachmentDownloadFailure();
+      throw const AttachmentDownloadFailure('filesystem');
     } finally {
       await _removeTemp(tempFile);
     }
@@ -367,8 +424,8 @@ class AttachmentCache {
       );
     } on AttachmentFailure {
       rethrow;
-    } catch (_) {
-      throw const AttachmentDownloadFailure();
+    } catch (error) {
+      throw AttachmentDownloadFailure('size_threw', downloadErrorCause(error));
     }
   }
 
@@ -407,22 +464,31 @@ class AttachmentCache {
       if (!completer.isCompleted) completer.complete();
     }
 
+    final Stream<api.TransferProgress> stream;
     try {
-      final stream = _downloader(aps, attachment, path);
+      stream = _downloader(aps, attachment, path);
+    } catch (error) {
+      fail(AttachmentDownloadFailure('construct', downloadErrorCause(error)));
+      return completer.future;
+    }
+
+    try {
       timer = Timer(timeout, () => fail(const AttachmentTimeoutFailure()));
       final created = stream.listen(
         (progress) {
           if (settled) return;
           if (progress.prog < 0 || progress.total < 0) {
-            fail(const AttachmentDownloadFailure());
+            fail(const AttachmentDownloadFailure('progress_negative'));
           } else if (progress.total > maxFileBytes ||
               progress.prog > maxFileBytes) {
             fail(const AttachmentTooLargeFailure());
           } else if (progress.prog > progress.total) {
-            fail(const AttachmentDownloadFailure());
+            fail(const AttachmentDownloadFailure('progress_over_total'));
           }
         },
-        onError: (Object _) => fail(const AttachmentDownloadFailure()),
+        onError: (Object error) => fail(
+          AttachmentDownloadFailure('stream', downloadErrorCause(error)),
+        ),
         onDone: complete,
         cancelOnError: true,
       );
@@ -430,8 +496,8 @@ class AttachmentCache {
       if (settled) {
         unawaited(created.cancel());
       }
-    } catch (_) {
-      fail(const AttachmentDownloadFailure());
+    } catch (error) {
+      fail(AttachmentDownloadFailure('listen', downloadErrorCause(error)));
     }
 
     return completer.future;

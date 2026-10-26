@@ -322,7 +322,10 @@ Future<void> main(List<String> arguments) async {
               },
               stop: stop,
               attachments: attachmentCache,
-              aps: push.conn,
+              // `dupDaemonDesk` takes ownership of every opaque handle on the
+              // restored state, so `push.conn` is disposed from here on. The
+              // returned desk state carries the live connection.
+              aps: deskState.conn,
             ),
             onDone: stop,
           );
@@ -526,13 +529,21 @@ Future<void> _handleCommand({
           bytes: fetched.bytes,
         ));
       } on AttachmentFailure catch (error) {
-        stderr.writeln('attachment fetch failed: ${error.code}');
+        final failure = error is AttachmentDownloadFailure ? error : null;
+        final detail = failure == null
+            ? ''
+            : ' stage=${failure.stage}'
+                '${failure.cause == null ? '' : ' cause=${failure.cause}'}';
+        stderr.writeln('attachment fetch failed: ${error.code}$detail');
         writeProtocolFrame(errorFrame(
           requestId: command.requestId,
           code: _attachmentErrorCode(error),
         ));
-      } catch (_) {
-        stderr.writeln('attachment fetch failed: failed');
+      } catch (error) {
+        stderr.writeln(
+          'attachment fetch failed: failed stage=unexpected '
+          'cause=${downloadErrorCause(error)}',
+        );
         writeProtocolFrame(errorFrame(
           requestId: command.requestId,
           code: ProtocolCodes.failed,
