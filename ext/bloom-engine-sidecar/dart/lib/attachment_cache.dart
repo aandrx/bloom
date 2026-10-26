@@ -261,6 +261,10 @@ class AttachmentCache {
             await finalFile.delete();
             throw const AttachmentDownloadFailure();
           }
+          if (stat.size > knownSize) {
+            await finalFile.delete();
+            throw const AttachmentDownloadFailure();
+          }
           await _setMode(finalFile.path, '600');
           await _evict(protect: finalFile.path);
           return AttachmentCachedFile(
@@ -468,7 +472,7 @@ class AttachmentCache {
         if (!_tokenFilePattern.hasMatch(name)) continue;
         final stat = await entity.stat();
         if (stat.type != FileSystemEntityType.file) continue;
-        if (now.difference(stat.modified) > maxAge) {
+        if (now.difference(stat.modified) > maxAge && entity.path != protect) {
           await entity.delete();
           continue;
         }

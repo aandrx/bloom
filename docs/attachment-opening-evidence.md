@@ -64,7 +64,7 @@ The sidecar-only registry and cache are implemented in
   assertion, because MMCS attachments may sum multiple variants;
 - content-free failure types and redacted metadata/debug strings.
 
-81 Dart tests pass, including fake-downloader atomicity, concurrency, timeout,
+82 Dart tests pass, including fake-downloader atomicity, concurrency, timeout,
 size and quota cases, plus format and analysis. The registry/cache is not wired
 into the sidecar command loop, no IPC/daemon/store/TUI change exists, and no real
 download has run.

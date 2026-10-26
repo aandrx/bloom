@@ -407,6 +407,28 @@ void main() {
       expect(finalFile.existsSync(), isFalse);
     });
 
+    test('reuse does not delete an aged file that is still being returned',
+        () async {
+      root.createSync(recursive: true);
+      final token = register();
+      final finalFile = File('${root.path}/$token.bin');
+      await finalFile.writeAsBytes([9, 8, 7]);
+      await finalFile
+          .setLastModified(DateTime.now().subtract(const Duration(days: 31)));
+      final cache = AttachmentCache(
+        root: root,
+        registry: registry,
+        downloader: (_, __, ___) => const Stream<api.TransferProgress>.empty(),
+        sizeResolver: (_) async => 3,
+      );
+
+      final result = await _fetch(cache, token);
+
+      expect(result.reused, isTrue);
+      expect(finalFile.existsSync(), isTrue);
+      expect(await finalFile.readAsBytes(), [9, 8, 7]);
+    });
+
     test('reuses an existing regular final file without downloading', () async {
       root.createSync(recursive: true);
       final token = register();
@@ -420,7 +442,7 @@ void main() {
           downloads++;
           return const Stream<api.TransferProgress>.empty();
         },
-        sizeResolver: (_) async => 1,
+        sizeResolver: (_) async => 3,
       );
 
       final result = await _fetch(cache, token);
