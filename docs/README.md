@@ -11,6 +11,7 @@ Start with [fresh-session handoff](handoff.md). The root [AGENTS.md](../AGENTS.m
 | [Status](status.md) | Implemented/partial/missing features and evidence boundaries |
 | [System design](system-design.md) | Current Rust daemon/TUI, Dart child, store, identity and lifecycle architecture |
 | [Implementation roadmap](implementation-plan.md) | Active ordered work and acceptance gates, not completed features |
+| [Next iteration plan](next-iteration-plan.md) | Proposed sequence for live recovery, packaging diagnostics, remaining rich messaging, GPUI and multi-service |
 | [TUI user guide](tui.md) | Controls, preferences, screen behavior, setup and troubleshooting |
 | [TUI internals](tui-internals.md) | Redraw, state/ownership, geometry, palettes, terminal lifecycle and test tooling |
 | [Local filename search](filename-search.md) | Body-first filename search, display rules, v6 compatibility, verification status, and limits |
