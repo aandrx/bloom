@@ -185,9 +185,9 @@ Inbound reactions, text edits and whole-body unsends are accepted. Remaining wor
 ### C1. Inbound attachment usefulness
 
 - Already present: reported filename metadata and safe placeholders.
-- Missing: opening or downloading the file, previews, and content search.
-- Gate: a verified local path or download API that does not imply success before bytes exist. If the only route is the blocked archive/object path, keep display-only and document the block.
-- Acceptance: no fabricated filename or "downloaded" claim; unsupported parts remain explicit; no plaintext extraction or URL inference.
+- [Evidence](attachment-opening-evidence.md) now shows a real bridge path: `api.downloadMmcs`/`downloadAttachment`, an `ApsConnection` in the restored sidecar, and upstream file-writing implementations. Bloom currently discards the MMCS material and has no token, path, or opening contract.
+- The API gate passes; end-to-end opening does not. Next unit is C1b: a sidecar-only bounded token registry and private atomic file writer, then C1c typed IPC, C1d explicit TUI save/open, and C1e one authorized live inbound attachment.
+- Acceptance: no fabricated filename or "downloaded" claim; unsupported parts remain explicit; no plaintext extraction, URL inference, automatic download, or engine-database read.
 
 ### C2. Outbound edits, unsend and reactions
 

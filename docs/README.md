@@ -33,6 +33,7 @@ Start with [fresh-session handoff](handoff.md). The root [AGENTS.md](../AGENTS.m
 | [Historical ingestion plan](historical-ingestion-plan.md) | Design-only gate for importing past messages; blocked at the engine boundary |
 | [Engine recovery plan](engine-recovery-plan.md) | Implemented generation-scoped engine restart, synthetic runtime evidence, invariants and live-verification limit |
 | [Attachment filename baseline](attachment-search-gap.md) | Historical ingestion gap, accepted prerequisites, and limits of old unsupported records |
+| [Attachment opening evidence](attachment-opening-evidence.md) | Bridge/API evidence for inbound attachment download, safety design, and live-verification limits |
 | [Multi-service research and proposed plan](multi-service-research.md) | Deferred Slack/Discord feasibility, policy/access limits, service-native navigation and staged acceptance gates; not implemented connectors |
 | [Engine-sidecar evidence](engine-sidecar.md) | Historical research/authorized live experiments plus updated integration boundaries; not current-checkout live proof |
 | [IDS validation gate](ids-validation-gate.md) | Independent registration remains blocked; existing-engine reuse does not open this gate |
