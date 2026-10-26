@@ -49,6 +49,27 @@ The API-availability gate **passes**: a real download path exists through the ow
 
 The end-to-end opening gate **does not pass**: Bloom has no verified way to retain the engine attachment object, request a download safely, choose a destination, bound the result, or open it. A live download against the installed engine has not been run and would require an explicit authorized test with a real inbound attachment.
 
+## C1c implementation evidence
+
+C1c connects the path without adding a TUI action:
+
+- inbound normal-message attachments are registered in the sidecar registry and
+  receive an opaque token at their physical part position;
+- the codec carries the token only on that attachment part, and the daemon mapper
+  validates it into `AttachmentRef.fetch_token`;
+- the sidecar accepts `attachment_fetch`, downloads through C1b into its private
+  cache, and returns only a correlated path and byte count or a bounded error;
+- the daemon engine waits on a correlated attachment waiter and rejects relative
+  or parent-traversal paths; IPC v8 adds typed `fetch_attachment` and
+  `attachment_fetched` operations;
+- no key, signature, URL, object ID, raw content, or path is logged.
+
+Rust workspace tests, strict Clippy, formatting, source guard, 86 Dart tests and
+68 fixture tests pass. No TUI action calls the operation, no attachment has been
+downloaded from the live engine, and fixture daemons do not implement a fetch
+result. Token identity is generation-scoped and becomes invalid after sidecar
+restart.
+
 ## C1b implementation evidence
 
 The sidecar-only registry and cache are implemented in

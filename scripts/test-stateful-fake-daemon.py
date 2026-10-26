@@ -39,7 +39,7 @@ def oversized_response(limit):
 
 def send(client, obj):
     payload = json.dumps(obj).encode()
-    client.sendall(b"\x07" + struct.pack(">I", len(payload)) + payload)
+    client.sendall(b"\x08" + struct.pack(">I", len(payload)) + payload)
 
 
 def recv_exact(client, size):
@@ -55,7 +55,7 @@ def recv_exact(client, size):
 def recv(client):
     header = recv_exact(client, 5)
     version, size = struct.unpack(">BI", header)
-    if version != 7 or not 0 < size <= 1048576:
+    if version != 8 or not 0 < size <= 1048576:
         raise AssertionError("invalid response frame")
     return json.loads(recv_exact(client, size))
 
@@ -1304,10 +1304,10 @@ class FrameSerialization(unittest.TestCase):
             module["frame"](event)
 
     def test_fake_daemon_frames_stay_within_limit(self):
-        self.check_fixture(FAKE, 7)
+        self.check_fixture(FAKE, 8)
 
     def test_stateful_fake_daemon_frames_stay_within_limit(self):
-        self.check_fixture(DAEMON, 7)
+        self.check_fixture(DAEMON, 8)
 
 
 class FrameHeaderParity(unittest.TestCase):
@@ -1338,13 +1338,13 @@ class FrameHeaderParity(unittest.TestCase):
             server.close()
         return outcome
 
-    def test_valid_v7_frame_parses_in_both_fixtures(self):
+    def test_valid_v8_frame_parses_in_both_fixtures(self):
         payload = {"request_id": 3, "request": {"op": "echo", "who": identity("me@example.invalid")}}
         for path in (DAEMON, FAKE):
             with self.subTest(fixture=os.path.basename(path)):
                 module = runpy.run_path(path)
                 frame_version, body, size = parse_frame(module["frame"](payload))
-                self.assertEqual(frame_version, 7)
+                self.assertEqual(frame_version, 8)
                 self.assertEqual(size, len(json.dumps(body, separators=(",", ":"), ensure_ascii=False).encode()))
                 outcome = self.call_read_frame(module, module["frame"](payload))
                 self.assertNotIn("error", outcome)
@@ -1355,9 +1355,10 @@ class FrameHeaderParity(unittest.TestCase):
         cases = {
             "version 5": (5, 2),
             "version 6": (6, 2),
+            "version 7": (7, 2),
             "version 99": (99, 2),
-            "zero length": (7, 0),
-            "oversized length": (7, limit + 1),
+            "zero length": (8, 0),
+            "oversized length": (8, limit + 1),
         }
         for label, (version, length) in cases.items():
             outcomes = []

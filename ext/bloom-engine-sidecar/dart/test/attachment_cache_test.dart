@@ -71,6 +71,21 @@ void main() {
       expect(entry?.messageId, 'm1');
       expect(entry?.partIndex, 0);
       expect(identical(entry?.attachment, attachment), isTrue);
+      final refreshed = _attachment(name: 'refreshed.jpg');
+      expect(
+        registry.register(
+          messageId: 'm1',
+          partIndex: 0,
+          attachment: refreshed,
+        ),
+        first,
+        reason: 're-delivery must retain the advertised token',
+      );
+      expect(
+        identical(registry.lookup(first)?.attachment, refreshed),
+        isTrue,
+        reason: 'the refreshed engine handle must replace the stale one',
+      );
       expect(registry.remove(first)?.token, first);
       expect(registry.lookup(first), isNull);
     });

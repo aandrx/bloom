@@ -291,6 +291,18 @@ impl BloomClient {
         }
     }
 
+    /// Fetch one opaque attachment token through the daemon. Returns the private
+    /// local cache path and its byte length. The caller must not log either.
+    pub async fn fetch_attachment(&self, token: String) -> Result<(String, u64), ClientError> {
+        match self
+            .request_with_timeout(RequestKind::FetchAttachment { token }, SYNC_REQUEST_TIMEOUT)
+            .await?
+        {
+            ResponseKind::AttachmentFetched { path, bytes } => Ok((path, bytes)),
+            _ => Err(ClientError::UnexpectedResponse),
+        }
+    }
+
     pub async fn send(
         &self,
         conversation_id: ConversationId,
@@ -578,6 +590,43 @@ mod tests {
         assert_eq!(
             client.draft_delete(key, 9).await.unwrap(),
             DraftWriteOutcome::Stale
+        );
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn attachment_fetch_uses_v8_and_returns_the_typed_result() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("attachment");
+        let listener = UnixListener::bind(&path).unwrap();
+        let token = "0123456789abcdef0123456789abcdef".to_owned();
+        let expected = token.clone();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let request = crate::read_request(&mut stream).await.unwrap();
+            assert!(matches!(
+                &request.request,
+                RequestKind::FetchAttachment { token } if token == &expected
+            ));
+            write_response(
+                &mut stream,
+                &Response {
+                    request_id: request.request_id,
+                    response: ResponseKind::AttachmentFetched {
+                        path: "/private/cache/token.bin".into(),
+                        bytes: 42,
+                    },
+                },
+            )
+            .await
+            .unwrap();
+        });
+        assert_eq!(
+            BloomClient::new(path)
+                .fetch_attachment(token)
+                .await
+                .unwrap(),
+            ("/private/cache/token.bin".to_owned(), 42)
         );
         server.await.unwrap();
     }

@@ -150,6 +150,28 @@ void main() {
       expect(third['handle'], 'tel:+15550000002');
     });
 
+    test('injects fetch tokens only at their physical part position', () {
+      const token = '0123456789abcdef0123456789abcdef';
+      final encoded = encodePushMessage(
+        api.PushMessage.iMessage(fullInstance()),
+        fetchTokens: <int, String>{1: token},
+      );
+      final normal = messageBody(encoded)['value']! as Map<String, Object?>;
+      final parts = normal['parts']! as List;
+      final attachment = (parts[1] as Map)['part']! as Map;
+      expect(attachment['fetch_token'], token);
+      expect((parts[0] as Map)['part'], isNot(contains('fetch_token')));
+      expect((parts[2] as Map)['part'], isNot(contains('fetch_token')));
+
+      final without = encodePushMessage(
+        api.PushMessage.iMessage(fullInstance()),
+      );
+      final plainNormal =
+          messageBody(without)['value']! as Map<String, Object?>;
+      final plainParts = plainNormal['parts']! as List;
+      expect((plainParts[1] as Map)['part'], isNot(contains('fetch_token')));
+    });
+
     test('distinct messages stay distinct', () {
       final first = jsonEncode(
         encodePushMessage(

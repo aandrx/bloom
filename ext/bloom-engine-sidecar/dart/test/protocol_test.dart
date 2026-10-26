@@ -97,6 +97,48 @@ void main() {
       expect(command, isA<ShutdownCommand>());
     });
 
+    test('accepts attachment_fetch only with a lowercase hex token', () {
+      const token = '0123456789abcdef0123456789abcdef';
+      final command = decodeCommand(
+        jsonEncode(<String, Object?>{
+          'version': protocolVersion,
+          'type': 'attachment_fetch',
+          'request_id': 31,
+          'token': token,
+        }),
+      );
+      expect(command, isA<AttachmentFetchCommand>());
+      expect((command as AttachmentFetchCommand).requestId, 31);
+      expect(command.token, token);
+      for (final invalid in <Object?>[
+        null,
+        5,
+        '',
+        '0123456789ABCDEF0123456789abcdef',
+        '0123456789abcdef0123456789abcdeg',
+        '0123456789abcdef0123456789abcde',
+        '0123456789abcdef0123456789abcdef0',
+      ]) {
+        expect(
+          () => decodeCommand(
+            jsonEncode(<String, Object?>{
+              'version': protocolVersion,
+              'type': 'attachment_fetch',
+              'request_id': 31,
+              'token': invalid,
+            }),
+          ),
+          throwsA(
+            isA<ProtocolException>().having(
+              (e) => e.code,
+              'code',
+              ProtocolCodes.invalidToken,
+            ),
+          ),
+        );
+      }
+    });
+
     test('rejects a scalar-only legacy send with a correlated response', () {
       final frame = decodeFrame(
         rejectedCommandFrame(
@@ -128,6 +170,38 @@ void main() {
       );
       expect(unrelated['type'], 'error');
       expect(rejectedSendRequestId('not json'), isNull);
+    });
+
+    test('rejects a malformed attachment frame with its request id', () {
+      final frame = decodeFrame(
+        rejectedCommandFrame(
+          jsonEncode(<String, Object?>{
+            'version': protocolVersion,
+            'type': 'attachment_fetch',
+            'request_id': 44,
+            'token': 'not-a-token',
+          }),
+          ProtocolCodes.invalidToken,
+        ),
+      );
+      expect(frame['type'], 'error');
+      expect(frame['request_id'], 44);
+      expect(frame['code'], ProtocolCodes.invalidToken);
+    });
+
+    test('attachment result carries its correlated path and bytes', () {
+      final frame = decodeFrame(
+        attachmentFetchedFrame(
+          requestId: 45,
+          path: '/private/cache/token.bin',
+          bytes: 12,
+        ),
+      );
+      expect(frame['type'], 'attachment_fetched');
+      expect(frame['request_id'], 45);
+      expect(frame['path'], '/private/cache/token.bin');
+      expect(frame['bytes'], 12);
+      expect(frame['version'], protocolVersion);
     });
 
     test('rejects malformed frames with bounded codes', () {
@@ -225,6 +299,7 @@ void main() {
         ),
         sendConfirmFrame(requestId: 1, messageId: 'm', accepted: true),
         shutdownAckFrame(requestId: 2),
+        attachmentFetchedFrame(requestId: 3, path: '/p', bytes: 1),
         sessionFrame(state: 'active'),
         errorFrame(code: ProtocolCodes.sendFailed, retryable: true),
       ]) {

@@ -1580,3 +1580,85 @@ async fn the_daemon_sends_engine_form_recipients_exactly_once_prefixed() {
         );
     }
 }
+
+fn attachment_script(dir: &std::path::Path, name: &str, reply: &str) -> PathBuf {
+    let path = dir.join(name);
+    let script = format!(
+        "#!/bin/sh\nprintf '%s\\n' '{{\"version\":1,\"type\":\"ready\",\"engine_version\":\"fake\",\"handles\":[],\"capabilities\":{{\"send\":true,\"history\":false,\"recipient_lists\":true}}}}'\nwhile IFS= read -r line; do\n  case \"$line\" in\n    *'\"type\":\"attachment_fetch\"'*)\n      id=$(printf '%s' \"$line\" | sed -n 's/.*\"request_id\":\\([0-9]*\\).*/\\1/p')\n      {reply}\n      ;;\n  esac\ndone\n"
+    );
+    fs::write(&path, script).unwrap();
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o700)).unwrap();
+    path
+}
+
+const FETCH_TOKEN: &str = "0123456789abcdef0123456789abcdef";
+
+#[tokio::test]
+async fn attachment_fetch_returns_success_and_correlated_error() {
+    let dir = tempfile::tempdir().unwrap();
+    let private = dir.path().join("private");
+    fs::create_dir(&private).unwrap();
+    fs::set_permissions(&private, fs::Permissions::from_mode(0o700)).unwrap();
+    let success = attachment_script(
+        dir.path(),
+        "attachment-success.sh",
+        "printf '{\"version\":1,\"type\":\"attachment_fetched\",\"request_id\":%s,\"path\":\"/private/cache/x.bin\",\"bytes\":12}\\n' \"$id\"",
+    );
+    let engine = lifecycle_engine(success, &private);
+    let _events = engine.take_events().await.unwrap();
+    engine.start().await.unwrap();
+    let file = tokio::time::timeout(Duration::from_secs(3), engine.fetch_attachment(FETCH_TOKEN))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(file.path, "/private/cache/x.bin");
+    assert_eq!(file.bytes, 12);
+    engine.stop().await.unwrap();
+
+    let private = dir.path().join("private-error");
+    fs::create_dir(&private).unwrap();
+    fs::set_permissions(&private, fs::Permissions::from_mode(0o700)).unwrap();
+    let failure = attachment_script(
+        dir.path(),
+        "attachment-error.sh",
+        "printf '{\"version\":1,\"type\":\"error\",\"request_id\":%s,\"code\":\"too_large\",\"retryable\":false}\\n' \"$id\"",
+    );
+    let engine = lifecycle_engine(failure, &private);
+    let _events = engine.take_events().await.unwrap();
+    engine.start().await.unwrap();
+    assert_eq!(
+        tokio::time::timeout(Duration::from_secs(3), engine.fetch_attachment(FETCH_TOKEN),)
+            .await
+            .unwrap(),
+        Err(bloom_transport::TransportError::Protocol)
+    );
+    engine.stop().await.unwrap();
+}
+
+#[tokio::test]
+async fn attachment_fetch_rejects_bad_tokens_and_fails_on_stream_cleanup() {
+    let dir = tempfile::tempdir().unwrap();
+    let private = dir.path().join("private");
+    fs::create_dir(&private).unwrap();
+    fs::set_permissions(&private, fs::Permissions::from_mode(0o700)).unwrap();
+    let script = attachment_script(
+        dir.path(),
+        "attachment-cleanup.sh",
+        "printf '\\036not-json\\n'; exec sleep 30",
+    );
+    let engine = lifecycle_engine(script, &private);
+    let _events = engine.take_events().await.unwrap();
+    engine.start().await.unwrap();
+    assert_eq!(
+        engine.fetch_attachment("not-a-token").await,
+        Err(bloom_transport::TransportError::Protocol)
+    );
+    assert_eq!(
+        tokio::time::timeout(Duration::from_secs(3), engine.fetch_attachment(FETCH_TOKEN),)
+            .await
+            .unwrap(),
+        Err(bloom_transport::TransportError::TransportUnavailable),
+        "stream failure must fail pending attachment waiters"
+    );
+    engine.stop().await.unwrap();
+}

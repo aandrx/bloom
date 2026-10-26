@@ -30,6 +30,11 @@ class ProtocolCodes {
   static const String noSenderHandle = 'no_sender_handle';
   static const String sendFailed = 'send_failed';
   static const String engineUnavailable = 'engine_unavailable';
+  static const String invalidToken = 'invalid_token';
+  static const String tooLarge = 'too_large';
+  static const String timeout = 'timeout';
+  static const String unavailable = 'unavailable';
+  static const String failed = 'failed';
 }
 
 class ProtocolException implements Exception {
@@ -67,6 +72,16 @@ final class SyncConversationsCommand extends Command {
   final int requestId;
 }
 
+final class AttachmentFetchCommand extends Command {
+  const AttachmentFetchCommand({
+    required this.requestId,
+    required this.token,
+  });
+
+  final int requestId;
+  final String token;
+}
+
 final class ShutdownCommand extends Command {
   const ShutdownCommand({required this.requestId});
 
@@ -91,16 +106,33 @@ int? rejectedSendRequestId(String line) {
   return null;
 }
 
+int? _rejectedAttachmentRequestId(String line) {
+  try {
+    final decoded = jsonDecode(line);
+    if (decoded is Map<String, dynamic> &&
+        decoded['type'] == 'attachment_fetch' &&
+        decoded['request_id'] is int) {
+      return decoded['request_id'] as int;
+    }
+  } catch (_) {
+    // Invalid JSON has no trustworthy request ID.
+  }
+  return null;
+}
+
 /// Create a bounded, correlated reply when rejecting a command frame.
 String rejectedCommandFrame(String line, String code) {
   final requestId = rejectedSendRequestId(line);
-  if (requestId == null) return errorFrame(code: code);
-  return sendConfirmFrame(
-    requestId: requestId,
-    messageId: '',
-    accepted: false,
-    error: code,
-  );
+  if (requestId != null) {
+    return sendConfirmFrame(
+      requestId: requestId,
+      messageId: '',
+      accepted: false,
+      error: code,
+    );
+  }
+  final fetchRequestId = _rejectedAttachmentRequestId(line);
+  return errorFrame(code: code, requestId: fetchRequestId);
 }
 
 /// Parse one stdin line. Throws ProtocolException on any malformed input.
@@ -173,6 +205,22 @@ Command decodeCommand(String line) {
         );
       }
       return SyncConversationsCommand(requestId: requestId);
+    case 'attachment_fetch':
+      final requestId = decoded['request_id'];
+      final token = decoded['token'];
+      if (requestId is! int) {
+        throw ProtocolException(
+          ProtocolCodes.invalidFrame,
+          'attachment_fetch requires integer request_id',
+        );
+      }
+      if (token is! String || !_attachmentTokenPattern.hasMatch(token)) {
+        throw ProtocolException(
+          ProtocolCodes.invalidToken,
+          'attachment_fetch requires a 32-character lowercase hex token',
+        );
+      }
+      return AttachmentFetchCommand(requestId: requestId, token: token);
     case 'shutdown':
       final requestId = decoded['request_id'];
       if (requestId is! int) {
@@ -204,6 +252,8 @@ String? _optionalChatGuid(Map<String, dynamic> decoded) {
 
 String _frame(Map<String, Object?> body) =>
     jsonEncode(<String, Object?>{'version': protocolVersion, ...body});
+
+final RegExp _attachmentTokenPattern = RegExp(r'^[0-9a-f]{32}$');
 
 /// Whether the sidecar can return historical messages.
 ///
@@ -288,6 +338,20 @@ String syncResultFrame({
 /// Acknowledgement that the sidecar has begun shutting down.
 String shutdownAckFrame({required int requestId}) =>
     _frame(<String, Object?>{'type': 'shutdown_ack', 'request_id': requestId});
+
+/// Result of a correlated attachment fetch. The path is a local cache location
+/// and must never be logged by the sidecar.
+String attachmentFetchedFrame({
+  required int requestId,
+  required String path,
+  required int bytes,
+}) =>
+    _frame(<String, Object?>{
+      'type': 'attachment_fetched',
+      'request_id': requestId,
+      'path': path,
+      'bytes': bytes,
+    });
 
 /// One conversation imported from the existing local history, emitted once during
 /// startup import so the daemon can serve History from its own store afterwards.

@@ -20,9 +20,9 @@ use std::{fmt, io};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use unicode_segmentation::UnicodeSegmentation;
 
-/// Bumped to 7 for daemon-owned durable drafts. Version 6 peers are rejected
-/// at the frame byte, so they cannot silently ignore draft operations.
-pub const PROTOCOL_VERSION: u16 = 7;
+/// Bumped to 8 for typed attachment fetch. Version 7 peers are rejected at
+/// the frame byte, so they cannot silently ignore attachment requests.
+pub const PROTOCOL_VERSION: u16 = 8;
 /// Largest accepted `message_context` limit. Dispatch rejects larger limits
 /// instead of clamping them.
 pub const MAX_MESSAGE_CONTEXT_LIMIT: u32 = 200;
@@ -333,6 +333,11 @@ pub enum RequestKind {
         key: DraftKey,
         revision: u64,
     },
+    /// Fetch one previously advertised opaque attachment token through the
+    /// sidecar. The token is exactly 32 lowercase hex characters.
+    FetchAttachment {
+        token: String,
+    },
 }
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Response {
@@ -372,6 +377,10 @@ pub enum ResponseKind {
     },
     DraftDelete {
         outcome: DraftWriteOutcome,
+    },
+    AttachmentFetched {
+        path: String,
+        bytes: u64,
     },
     Error {
         error: ProtocolError,
@@ -792,7 +801,7 @@ mod tests {
             ResponseKind::MessageContext { messages } => assert_eq!(messages, vec![message]),
             _ => panic!("expected message context"),
         }
-        assert_eq!(PROTOCOL_VERSION, 7);
+        assert_eq!(PROTOCOL_VERSION, 8);
     }
 
     #[test]

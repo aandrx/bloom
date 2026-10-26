@@ -39,6 +39,24 @@ pub const SEND_TIMEOUT: Duration = Duration::from_secs(30);
 /// Grace period for final sidecar frames; also bounds individual shutdown I/O.
 pub const STOP_TIMEOUT: Duration = Duration::from_secs(10);
 const READER_STOP_TIMEOUT: Duration = Duration::from_secs(2);
+/// The sidecar bounds one attachment download to 120 seconds, so the daemon
+/// waits at least as long without retrying automatically.
+pub const ATTACHMENT_FETCH_TIMEOUT: Duration = Duration::from_secs(150);
+
+/// A fetched attachment's private local cache file.
+#[derive(Clone, PartialEq, Eq)]
+pub struct AttachmentFile {
+    pub path: String,
+    pub bytes: u64,
+}
+impl std::fmt::Debug for AttachmentFile {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AttachmentFile")
+            .field("path", &"[REDACTED]")
+            .field("bytes", &self.bytes)
+            .finish()
+    }
+}
 
 pub fn transport_id() -> TransportId {
     TransportId::new("openbubbles").expect("static transport id is valid")
@@ -112,12 +130,14 @@ struct Pending {
 
 type SyncResult = TransportResult<(bool, u32)>;
 type SyncWaiters = Arc<Mutex<HashMap<u64, oneshot::Sender<SyncResult>>>>;
+type AttachmentWaiters = Arc<Mutex<HashMap<u64, oneshot::Sender<TransportResult<AttachmentFile>>>>>;
 
 #[derive(Clone)]
 struct ReadFrameContext {
     outgoing: mpsc::Sender<TransportEvent>,
     pending: Arc<Pending>,
     sync_waiters: SyncWaiters,
+    attachment_waiters: AttachmentWaiters,
     sync_events: Arc<tokio::sync::Mutex<()>>,
     id: TransportId,
     my_handles: Arc<Mutex<Vec<String>>>,
@@ -146,6 +166,7 @@ pub struct Engine {
     sync_waiters: SyncWaiters,
     sync_events: Arc<tokio::sync::Mutex<()>>,
     sync_lock: tokio::sync::Mutex<()>,
+    attachment_waiters: AttachmentWaiters,
     reader_stop: Arc<tokio::sync::Notify>,
     reader_done: tokio::sync::watch::Sender<bool>,
     lifecycle_lock: tokio::sync::Mutex<()>,
@@ -172,6 +193,7 @@ impl Engine {
             sync_waiters: Arc::new(Mutex::new(HashMap::new())),
             sync_events: Arc::new(tokio::sync::Mutex::new(())),
             sync_lock: tokio::sync::Mutex::new(()),
+            attachment_waiters: Arc::new(Mutex::new(HashMap::new())),
             reader_stop: Arc::new(tokio::sync::Notify::new()),
             reader_done,
             lifecycle_lock: tokio::sync::Mutex::new(()),
@@ -278,6 +300,45 @@ impl Engine {
             Ok(Ok(result)) => result,
             _ => {
                 self.sync_waiters.lock().unwrap().remove(&request_id);
+                Err(TransportError::Protocol)
+            }
+        }
+    }
+
+    /// Fetch one opaque attachment token through the sidecar. The token is
+    /// validated locally; no path, key or content crosses this call in logs.
+    /// A failure is returned once and is never retried automatically.
+    pub async fn fetch_attachment(&self, token: &str) -> TransportResult<AttachmentFile> {
+        if !AttachmentRef::is_valid_fetch_token(token) {
+            return Err(TransportError::Protocol);
+        }
+        if !self.started.load(Ordering::SeqCst) {
+            return Err(TransportError::TransportUnavailable);
+        }
+        let request_id = self.next_request.fetch_add(1, Ordering::Relaxed);
+        let (tx, rx) = oneshot::channel();
+        self.attachment_waiters
+            .lock()
+            .unwrap()
+            .insert(request_id, tx);
+        if self
+            .write_frame(&serde_json::json!({
+                "version": 1,
+                "type": "attachment_fetch",
+                "request_id": request_id,
+                "token": token,
+            }))
+            .await
+            .is_err()
+        {
+            self.attachment_waiters.lock().unwrap().remove(&request_id);
+            return Err(TransportError::TransportUnavailable);
+        }
+        match tokio::time::timeout(ATTACHMENT_FETCH_TIMEOUT, rx).await {
+            Ok(Ok(result)) => result,
+            Ok(Err(_)) => Err(TransportError::Internal),
+            Err(_) => {
+                self.attachment_waiters.lock().unwrap().remove(&request_id);
                 Err(TransportError::Protocol)
             }
         }
@@ -433,6 +494,7 @@ impl Engine {
         let recipient_lists_supported = self.recipient_lists_supported.clone();
         let pending = self.pending.clone();
         let sync_waiters = self.sync_waiters.clone();
+        let attachment_waiters = self.attachment_waiters.clone();
         let sync_events = self.sync_events.clone();
         let started = self.started.clone();
         let stdin = self.stdin.clone();
@@ -448,6 +510,7 @@ impl Engine {
                     outgoing,
                     pending,
                     sync_waiters,
+                    attachment_waiters,
                     sync_events,
                     id,
                     my_handles,
@@ -600,6 +663,10 @@ async fn cleanup_reader(context: &ReadFrameContext) {
     for (_, waiter) in waiters {
         let _ = waiter.send(Err(TransportError::TransportUnavailable));
     }
+    let attachment_waiters = std::mem::take(&mut *context.attachment_waiters.lock().unwrap());
+    for (_, waiter) in attachment_waiters {
+        let _ = waiter.send(Err(TransportError::TransportUnavailable));
+    }
     // Written-but-unacknowledged sends retain their timeout outcome: failure of
     // the stream cannot prove that the remote service did not accept them.
     context.stdin.lock().await.take();
@@ -628,6 +695,7 @@ async fn process_frames(stdout: tokio::process::ChildStdout, context: ReadFrameC
         outgoing,
         pending,
         sync_waiters,
+        attachment_waiters,
         sync_events,
         id,
         my_handles: my_handles_store,
@@ -794,7 +862,34 @@ async fn process_frames(stdout: tokio::process::ChildStdout, context: ReadFrameC
                     .get("code")
                     .and_then(Value::as_str)
                     .unwrap_or("unknown");
+                let request_id = frame.get("request_id").and_then(Value::as_u64);
+                if let Some(request_id) = request_id {
+                    if let Some(waiter) = attachment_waiters.lock().unwrap().remove(&request_id) {
+                        let _ = waiter.send(Err(map_attachment_error(code)));
+                        continue;
+                    }
+                }
                 eprintln!("engine reported error: {code}");
+            }
+            Some("attachment_fetched") => {
+                let request_id = frame.get("request_id").and_then(Value::as_u64);
+                let path = frame
+                    .get("path")
+                    .and_then(Value::as_str)
+                    .filter(|path| !path.is_empty());
+                let bytes = frame.get("bytes").and_then(Value::as_u64);
+                let result = match (path, bytes) {
+                    (Some(path), Some(bytes)) if safe_attachment_path(path) => Ok(AttachmentFile {
+                        path: path.to_owned(),
+                        bytes,
+                    }),
+                    _ => Err(TransportError::Protocol),
+                };
+                if let Some(waiter) =
+                    request_id.and_then(|id| attachment_waiters.lock().unwrap().remove(&id))
+                {
+                    let _ = waiter.send(result);
+                }
             }
             Some("shutdown_ack") => {}
             Some("sync_result") => {
@@ -876,6 +971,23 @@ async fn process_frames(stdout: tokio::process::ChildStdout, context: ReadFrameC
             .collect::<Vec<_>>()
             .join(", ");
         eprintln!("engine skipped payloads: {summary}");
+    }
+}
+
+fn safe_attachment_path(path: &str) -> bool {
+    let path = std::path::Path::new(path);
+    path.is_absolute()
+        && path
+            .components()
+            .all(|component| !matches!(component, std::path::Component::ParentDir))
+}
+
+fn map_attachment_error(code: &str) -> TransportError {
+    match code {
+        "invalid_token" => TransportError::Protocol,
+        "unavailable" => TransportError::TransportUnavailable,
+        "too_large" | "timeout" => TransportError::Protocol,
+        _ => TransportError::Internal,
     }
 }
 
@@ -1028,7 +1140,14 @@ fn attachment_part(
             kind: "attachment".to_owned(),
         };
     }
-    match AttachmentRef::new(token, mime_type, file_name, byte_len) {
+    let fetch_token = part
+        .get("fetch_token")
+        .and_then(Value::as_str)
+        .filter(|token| AttachmentRef::is_valid_fetch_token(token))
+        .map(str::to_owned);
+    match AttachmentRef::new(token, mime_type, file_name, byte_len)
+        .and_then(|reference| reference.with_fetch_token(fetch_token))
+    {
         Ok(reference) => MessagePart::Attachment(reference),
         Err(_) => MessagePart::Unsupported {
             kind: "attachment".to_owned(),
@@ -1755,6 +1874,38 @@ mod tests {
                 kind: "attachment".to_owned()
             }]
         );
+    }
+
+    #[test]
+    fn attachment_metadata_keeps_a_valid_fetch_token_and_ignores_invalid() {
+        const TOKEN: &str = "0123456789abcdef0123456789abcdef";
+        let value = attachment_payload(json!([
+            {"part": {"type": "attachment", "name": "a.jpg", "fetch_token": TOKEN}},
+            {"part": {"type": "attachment", "name": "b.jpg", "fetch_token": "not-a-token"}}
+        ]));
+        let message = mapped_message(&value);
+        assert_eq!(first_attachment(&message).fetch_token(), Some(TOKEN));
+        assert_eq!(
+            first_attachment(&message).fetch_token(),
+            Some(TOKEN),
+            "only the first attachment is checked here"
+        );
+        let second = Message::new(
+            message.id().clone(),
+            message.conversation_id().clone(),
+            None,
+            message.sender.clone(),
+            vec![message.parts()[1].clone()],
+            message.created_at,
+            None,
+            message.delivery.clone(),
+            message.from_me,
+            None,
+            Vec::new(),
+            None,
+        )
+        .unwrap();
+        assert_eq!(first_attachment(&second).fetch_token(), None);
     }
 
     #[test]

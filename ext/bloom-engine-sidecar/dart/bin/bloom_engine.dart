@@ -16,6 +16,7 @@ import 'dart:math';
 
 import 'package:flutter_rust_bridge/flutter_rust_bridge_for_generated_io.dart';
 
+import '../lib/attachment_cache.dart';
 import '../lib/payload_codec.dart';
 import '../lib/protocol.dart';
 import '../lib/send_coordinator.dart';
@@ -232,6 +233,11 @@ Future<void> main(List<String> arguments) async {
     return;
   }
   final (push, watcher) = restored;
+  final attachmentRegistry = AttachmentRegistry();
+  final attachmentCache = AttachmentCache(
+    root: AttachmentCache.resolveDefaultRoot(),
+    registry: attachmentRegistry,
+  );
   final (pollState, deskState) = api.dupDaemonDesk(state: push);
   // Take the CloudKit client from the state dupDaemonDesk returned: it consumes the
   // restored state, and handles read from the original are disposed with it. The
@@ -315,6 +321,8 @@ Future<void> main(List<String> arguments) async {
                 ));
               },
               stop: stop,
+              attachments: attachmentCache,
+              aps: push.conn,
             ),
             onDone: stop,
           );
@@ -338,7 +346,9 @@ Future<void> main(List<String> arguments) async {
         final message = value.field0;
         if (message == null) return;
         sequence++;
-        final payload = encodePushMessage(message);
+        final fetchTokens =
+            registerInboundAttachments(message, attachmentRegistry);
+        final payload = encodePushMessage(message, fetchTokens: fetchTokens);
         if (payload['variant'] == 'sendConfirm') {
           final uuid = payload['uuid'];
           if (uuid is String &&
@@ -491,6 +501,8 @@ Future<void> _handleCommand({
   required dynamic deskState,
   required SendCoordinator sends,
   required Future<void> Function(int) sync,
+  required AttachmentCache attachments,
+  required Object? aps,
   required void Function() stop,
 }) async {
   final Command command;
@@ -505,6 +517,27 @@ Future<void> _handleCommand({
   switch (command) {
     case SyncConversationsCommand():
       await sync(command.requestId);
+    case AttachmentFetchCommand():
+      try {
+        final fetched = await attachments.fetch(command.token, aps: aps);
+        writeProtocolFrame(attachmentFetchedFrame(
+          requestId: command.requestId,
+          path: fetched.file.path,
+          bytes: fetched.bytes,
+        ));
+      } on AttachmentFailure catch (error) {
+        stderr.writeln('attachment fetch failed: ${error.code}');
+        writeProtocolFrame(errorFrame(
+          requestId: command.requestId,
+          code: _attachmentErrorCode(error),
+        ));
+      } catch (_) {
+        stderr.writeln('attachment fetch failed: failed');
+        writeProtocolFrame(errorFrame(
+          requestId: command.requestId,
+          code: ProtocolCodes.failed,
+        ));
+      }
     case ShutdownCommand():
       writeProtocolFrame(shutdownAckFrame(requestId: command.requestId));
       stop();
@@ -550,4 +583,39 @@ Future<void> _handleCommand({
         );
       }
   }
+}
+
+String _attachmentErrorCode(AttachmentFailure failure) {
+  if (failure is AttachmentInvalidTokenFailure)
+    return ProtocolCodes.invalidToken;
+  if (failure is AttachmentTooLargeFailure) return ProtocolCodes.tooLarge;
+  if (failure is AttachmentTimeoutFailure) return ProtocolCodes.timeout;
+  if (failure is AttachmentUnsafeRootFailure) return ProtocolCodes.unavailable;
+  return ProtocolCodes.failed;
+}
+
+/// Register every attachment part of one inbound normal message by physical
+/// position, returning the token map the codec injects into those parts.
+Map<int, String> registerInboundAttachments(
+  api.PushMessage message,
+  AttachmentRegistry registry,
+) {
+  if (message is! api.PushMessage_IMessage) return const <int, String>{};
+  final inst = message.field0;
+  if (inst.id.isEmpty) return const <int, String>{};
+  final encoded = inst.message;
+  if (encoded is! api.Message_Message) return const <int, String>{};
+  final parts = encoded.field0.parts.field0;
+  final tokens = <int, String>{};
+  for (var position = 0; position < parts.length; position++) {
+    final part = parts[position].part_;
+    if (part is api.MessagePart_Attachment) {
+      tokens[position] = registry.register(
+        messageId: inst.id,
+        partIndex: position,
+        attachment: part.field0,
+      );
+    }
+  }
+  return tokens;
 }

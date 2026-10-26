@@ -660,6 +660,20 @@ impl RequestHandler for Service {
         })
     }
 
+    fn fetch_attachment(&self, token: String) -> HandlerFuture<'_, (String, u64)> {
+        Box::pin(async move {
+            if !bloom_domain::AttachmentRef::is_valid_fetch_token(&token) {
+                return Err(ProtocolError::InvalidRequest);
+            }
+            let engine = self.current_engine();
+            match engine.fetch_attachment(&token).await {
+                Ok(file) => Ok((file.path, file.bytes)),
+                Err(TransportError::Unsupported) => Err(ProtocolError::Unsupported),
+                Err(_) => Err(ProtocolError::Internal),
+            }
+        })
+    }
+
     fn draft_save(
         &self,
         key: IpcDraftKey,
@@ -1177,6 +1191,26 @@ mod draft_service_tests {
         assert_eq!(loaded.draft, None);
         assert_eq!(loaded.revision_floor, 4);
         assert!(loaded.corrupt_deleted);
+    }
+
+    #[tokio::test]
+    async fn attachment_fetch_validates_tokens_and_fails_without_a_started_engine() {
+        let (_directory, service) = harness();
+        assert_eq!(
+            service
+                .fetch_attachment("not-a-token".into())
+                .await
+                .unwrap_err(),
+            ProtocolError::InvalidRequest
+        );
+        assert_eq!(
+            service
+                .fetch_attachment("0123456789abcdef0123456789abcdef".into())
+                .await
+                .unwrap_err(),
+            ProtocolError::Internal,
+            "an unstarted engine must not fabricate a path"
+        );
     }
 
     #[tokio::test]

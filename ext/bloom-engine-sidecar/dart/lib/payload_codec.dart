@@ -20,11 +20,13 @@ const String kUnsupported = 'unsupported';
 const String _opaqueHandleReason =
     'carries opaque engine handles; not serializable outside the engine process';
 
-Map<String, Object?> encodePushMessage(api.PushMessage value) => value.map(
+Map<String, Object?> encodePushMessage(api.PushMessage value,
+        {Map<int, String>? fetchTokens}) =>
+    value.map(
       iMessage: (variant) => <String, Object?>{
         'variant': 'iMessage',
         'complete': true,
-        'inst': encodeMessageInst(variant.field0),
+        'inst': encodeMessageInst(variant.field0, fetchTokens: fetchTokens),
       },
       sendConfirm: (variant) => <String, Object?>{
         'variant': 'sendConfirm',
@@ -81,14 +83,15 @@ Map<String, Object?> encodePushMessage(api.PushMessage value) => value.map(
       },
     );
 
-Map<String, Object?> encodeMessageInst(api.MessageInst value) =>
+Map<String, Object?> encodeMessageInst(api.MessageInst value,
+        {Map<int, String>? fetchTokens}) =>
     <String, Object?>{
       'id': value.id,
       'sender': value.sender,
       'conversation': value.conversation == null
           ? null
           : encodeConversation(value.conversation!),
-      'message': encodeMessage(value.message),
+      'message': encodeMessage(value.message, fetchTokens: fetchTokens),
       'sent_timestamp_ms': value.sentTimestamp,
       'send_delivered': value.sendDelivered,
       'verification_failed': value.verificationFailed,
@@ -109,11 +112,13 @@ Map<String, Object?> _unmodelled(String name) => <String, Object?>{
       'reason': 'message variant not modelled yet',
     };
 
-Map<String, Object?> encodeMessage(api.Message value) => value.map(
+Map<String, Object?> encodeMessage(api.Message value,
+        {Map<int, String>? fetchTokens}) =>
+    value.map(
       message: (variant) => <String, Object?>{
         'type': 'normal',
         'complete': true,
-        'value': encodeNormalMessage(variant.field0),
+        'value': encodeNormalMessage(variant.field0, fetchTokens: fetchTokens),
       },
       react: (variant) => <String, Object?>{
         'type': 'react',
@@ -214,9 +219,10 @@ Map<String, Object?> encodeMessage(api.Message value) => value.map(
           _unmodelled('setTranscriptBackground'),
     );
 
-Map<String, Object?> encodeNormalMessage(api.NormalMessage value) =>
+Map<String, Object?> encodeNormalMessage(api.NormalMessage value,
+        {Map<int, String>? fetchTokens}) =>
     <String, Object?>{
-      'parts': encodeParts(value.parts),
+      'parts': encodeParts(value.parts, fetchTokens: fetchTokens),
       'service': encodeService(value.service),
       'effect': value.effect,
       'reply_guid': value.replyGuid,
@@ -240,10 +246,18 @@ Map<String, Object?> encodeService(api.MessageType value) => value.map(
       },
     );
 
-List<Map<String, Object?>> encodeParts(api.MessageParts value) =>
-    value.field0.map(encodeIndexedPart).toList();
+List<Map<String, Object?>> encodeParts(api.MessageParts value,
+        {Map<int, String>? fetchTokens}) =>
+    <Map<String, Object?>>[
+      for (var position = 0; position < value.field0.length; position++)
+        encodeIndexedPart(
+          value.field0[position],
+          fetchToken: fetchTokens?[position],
+        ),
+    ];
 
-Map<String, Object?> encodeIndexedPart(api.IndexedMessagePart value) =>
+Map<String, Object?> encodeIndexedPart(api.IndexedMessagePart value,
+        {String? fetchToken}) =>
     <String, Object?>{
       'idx': value.idx,
       'part': value.part_.map(
@@ -273,6 +287,7 @@ Map<String, Object?> encodeIndexedPart(api.IndexedMessagePart value) =>
           'name': variant.field0.name,
           'uti_type': variant.field0.utiType,
           'mime': variant.field0.mime,
+          if (fetchToken != null) 'fetch_token': fetchToken,
           'attachment_type': variant.field0.aType.map(
             inline: (v) => <String, Object?>{
               'kind': 'inline',

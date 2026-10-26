@@ -388,8 +388,18 @@ pub struct AttachmentRef {
     mime_type: Option<String>,
     file_name: Option<String>,
     byte_len: Option<u64>,
+    /// Opaque sidecar fetch handle. Never a local path and never logged.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    fetch_token: Option<String>,
 }
 impl AttachmentRef {
+    /// Whether `token` is an opaque 32-lowercase-hex attachment fetch handle.
+    pub fn is_valid_fetch_token(token: &str) -> bool {
+        token.len() == 32
+            && token
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
+    }
     pub fn new(
         id: impl Into<String>,
         mime_type: Option<String>,
@@ -401,10 +411,26 @@ impl AttachmentRef {
             mime_type,
             file_name,
             byte_len,
+            fetch_token: None,
         })
     }
     pub fn id(&self) -> &str {
         &self.id
+    }
+    /// Builder that attaches an already-validated fetch token.
+    pub fn with_fetch_token(mut self, token: Option<String>) -> Result<Self, InvalidId> {
+        self.fetch_token = None;
+        if let Some(token) = token {
+            if !Self::is_valid_fetch_token(&token) {
+                return Err(InvalidId);
+            }
+            self.fetch_token = Some(token);
+        }
+        Ok(self)
+    }
+    /// Opaque sidecar fetch handle, when the transport supplied one.
+    pub fn fetch_token(&self) -> Option<&str> {
+        self.fetch_token.as_deref()
     }
     /// Reported attachment file name, exactly as supplied by the transport.
     ///
@@ -422,6 +448,10 @@ impl fmt::Debug for AttachmentRef {
             .field("mime_type", &self.mime_type)
             .field("file_name", &"[REDACTED]")
             .field("byte_len", &self.byte_len)
+            .field(
+                "fetch_token",
+                &self.fetch_token.as_ref().map(|_| "[REDACTED]"),
+            )
             .finish()
     }
 }
@@ -433,9 +463,13 @@ impl<'de> Deserialize<'de> for AttachmentRef {
             mime_type: Option<String>,
             file_name: Option<String>,
             byte_len: Option<u64>,
+            #[serde(default)]
+            fetch_token: Option<String>,
         }
         let w = W::deserialize(d)?;
-        Self::new(w.id, w.mime_type, w.file_name, w.byte_len).map_err(serde::de::Error::custom)
+        Self::new(w.id, w.mime_type, w.file_name, w.byte_len)
+            .and_then(|attachment| attachment.with_fetch_token(w.fetch_token))
+            .map_err(serde::de::Error::custom)
     }
 }
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -664,6 +698,43 @@ mod tests {
         )
         .unwrap();
         assert_eq!(restored.file_name(), None);
+        assert_eq!(restored.fetch_token(), None);
+    }
+    #[test]
+    fn attachment_fetch_token_is_optional_validated_and_redacted() {
+        let token = "0123456789abcdef0123456789abcdef";
+        let attachment = AttachmentRef::new("a", None, None, None)
+            .unwrap()
+            .with_fetch_token(Some(token.into()))
+            .unwrap();
+        assert_eq!(attachment.fetch_token(), Some(token));
+        let value = serde_json::to_value(&attachment).unwrap();
+        assert_eq!(value["fetch_token"], token);
+        assert_eq!(
+            serde_json::from_value::<AttachmentRef>(value).unwrap(),
+            attachment
+        );
+        let debug = format!("{attachment:?}");
+        assert!(debug.contains("[REDACTED]"));
+        assert!(!debug.contains(token));
+
+        for invalid in [
+            "",
+            "0123456789ABCDEF0123456789abcdef",
+            "0123456789abcdef0123456789abcdeg",
+            "0123456789abcdef0123456789abcde",
+            "0123456789abcdef0123456789abcdef0",
+        ] {
+            assert!(!AttachmentRef::is_valid_fetch_token(invalid));
+            assert!(AttachmentRef::new("a", None, None, None)
+                .unwrap()
+                .with_fetch_token(Some(invalid.into()))
+                .is_err());
+        }
+        assert!(
+            serde_json::from_str::<AttachmentRef>(r#"{"id":"a","fetch_token":"not-a-token"}"#)
+                .is_err()
+        );
     }
     #[test]
     fn reaction_part_round_trips_and_defaults_to_none() {

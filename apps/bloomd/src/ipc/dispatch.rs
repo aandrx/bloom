@@ -81,6 +81,9 @@ pub trait RequestHandler: Send + Sync {
     fn draft_delete(&self, _key: DraftKey, _revision: u64) -> HandlerFuture<'_, DraftWriteOutcome> {
         Box::pin(async { Err(ProtocolError::Unsupported) })
     }
+    fn fetch_attachment(&self, _token: String) -> HandlerFuture<'_, (String, u64)> {
+        Box::pin(async { Err(ProtocolError::Unsupported) })
+    }
 }
 
 /// Serve sequential requests. Codec errors and idle timeouts close this connection.
@@ -262,6 +265,18 @@ async fn serve_inner<H: RequestHandler>(
                 } else {
                     match handler.draft_delete(key, revision).await {
                         Ok(outcome) => ResponseKind::DraftDelete { outcome },
+                        Err(error) => ResponseKind::Error { error },
+                    }
+                }
+            }
+            RequestKind::FetchAttachment { token } => {
+                if !bloom_domain::AttachmentRef::is_valid_fetch_token(&token) {
+                    ResponseKind::Error {
+                        error: ProtocolError::InvalidRequest,
+                    }
+                } else {
+                    match handler.fetch_attachment(token).await {
+                        Ok((path, bytes)) => ResponseKind::AttachmentFetched { path, bytes },
                         Err(error) => ResponseKind::Error { error },
                     }
                 }

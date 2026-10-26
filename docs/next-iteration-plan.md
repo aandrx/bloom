@@ -186,7 +186,7 @@ Inbound reactions, text edits and whole-body unsends are accepted. Remaining wor
 
 - Already present: reported filename metadata and safe placeholders.
 - [Evidence](attachment-opening-evidence.md) now shows a real bridge path: `api.downloadMmcs`/`downloadAttachment`, an `ApsConnection` in the restored sidecar, and upstream file-writing implementations. Bloom currently discards the MMCS material and has no token, path, or opening contract.
-- The API gate passes; end-to-end opening does not. C1b is implemented as a sidecar-only bounded registry and private atomic cache with fake-downloader tests (82 Dart tests); it is not wired into the command loop. Next is C1c typed IPC, C1d explicit TUI save/open, and C1e one authorized live inbound attachment.
+- The API gate passes; end-to-end opening does not. C1b is implemented as a sidecar-only bounded registry and private atomic cache. C1c adds sidecar token delivery and `attachment_fetch`, the daemon engine waiter/path guard, and typed IPC v8; no TUI action calls it. Next are C1d explicit TUI save/open and C1e one authorized live inbound attachment.
 - Acceptance: no fabricated filename or "downloaded" claim; unsupported parts remain explicit; no plaintext extraction, URL inference, automatic download, or engine-database read.
 
 ### C2. Outbound edits, unsend and reactions

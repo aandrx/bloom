@@ -85,6 +85,7 @@ class AttachmentRegistry {
   final String Function() _tokenFactory;
   final LinkedHashMap<String, AttachmentRegistration> _entries =
       LinkedHashMap<String, AttachmentRegistration>();
+  final Map<String, String> _byPart = {};
 
   /// Registers one part and returns its opaque token.
   String register({
@@ -99,9 +100,27 @@ class AttachmentRegistry {
       throw ArgumentError.value(partIndex, 'partIndex');
     }
 
+    final partKey = '$messageId\u0000$partIndex';
+    final existing = _byPart[partKey];
+    if (existing != null && _entries.containsKey(existing)) {
+      // Keep the advertised token but refresh the engine handle and recency:
+      // a redelivery can carry a refreshed attachment object.
+      final registration = _entries.remove(existing)!;
+      _entries[existing] = AttachmentRegistration(
+        token: existing,
+        messageId: registration.messageId,
+        partIndex: registration.partIndex,
+        attachment: attachment,
+      );
+      return existing;
+    }
     final token = _uniqueToken();
     if (_entries.length >= maxEntries) {
-      _entries.remove(_entries.keys.first);
+      final oldest = _entries.keys.first;
+      final removed = _entries.remove(oldest);
+      if (removed != null) {
+        _byPart.remove('${removed.messageId}\u0000${removed.partIndex}');
+      }
     }
     _entries[token] = AttachmentRegistration(
       token: token,
@@ -109,12 +128,19 @@ class AttachmentRegistry {
       partIndex: partIndex,
       attachment: attachment,
     );
+    _byPart[partKey] = token;
     return token;
   }
 
   AttachmentRegistration? lookup(String token) => _entries[token];
 
-  AttachmentRegistration? remove(String token) => _entries.remove(token);
+  AttachmentRegistration? remove(String token) {
+    final removed = _entries.remove(token);
+    if (removed != null) {
+      _byPart.remove('${removed.messageId}\u0000${removed.partIndex}');
+    }
+    return removed;
+  }
 
   int get length => _entries.length;
 
