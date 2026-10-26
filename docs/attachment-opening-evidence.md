@@ -157,8 +157,12 @@ ps -eo pid,args | grep -E '[b]loom_engine\.dart' || true
 ```
 
 Both process checks must print nothing. The temporary store, cache and probe root
-are deleted; do not copy them. The probe was exercised against a fake daemon, but
-no live attachment has been downloaded.
+are deleted; do not copy them. The probe was exercised against a fake daemon. The
+first authorized live run found an attachment token and issued the fetch, but the
+daemon did not return `attachment_fetched`; the probe removed its temporary log,
+so the sidecar failure code was not captured. A rerun now prints only bounded
+`attachment fetch`/`engine reported error` diagnostic lines before cleanup. C1e
+remains not passed until a live rerun returns `"result": "passed"`.
 
 ## C1b implementation evidence
 
