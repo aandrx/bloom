@@ -865,6 +865,7 @@ async fn process_frames(stdout: tokio::process::ChildStdout, context: ReadFrameC
                 let request_id = frame.get("request_id").and_then(Value::as_u64);
                 if let Some(request_id) = request_id {
                     if let Some(waiter) = attachment_waiters.lock().unwrap().remove(&request_id) {
+                        eprintln!("attachment fetch sidecar error: {code}");
                         let _ = waiter.send(Err(map_attachment_error(code)));
                         continue;
                     }

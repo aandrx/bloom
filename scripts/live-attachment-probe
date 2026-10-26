@@ -285,7 +285,16 @@ def run(args, root):
         }, timeout=180.0)
         result["fetch_seconds"] = round(time.monotonic() - fetched_at, 2)
         if response.get("result") != "attachment_fetched":
-            raise ProbeError("daemon did not return an attachment_fetched result")
+            # Codes and bounded lines only; no path, token or message content.
+            try:
+                for line in log_path.read_text(errors="replace").splitlines():
+                    if "attachment fetch" in line or "engine reported error" in line:
+                        print(line, file=sys.stderr)
+            except OSError:
+                pass
+            raise ProbeError(
+                f"daemon did not return an attachment_fetched result ({response.get('error', 'unknown')})"
+            )
         result["bytes"] = response.get("bytes")
         result["file_mode"] = oct(
             verify_cache(response["path"], int(response["bytes"]), cache_root)

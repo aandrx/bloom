@@ -668,8 +668,14 @@ impl RequestHandler for Service {
             let engine = self.current_engine();
             match engine.fetch_attachment(&token).await {
                 Ok(file) => Ok((file.path, file.bytes)),
-                Err(TransportError::Unsupported) => Err(ProtocolError::Unsupported),
-                Err(_) => Err(ProtocolError::Internal),
+                Err(error) => {
+                    // Bounded transport kind only; never token, path or content.
+                    eprintln!("attachment fetch failed: {error:?}");
+                    match error {
+                        TransportError::Unsupported => Err(ProtocolError::Unsupported),
+                        _ => Err(ProtocolError::Internal),
+                    }
+                }
             }
         })
     }
