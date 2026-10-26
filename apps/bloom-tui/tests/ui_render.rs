@@ -11,7 +11,7 @@ use bloom_domain::{
 use bloom_ipc::{MessageSearchHit, ParticipantFilter};
 use bloom_tui::{
     app::{
-        message_text, App, Focus, SendFeedback, SendPhase, Theme, OLDER_PAGE_LIMIT,
+        message_text, Action, App, Focus, SendFeedback, SendPhase, Theme, OLDER_PAGE_LIMIT,
         SEARCH_RESULT_LIMIT,
     },
     daemon::{ConnectionState, HISTORY_LIMIT},
@@ -5204,4 +5204,129 @@ fn edited_and_unsent_notes_are_truthful_and_survive_narrow_widths() {
     let (buffer, hits) = cached_frame(&app, 44, 18, &mut ui::RenderCache::default());
     let transcript = transcript_flat(&buffer, &hits);
     assert!(!transcript.contains("Edited") && !transcript.contains("Unsent"));
+}
+
+#[test]
+fn attachment_picker_shows_every_choice_and_moves_the_marker() {
+    const NEW: &str = "fedcba9876543210fedcba9876543210";
+    const OLD: &str = "0123456789abcdef0123456789abcdef";
+    let chat = conversation("Picks", 2, 1);
+    let attachment = |name: &str, token: &str| {
+        MessagePart::Attachment(
+            AttachmentRef::new(
+                format!("local-metadata:{name}"),
+                Some("image/jpeg".into()),
+                Some(name.into()),
+                Some(3),
+            )
+            .unwrap()
+            .with_fetch_token(Some(token.into()))
+            .unwrap(),
+        )
+    };
+    let mut app = App {
+        selected: Some(chat.id.clone()),
+        ..Default::default()
+    };
+    app.messages.insert(
+        chat.id.clone(),
+        vec![
+            message_with_parts(
+                &chat,
+                "older",
+                10,
+                vec![attachment("photo.jpg", OLD)],
+                false,
+            ),
+            message_with_parts(
+                &chat,
+                "newer",
+                20,
+                vec![attachment("report.pdf", NEW)],
+                false,
+            ),
+        ],
+    );
+    app.draft = "/attachment".into();
+    assert_eq!(
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+        Action::None
+    );
+
+    let flat = |app: &App| {
+        let rendered = buffer(app, 100, 30);
+        (0..rendered.area.height)
+            .map(|y| row_text(&rendered, y))
+            .collect::<Vec<_>>()
+    };
+    let rows = flat(&app);
+    let joined = rows.join("\n");
+    assert!(joined.contains("Attachments"), "modal title: {joined}");
+    assert!(joined.contains("report.pdf"), "newest choice: {joined}");
+    assert!(joined.contains("photo.jpg"), "older choice: {joined}");
+    assert!(joined.contains("Enter save"), "action hint: {joined}");
+    assert!(
+        !joined.contains(NEW) && !joined.contains(OLD),
+        "tokens are never painted"
+    );
+    assert!(
+        rows.iter()
+            .any(|row| row.contains("report.pdf") && row.contains('›')),
+        "newest starts selected: {joined}"
+    );
+
+    app.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+    let moved = flat(&app).join("\n");
+    assert!(
+        moved
+            .lines()
+            .any(|row| row.contains("photo.jpg") && row.contains('›')),
+        "the marker follows the selection: {moved}"
+    );
+}
+
+#[test]
+fn attachment_picker_survives_a_tiny_viewport() {
+    let mut app = App {
+        attachment_picker: None,
+        ..Default::default()
+    };
+    let chat = conversation("Tiny", 2, 1);
+    let attachment = MessagePart::Attachment(
+        AttachmentRef::new(
+            "local-metadata:tiny",
+            None,
+            Some("photo.jpg".into()),
+            Some(3),
+        )
+        .unwrap()
+        .with_fetch_token(Some("fedcba9876543210fedcba9876543210".into()))
+        .unwrap(),
+    );
+    app.messages.insert(
+        chat.id.clone(),
+        vec![message_with_parts(
+            &chat,
+            "tiny",
+            10,
+            vec![attachment],
+            false,
+        )],
+    );
+    app.selected = Some(chat.id.clone());
+    app.draft = "/attachment".into();
+    assert_eq!(
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+        Action::None
+    );
+
+    let rendered = buffer(&app, 11, 6);
+    let joined = (0..rendered.area.height)
+        .map(|y| row_text(&rendered, y))
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(
+        joined.contains("photo.jpg"),
+        "the selected choice stays visible in the 11-column fallback: {joined}"
+    );
 }

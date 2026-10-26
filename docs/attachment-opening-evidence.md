@@ -214,9 +214,9 @@ No Rust source changed for C1e.
 
 ## C1f explicit external open
 
-`/open` selects the same newest token as `/attachment`, fetches it, and then
-launches a desktop opener with the cache path. Nothing opens automatically, and
-`/attachment` still never opens anything.
+`/open` fetches the newest loaded attachment and then launches a desktop opener
+with the cache path. Nothing opens automatically. `/attachment` opens the chooser
+covered in C1g instead.
 
 The path is accepted only when it is absolute, contains no `..`, is not a
 symlink, is a regular file, and is non-empty. It is passed as one argv element
@@ -227,13 +227,12 @@ a command line). The child is reaped on a detached thread, and success means the
 opener process started, not that a viewer displayed the file. Failure messages
 name the reason without repeating the path.
 
-Observed gates: 160 library tests, 82 interaction tests, 12 daemon-session tests,
-8 input-safety tests, 3 launcher tests, 9 binary tests, and 68 fixture tests pass.
-A unit test launches a recorder script and proves the opener receives exactly one
-argument, the cache path. Three real-binary PTY tests cover the attachment
-surface: the existing `/attachment` save test now also waits before proving the
-recorder was never invoked, a new `/open` test compares the recorder's argument
-with the path the fixture daemon returned, and a new missing-opener test shows
+Observed gates: 166 library tests, 82 interaction tests, 12 daemon-session tests,
+8 input-safety tests, 3 launcher tests, 9 binary tests, 124 render tests, and 68
+fixture tests pass. A unit test launches a recorder script and proves the opener
+receives exactly one argument, the cache path. Two real-binary PTY tests cover
+the open surface: `/open` compares the recorder's argument with the path the
+fixture daemon returned, and a missing opener shows
 `No file opener is available`. The fixture daemon materializes a real cache file
 instead of returning a placeholder path.
 
@@ -242,8 +241,37 @@ changed and still does not list every slash command.
 
 Limits: no test launches a real desktop viewer, no live-fetched file has been
 opened through the TUI, and Bloom does not read, render, or verify the file's
-content. Token identity remains sidecar-generation scoped, and only the newest
-loaded attachment is selectable.
+content. Token identity remains sidecar-generation scoped.
+
+## C1g attachment chooser
+
+`/attachment` opens a modal chooser over every loaded attachment part that still
+carries a fetch token, newest first, showing the reported name and sender label.
+Up / Down, PageUp / PageDown, Home / End move; Enter fetches and saves the choice;
+`o` fetches and opens it; Esc or Ctrl+C cancels. A click on a row selects and
+saves it, a click outside or a right-click cancels, and a wheel over any pane
+moves the chooser instead of retargeting the chat behind it. Parts without a
+token are omitted, and a chat with none keeps the existing
+`No fetchable attachment is loaded` error instead of opening an empty modal.
+
+The chooser holds a snapshot: it does not follow arrivals while open, and the
+sidecar-generation rule still applies, so a stale token fails cleanly at fetch.
+Nothing is downloaded until Enter or `o`, and the modal never opens a file.
+
+Observed gates: 404 TUI tests (166 library and the render/interaction suites),
+strict Clippy and formatting pass; 68 fixture tests pass. Two new render tests
+cover the modal rows, the selection marker and an 11-column fallback, and prove
+tokens are never painted. Library tests also prove the chooser owns the wheel,
+ignores modified `o`, cancels on right-click, and does not downgrade an in-flight
+`/open`. Four real-binary PTY tests cover the attachment surface: save through the
+chooser (and no opener invocation), choosing the older row, external open, and a
+missing opener. The older-row test reseeds two attachments, moves the selection
+down, and asserts the fetched path carries the older token, proving the choice
+reaches IPC.
+
+Limits: no live-fetched attachment has been chosen through the chooser, and it
+cannot list attachments whose tokens died with a previous sidecar generation or
+that are outside the loaded transcript window.
 
 ## C1b implementation evidence
 
@@ -283,6 +311,7 @@ download has run.
 4. **C1d:** TUI explicit save/open action plus PTY failure/success states against a synthetic fixture.
 5. **C1e:** one authorized live inbound attachment download; otherwise remain display-only. **Passed** on 2026-10-26: 325,019 bytes, mode `0600`, `"result": "passed"`.
 6. **C1f:** explicit external open through a desktop opener, with no automatic open and no shell.
+7. **C1g:** chooser over every loaded fetchable attachment, with save and open actions.
 
 ## Exclusions
 

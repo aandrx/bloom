@@ -2175,6 +2175,7 @@ pub enum Hit {
     SearchParticipant(Option<ParticipantFilter>),
     EmojiRow(usize),
     ThemeRow(usize),
+    AttachmentPickerRow(usize),
     ContextMenuRow(usize),
     HeaderSettings,
     HeaderHelp,
@@ -2213,6 +2214,9 @@ pub struct HitMap {
     pub search_participant_rows: Vec<(Rect, Option<ParticipantFilter>)>,
     pub emoji_rows: Vec<(Rect, usize)>,
     pub theme_rows: Vec<(Rect, usize)>,
+    /// The modal attachment chooser and its clickable rows.
+    pub attachment_picker: Option<Rect>,
+    pub attachment_picker_rows: Vec<(Rect, usize)>,
     /// The conversation context menu and its items.
     pub context_menu: Option<Rect>,
     pub context_menu_rows: Vec<(Rect, usize)>,
@@ -2264,10 +2268,15 @@ impl HitMap {
     pub fn overlay_contains(&self, column: u16, row: u16) -> bool {
         self.drawer.is_some()
             || self.help.is_some()
-            || [self.menu, self.context_menu, self.popup]
-                .into_iter()
-                .flatten()
-                .any(|area| Self::contains(area, column, row))
+            || [
+                self.menu,
+                self.context_menu,
+                self.popup,
+                self.attachment_picker,
+            ]
+            .into_iter()
+            .flatten()
+            .any(|area| Self::contains(area, column, row))
     }
 
     /// Resolve a pointer position. Overlays take priority over the panes below
@@ -2290,6 +2299,15 @@ impl HitMap {
         if self.help.is_some() {
             // Help is modal: clicks anywhere dismiss it without reaching panes
             // rendered underneath, even when the pointer is outside the sheet.
+            return Some(Hit::CloseOverlay);
+        }
+        if let Some(picker) = self.attachment_picker {
+            // The chooser is modal too: a click outside cancels it.
+            if Self::contains(picker, column, row) {
+                return Self::row_at(&self.attachment_picker_rows, column, row)
+                    .map(Hit::AttachmentPickerRow)
+                    .or(Some(Hit::CloseOverlay));
+            }
             return Some(Hit::CloseOverlay);
         }
         if let Some(menu) = self.menu {
@@ -2656,7 +2674,7 @@ fn render_cached_with_mode(
             render_composer_layout(frame, &layout, muted, palette, palette.input_surface);
         }
         let help = render_help(frame, app, inner, palette);
-        return HitMap {
+        let mut hits = HitMap {
             help,
             composer: layout.input,
             composer_positions: if !muted && app.filter_query().is_none() {
@@ -2666,6 +2684,11 @@ fn render_cached_with_mode(
             },
             ..Default::default()
         };
+        if let Some((panel, rows)) = render_attachment_picker(frame, app, inner, palette) {
+            hits.attachment_picker = Some(panel);
+            hits.attachment_picker_rows = rows;
+        }
+        return hits;
     }
     if app.search_participant_picker_open() && inner.width < 70 {
         return render_narrow_participant_picker(frame, app, inner, palette);
@@ -3789,6 +3812,10 @@ fn render_cached_with_mode(
     // Help is a modal over the entire terminal, including the composer on
     // shorter viewports. Draw it last so the composer cannot erase its bottom.
     hits.help = render_help(frame, app, inner, palette);
+    if let Some((panel, rows)) = render_attachment_picker(frame, app, inner, palette) {
+        hits.attachment_picker = Some(panel);
+        hits.attachment_picker_rows = rows;
+    }
     hits
 }
 
@@ -4118,6 +4145,106 @@ fn speaker_color(label: &str, from_me: bool, palette: &Palette) -> Color {
 
 /// The right-click menu for a chat, drawn beside its sidebar row so it reads as
 /// belonging to that row. Returns the panel and each action's hitbox.
+/// Modal chooser over the fetchable attachments in the selected chat.
+fn render_attachment_picker(
+    frame: &mut Frame<'_>,
+    app: &App,
+    area: Rect,
+    palette: Palette,
+) -> Option<(Rect, Vec<(Rect, usize)>)> {
+    let picker = app.attachment_picker.as_ref()?;
+    if area.width == 0 || area.height == 0 || picker.candidates.is_empty() {
+        return None;
+    }
+    if area.width < 12 || area.height < 5 {
+        // Too small for a list: show the selected row alone so the modal state is
+        // still visible instead of leaving an unexplained swallowed key.
+        let panel = Rect::new(area.x, area.y, area.width, 1);
+        let candidate = &picker.candidates[picker.selection.min(picker.candidates.len() - 1)];
+        let label = format!(
+            "› {} · {}",
+            candidate.name().unwrap_or("attachment").escape_debug(),
+            candidate.sender()
+        );
+        frame.render_widget(Clear, panel);
+        frame.render_widget(
+            Paragraph::new(truncate_display_graphemes(&label, panel.width as usize))
+                .style(Style::default().fg(palette.text).bg(palette.selection)),
+            panel,
+        );
+        return Some((panel, Vec::new()));
+    }
+    let panel_width = area.width.saturating_sub(4).clamp(12, 56);
+    let row_budget = area.height.saturating_sub(4).max(1) as usize;
+    let visible = picker.candidates.len().min(row_budget);
+    let panel_height = visible as u16 + 3;
+    let panel = Rect::new(
+        area.x + area.width.saturating_sub(panel_width) / 2,
+        area.y + area.height.saturating_sub(panel_height) / 2,
+        panel_width,
+        panel_height,
+    );
+    frame.render_widget(Clear, panel);
+    frame.render_widget(
+        Block::default()
+            .borders(Borders::ALL)
+            .border_type(BorderType::Rounded)
+            .border_style(Style::default().fg(palette.rule))
+            .title("Attachments")
+            .style(Style::default().bg(palette.input_surface)),
+        panel,
+    );
+    let inner = panel.inner(Margin {
+        horizontal: 1,
+        vertical: 1,
+    });
+    let list_height = inner.height.saturating_sub(1) as usize;
+    let start = picker
+        .selection
+        .saturating_sub(list_height.saturating_sub(1));
+    let mut rows = Vec::new();
+    for (offset, candidate) in picker
+        .candidates
+        .iter()
+        .enumerate()
+        .skip(start)
+        .take(list_height)
+    {
+        let y = inner.y + (offset - start) as u16;
+        let item = Rect::new(inner.x, y, inner.width, 1);
+        let selected = offset == picker.selection;
+        let bg = if selected {
+            palette.selection
+        } else {
+            palette.input_surface
+        };
+        let label = format!(
+            "{} {} · {}",
+            if selected { "›" } else { " " },
+            candidate.name().unwrap_or("attachment").escape_debug(),
+            candidate.sender()
+        );
+        frame.render_widget(
+            Paragraph::new(truncate_display_graphemes(&label, item.width as usize))
+                .style(Style::default().fg(palette.text).bg(bg)),
+            item,
+        );
+        rows.push((item, offset));
+    }
+    let hint = "Enter save · o open · Esc cancel";
+    frame.render_widget(
+        Paragraph::new(truncate_display_graphemes(hint, inner.width as usize))
+            .style(Style::default().fg(palette.muted)),
+        Rect::new(
+            inner.x,
+            inner.y + inner.height.saturating_sub(1),
+            inner.width,
+            1,
+        ),
+    );
+    Some((panel, rows))
+}
+
 fn render_context_menu(
     frame: &mut Frame<'_>,
     app: &App,

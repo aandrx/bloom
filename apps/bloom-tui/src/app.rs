@@ -495,6 +495,8 @@ pub struct App {
     pub attachment_in_flight: Option<String>,
     /// Whether a successful fetch should also open the file externally.
     pub open_after_attachment_fetch: bool,
+    /// Open modal listing every fetchable attachment in the selected chat.
+    pub attachment_picker: Option<AttachmentPicker>,
     pub sync_in_flight: bool,
     pub send_feedback: Option<SendFeedback>,
     pub recoverable_send: Option<RecoveryDraft>,
@@ -579,6 +581,41 @@ pub struct UnreadCount {
 pub struct ChatDrawer {
     pub query: String,
     pub selected: Option<ConversationId>,
+}
+
+/// One loaded attachment that can still be fetched from the sidecar.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AttachmentCandidate {
+    token: String,
+    name: Option<String>,
+    sender: String,
+    created_at: i64,
+}
+
+impl AttachmentCandidate {
+    pub fn token(&self) -> &str {
+        &self.token
+    }
+
+    /// Reported name, never trusted as a path.
+    pub fn name(&self) -> Option<&str> {
+        self.name.as_deref()
+    }
+
+    pub fn sender(&self) -> &str {
+        &self.sender
+    }
+
+    pub fn created_at(&self) -> i64 {
+        self.created_at
+    }
+}
+
+/// Modal chooser over every fetchable attachment in the selected chat.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct AttachmentPicker {
+    pub candidates: Vec<AttachmentCandidate>,
+    pub selection: usize,
 }
 
 /// A small right-click menu over a conversation.
@@ -683,6 +720,7 @@ impl Default for App {
             pending_attachment: None,
             attachment_in_flight: None,
             open_after_attachment_fetch: false,
+            attachment_picker: None,
             sync_in_flight: false,
             send_feedback: None,
             recoverable_send: None,
@@ -1081,6 +1119,7 @@ impl App {
             || self.contacts_open
             || self.settings_open
             || self.theme_panel_open
+            || self.attachment_picker.is_some()
         {
             return None;
         }
@@ -3274,7 +3313,7 @@ impl App {
             ("/unhide", "Restore chats hidden with Close"),
             ("/unread", "Jump to the first unread message"),
             ("/cancel", "Close the composer"),
-            ("/attachment", "Save the newest attachment in this chat"),
+            ("/attachment", "Choose an attachment to save or open"),
             ("/open", "Open the newest attachment externally"),
         ]
         .into_iter()
@@ -3312,17 +3351,127 @@ impl App {
         self.command_menu = false;
     }
 
+    /// Open the chooser over every fetchable attachment in the selected chat.
+    fn begin_attachment_picker(&mut self) {
+        self.draft.clear();
+        self.draft_cursor = 0;
+        self.command_menu = false;
+        if self.pending_attachment.is_some() || self.attachment_in_flight.is_some() {
+            self.notice = Some("Attachment fetch is already in progress.".into());
+            return;
+        }
+        self.open_after_attachment_fetch = false;
+        let Some(conversation_id) = self.selected.as_ref() else {
+            self.error = Some("Open a chat before choosing an attachment.".into());
+            self.notice = None;
+            return;
+        };
+        let mut candidates = Vec::new();
+        for message in self.messages.get(conversation_id).into_iter().flatten() {
+            for part in message.parts() {
+                let bloom_domain::MessagePart::Attachment(attachment) = part else {
+                    continue;
+                };
+                let Some(token) = attachment.fetch_token() else {
+                    continue;
+                };
+                candidates.push(AttachmentCandidate {
+                    token: token.to_owned(),
+                    name: attachment.file_name().map(str::to_owned),
+                    sender: self.contact_label(&message.sender),
+                    created_at: message.created_at,
+                });
+            }
+        }
+        if candidates.is_empty() {
+            self.error = Some("No fetchable attachment is loaded in this chat.".into());
+            self.notice = None;
+            return;
+        }
+        // Newest first; a stable sort keeps part order within one message.
+        candidates.sort_by_key(|candidate| std::cmp::Reverse(candidate.created_at));
+        self.error = None;
+        self.notice = None;
+        self.attachment_picker = Some(AttachmentPicker {
+            candidates,
+            selection: 0,
+        });
+    }
+
+    fn attachment_picker_key(&mut self, key: KeyEvent) {
+        let Some(picker) = self.attachment_picker.as_ref() else {
+            return;
+        };
+        let last = picker.candidates.len().saturating_sub(1);
+        match key.code {
+            KeyCode::Esc => self.attachment_picker = None,
+            KeyCode::Enter => self.confirm_attachment_picker(false),
+            KeyCode::Char('o' | 'O')
+                if !key.modifiers.intersects(
+                    KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SUPER,
+                ) =>
+            {
+                self.confirm_attachment_picker(true)
+            }
+            KeyCode::Up | KeyCode::Char('k') => self.attachment_picker_step(-1),
+            KeyCode::Down | KeyCode::Char('j') => self.attachment_picker_step(1),
+            KeyCode::PageUp => self.attachment_picker_step(-5),
+            KeyCode::PageDown => self.attachment_picker_step(5),
+            KeyCode::Home => {
+                if let Some(picker) = self.attachment_picker.as_mut() {
+                    picker.selection = 0;
+                }
+            }
+            KeyCode::End => {
+                if let Some(picker) = self.attachment_picker.as_mut() {
+                    picker.selection = last;
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn attachment_picker_step(&mut self, delta: isize) {
+        let Some(picker) = self.attachment_picker.as_mut() else {
+            return;
+        };
+        let last = picker.candidates.len().saturating_sub(1);
+        picker.selection = if delta.is_negative() {
+            picker.selection.saturating_sub(delta.unsigned_abs())
+        } else {
+            (picker.selection + delta as usize).min(last)
+        };
+    }
+
+    fn confirm_attachment_picker(&mut self, open_externally: bool) {
+        let Some(picker) = self.attachment_picker.take() else {
+            return;
+        };
+        let Some(candidate) = picker.candidates.get(picker.selection) else {
+            return;
+        };
+        let label = candidate.name().unwrap_or("attachment").escape_debug();
+        self.error = None;
+        self.notice = Some(if open_externally {
+            format!("Fetching {label} to open...")
+        } else {
+            format!("Fetching {label}...")
+        });
+        self.open_after_attachment_fetch = open_externally;
+        self.pending_attachment = Some(candidate.token().to_owned());
+    }
+
     /// Select the newest loaded attachment that carries a sidecar fetch token.
     /// The action is explicit: neither `/attachment` nor `/open` downloads on its
     /// own, and only `/open` asks the shell to launch an external viewer.
     fn begin_attachment_fetch(&mut self, open_externally: bool) {
-        self.open_after_attachment_fetch = false;
         if self.pending_attachment.is_some() || self.attachment_in_flight.is_some() {
             self.notice = Some("Attachment fetch is already in progress.".into());
             self.draft.clear();
             self.draft_cursor = 0;
             return;
         }
+        self.open_after_attachment_fetch = false;
         let Some(conversation_id) = self.selected.as_ref() else {
             self.error = Some("Open a chat before fetching an attachment.".into());
             self.notice = None;
@@ -3522,7 +3671,7 @@ impl App {
             }
             ["/nickname", ..] => self.execute_nickname_command(),
             ["/search", ..] => self.execute_search_command(),
-            ["/attachment"] => self.begin_attachment_fetch(false),
+            ["/attachment"] => self.begin_attachment_picker(),
             ["/open"] => self.begin_attachment_fetch(true),
             ["/new"] => {
                 self.error = None;
@@ -3942,7 +4091,9 @@ impl App {
             return self.search_key(key);
         }
         if key.code == KeyCode::Char('f') && key.modifiers.contains(KeyModifiers::CONTROL) {
-            self.open_search();
+            if self.attachment_picker.is_none() {
+                self.open_search();
+            }
             return Action::None;
         }
         if self.draft.is_empty() {
@@ -3964,6 +4115,7 @@ impl App {
                 && !self.help_open
                 && self.context_menu.is_none()
                 && self.renaming.is_none()
+                && self.attachment_picker.is_none()
                 && self.filter.is_none()
                 && !self.leader_pending
                 && (!self.new_conversation || self.pending_address.is_some());
@@ -3999,6 +4151,10 @@ impl App {
             return Action::None;
         }
         if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
+            if self.attachment_picker.is_some() {
+                self.attachment_picker = None;
+                return Action::None;
+            }
             if self.filter_query().is_some() && !self.filter_query().unwrap_or_default().is_empty()
             {
                 self.filter = Some(String::new());
@@ -4048,6 +4204,11 @@ impl App {
             return Action::None;
         }
 
+        if self.attachment_picker.is_some() {
+            self.attachment_picker_key(key);
+            return self.take_pending_action();
+        }
+
         // The rename prompt owns the keyboard while it is open.
         if self.renaming.is_some() {
             match key.code {
@@ -4078,6 +4239,7 @@ impl App {
             && !self.settings_open
             && !self.theme_panel_open
             && !self.help_open
+            && self.attachment_picker.is_none()
         {
             self.select_step(-1);
             return Action::None;
@@ -4632,6 +4794,28 @@ impl App {
             }
             return Action::None;
         }
+        if self.attachment_picker.is_some() {
+            // The chooser is modal for the pointer: wheel and clicks must never
+            // reach the sidebar (which would retarget the chat under it) or any
+            // pane behind the panel.
+            match kind {
+                MouseEventKind::ScrollUp => self.attachment_picker_step(-(WHEEL_ROWS as isize)),
+                MouseEventKind::ScrollDown => self.attachment_picker_step(WHEEL_ROWS as isize),
+                MouseEventKind::Down(MouseButton::Left) => match hits.at(column, row) {
+                    Some(Hit::AttachmentPickerRow(index)) => {
+                        if let Some(picker) = self.attachment_picker.as_mut() {
+                            picker.selection = index.min(picker.candidates.len().saturating_sub(1));
+                        }
+                        self.confirm_attachment_picker(false);
+                    }
+                    Some(Hit::CloseOverlay) => self.attachment_picker = None,
+                    _ => {}
+                },
+                MouseEventKind::Down(MouseButton::Right) => self.attachment_picker = None,
+                _ => {}
+            }
+            return Action::None;
+        }
         if self.search.is_some() {
             // Search is modal for the pointer too: only its own rows and wheel
             // reach it, so a header or pane click cannot stack an overlay on top.
@@ -4838,6 +5022,7 @@ impl App {
                 Some(Hit::CloseOverlay) => {
                     self.help_open = false;
                     self.command_menu = false;
+                    self.attachment_picker = None;
                     if self.contacts_open {
                         self.close_contacts();
                     } else if self.settings_open || self.theme_panel_open {
@@ -5942,7 +6127,7 @@ mod tests {
     }
 
     #[test]
-    fn attachment_command_fetches_only_the_newest_token_and_reports_the_path() {
+    fn attachment_command_lists_fetchable_tokens_newest_first_and_saves_the_choice() {
         const OLD: &str = "0123456789abcdef0123456789abcdef";
         const NEW: &str = "fedcba9876543210fedcba9876543210";
         let chat = conversation("attachment@example.test", Some(20));
@@ -5963,16 +6148,41 @@ mod tests {
         older.parts = vec![attachment(OLD)];
         let mut newer = message(&chat, "newer", 20, "newer");
         newer.parts = vec![attachment(NEW)];
+        // Newer, but without a fetch token: it cannot be offered or fetched.
+        let mut stale = message(&chat, "stale", 30, "stale");
+        stale.parts = vec![bloom_domain::MessagePart::Attachment(
+            bloom_domain::AttachmentRef::new(
+                "local-metadata:stale",
+                Some("image/jpeg".into()),
+                Some("old.jpg".into()),
+                Some(3),
+            )
+            .unwrap(),
+        )];
         let mut app = App {
             selected: Some(chat.id.clone()),
             ..Default::default()
         };
-        app.messages.insert(chat.id.clone(), vec![older, newer]);
+        app.messages
+            .insert(chat.id.clone(), vec![older, newer, stale]);
+
         app.draft = "/attachment".into();
+        assert_eq!(
+            app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+            Action::None,
+            "the command opens the chooser instead of fetching blindly"
+        );
+        let picker = app.attachment_picker.as_ref().expect("picker is open");
+        assert_eq!(picker.candidates.len(), 2);
+        assert_eq!(picker.candidates[0].token(), NEW);
+        assert_eq!(picker.candidates[0].name(), Some("photo.jpg"));
+        assert_eq!(picker.candidates[1].token(), OLD);
+
         assert_eq!(
             app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
             Action::FetchAttachment { token: NEW.into() }
         );
+        assert!(app.attachment_picker.is_none());
         app.finish_attachment_fetch(NEW, Ok(("/tmp/photo.jpg".into(), 3)));
         assert!(app
             .notice
@@ -5987,6 +6197,150 @@ mod tests {
             .error
             .as_deref()
             .is_some_and(|text| text.contains("unavailable")));
+    }
+
+    fn picker_app(tokens: &[(&str, i64)]) -> App {
+        let chat = conversation("picker@example.test", Some(20));
+        let mut messages = Vec::new();
+        for (index, (token, created_at)) in tokens.iter().enumerate() {
+            let mut message = message(&chat, &format!("message-{index}"), *created_at, "body");
+            message.parts = vec![bloom_domain::MessagePart::Attachment(
+                bloom_domain::AttachmentRef::new(
+                    format!("local-metadata:{token}"),
+                    Some("image/jpeg".into()),
+                    Some(format!("file-{index}.jpg")),
+                    Some(3),
+                )
+                .unwrap()
+                .with_fetch_token(Some((*token).into()))
+                .unwrap(),
+            )];
+            messages.push(message);
+        }
+        let mut app = App {
+            selected: Some(chat.id.clone()),
+            ..Default::default()
+        };
+        app.messages.insert(chat.id, messages);
+        app.draft = "/attachment".into();
+        assert_eq!(
+            app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+            Action::None
+        );
+        app
+    }
+
+    #[test]
+    fn attachment_picker_moves_and_fetches_the_older_choice() {
+        const OLD: &str = "0123456789abcdef0123456789abcdef";
+        const NEW: &str = "fedcba9876543210fedcba9876543210";
+        let mut app = picker_app(&[(OLD, 10), (NEW, 20)]);
+
+        assert_eq!(app.attachment_picker.as_ref().unwrap().selection, 0);
+        assert_eq!(
+            app.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE)),
+            Action::None
+        );
+        assert_eq!(app.attachment_picker.as_ref().unwrap().selection, 1);
+        assert_eq!(
+            app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+            Action::FetchAttachment { token: OLD.into() }
+        );
+    }
+
+    #[test]
+    fn attachment_picker_opens_the_selected_choice_externally() {
+        const TOKEN: &str = "fedcba9876543210fedcba9876543210";
+        let mut app = picker_app(&[(TOKEN, 10)]);
+
+        assert_eq!(
+            app.handle_key(KeyEvent::new(KeyCode::Char('o'), KeyModifiers::NONE)),
+            Action::FetchAttachment {
+                token: TOKEN.into()
+            }
+        );
+        assert!(app.open_after_attachment_fetch);
+        assert_eq!(
+            app.finish_attachment_fetch(TOKEN, Ok(("/tmp/file-0.jpg".into(), 3))),
+            Some("/tmp/file-0.jpg".into())
+        );
+    }
+
+    #[test]
+    fn attachment_picker_cancels_without_fetching() {
+        const TOKEN: &str = "fedcba9876543210fedcba9876543210";
+        let mut app = picker_app(&[(TOKEN, 10)]);
+
+        assert_eq!(
+            app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)),
+            Action::None
+        );
+        assert!(app.attachment_picker.is_none());
+        assert!(app.pending_attachment.is_none());
+        assert!(!app.open_after_attachment_fetch);
+    }
+
+    #[test]
+    fn attachment_picker_owns_the_wheel_and_cannot_retarget_the_chat() {
+        const A: &str = "0123456789abcdef0123456789abcdef";
+        const B: &str = "fedcba9876543210fedcba9876543210";
+        let mut app = picker_app(&[(A, 10), (B, 20)]);
+        let selected = app.selected.clone();
+        let hits = crate::ui::HitMap::default();
+
+        assert_eq!(
+            app.handle_mouse(MouseEventKind::ScrollDown, 0, 0, &hits),
+            Action::None
+        );
+        assert_eq!(app.selected, selected, "a wheel must not retarget the chat");
+        assert_eq!(app.attachment_picker.as_ref().unwrap().selection, 1);
+
+        assert_eq!(
+            app.handle_mouse(MouseEventKind::ScrollUp, 0, 0, &hits),
+            Action::None
+        );
+        assert_eq!(app.attachment_picker.as_ref().unwrap().selection, 0);
+    }
+
+    #[test]
+    fn attachment_picker_ignores_modified_o_and_right_click_cancels() {
+        const TOKEN: &str = "fedcba9876543210fedcba9876543210";
+        let mut app = picker_app(&[(TOKEN, 10)]);
+        assert_eq!(
+            app.handle_key(KeyEvent::new(KeyCode::Char('o'), KeyModifiers::CONTROL)),
+            Action::None
+        );
+        assert!(
+            app.attachment_picker.is_some(),
+            "Ctrl+O is not the open action"
+        );
+
+        let hits = crate::ui::HitMap::default();
+        assert_eq!(
+            app.handle_mouse(MouseEventKind::Down(MouseButton::Right), 0, 0, &hits),
+            Action::None
+        );
+        assert!(app.attachment_picker.is_none());
+    }
+
+    #[test]
+    fn a_refused_attachment_command_keeps_a_pending_open_intent() {
+        const TOKEN: &str = "fedcba9876543210fedcba9876543210";
+        let mut app = App {
+            attachment_in_flight: Some(TOKEN.into()),
+            open_after_attachment_fetch: true,
+            ..Default::default()
+        };
+
+        app.begin_attachment_picker();
+        assert!(
+            app.open_after_attachment_fetch,
+            "a refused /attachment must not downgrade an in-flight /open"
+        );
+        assert!(app.attachment_picker.is_none());
+
+        app.begin_attachment_fetch(false);
+        assert!(app.open_after_attachment_fetch);
     }
 
     #[test]
@@ -6069,6 +6423,10 @@ mod tests {
         app.messages.insert(chat.id.clone(), vec![message]);
 
         app.draft = "/attachment".into();
+        assert_eq!(
+            app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+            Action::None
+        );
         assert_eq!(
             app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
             Action::FetchAttachment {

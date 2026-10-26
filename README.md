@@ -1,6 +1,6 @@
 # Bloom
 
-Bloom is an experimental keyboard-first terminal messenger using an existing OpenBubbles registration. Text messaging, local stored history, automatic engine-child recovery, read-only inbound reaction display, explicit inbound attachment saving, and explicit external opening of a saved attachment are implemented; attachment saving is live-verified on one inbound file. Remote history import, Bloom-owned sign-in, outbound reactions, edits/unsend, and outbound attachment send are not.
+Bloom is an experimental keyboard-first terminal messenger using an existing OpenBubbles registration. Text messaging, local stored history, automatic engine-child recovery, read-only inbound reaction display, and inbound attachment saving and opening are implemented; attachments use a chooser over loaded files with save or explicit external open, and saving is live-verified on one inbound file. Remote history import, Bloom-owned sign-in, outbound reactions, edits/unsend, and outbound attachment send are not.
 
 ## Design reference
 

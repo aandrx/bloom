@@ -877,7 +877,7 @@ class ReadingFlows(unittest.TestCase):
                              f'unsend must not imply deletion at {width}')
             self.artifact(f'edit-unsend-notes-{width}')
 
-    def seed_attachment(self):
+    def seed_attachment(self, extra=None):
         self.stop_tui()
         self.fixture.stop_daemon()
         state = self.fixture.persisted()
@@ -906,6 +906,28 @@ class ReadingFlows(unittest.TestCase):
             'reactions': [],
             'unsent_at': None,
         })
+        if extra is not None:
+            extra_token, extra_name = extra
+            state['messages'].append({
+                'id': {'transport': 'openbubbles', 'value': 'attachment-pty-0002'},
+                'conversation_id': CID,
+                'remote_id': None,
+                'sender': sender,
+                'parts': [{'type': 'attachment', 'value': {
+                    'id': 'local-metadata:attachment-pty-extra',
+                    'mime_type': 'application/pdf',
+                    'file_name': extra_name,
+                    'byte_len': 42,
+                    'fetch_token': extra_token,
+                }}],
+                'created_at': newest + 20,
+                'sent_at': None,
+                'delivery': 'delivered',
+                'from_me': False,
+                'edited_at': None,
+                'reactions': [],
+                'unsent_at': None,
+            })
         self.fixture.store_path.write_text(json.dumps(state))
         self.fixture.start_daemon()
         self.start_tui()
@@ -913,9 +935,12 @@ class ReadingFlows(unittest.TestCase):
         self.wait_for(lambda: 'photo.jpg' in self.text())
         return token
 
-    def test_attachment_command_saves_newest_loaded_attachment(self):
+    def test_attachment_command_saves_the_choice_from_the_picker(self):
         self.seed_attachment()
         self.key(b'/attachment')
+        self.key(b'\r')
+        self.wait_for(lambda: 'Enter save' in self.text())
+        self.assertIn('photo.jpg', self.text(), 'the chooser lists its name')
         self.key(b'\r')
         self.wait_for(lambda: 'Attachment saved to' in self.text())
         self.assertIn('attachments/', self.text(),
@@ -926,6 +951,24 @@ class ReadingFlows(unittest.TestCase):
         self.assertFalse(self.opener_record.exists(),
                          'saving must not launch an external opener')
         self.artifact('attachment-saved')
+
+    def test_attachment_picker_selects_the_older_loaded_attachment(self):
+        older = self.seed_attachment(
+            extra=('fedcba9876543210fedcba9876543210', 'report.pdf'))
+        self.key(b'/attachment')
+        self.key(b'\r')
+        self.wait_for(lambda: 'Enter save' in self.text())
+        self.assertIn('report.pdf', self.text(), 'newest choice is listed')
+        self.assertIn('photo.jpg', self.text(), 'older choice is listed')
+        self.key(b'\x1b[B')  # Down
+        self.resize(200, 30)
+        self.key(b'\r')
+        self.wait_for(lambda: 'Attachment saved to' in self.text())
+        self.wait_for(lambda: older in self.text())
+        self.assertIn(older, self.text(),
+                      'the fetched path belongs to the chosen older attachment')
+        self.assertNotIn('fedcba9876543210fedcba9876543210', self.text())
+        self.artifact('attachment-picker-older')
 
     def test_open_command_fetches_then_launches_the_external_opener(self):
         token = self.seed_attachment()
