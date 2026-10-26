@@ -529,12 +529,10 @@ Future<void> _handleCommand({
           bytes: fetched.bytes,
         ));
       } on AttachmentFailure catch (error) {
-        final failure = error is AttachmentDownloadFailure ? error : null;
-        final detail = failure == null
-            ? ''
-            : ' stage=${failure.stage}'
-                '${failure.cause == null ? '' : ' cause=${failure.cause}'}';
-        stderr.writeln('attachment fetch failed: ${error.code}$detail');
+        stderr.writeln(
+          'attachment fetch failed: ${error.code}'
+          '${attachmentFailureDetail(error)}',
+        );
         writeProtocolFrame(errorFrame(
           requestId: command.requestId,
           code: _attachmentErrorCode(error),

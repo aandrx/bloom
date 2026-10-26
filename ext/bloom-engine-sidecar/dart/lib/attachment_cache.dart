@@ -103,6 +103,15 @@ String errorTypeToken(Object error) {
   return safe.length <= 40 ? safe : safe.substring(0, 40);
 }
 
+/// Bounded, content-free suffix for a fetch-failure diagnostic line.
+String attachmentFailureDetail(AttachmentFailure failure) {
+  if (failure is! AttachmentDownloadFailure) {
+    return '';
+  }
+  final cause = failure.cause;
+  return ' stage=${failure.stage}${cause == null ? '' : ' cause=$cause'}';
+}
+
 class AttachmentUnsafeRootFailure extends AttachmentFailure {
   const AttachmentUnsafeRootFailure() : super('unsafe_root');
 }

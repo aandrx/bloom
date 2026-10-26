@@ -157,9 +157,14 @@ ps -eo pid,args | grep -E '[b]loom_engine\.dart' || true
 
 Both process checks must print nothing. The temporary store, cache and probe root
 are deleted; do not copy them. The probe was exercised against a fake daemon. The
-first authorized live run found an attachment token and issued the fetch, but the
-daemon did not return `attachment_fetched`; the probe removed its temporary log,
-so the sidecar failure code was not captured.
+first authorized live run, made before bounded diagnostics existed, found an
+attachment token and issued the fetch, but returned no `attachment_fetched`; its
+temporary log was removed, so no sidecar failure code was captured for that run.
+Attempts during the later diagnosis all failed before any engine request and were
+captured: one printed only `download_failed`, the next `stage=thrown` with an
+unclassified cause, and the next `stage=construct` with
+`unclassified_DroppableDisposedException`. The first run is consistent with the
+same defect but is not claimed as such, because its code was lost.
 
 ### C1e result
 
@@ -192,14 +197,17 @@ passing that stale `push.conn`; it now passes `deskState.conn` from the state
 No download was attempted against Apple with the stale handle.
 
 The diagnostic line is bounded and content-free. Failures report a fixed stage
-(`size`, `reuse_empty`, `reuse_oversized`, `temp_create`, `temp_stat`,
-`size_mismatch`, `filesystem`, `progress_negative`, `progress_over_total`,
-`size_threw`, `construct`, `listen`, `stream`) and either an allowlisted engine
+(`size`, `reuse_empty`, `reuse_oversized`, `reuse_stat`, `cache_entry`,
+`temp_create`, `temp_stat`, `size_mismatch`, `filesystem`, `progress_negative`,
+`progress_over_total`, `size_threw`, `construct`, `listen`, `stream`, or the
+`download` default if a call site omits one) and either an allowlisted engine
 cause token (`mmcs_get_failed`, `not_connected`, `resource_timeout`, `auth`,
 `http`, `io`, and similar) or `unclassified_<RuntimeType>` for anything else.
 Engine error text is scanned only to pick a token and is never logged, so object
 identifiers, signatures, URLs and attachment names cannot reach the daemon log.
-Current gates after the fix: 91 Dart tests pass and `dart analyze` reports no
+`attachmentFailureDetail` builds that suffix and is unit-tested, so a regression
+that logged raw error text would fail a test.
+Current gates after the fix: 92 Dart tests pass and `dart analyze` reports no
 issues for `bin`, `lib/attachment_cache.dart` and `test`. The vendored generated
 bindings still report 24 pre-existing analyzer warnings, unchanged by this work.
 No Rust source changed for C1e.

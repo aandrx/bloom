@@ -739,5 +739,20 @@ void main() {
       expect(failure.cause, 'unclassified_StateError');
       expect(failure.toString(), isNot(contains('private-photo')));
     });
+
+    test('the log suffix carries only fixed tokens', () async {
+      final failure = await failureOf(
+        (_, __, ___) => Stream<api.TransferProgress>.error(
+          Exception('MMCS GET failed Some("/secret/photo.jpg")'),
+        ),
+      );
+
+      final detail = attachmentFailureDetail(failure);
+      expect(detail, ' stage=stream cause=mmcs_get_failed');
+      expect(detail, isNot(contains('secret')));
+      expect(detail, isNot(contains('photo')));
+      expect(attachmentFailureDetail(const AttachmentInvalidTokenFailure()),
+          isEmpty);
+    });
   });
 }
