@@ -127,6 +127,12 @@ The probe script itself was exercised against a disposable fake daemon that spaw
 - Treat renewal, ABI compatibility, and recovery of the real registration across restarts as unverified unless directly observed.
 - If the probe fails, preserve only allowlisted logs and the structural outcome; never attach raw engine logs.
 
+### Track A result
+
+Passed on the first authorized run. A temporary daemon started with the real registration and isolated socket/store; the first engine child was killed after its parent and command line were verified; the daemon stayed alive, the old PID was reaped, a different replacement PID appeared after 0.42 seconds, and the replacement reached an active session. The conversation listing returned zero conversations, so this proves child replacement and session recovery, not message transfer or archive readiness. Cleanup removed the daemon, both engine PIDs and the temporary store; no owner remained.
+
+Limits: one run, no sends, no inbound message round trip, no conversation listing content, no renewal or ABI check, and no restart of the daemon itself. Treat repeated recovery, crash-loop exhaustion against the real engine, and delivery after recovery as separate unverified gates.
+
 ## Track B: packaging phase 4 diagnostics
 
 Goal: explain or structurally contain the intermittent daemon-owned unparsable frame, then finish the two-part install gate.

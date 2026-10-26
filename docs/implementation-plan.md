@@ -24,13 +24,13 @@ Local unread navigation is accepted under shipp with synthetic evidence. Workspa
 
 ## Queued backend/product work and acceptance
 
-### 1. Generation-scoped engine recovery (accepted, live-unverified)
+### 1. Generation-scoped engine recovery (accepted, live child replacement verified)
 
 Historical message ingestion has a [design-only plan](historical-ingestion-plan.md). It is blocked: the sidecar exposes no message archive, `history_message` and `history_complete` are stubs, and the headless ObjectBox path is unavailable. Do not start that work without the gate evidence, and do not fabricate identity, dedupe by body or time, or claim completeness from a placeholder frame.
 
-The [engine recovery plan](engine-recovery-plan.md) is implemented and wired. A pure bounded retry policy, a swappable engine slot, a drain-and-join generation seam, an unwired-then-wired restart loop, and TUI outage labels all pass synthetic checks, including a runtime test that kills a real child process and observes a replacement. Crash loops now exhaust the attempt budget because a generation must stay up for a stability window before it resets the budget. Initial start failure stays fatal, uncertain sends are never replayed, and the real Dart sidecar remains live-unverified.
+The [engine recovery plan](engine-recovery-plan.md) is implemented and wired. A pure bounded retry policy, a swappable engine slot, a drain-and-join generation seam, an unwired-then-wired restart loop, and TUI outage labels all pass synthetic checks, including a runtime test that kills a real child process and observes a replacement. Crash loops now exhaust the attempt budget because a generation must stay up for a stability window before it resets the budget. Initial start failure stays fatal, uncertain sends are never replayed. An authorized live probe killed the real sidecar child once: the daemon survived, the old child was reaped, a different child appeared after 0.42 s, and the replacement session became active. Message transfer after recovery, repeated deaths, crash-loop exhaustion, daemon restart, renewal and ABI remain unverified.
 
-Accepted boundary: policy, swapping, old-generation drain/join, daemon wiring, stability-window budgeting, shutdown cancellation, TUI outage presentation, and a synthetic real-child replacement test are covered. Authorized live receive/restart against the real Dart sidecar is a separate user-approved release gate. No further recovery implementation is queued before that evidence.
+Accepted boundary: policy, swapping, old-generation drain/join, daemon wiring, stability-window budgeting, shutdown cancellation, TUI outage presentation, a synthetic real-child replacement test, and one authorized live child-replacement run are covered. Repeated recovery, crash-loop exhaustion, delivery after recovery, daemon restart, renewal and ABI remain separate unverified gates.
 
 ### 2. Verified historical ingestion (design complete, blocked)
 
