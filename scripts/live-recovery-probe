@@ -1,0 +1,406 @@
+#!/usr/bin/env python3
+"""One-shot live engine recovery probe.
+
+Starts one daemon against the user's real OpenBubbles registration, kills only its
+engine child once, proves one replacement owner, and removes the temporary store.
+
+This script is intentionally hard to run. It requires the authorization token
+below, refuses when another Bloom/OpenBubbles owner exists, and rejects paths that
+are not isolated from the personal Bloom store. It never sends, syncs history,
+imports archives, changes registration, or prints message/account content.
+
+Usage:
+  BLOOM_LIVE_RECOVERY_ACK=one-shot-authorized \
+  BLOOM_ENGINE_STATE=... BLOOM_ENGINE_LIBRARY=... BLOOM_ENGINE_SCRIPT=... \
+  BLOOM_DART_EXECUTABLE=... \
+  scripts/live-recovery-probe --bloomd target/debug/bloomd
+
+Add --preflight to run every read-only check and exit without starting anything.
+"""
+
+import argparse
+import json
+import os
+from pathlib import Path
+import re
+import shutil
+import signal
+import socket
+import struct
+import subprocess
+import sys
+import tempfile
+import time
+
+ACK = "one-shot-authorized"
+VERSION = 7
+MAX_FRAME = 1024 * 1024
+START_TIMEOUT = 120.0
+REPLACEMENT_TIMEOUT = 90.0
+STOP_TIMEOUT = 30.0
+PID_LINE = re.compile(r"engine child started pid=(?:Some\()?(\d+)")
+
+
+class ProbeError(Exception):
+    pass
+
+
+def process_argv(pid):
+    try:
+        raw = Path(f"/proc/{pid}/cmdline").read_bytes()
+    except FileNotFoundError:
+        return []
+    return [part.decode("utf-8", "replace") for part in raw.split(b"\0") if part]
+
+
+def process_command(pid):
+    return " ".join(process_argv(pid))
+
+
+def process_parent(pid):
+    try:
+        stat = Path(f"/proc/{pid}/stat").read_text()
+    except FileNotFoundError:
+        return None
+    # The command name may contain spaces; fields after the final ')' are stable.
+    fields = stat.rsplit(")", 1)[1].split()
+    try:
+        return int(fields[1])
+    except (IndexError, ValueError):
+        return None
+
+
+def live_owners():
+    owners = []
+    for entry in Path("/proc").iterdir():
+        if not entry.name.isdigit():
+            continue
+        pid = int(entry.name)
+        if pid == os.getpid():
+            continue
+        argv = process_argv(pid)
+        if not argv:
+            continue
+        executable = Path(argv[0]).name
+        sidecar = any(arg.endswith("bloom_engine.dart") for arg in argv[1:])
+        if executable == "bloomd" or sidecar:
+            owners.append((pid, " ".join(argv)))
+    return owners
+
+
+def open_owner():
+    for entry in Path("/proc").iterdir():
+        if not entry.name.isdigit():
+            continue
+        pid = int(entry.name)
+        if pid == os.getpid():
+            continue
+        argv = process_argv(pid)
+        if not argv:
+            continue
+        executable = Path(argv[0]).name
+        command = " ".join(argv)
+        if executable == "OpenBubbles":
+            return pid, command
+        if (
+            executable in {"flatpak", "bwrap"}
+            and "app.openbubbles.OpenBubbles" in argv
+        ):
+            return pid, command
+        if executable == "OpenBubbles" or "/app/" in argv[0]:
+            return pid, command
+    return None
+
+
+def require_isolated(path, root, label):
+    resolved = Path(path).resolve()
+    if root not in resolved.parents and resolved != root:
+        raise ProbeError(f"{label} must live inside the temporary root")
+    return resolved
+
+
+def frame(value):
+    data = json.dumps(value, separators=(",", ":"), ensure_ascii=False).encode()
+    if not data or len(data) > MAX_FRAME:
+        raise ProbeError("request frame is empty or too large")
+    return bytes([VERSION]) + struct.pack(">I", len(data)) + data
+
+
+def read_exact(stream, length):
+    data = bytearray()
+    while len(data) < length:
+        chunk = stream.recv(length - len(data))
+        if not chunk:
+            raise ProbeError("daemon closed the IPC connection")
+        data.extend(chunk)
+    return bytes(data)
+
+
+def read_frame(stream, timeout):
+    stream.settimeout(timeout)
+    header = read_exact(stream, 5)
+    if header[0] != VERSION:
+        raise ProbeError("daemon answered with an unexpected IPC version")
+    length = struct.unpack(">I", header[1:])[0]
+    if length == 0 or length > MAX_FRAME:
+        raise ProbeError("daemon answered with an invalid frame length")
+    return json.loads(read_exact(stream, length))
+
+
+def request(socket_path, payload, timeout=30.0):
+    with socket.socket(socket.AF_UNIX) as connection:
+        connection.settimeout(timeout)
+        connection.connect(str(socket_path))
+        connection.sendall(frame(payload))
+        reply = read_frame(connection, timeout)
+    if "response" not in reply:
+        raise ProbeError("daemon reply had no response envelope")
+    return reply["response"]
+
+
+def wait_for_socket(socket_path, deadline, daemon):
+    while time.monotonic() < deadline:
+        if daemon.poll() is not None:
+            raise ProbeError("daemon exited during startup")
+        if socket_path.exists():
+            return
+        time.sleep(0.1)
+    raise ProbeError("daemon never created its socket")
+
+
+def wait_for_pid(log_path, deadline, daemon, previous=None):
+    while time.monotonic() < deadline:
+        if daemon.poll() is not None:
+            raise ProbeError("daemon exited while waiting for an engine child")
+        try:
+            text = log_path.read_text(errors="replace")
+        except FileNotFoundError:
+            text = ""
+        found = [int(match) for match in PID_LINE.findall(text)]
+        for pid in found:
+            if previous is not None and pid == previous:
+                continue
+            if Path(f"/proc/{pid}").exists():
+                return pid
+        time.sleep(0.1)
+    raise ProbeError("no engine child appeared before the deadline")
+
+
+def engine_children(daemon_pid):
+    children = []
+    for entry in Path("/proc").iterdir():
+        if not entry.name.isdigit():
+            continue
+        pid = int(entry.name)
+        if process_parent(pid) != daemon_pid:
+            continue
+        command = process_command(pid)
+        if "bloom_engine" in command:
+            children.append(pid)
+    return children
+
+
+def wait_for_single_engine(daemon_pid, deadline, expected=None):
+    while time.monotonic() < deadline:
+        children = engine_children(daemon_pid)
+        if expected is None and len(children) == 1:
+            return children[0]
+        if expected is not None and children == [expected]:
+            return expected
+        time.sleep(0.1)
+    raise ProbeError("engine child ownership was not exactly one live process")
+
+
+def session_active(socket_path, deadline):
+    with socket.socket(socket.AF_UNIX) as connection:
+        connection.settimeout(10.0)
+        connection.connect(str(socket_path))
+        connection.sendall(frame({
+            "request_id": 91,
+            "request": {"op": "subscribe"},
+        }))
+        acknowledged = read_frame(connection, 10.0)
+        if acknowledged.get("response", {}).get("result") != "subscribed":
+            raise ProbeError("daemon refused the recovery subscription")
+        while time.monotonic() < deadline:
+            event = read_frame(connection, 10.0)
+            kind = event.get("event", {})
+            if kind.get("event") == "session" and kind.get("state") == "active":
+                return
+    raise ProbeError("engine session never became active after replacement")
+
+
+def list_conversations(socket_path):
+    reply = request(socket_path, {
+        "request_id": 92,
+        "request": {"op": "list_conversations"},
+    })
+    if reply.get("result") != "conversations":
+        raise ProbeError("daemon did not answer list_conversations")
+    return len(reply.get("conversations", []))
+
+
+def stop_daemon(daemon):
+    if daemon.poll() is None:
+        daemon.send_signal(signal.SIGTERM)
+    try:
+        daemon.wait(timeout=STOP_TIMEOUT)
+    except subprocess.TimeoutExpired:
+        daemon.kill()
+        daemon.wait(timeout=10.0)
+
+
+def run_probe(args, root):
+    if os.environ.get("BLOOM_LIVE_RECOVERY_ACK") != ACK:
+        raise ProbeError(
+            "live recovery is not authorized; set BLOOM_LIVE_RECOVERY_ACK=" + ACK
+        )
+    if not Path(args.bloomd).is_file():
+        raise ProbeError("bloomd binary does not exist")
+    for label, value in [
+        ("engine state", args.engine_state),
+        ("engine library", args.engine_library),
+        ("engine script", args.engine_script),
+        ("dart executable", args.dart),
+    ]:
+        if not Path(value).exists():
+            raise ProbeError(f"{label} does not exist")
+    if live_owners():
+        raise ProbeError("another Bloom or engine owner is running")
+    owner = open_owner()
+    if owner is not None:
+        raise ProbeError("OpenBubbles is still running")
+
+    socket_path = root / "bloomd.sock"
+    store_path = root / "store.db"
+    if socket_path.exists() or store_path.exists():
+        raise ProbeError("temporary socket or store already exists")
+    log_path = root / "bloomd.log"
+    env = dict(os.environ)
+    env.update({
+        "BLOOM_SOCKET_PATH": str(socket_path),
+        "BLOOM_STORE_PATH": str(store_path),
+        "BLOOM_ENGINE_STATE": args.engine_state,
+        "BLOOM_ENGINE_LIBRARY": args.engine_library,
+        "BLOOM_ENGINE_SCRIPT": args.engine_script,
+        "BLOOM_DART_EXECUTABLE": args.dart,
+        "XDG_DATA_HOME": str(root / "data"),
+        "XDG_STATE_HOME": str(root / "state"),
+        "XDG_CONFIG_HOME": str(root / "config"),
+    })
+    log = open(log_path, "w", encoding="utf-8", buffering=1)
+    os.fchmod(log.fileno(), 0o600)
+    started = time.monotonic()
+    daemon = subprocess.Popen(
+        [args.bloomd],
+        env=env,
+        stdin=subprocess.DEVNULL,
+        stdout=log,
+        stderr=log,
+    )
+    evidence = {
+        "daemon_pid": daemon.pid,
+        "first_engine_pid": None,
+        "replacement_engine_pid": None,
+        "first_socket_seconds": None,
+        "replacement_seconds": None,
+        "conversations": None,
+        "session_active": False,
+        "result": "failed",
+    }
+    try:
+        wait_for_socket(socket_path, time.monotonic() + START_TIMEOUT, daemon)
+        evidence["first_socket_seconds"] = round(time.monotonic() - started, 2)
+        first = wait_for_pid(log_path, time.monotonic() + START_TIMEOUT, daemon)
+        wait_for_single_engine(daemon.pid, time.monotonic() + 30.0, first)
+        evidence["first_engine_pid"] = first
+        evidence["conversations"] = list_conversations(socket_path)
+        session_active(socket_path, time.monotonic() + 60.0)
+        evidence["session_active"] = True
+
+        command = process_command(first)
+        if process_parent(first) != daemon.pid or "bloom_engine" not in command:
+            raise ProbeError("refusing to kill a process that is not this daemon's engine")
+        os.kill(first, signal.SIGKILL)
+        killed = time.monotonic()
+        replacement = wait_for_pid(
+            log_path,
+            killed + REPLACEMENT_TIMEOUT,
+            daemon,
+            previous=first,
+        )
+        if replacement == first:
+            raise ProbeError("replacement reused the old engine pid")
+        if Path(f"/proc/{first}").exists():
+            raise ProbeError("old engine child was not reaped")
+        wait_for_single_engine(daemon.pid, killed + 30.0, replacement)
+        evidence["replacement_engine_pid"] = replacement
+        evidence["replacement_seconds"] = round(time.monotonic() - killed, 2)
+        evidence["conversations"] = list_conversations(socket_path)
+        session_active(socket_path, time.monotonic() + 60.0)
+        evidence["session_active"] = True
+        evidence["result"] = "passed"
+        return evidence, log_path
+    finally:
+        stop_daemon(daemon)
+        log.close()
+        if engine_children(daemon.pid):
+            raise ProbeError("engine child survived daemon cleanup")
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--bloomd", default=str(Path(__file__).resolve().parents[1] /
+                                                 "target/debug/bloomd"))
+    parser.add_argument("--engine-state", default=os.environ.get("BLOOM_ENGINE_STATE", ""))
+    parser.add_argument("--engine-library", default=os.environ.get("BLOOM_ENGINE_LIBRARY", ""))
+    parser.add_argument("--engine-script", default=os.environ.get("BLOOM_ENGINE_SCRIPT", ""))
+    parser.add_argument("--dart", default=os.environ.get("BLOOM_DART_EXECUTABLE", "dart"))
+    parser.add_argument("--preflight", action="store_true")
+    parser.add_argument("--evidence-dir", default="")
+    args = parser.parse_args()
+
+    try:
+        if args.preflight:
+            if live_owners():
+                raise ProbeError("another Bloom or engine owner is running")
+            if open_owner() is not None:
+                raise ProbeError("OpenBubbles is still running")
+            for label, value in [
+                ("bloomd binary", args.bloomd),
+                ("engine state", args.engine_state),
+                ("engine library", args.engine_library),
+                ("engine script", args.engine_script),
+                ("dart executable", args.dart),
+            ]:
+                if not value or not Path(value).exists():
+                    raise ProbeError(f"{label} does not exist or was not provided")
+            print("preflight: no competing owner; required paths exist")
+            return 0
+
+        root = Path(tempfile.mkdtemp(prefix="bloom-live-recovery-")).resolve()
+        root.chmod(0o700)
+        evidence, log_path = run_probe(args, root)
+        evidence_path = Path(args.evidence_dir).expanduser() if args.evidence_dir \
+            else Path.home() / f"bloom-live-recovery-{int(time.time())}"
+        evidence_path.mkdir(parents=True, exist_ok=True, mode=0o700)
+        summary_path = evidence_path / "recovery-summary.json"
+        summary_path.write_text(json.dumps(evidence, indent=2) + "\n")
+        summary_path.chmod(0o600)
+        print(json.dumps(evidence, indent=2))
+        print(f"summary kept at {summary_path}")
+        return 0 if evidence["result"] == "passed" else 1
+    except ProbeError as error:
+        print(f"live recovery aborted: {error}", file=sys.stderr)
+        return 2
+    finally:
+        for pid, _ in live_owners():
+            if pid != os.getpid():
+                print(f"warning: surviving owner pid {pid} present", file=sys.stderr)
+        if 'root' in locals():
+            # The temporary store can contain real pushes and is never preserved.
+            shutil.rmtree(root, ignore_errors=True)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

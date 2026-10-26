@@ -63,6 +63,63 @@ Add an ignored live test or a small scripted probe that:
 
 Forbidden: sending a message, forcing a sync, importing history, copying the store, printing handles/IDs/content, touching registration files, or retrying an uncertain operation.
 
+### Exact commands
+
+Run from the repository root after reading the authorization statement. Do not set the token before you have decided to authorize the run.
+
+```sh
+cd $HOME/Documents/Projects/bloom
+cargo build -p bloomd
+
+STATE="$HOME/.var/app/app.openbubbles.OpenBubbles/data/bluebubbles"
+FLATPAK="$(flatpak info --show-location app.openbubbles.OpenBubbles)"
+LIB="$FLATPAK/files/bluebubbles/lib/librust_lib_bluebubbles.so"
+SCRIPT="$PWD/ext/bloom-engine-sidecar/dart/bin/bloom_engine.dart"
+DART="$(command -v dart || printf '%s' "$HOME/.cache/dart-sdk/dart-sdk/bin/dart")"
+
+test -d "$STATE"
+test -f "$LIB"
+test -f "$SCRIPT"
+test -x "$DART"
+```
+
+Close OpenBubbles, then run the read-only preflight. It starts nothing and refuses if any competing owner exists:
+
+```sh
+BLOOM_ENGINE_STATE="$STATE" \
+BLOOM_ENGINE_LIBRARY="$LIB" \
+BLOOM_ENGINE_SCRIPT="$SCRIPT" \
+BLOOM_DART_EXECUTABLE="$DART" \
+scripts/live-recovery-probe --preflight
+```
+
+After that prints `preflight: no competing owner; required paths exist`, authorize exactly one run by setting the guard token. This token is a script guard, not a substitute for your authorization statement:
+
+```sh
+export BLOOM_LIVE_RECOVERY_ACK=one-shot-authorized
+scripts/live-recovery-probe \
+  --bloomd target/debug/bloomd \
+  --engine-state "$STATE" \
+  --engine-library "$LIB" \
+  --engine-script "$SCRIPT" \
+  --dart "$DART" \
+  --evidence-dir "$HOME/bloom-live-recovery-evidence"
+```
+
+The script starts one daemon with an isolated socket/store, waits for a child, kills only that verified child, requires a different reaped-and-replaced PID, checks the session and conversation listing, stops the daemon, rejects a surviving engine child, and deletes the temporary store. It prints only structural results and keeps `recovery-summary.json` in the evidence directory.
+
+After it exits, clear the token and verify cleanup:
+
+```sh
+unset BLOOM_LIVE_RECOVERY_ACK
+pgrep -x bloomd || true
+ps -eo pid,args | grep -E '[b]loom_engine\.dart' || true
+```
+
+Both process checks must print nothing. Read only `recovery-summary.json`; do not open or share the temporary daemon log, which may contain live activity metadata.
+
+The probe script itself was exercised against a disposable fake daemon that spawned, killed and replaced a dummy `bloom_engine.dart` child. That validates its process checks, IPC queries, replacement wait and cleanup logic without touching live state; it is not live-engine evidence.
+
 ### Acceptance and abort rules
 
 - Pass only if one owner exists at every sampled moment, the replacement is a different reaped-and-replaced child, the daemon never exits, and no process or socket survives cleanup.
