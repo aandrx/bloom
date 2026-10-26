@@ -26,6 +26,8 @@ import '../lib/upstream/frb_generated.dart';
 
 const String engineVersion = 'openbubbles-v1.15.0+205';
 
+void writeProtocolFrame(String line) => stdout.writeln(wireLine(line));
+
 class SidecarConfig {
   SidecarConfig({
     required this.stateDirectory,
@@ -225,7 +227,7 @@ Future<void> main(List<String> arguments) async {
     path: config.stateDirectory,
   );
   if (restored == null) {
-    stdout.writeln(errorFrame(code: ProtocolCodes.engineUnavailable));
+    writeProtocolFrame(errorFrame(code: ProtocolCodes.engineUnavailable));
     exitCode = 3;
     return;
   }
@@ -236,7 +238,7 @@ Future<void> main(List<String> arguments) async {
   // app itself reads the client from its desktop state for the same reason.
   final cloudMessagesClient = deskState.icloudServices?.cloudMessagesClient;
 
-  late final SendCoordinator sends = SendCoordinator(stdout.writeln);
+  late final SendCoordinator sends = SendCoordinator(writeProtocolFrame);
   var sequence = 0;
   var stopping = false;
 
@@ -254,7 +256,7 @@ Future<void> main(List<String> arguments) async {
   }
   // The ready frame owns the capability wiring, so chat sync cannot advertise
   // history that no command can produce.
-  stdout.writeln(
+  writeProtocolFrame(
     sidecarReadyFrame(engineVersion: engineVersion, handles: handles),
   );
 
@@ -272,7 +274,7 @@ Future<void> main(List<String> arguments) async {
       // Request id zero is reserved for an unsolicited startup completion. The
       // daemon uses it to publish the ordered conversation-list refresh event.
       unawaited(runSync(client).then((result) {
-        stdout.writeln(syncResultFrame(
+        writeProtocolFrame(syncResultFrame(
           requestId: 0,
           status: result.status,
           conversations: result.count,
@@ -298,7 +300,7 @@ Future<void> main(List<String> arguments) async {
               sync: (requestId) async {
                 final client = cloudMessagesClient;
                 if (client == null) {
-                  stdout.writeln(syncResultFrame(
+                  writeProtocolFrame(syncResultFrame(
                     requestId: requestId,
                     status: 'failed',
                     conversations: 0,
@@ -306,7 +308,7 @@ Future<void> main(List<String> arguments) async {
                   return;
                 }
                 final result = await runSync(client);
-                stdout.writeln(syncResultFrame(
+                writeProtocolFrame(syncResultFrame(
                   requestId: requestId,
                   status: result.status,
                   conversations: result.count,
@@ -323,7 +325,7 @@ Future<void> main(List<String> arguments) async {
       result = await api.recvWait(watcher: watcher, state: pollState);
     } catch (error) {
       stderr.writeln('poll failed: $error');
-      stdout.writeln(
+      writeProtocolFrame(
         errorFrame(code: ProtocolCodes.engineUnavailable, retryable: true),
       );
       await Future<void>.delayed(const Duration(seconds: 1));
@@ -347,7 +349,7 @@ Future<void> main(List<String> arguments) async {
             return;
           }
         }
-        stdout.writeln(inboundFrame(sequence: sequence, payload: payload));
+        writeProtocolFrame(inboundFrame(sequence: sequence, payload: payload));
         if (Platform.environment['BLOOM_TIMING_DIAGNOSTICS'] == '1') {
           stderr.writeln(
             'bloom timing sidecar frame_encode_us=${receivedAt.elapsedMicroseconds} sequence=$sequence',
@@ -452,7 +454,8 @@ Future<_SyncResult> _syncChats(
           break;
         }
         rows++;
-        stdout.writeln(conversationFrame(sequence: rows, conversation: mapped));
+        writeProtocolFrame(
+            conversationFrame(sequence: rows, conversation: mapped));
       }
       if (limited) break;
       if (!hasMore) break;
@@ -495,7 +498,7 @@ Future<void> _handleCommand({
     command = decodeCommand(line);
   } on ProtocolException catch (error) {
     stderr.writeln('rejected command: ${error.code}');
-    stdout.writeln(rejectedCommandFrame(line, error.code));
+    writeProtocolFrame(rejectedCommandFrame(line, error.code));
     return;
   }
 
@@ -503,7 +506,7 @@ Future<void> _handleCommand({
     case SyncConversationsCommand():
       await sync(command.requestId);
     case ShutdownCommand():
-      stdout.writeln(shutdownAckFrame(requestId: command.requestId));
+      writeProtocolFrame(shutdownAckFrame(requestId: command.requestId));
       stop();
     case SendCommand():
       String? messageId;
@@ -511,7 +514,7 @@ Future<void> _handleCommand({
         final handles = await api.getHandles(state: deskState.client);
         final sender = chooseSender(handles, command.recipients);
         if (sender == null) {
-          stdout.writeln(
+          writeProtocolFrame(
             errorFrame(
               requestId: command.requestId,
               code: ProtocolCodes.noSenderHandle,
@@ -538,7 +541,7 @@ Future<void> _handleCommand({
       } catch (error) {
         if (messageId != null) sends.discard(messageId);
         stderr.writeln('send failed: $error');
-        stdout.writeln(
+        writeProtocolFrame(
           errorFrame(
             requestId: command.requestId,
             code: ProtocolCodes.sendFailed,

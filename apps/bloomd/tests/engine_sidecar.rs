@@ -40,6 +40,7 @@ fn fake_sidecar(dir: &std::path::Path) -> PathBuf {
     let script = r#"#!/bin/sh
 # Ignores its arguments; speaks the sidecar protocol on stdio.
 cat <<'FRAMES'
+8 foreign engine diagnostic that must be skipped
 {"version":1,"type":"ready","engine_version":"fake","handles":["mailto:me@example.invalid"],"capabilities":{"send":true,"history":false,"recipient_lists":true}}
 {"version":1,"type":"inbound_message","sequence":1,"payload":{"variant":"iMessage","complete":true,"inst":{"id":"inbound-1","sender":"tel:+15550000001","conversation":{"participants":["tel:+15550000001","mailto:me@example.invalid"],"cv_name":null,"sender_guid":"iMessage;-;+15550000001","after_guid":null},"message":{"type":"normal","complete":true,"value":{"parts":[{"idx":0,"part":{"type":"text","text":"first"}}],"service":{"type":"iMessage","complete":true}}},"sent_timestamp_ms":1700000000000,"send_delivered":false,"verification_failed":false}}}
 {"version":1,"type":"inbound_message","sequence":2,"payload":{"variant":"iMessage","complete":true,"inst":{"id":"group-inbound-1","sender":"mailto:one@example.invalid","conversation":{"participants":["mailto:one@example.invalid","tel:+15550000002","mailto:me@example.invalid"],"cv_name":"Two people","sender_guid":"iMessage;-;group-with-two-people","after_guid":null},"message":{"type":"normal","complete":true,"value":{"parts":[{"idx":0,"part":{"type":"text","text":"group first"}}],"service":{"type":"iMessage","complete":true}}},"sent_timestamp_ms":1700000000001,"send_delivered":false,"verification_failed":false}}}
@@ -67,7 +68,7 @@ done
 async fn malformed_stdout_terminates_engine_and_rejects_later_sends() {
     let dir = tempfile::tempdir().unwrap();
     let script = dir.path().join("malformed.sh");
-    fs::write(&script, "#!/bin/sh\nprintf '%s\\n' '{\"type\":\"ready\",\"handles\":[\"tel:+15550000000\"]}' 'not-json'\nexec sleep 30\n").unwrap();
+    fs::write(&script, "#!/bin/sh\nprintf '%s\\n' '{\"type\":\"ready\",\"handles\":[\"tel:+15550000000\"]}'\nprintf '\\036not-json\\n'\nexec sleep 30\n").unwrap();
     fs::set_permissions(&script, fs::Permissions::from_mode(0o700)).unwrap();
     let engine = Engine::new(EngineConfig {
         dart_executable: script.clone(),
@@ -152,7 +153,7 @@ async fn stream_failure_preserves_prior_messages_fails_sync_and_reaps_child() {
         .replace("inbound-1", "after-stream-failure");
     let script = dir.path().join("failure.sh");
     fs::write(&script, format!(
-        "{preamble}\nprintf '%s' \"$$\" > \"${{0%.sh}}.pid\"\nwhile IFS= read -r line; do\n  case \"$line\" in\n    *'\"type\":\"sync_conversations\"'*)\n      printf '%s\\n' 'not-json' '{rejected_frame}'\n      exec sleep 30\n      ;;\n  esac\ndone\n"
+        "{preamble}\nprintf '%s' \"$$\" > \"${{0%.sh}}.pid\"\nwhile IFS= read -r line; do\n  case \"$line\" in\n    *'\"type\":\"sync_conversations\"'*)\n      printf '\\036not-json\\n' '{rejected_frame}'\n      exec sleep 30\n      ;;\n  esac\ndone\n"
     )).unwrap();
     fs::set_permissions(&script, fs::Permissions::from_mode(0o700)).unwrap();
     let engine = lifecycle_engine(script.clone(), &private);

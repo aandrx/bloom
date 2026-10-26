@@ -172,6 +172,12 @@ After either a root-cause fix or containment:
 2. Lifecycle checks: socket appears, TUI reaches readiness, exactly one daemon and one engine, SIGTERM leaves no child or stale socket, temporary store deleted by the harness.
 3. Report the two halves separately. ABI and licensing remain unverified until their own review.
 
+### Track B result
+
+The 768-byte line is consistent with a foreign stdout writer: the installed engine library contains multiple Rust logger implementations that can write to stdout. Rather than print or rewrite their payload, the sidecar now marks every protocol line, and the daemon skips a bounded number of unmarked non-JSON lines with a redacted structural log. Unmarked JSON remains compatible; a malformed marked frame still fails closed. Synthetic tests cover both paths.
+
+This is containment, not a proven root cause, and the live staged-prefix gate has not been rerun. Phase 4 remains open until that run and its two-half lifecycle checks pass.
+
 ## Track C: remaining rich messaging
 
 Inbound reactions, text edits and whole-body unsends are accepted. Remaining work is gated by transport evidence, not UI demand.

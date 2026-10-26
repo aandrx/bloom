@@ -640,6 +640,7 @@ async fn process_frames(stdout: tokio::process::ChildStdout, context: ReadFrameC
     } = context;
     let mut reader = BufReader::new(stdout);
     let mut my_handles: Vec<String> = Vec::new();
+    let mut foreign_stdout_lines: u64 = 0;
     let mut skipped_conversations = 0usize;
     let mut skipped: HashMap<SkipReason, u64> = HashMap::new();
     loop {
@@ -666,7 +667,29 @@ async fn process_frames(stdout: tokio::process::ChildStdout, context: ReadFrameC
                 break;
             }
         };
-        let frame: Value = match serde_json::from_str(&line) {
+        // The linked engine can write diagnostics to the same stdout. A marked
+        // line is protocol; unmarked JSON remains accepted for older sidecars.
+        // Anything else is foreign output: log only its structure and skip it,
+        // bounded so repeated corruption still closes the connection.
+        let protocol_line = if let Some(marked) = line.strip_prefix('\u{1e}') {
+            marked
+        } else if line.trim_start().starts_with('{') {
+            line.as_str()
+        } else {
+            foreign_stdout_lines += 1;
+            eprintln!(
+                "engine stdout carried an unmarked non-JSON line; skipping ({})",
+                unparsable_frame_summary(&line)
+            );
+            if foreign_stdout_lines > MAX_FOREIGN_STDOUT_LINES {
+                eprintln!(
+                    "engine produced too many foreign stdout lines; closing engine connection"
+                );
+                break;
+            }
+            continue;
+        };
+        let frame: Value = match serde_json::from_str(protocol_line) {
             Ok(frame) => frame,
             Err(_) => {
                 eprintln!(
@@ -1037,6 +1060,10 @@ fn envelope_sender(inst: &Value) -> Result<Handle, SkipReason> {
 /// Reaction kinds this mapper has evidence for. Anything else, including a
 /// free-form string or an emoji object, is skipped rather than guessed.
 const KNOWN_REACTIONS: [&str; 6] = ["heart", "like", "dislike", "laugh", "emphasize", "question"];
+
+/// A bounded number of foreign stdout lines is tolerated so one engine logger
+/// cannot permanently kill the session; repeated corruption still fails closed.
+const MAX_FOREIGN_STDOUT_LINES: u64 = 16;
 
 fn map_reaction(
     inst: &Value,

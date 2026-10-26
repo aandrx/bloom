@@ -10,6 +10,14 @@ import 'dart:convert';
 
 const int protocolVersion = 1;
 
+/// Marks a protocol line on stdout. The linked engine library can write its own
+/// diagnostics to stdout; the daemon accepts marked frames, tolerates legacy
+/// unmarked JSON, and skips other unmarked lines with a bounded structural log.
+const String wireMarker = '\u001e';
+
+/// Prefix one protocol line for the stdout stream.
+String wireLine(String frame) => '$wireMarker$frame';
+
 /// Reject absurd lines before parsing rather than allocating unbounded memory.
 const int maxFrameBytes = 1 << 20;
 

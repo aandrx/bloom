@@ -210,6 +210,12 @@ void main() {
       expect(frame['version'], protocolVersion);
     });
 
+    test('wire marker protects protocol lines from foreign stdout', () {
+      final line = wireLine('{"version":1}');
+      expect(line.startsWith(wireMarker), isTrue);
+      expect(line.substring(wireMarker.length), '{"version":1}');
+    });
+
     test('every frame carries the protocol version', () {
       for (final line in <String>[
         readyFrame(engineVersion: 'v', canSend: true, canReadHistory: false),

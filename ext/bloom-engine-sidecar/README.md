@@ -36,8 +36,11 @@ state and the same push connection.
 ## Protocol
 
 Newline-delimited UTF-8 JSON on stdin/stdout, one object per line, every frame
-carrying `"version": 1`. stdout carries protocol frames only; diagnostics go to
-stderr. Frames larger than 1 MiB are rejected before parsing.
+carrying `"version": 1`. Every protocol line on stdout begins with the ASCII
+record-separator marker `\u001e`; diagnostics go to stderr. The daemon also
+accepts legacy unmarked JSON, and skips a bounded number of unmarked non-JSON
+lines with a structural log because the linked engine can write its own logger
+output to stdout. Repeated foreign output still closes the connection. Frames larger than 1 MiB are rejected before parsing.
 
 Daemon to sidecar:
 
