@@ -218,14 +218,13 @@ Recommendation: keep the TUI as the supported client and evaluate GPUI as a seco
 - A GUI earns its cost on transcript layout, inline attachments, notifications, selection and pointer interaction, not on duplicating existing terminal structure.
 - The daemon/IPC boundary already supports another client, but shared UI state (`App`) is ratatui-shaped and must be extracted deliberately.
 
-### Bounded spike
+### Bounded spike result
 
-1. Build a disposable window that renders one long synthetic transcript with wrapping, selection, scroll, theme switching, and an attachment placeholder.
-2. Verify Linux Wayland and X11, input methods, high-DPI, frame time on a long transcript, and packaging impact.
-3. Compare against the previews, not a port of terminal geometry.
-4. Decide: proceed, defer, or reject. A successful spike is not a production port.
+A first compatibility/virtualization spike is complete in `spike/gpui/`, outside the workspace. GPUI 0.2.2 builds with Bloom's pinned Rust 1.97.1 after pinning `libc = 0.2.186` for a transitive `xattr` compatibility issue. It opens a dark three-pane synthetic messenger and virtualizes 10,000 fixed-height rows with Unicode, edited/unsent/reaction and attachment-placeholder states. Eight tests, strict Clippy, formatting, release build and an X11/Xwayland smoke pass; a headless 10,000-row run measured only model construction and six-row slice traversal, not rendered frames.
 
-If it proceeds, split into: shared client-state extraction, IPC client reuse, transcript surface, composer, attachments/notifications, and packaging. Keep the TUI passing throughout.
+Decision: GPUI is technically viable but not selected for a production port yet. The next bounded spike must add an editable composer, text selection/input-method checks, deterministic visual capture against the previews, and actual scroll/frame measurements on Wayland and X11. Theme switching, accessibility, responsive pane collapse, inline image rendering and packaging remain unproven.
+
+If that second spike passes, split production work into shared client-state extraction, IPC client reuse, transcript surface, composer, attachments/notifications, accessibility and packaging. Keep the TUI passing and supported throughout.
 
 ## Track E: multi-service direction
 

@@ -65,6 +65,16 @@ Frame budget under a long transcript, text layout fidelity against the previews,
 attachment rendering, and the same headless screenshot pipeline the TUI already has, so
 the design loop keeps working after the port.
 
+## 2026-10-26 bounded spike result
+
+A disposable standalone spike now lives in `spike/gpui/`; it is outside the root workspace and uses no daemon, IPC, account or engine. GPUI 0.2.2 builds under Bloom's pinned Rust 1.97.1 after pinning `libc = 0.2.186`: GPUI's transitive `xattr 0.2.3` still references `libc::ENOATTR`, which newer libc releases removed.
+
+The spike opens a 1200x780 dark three-pane synthetic messenger with a 220 px conversation list, a `uniform_list` transcript of 10,000 fixed-height 176 px rows, a 260 px details panel and a static composer. The row height is sized for the worst synthetic combination of three body lines, metadata, attachment and reactions, so virtualization does not hide clipped content. Rows cover incoming/outgoing surfaces, multiline Unicode, edited/unsent labels, reactions and attachment placeholders. It is dark-only, noninteractive beyond native scrolling, and has no responsive pane collapse; the 820x520 minimum prevents an unreadable narrow window.
+
+Observed gates: `cargo check`, eight unit tests, strict Clippy, formatting and release build pass. A release `--measure --rows 10000` run reported `build_ms=1.937`, `slices_ms=0.046`, checksum `481e356c24740c83`; this measures model construction and 100 six-row synthetic viewport slices, not GPUI frame rendering. The release binary is 25,343,504 bytes and links XCB/xkbcommon libraries. The real window remained alive for an 8-second X11/Xwayland smoke under the current Wayland session with no stderr.
+
+Decision: **GPUI remains viable but not selected for a production port.** The spike proves toolchain and basic virtualization compatibility. It does not prove frame budget, Wayland-native behavior, input methods, selection, accessibility, inline image rendering, screenshot fidelity or packaging. Before proceeding, the next bounded unit must add deterministic screenshot review against the previews plus measured scroll/frame behavior and a real editable composer. The TUI remains supported regardless.
+
 ## Related
 
 - `docs/system-design.md` describes the current domain, engine process boundary, IPC and encrypted store a GUI client would reuse.
