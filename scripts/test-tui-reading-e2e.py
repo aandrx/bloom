@@ -996,6 +996,43 @@ class ReadingFlows(unittest.TestCase):
         self.assertFalse(self.opener_record.exists())
         self.artifact('attachment-open-missing-opener')
 
+    def test_attach_command_sends_a_local_file(self):
+        source = self.fixture.root / 'report.txt'
+        source.write_text('attachment body', encoding='utf-8')
+        self.key(b'/attach ' + str(source).encode())
+        self.key(b'\r')
+        self.wait_for(lambda: 'Attachment sent: report.txt' in self.text())
+        self.wait_for(lambda: self.text().count('report.txt') >= 2,
+                      timeout=8)
+        self.assertNotIn(str(source), self.text(),
+                         'the source path must not be painted')
+        state = json.loads(self.fixture.store_path.read_text(encoding='utf-8'))
+        parts = state['messages'][-1]['parts']
+        self.assertEqual(parts[0]['type'], 'attachment')
+        self.assertEqual(parts[0]['value']['file_name'], 'report.txt')
+        self.assertEqual(parts[0]['value']['byte_len'], len('attachment body'))
+        self.artifact('attachment-send')
+
+    def test_attach_command_refuses_a_relative_path(self):
+        self.key(b'/attach relative.txt')
+        self.key(b'\r')
+        self.wait_for(lambda: 'Attachment path must be absolute.' in self.text())
+        self.artifact('attachment-send-relative')
+
+    def test_attach_command_reports_a_missing_file(self):
+        self.key(b'/attach ' + str(self.fixture.root / 'missing.txt').encode())
+        self.key(b'\r')
+        self.wait_for(lambda: 'Attachment not sent: missing.txt' in self.text())
+        self.artifact('attachment-send-missing')
+
+    def test_attach_command_refuses_a_dot_segment(self):
+        source = self.fixture.root / 'report.txt'
+        source.write_text('attachment body', encoding='utf-8')
+        dotted = str(self.fixture.root) + '/./report.txt'
+        self.key(b'/attach ' + dotted.encode())
+        self.key(b'\r')
+        self.wait_for(lambda: 'Attachment not sent: report.txt' in self.text())
+        self.artifact('attachment-send-dot-segment')
 
 
 if __name__ == '__main__':

@@ -10,8 +10,8 @@ use crate::{
     store::{self, EncryptedStore},
 };
 use bloom_domain::{
-    Conversation, ConversationId, ConversationKind, DeliveryState, Handle, HandleKind, Message,
-    MessageId, OutgoingBody, Participant, Reaction,
+    AttachmentRef, Conversation, ConversationId, ConversationKind, DeliveryState, Handle,
+    HandleKind, Message, MessageId, MessagePart, OutgoingBody, Participant, Reaction,
 };
 use bloom_ipc::{
     DraftKey as IpcDraftKey, DraftLoad as IpcDraftLoad, DraftWriteOutcome as IpcDraftWriteOutcome,
@@ -334,6 +334,14 @@ impl Service {
         body: &OutgoingBody,
     ) -> Result<(String, Vec<String>, Conversation), ProtocolError> {
         let text = outgoing_text(body).map_err(|_| ProtocolError::Unsupported)?;
+        let (recipients, conversation) = self.send_targets(conversation_id)?;
+        Ok((text, recipients, conversation))
+    }
+
+    fn send_targets(
+        &self,
+        conversation_id: &ConversationId,
+    ) -> Result<(Vec<String>, Conversation), ProtocolError> {
         let store = self.store.lock().unwrap();
         let conversation = store::get_conversation(&store, conversation_id)
             .map_err(|_| ProtocolError::Internal)?
@@ -347,8 +355,36 @@ impl Service {
         if recipients.is_empty() {
             return Err(ProtocolError::NotFound);
         }
-        Ok((text, recipients, conversation))
+        Ok((recipients, conversation))
     }
+}
+
+/// The sidecar re-validates before reading. This bound keeps a mistyped path
+/// from becoming a multi-hour upload.
+const MAX_OUTBOUND_ATTACHMENT_BYTES: u64 = 25 * 1024 * 1024;
+
+fn outgoing_attachment_file(path: &str) -> Result<(String, u64), ProtocolError> {
+    let candidate = std::path::Path::new(path);
+    // Check raw segments: `Path::components` normalizes interior dots, which
+    // would let `/tmp/./file` pass a components-only rule.
+    if !candidate.is_absolute() || path.split('/').any(|part| part == "." || part == "..") {
+        return Err(ProtocolError::InvalidRequest);
+    }
+    let metadata =
+        std::fs::symlink_metadata(candidate).map_err(|_| ProtocolError::InvalidRequest)?;
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
+        return Err(ProtocolError::InvalidRequest);
+    }
+    let byte_len = metadata.len();
+    if byte_len == 0 || byte_len > MAX_OUTBOUND_ATTACHMENT_BYTES {
+        return Err(ProtocolError::InvalidRequest);
+    }
+    let name = candidate
+        .file_name()
+        .and_then(|name| name.to_str())
+        .filter(|name| !name.trim().is_empty())
+        .ok_or(ProtocolError::InvalidRequest)?;
+    Ok((name.to_owned(), byte_len))
 }
 
 /// A one-line preview of a message for the sidebar's second line. Our own
@@ -634,6 +670,69 @@ impl RequestHandler for Service {
                 None,
                 sender,
                 body.parts.clone(),
+                created_at,
+                None,
+                DeliveryState::Sent,
+                true,
+                None,
+                Vec::new(),
+                None,
+            )
+            .map_err(|_| ProtocolError::Internal)?;
+
+            {
+                let mut store = self.store.lock().unwrap();
+                store::ingest_inbound(&mut store, &conversation, &message)
+                    .map_err(|_| ProtocolError::Internal)?;
+            }
+            self.hub.publish(Event {
+                event: EventKind::Message {
+                    conversation_id: conversation.id,
+                    message,
+                    push_sequence: None,
+                },
+            });
+            Ok(message_id)
+        })
+    }
+
+    fn send_attachment(
+        &self,
+        conversation_id: ConversationId,
+        path: String,
+    ) -> HandlerFuture<'_, MessageId> {
+        Box::pin(async move {
+            let (name, byte_len) = outgoing_attachment_file(&path)?;
+            let (recipients, conversation) = self.send_targets(&conversation_id)?;
+
+            let engine = self.current_engine();
+            let message_id = engine
+                .send_attachment(&recipients, Some(&conversation.remote_id), &path)
+                .await
+                .map_err(map_transport_error)?;
+
+            let sender = conversation
+                .participants
+                .iter()
+                .find(|participant| participant.is_me)
+                .map(|participant| participant.handle.clone())
+                .unwrap_or_else(|| {
+                    Handle::new(HandleKind::Opaque, "me").expect("static handle is valid")
+                });
+            let created_at = now_millis();
+            let attachment = AttachmentRef::new(
+                format!("local:{}", message_id.value()),
+                None,
+                Some(name),
+                Some(byte_len),
+            )
+            .map_err(|_| ProtocolError::Internal)?;
+            let message = Message::new(
+                message_id.clone(),
+                conversation.id.clone(),
+                None,
+                sender,
+                vec![MessagePart::Attachment(attachment)],
                 created_at,
                 None,
                 DeliveryState::Sent,
@@ -1853,6 +1952,75 @@ mod reaction_service_tests {
                 .await
                 .is_err(),
             "missing conversation must not publish an event"
+        );
+    }
+}
+
+#[cfg(test)]
+mod outgoing_attachment_tests {
+    use super::*;
+
+    fn file_with(directory: &std::path::Path, name: &str, bytes: usize) -> std::path::PathBuf {
+        let path = directory.join(name);
+        std::fs::write(&path, vec![b'x'; bytes]).unwrap();
+        path
+    }
+
+    #[test]
+    fn accepts_a_regular_file_and_reports_its_name_and_size() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = file_with(directory.path(), "report.txt", 5);
+        assert_eq!(
+            outgoing_attachment_file(path.to_str().unwrap()).unwrap(),
+            ("report.txt".to_owned(), 5)
+        );
+    }
+
+    #[test]
+    fn rejects_relative_parent_missing_directory_symlink_and_empty_paths() {
+        let directory = tempfile::tempdir().unwrap();
+        let folder = directory.path().join("folder");
+        std::fs::create_dir(&folder).unwrap();
+        let empty = file_with(directory.path(), "empty", 0);
+        let target = file_with(directory.path(), "target", 1);
+        // Exists so the interior-dot case fails only because of the raw segment
+        // check, not because the file is missing.
+        file_with(directory.path(), "report.txt", 5);
+        let link = directory.path().join("link");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+
+        for path in [
+            "relative.txt".to_owned(),
+            format!("{}/../escape", directory.path().display()),
+            format!("{}/./report.txt", directory.path().display()),
+            folder.to_str().unwrap().to_owned(),
+            link.to_str().unwrap().to_owned(),
+            empty.to_str().unwrap().to_owned(),
+            directory
+                .path()
+                .join("missing")
+                .to_str()
+                .unwrap()
+                .to_owned(),
+            "/".to_owned(),
+        ] {
+            assert_eq!(
+                outgoing_attachment_file(&path),
+                Err(ProtocolError::InvalidRequest),
+                "expected rejection for {path}"
+            );
+        }
+    }
+
+    #[test]
+    fn rejects_a_file_over_the_outbound_bound() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("large.bin");
+        let handle = std::fs::File::create(&path).unwrap();
+        handle.set_len(MAX_OUTBOUND_ATTACHMENT_BYTES + 1).unwrap();
+        assert_eq!(
+            outgoing_attachment_file(path.to_str().unwrap()),
+            Err(ProtocolError::InvalidRequest)
         );
     }
 }

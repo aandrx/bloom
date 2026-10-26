@@ -164,6 +164,22 @@ pub fn request_result(stage: Stage, attempt: u64, elapsed: Duration, error: Opti
     }
 }
 
+/// Outbound attachment sends have no draft attempt id. Log bounded timing and
+/// category only; never the path or file name.
+pub fn attachment_send_result(elapsed: Duration, error: Option<&ClientError>) {
+    match error {
+        Some(error) => record(&format!(
+            "request result stage=send_attachment elapsed_ms={} result=error category={}",
+            elapsed.as_millis(),
+            category(error)
+        )),
+        None => record(&format!(
+            "request result stage=send_attachment elapsed_ms={} result=ok",
+            elapsed.as_millis()
+        )),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

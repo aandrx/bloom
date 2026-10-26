@@ -58,6 +58,10 @@ pub enum Action {
     FetchAttachment {
         token: String,
     },
+    SendAttachment {
+        conversation: ConversationId,
+        path: String,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -497,6 +501,11 @@ pub struct App {
     pub open_after_attachment_fetch: bool,
     /// Open modal listing every fetchable attachment in the selected chat.
     pub attachment_picker: Option<AttachmentPicker>,
+    /// Basename of an outbound attachment send in flight. Used for the notice
+    /// and to refuse a second concurrent send.
+    pub attachment_send_in_flight: Option<String>,
+    /// An accepted `/attach` command awaiting transfer to the shell.
+    pub pending_attachment_send: Option<(ConversationId, String)>,
     pub sync_in_flight: bool,
     pub send_feedback: Option<SendFeedback>,
     pub recoverable_send: Option<RecoveryDraft>,
@@ -721,6 +730,8 @@ impl Default for App {
             attachment_in_flight: None,
             open_after_attachment_fetch: false,
             attachment_picker: None,
+            attachment_send_in_flight: None,
+            pending_attachment_send: None,
             sync_in_flight: false,
             send_feedback: None,
             recoverable_send: None,
@@ -2572,7 +2583,7 @@ impl App {
     /// moves on to the body so a new conversation cannot be started with a
     /// placeholder message.
     pub fn submit_intent(&mut self) -> CompositionIntent {
-        if self.pending_send_attempt.is_some() {
+        if self.pending_send_attempt.is_some() || self.attachment_send_in_flight.is_some() {
             return CompositionIntent::None;
         }
         let value = if self.new_conversation && self.pending_address.is_none() {
@@ -3314,6 +3325,7 @@ impl App {
             ("/unread", "Jump to the first unread message"),
             ("/cancel", "Close the composer"),
             ("/attachment", "Choose an attachment to save or open"),
+            ("/attach", "Send a local file to this chat"),
             ("/open", "Open the newest attachment externally"),
         ]
         .into_iter()
@@ -3512,6 +3524,28 @@ impl App {
         self.pending_attachment = Some(token);
     }
 
+    /// Settle one outbound attachment send. A protocol timeout is reported as
+    /// uncertain; nothing is retried automatically.
+    pub fn finish_attachment_send(&mut self, result: Result<MessageId, SendFailure>) {
+        let Some(name) = self.attachment_send_in_flight.take() else {
+            return;
+        };
+        match result {
+            Ok(_) => {
+                self.error = None;
+                self.notice = Some(format!("Attachment sent: {}", name.escape_debug()));
+            }
+            Err(error) => {
+                self.notice = None;
+                self.error = Some(if error.uncertain {
+                    "Attachment send outcome is uncertain; check the chat before resending.".into()
+                } else {
+                    format!("Attachment not sent: {}", name.escape_debug())
+                });
+            }
+        }
+    }
+
     /// Settles a fetch. Returns the cache path when the caller must open it.
     pub fn finish_attachment_fetch(
         &mut self,
@@ -3617,6 +3651,10 @@ impl App {
     }
 
     fn execute_command(&mut self) {
+        if self.draft == "/attach" || self.draft.starts_with("/attach ") {
+            self.execute_attach_command();
+            return;
+        }
         let words: Vec<_> = self.draft.split_whitespace().collect();
         self.command_menu = false;
         match words.as_slice() {
@@ -3705,8 +3743,51 @@ impl App {
         }
     }
 
+    fn execute_attach_command(&mut self) {
+        let path = self
+            .draft
+            .strip_prefix("/attach")
+            .unwrap_or("")
+            .trim()
+            .to_owned();
+        if path.is_empty() {
+            self.error = Some("Usage: /attach <absolute path>".into());
+            return;
+        }
+        if !path.starts_with('/') {
+            self.error = Some("Attachment path must be absolute.".into());
+            return;
+        }
+        if self.attachment_send_in_flight.is_some() {
+            self.error = Some("An attachment is already being sent.".into());
+            return;
+        }
+        if self.pending_send_attempt.is_some() {
+            self.error = Some("Wait for the current message to finish.".into());
+            return;
+        }
+        let Some(conversation) = self.selected.clone() else {
+            self.error = Some("Open a chat before sending an attachment.".into());
+            return;
+        };
+        let name = path.rsplit('/').next().unwrap_or("").to_owned();
+        if name.is_empty() {
+            self.error = Some("Attachment path has no file name.".into());
+            return;
+        }
+        self.error = None;
+        self.notice = Some(format!("Sending attachment {}...", name.escape_debug()));
+        self.attachment_send_in_flight = Some(name);
+        self.pending_attachment_send = Some((conversation, path));
+        self.draft.clear();
+        self.draft_cursor = 0;
+        self.command_menu = false;
+    }
+
     fn take_pending_action(&mut self) -> Action {
-        if let Some(token) = self.pending_attachment.take() {
+        if let Some((conversation, path)) = self.pending_attachment_send.take() {
+            Action::SendAttachment { conversation, path }
+        } else if let Some(token) = self.pending_attachment.take() {
             self.attachment_in_flight = Some(token.clone());
             Action::FetchAttachment { token }
         } else if let Some((request, query, participant)) = self.pending_search.take() {
@@ -5378,7 +5459,7 @@ impl App {
     /// Commands that take an argument autofill into the composer; commands that
     /// open a mode run the moment they are chosen.
     fn command_needs_argument(name: &str) -> bool {
-        matches!(name, "/nickname" | "/theme" | "/search")
+        matches!(name, "/nickname" | "/theme" | "/search" | "/attach")
     }
 
     /// Run (or autofill) the highlighted command from the popup.
@@ -6124,6 +6205,100 @@ mod tests {
         ];
         assert_eq!(chat_name(&group), "One, two, three +1");
         assert_eq!(conversation_subtitle(&group), "5 people");
+    }
+
+    #[test]
+    fn attach_command_queues_one_send_and_hides_the_source_path() {
+        let chat = conversation("attach@example.test", Some(10));
+        let mut app = App {
+            selected: Some(chat.id.clone()),
+            ..Default::default()
+        };
+        app.draft = "/attach /tmp/report.txt".into();
+        app.execute_command();
+        assert_eq!(app.attachment_send_in_flight.as_deref(), Some("report.txt"));
+        let notice = app.notice.clone().expect("sending notice");
+        assert!(notice.contains("report.txt"));
+        assert!(
+            !notice.contains("/tmp"),
+            "the notice must not show the path"
+        );
+        assert!(matches!(
+            app.take_pending_action(),
+            Action::SendAttachment { conversation, path }
+                if conversation == chat.id && path == "/tmp/report.txt"
+        ));
+        assert_eq!(app.take_pending_action(), Action::None);
+    }
+
+    #[test]
+    fn attach_command_refuses_relative_paths_and_a_second_concurrent_send() {
+        let chat = conversation("attach@example.test", Some(10));
+        let mut app = App {
+            selected: Some(chat.id.clone()),
+            ..Default::default()
+        };
+        app.draft = "/attach relative.txt".into();
+        app.execute_command();
+        assert_eq!(
+            app.error.as_deref(),
+            Some("Attachment path must be absolute.")
+        );
+        assert_eq!(app.attachment_send_in_flight, None);
+
+        app.error = None;
+        app.attachment_send_in_flight = Some("first.txt".into());
+        app.draft = "/attach /tmp/second.txt".into();
+        app.execute_command();
+        assert_eq!(
+            app.error.as_deref(),
+            Some("An attachment is already being sent.")
+        );
+        assert_eq!(app.take_pending_action(), Action::None);
+    }
+
+    #[test]
+    fn attach_command_without_a_selected_chat_does_not_queue_a_send() {
+        let mut app = App {
+            draft: "/attach /tmp/report.txt".into(),
+            ..Default::default()
+        };
+        app.execute_command();
+        assert_eq!(
+            app.error.as_deref(),
+            Some("Open a chat before sending an attachment.")
+        );
+        assert_eq!(app.take_pending_action(), Action::None);
+    }
+
+    #[test]
+    fn attachment_send_results_clear_the_notice_and_keep_uncertainty_explicit() {
+        let mut app = App {
+            attachment_send_in_flight: Some("report.txt".into()),
+            ..Default::default()
+        };
+        app.finish_attachment_send(Err(SendFailure {
+            message: "protocol".into(),
+            uncertain: true,
+        }));
+        assert_eq!(app.attachment_send_in_flight, None);
+        assert!(app
+            .error
+            .as_deref()
+            .is_some_and(|message| message.contains("uncertain")));
+
+        app.error = None;
+        app.attachment_send_in_flight = Some("report.txt".into());
+        app.draft = "blocked body".into();
+        assert!(matches!(app.submit_intent(), CompositionIntent::None));
+        let id = bloom_domain::MessageId::new(
+            bloom_domain::TransportId::new("openbubbles").unwrap(),
+            "sent-report",
+        )
+        .unwrap();
+        app.finish_attachment_send(Ok(id));
+        assert_eq!(app.attachment_send_in_flight, None);
+        assert_eq!(app.notice.as_deref(), Some("Attachment sent: report.txt"));
     }
 
     #[test]

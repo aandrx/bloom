@@ -20,7 +20,7 @@ import threading
 import time
 import unicodedata
 
-PROTOCOL_VERSION = 8
+PROTOCOL_VERSION = 9
 MAX_FRAME = 1024 * 1024
 MAX_DRAFT_BYTES = 65_536
 SEARCH_SCAN_LIMIT = 20_000

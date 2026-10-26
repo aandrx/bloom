@@ -1,6 +1,6 @@
 # Inbound attachment opening: evidence gate
 
-Status: evidence gathered, no attachment download or opening implemented. This record answers whether Bloom has a lawful, reachable local path for inbound attachment content before any UI or storage change.
+Status: accepted at the documented boundaries below. C1e records a live inbound save and C1g a live chooser save. Earlier sections keep their original gate wording and name IPC v8; outbound attachment send later moved the protocol to v9.
 
 ## Question
 

@@ -36,7 +36,7 @@ import time
 from pathlib import Path
 
 ACK = 'one-shot-authorized'
-VERSION = 8
+VERSION = 9
 MAX_FRAME = 1 << 24
 TOKEN = re.compile(r'^[0-9a-f]{32}$')
 PID_LINE = re.compile(r'engine child started pid=(?:Some\()?(\d+)')

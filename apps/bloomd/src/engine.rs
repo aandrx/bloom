@@ -36,6 +36,9 @@ pub const MAX_FRAME_BYTES: usize = 1 << 20;
 pub const EVENT_CAPACITY: usize = 256;
 /// How long a send may wait for its confirmation before the result is uncertain.
 pub const SEND_TIMEOUT: Duration = Duration::from_secs(30);
+/// Attachment upload and send can legitimately outlast a text send. A timeout is
+/// an uncertain outcome: the remote side may still have accepted the file.
+pub const ATTACHMENT_SEND_TIMEOUT: Duration = Duration::from_secs(240);
 /// Grace period for final sidecar frames; also bounds individual shutdown I/O.
 pub const STOP_TIMEOUT: Duration = Duration::from_secs(10);
 const READER_STOP_TIMEOUT: Duration = Duration::from_secs(2);
@@ -275,6 +278,66 @@ impl Engine {
         }
     }
 
+    /// Upload and send one local file through the sidecar. The sidecar validates
+    /// the path again before reading it, and the path is never logged or stored.
+    pub async fn send_attachment(
+        &self,
+        recipients: &[String],
+        chat_guid: Option<&str>,
+        path: &str,
+    ) -> TransportResult<MessageId> {
+        if recipients.is_empty()
+            || recipients
+                .iter()
+                .any(|recipient| recipient.trim().is_empty())
+            || path.trim().is_empty()
+        {
+            return Err(TransportError::Protocol);
+        }
+        if !self.started.load(Ordering::SeqCst) {
+            return Err(TransportError::TransportUnavailable);
+        }
+        if recipients.len() > 1 && !self.recipient_lists_supported.load(Ordering::SeqCst) {
+            return Err(TransportError::Unsupported);
+        }
+        let request_id = self.next_request.fetch_add(1, Ordering::Relaxed);
+        let (sender, receiver) = oneshot::channel();
+        self.pending
+            .waiters
+            .lock()
+            .unwrap()
+            .insert(request_id, sender);
+
+        let mut frame = serde_json::json!({
+            "version": 1,
+            "type": "attachment_send",
+            "request_id": request_id,
+            "recipients": recipients,
+            "path": path,
+        });
+        if let [recipient] = recipients {
+            frame["recipient"] = Value::String(recipient.clone());
+        }
+        if let Some(guid) = chat_guid {
+            frame["chat_guid"] = Value::String(guid.to_owned());
+        }
+
+        if self.write_frame(&frame).await.is_err() {
+            self.pending.waiters.lock().unwrap().remove(&request_id);
+            return Err(TransportError::TransportUnavailable);
+        }
+
+        match tokio::time::timeout(ATTACHMENT_SEND_TIMEOUT, receiver).await {
+            Ok(Ok(result)) => result,
+            Ok(Err(_)) => Err(TransportError::Internal),
+            Err(_) => {
+                self.pending.waiters.lock().unwrap().remove(&request_id);
+                // The upload or send may have completed remotely.
+                Err(TransportError::Protocol)
+            }
+        }
+    }
+
     /// Request bounded remote conversation-list metadata sync. Does not fetch messages.
     pub async fn sync_conversations(&self) -> TransportResult<(bool, u32)> {
         let _serial = self.sync_lock.lock().await;
@@ -371,6 +434,8 @@ impl Transport for Engine {
             reactions: false,
             edits: false,
             unsend: false,
+            // The generic transport send rejects attachments; the daemon's
+            // store-backed send_attachment path is separate.
             attachments: false,
             groups: false,
             typing: false,

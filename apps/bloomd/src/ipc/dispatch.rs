@@ -62,6 +62,13 @@ pub trait RequestHandler: Send + Sync {
         conversation_id: ConversationId,
         body: OutgoingBody,
     ) -> HandlerFuture<'_, MessageId>;
+    fn send_attachment(
+        &self,
+        _conversation_id: ConversationId,
+        _path: String,
+    ) -> HandlerFuture<'_, MessageId> {
+        Box::pin(async { Err(ProtocolError::Unsupported) })
+    }
     fn start_conversation(
         &self,
         address: String,
@@ -175,6 +182,13 @@ async fn serve_inner<H: RequestHandler>(
                 conversation_id,
                 body,
             } => match handler.send(conversation_id, body).await {
+                Ok(message_id) => ResponseKind::Send { message_id },
+                Err(error) => ResponseKind::Error { error },
+            },
+            RequestKind::SendAttachment {
+                conversation_id,
+                path,
+            } => match handler.send_attachment(conversation_id, path).await {
                 Ok(message_id) => ResponseKind::Send { message_id },
                 Err(error) => ResponseKind::Error { error },
             },

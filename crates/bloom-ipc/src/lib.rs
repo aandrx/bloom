@@ -20,9 +20,9 @@ use std::{fmt, io};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use unicode_segmentation::UnicodeSegmentation;
 
-/// Bumped to 8 for typed attachment fetch. Version 7 peers are rejected at
-/// the frame byte, so they cannot silently ignore attachment requests.
-pub const PROTOCOL_VERSION: u16 = 8;
+/// Bumped to 9 for typed outbound attachment send. Version 8 peers are rejected
+/// at the frame byte, so they cannot silently ignore the new request.
+pub const PROTOCOL_VERSION: u16 = 9;
 /// Largest accepted `message_context` limit. Dispatch rejects larger limits
 /// instead of clamping them.
 pub const MAX_MESSAGE_CONTEXT_LIMIT: u32 = 200;
@@ -337,6 +337,13 @@ pub enum RequestKind {
     /// sidecar. The token is exactly 32 lowercase hex characters.
     FetchAttachment {
         token: String,
+    },
+    /// Send one local file to an existing conversation. `path` must be absolute;
+    /// the daemon validates it and hands it to the sidecar without persisting or
+    /// logging it. A new request variant requires a protocol version bump.
+    SendAttachment {
+        conversation_id: ConversationId,
+        path: String,
     },
 }
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -801,7 +808,34 @@ mod tests {
             ResponseKind::MessageContext { messages } => assert_eq!(messages, vec![message]),
             _ => panic!("expected message context"),
         }
-        assert_eq!(PROTOCOL_VERSION, 8);
+        assert_eq!(PROTOCOL_VERSION, 9);
+    }
+
+    #[test]
+    fn send_attachment_round_trips_and_keeps_the_path_out_of_debug() {
+        let transport = TransmissionForTests::transport();
+        let conversation = ConversationId::new(transport, "exact-conversation").unwrap();
+        let request = Request {
+            request_id: 21,
+            request: RequestKind::SendAttachment {
+                conversation_id: conversation.clone(),
+                path: "/tmp/exact-attachment.bin".into(),
+            },
+        };
+        let encoded = serde_json::to_value(&request).unwrap();
+        assert_eq!(encoded["request"]["op"], "send_attachment");
+        assert_eq!(encoded["request"]["path"], "/tmp/exact-attachment.bin");
+        let decoded: Request = serde_json::from_value(encoded).unwrap();
+        match decoded.request {
+            RequestKind::SendAttachment {
+                conversation_id,
+                path,
+            } => {
+                assert_eq!(conversation_id, conversation);
+                assert_eq!(path, "/tmp/exact-attachment.bin");
+            }
+            _ => panic!("expected send attachment"),
+        }
     }
 
     #[test]

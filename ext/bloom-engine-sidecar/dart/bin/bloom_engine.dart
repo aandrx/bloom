@@ -20,6 +20,7 @@ import '../lib/attachment_cache.dart';
 import '../lib/payload_codec.dart';
 import '../lib/protocol.dart';
 import '../lib/send_coordinator.dart';
+import '../lib/attachment_send.dart';
 import '../lib/single_flight.dart';
 import '../lib/upstream/api/api.dart' as api;
 import '../lib/upstream/lib.dart' as upstream;
@@ -590,6 +591,95 @@ Future<void> _handleCommand({
             retryable: true,
           ),
         );
+      }
+    case AttachmentSendCommand():
+      String? messageId;
+      try {
+        final handles = await api.getHandles(state: deskState.client);
+        final sender = chooseSender(handles, command.recipients);
+        if (sender == null) {
+          writeProtocolFrame(sendConfirmFrame(
+            requestId: command.requestId,
+            messageId: '',
+            accepted: false,
+            error: 'no_sender_handle',
+          ));
+          return;
+        }
+        // Validate as the last step before upload so a path swap during the
+        // handle lookup cannot slip between the checks and the read. The file
+        // API still takes a path, so a same-user swap during upload itself is a
+        // documented local-threat limit.
+        final attachment = validateOutgoingAttachment(command.path);
+        final engineSender = engineHandle(sender);
+        api.Attachment? uploaded;
+        final transfer = api.uploadAttachment(
+          aps: deskState.conn,
+          path: attachment.path,
+          mime: attachment.mime,
+          uti: attachment.uti,
+          name: attachment.name,
+        );
+        await for (final event in transfer) {
+          if (event.attachment != null) uploaded = event.attachment;
+        }
+        if (uploaded == null) {
+          throw const AttachmentSendFailure('upload_missing');
+        }
+        final inst = await api.newMsg(
+          conversation: engineConversationData(
+            recipients: command.recipients,
+            sender: engineSender,
+            chatGuid: command.chatGuid,
+          ),
+          sender: engineSender,
+          message: api.Message.message(api.NormalMessage(
+            parts: api.MessageParts(
+              field0: <api.IndexedMessagePart>[
+                api.IndexedMessagePart(
+                  part_: api.MessagePart.attachment(uploaded),
+                ),
+              ],
+            ),
+            service: const api.MessageType.iMessage(),
+            voice: false,
+          )),
+        );
+        messageId = inst.id;
+        sends.register(inst.id, command.requestId);
+        final stillRunning = await api.send(
+          state: deskState.client,
+          local: deskState.localBroadcast,
+          msg: inst,
+        );
+        sends.sendReturned(messageId: inst.id, stillRunning: stillRunning);
+      } on AttachmentSendFailure catch (failure) {
+        stderr.writeln('attachment send rejected: ${failure.code}');
+        writeProtocolFrame(sendConfirmFrame(
+          requestId: command.requestId,
+          messageId: '',
+          accepted: false,
+          error: failure.code,
+        ));
+      } catch (error) {
+        if (messageId != null) {
+          // The engine may already have accepted the attachment. Leave the
+          // request unresolved so the daemon reports an uncertain timeout
+          // rather than a false "not sent".
+          sends.discard(messageId);
+          stderr.writeln(
+            'attachment send outcome uncertain: ${error.runtimeType}',
+          );
+          return;
+        }
+        // Exception strings can contain the path, so log only the type.
+        stderr.writeln('attachment send failed: ${error.runtimeType}');
+        writeProtocolFrame(sendConfirmFrame(
+          requestId: command.requestId,
+          messageId: '',
+          accepted: false,
+          error: 'send_failed',
+        ));
       }
   }
 }

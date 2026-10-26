@@ -358,6 +358,18 @@ impl FakeDaemon {
                                     )
                                     .await;
                                 }
+                                RequestKind::SendAttachment { .. } => {
+                                    let _ = write_response(
+                                        &mut stream,
+                                        &Response {
+                                            request_id,
+                                            response: ResponseKind::Error {
+                                                error: ProtocolError::Unsupported,
+                                            },
+                                        },
+                                    )
+                                    .await;
+                                }
                                 RequestKind::FetchAttachment { .. } => {
                                     let _ = write_response(
                                         &mut stream,

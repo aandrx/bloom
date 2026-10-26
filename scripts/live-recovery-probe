@@ -33,7 +33,7 @@ import tempfile
 import time
 
 ACK = "one-shot-authorized"
-VERSION = 7
+VERSION = 9
 MAX_FRAME = 1024 * 1024
 START_TIMEOUT = 120.0
 REPLACEMENT_TIMEOUT = 90.0

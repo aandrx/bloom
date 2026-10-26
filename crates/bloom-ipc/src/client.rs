@@ -15,6 +15,10 @@ use tokio::net::UnixStream;
 static NEXT_ID: AtomicU64 = AtomicU64::new(1);
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 const SYNC_REQUEST_TIMEOUT: Duration = Duration::from_secs(150);
+/// Outbound attachment upload can outlast a text send and a sync. The daemon
+/// uses a shorter deadline (240 s) so it can report an uncertain outcome before
+/// this client gives up on the frame.
+const ATTACHMENT_SEND_TIMEOUT: Duration = Duration::from_secs(250);
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 
 #[derive(Clone)]
@@ -336,6 +340,28 @@ impl BloomClient {
         }
     }
 
+    /// Send one local file to an existing conversation. The daemon validates the
+    /// path and the sidecar uploads it; the path never appears in events or logs.
+    pub async fn send_attachment(
+        &self,
+        conversation_id: ConversationId,
+        path: String,
+    ) -> Result<MessageId, ClientError> {
+        match self
+            .request_with_timeout(
+                RequestKind::SendAttachment {
+                    conversation_id,
+                    path,
+                },
+                ATTACHMENT_SEND_TIMEOUT,
+            )
+            .await?
+        {
+            ResponseKind::Send { message_id } => Ok(message_id),
+            _ => Err(ClientError::UnexpectedResponse),
+        }
+    }
+
     pub async fn subscribe(&self) -> Result<EventStream, ClientError> {
         let id = Self::id();
         let mut stream = self.connect().await?;
@@ -595,7 +621,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn attachment_fetch_uses_v8_and_returns_the_typed_result() {
+    async fn attachment_fetch_uses_v9_and_returns_the_typed_result() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("attachment");
         let listener = UnixListener::bind(&path).unwrap();
@@ -627,6 +653,58 @@ mod tests {
                 .await
                 .unwrap(),
             ("/private/cache/token.bin".to_owned(), 42)
+        );
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn attachment_send_sends_one_typed_request_and_returns_the_message_id() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("attachment-send");
+        let listener = UnixListener::bind(&path).unwrap();
+        let expected = ConversationId::new(
+            bloom_domain::TransportId::new("openbubbles").unwrap(),
+            "iMessage;-;+15550001111",
+        )
+        .unwrap();
+        let reply = MessageId::new(
+            bloom_domain::TransportId::new("openbubbles").unwrap(),
+            "sent-attachment",
+        )
+        .unwrap();
+        let reply_for_server = reply.clone();
+        let expected_for_server = expected.clone();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let request = crate::read_request(&mut stream).await.unwrap();
+            match &request.request {
+                RequestKind::SendAttachment {
+                    conversation_id,
+                    path,
+                } => {
+                    assert_eq!(conversation_id, &expected_for_server);
+                    assert_eq!(path, "/private/outgoing.bin");
+                }
+                _ => panic!("expected send attachment"),
+            }
+            write_response(
+                &mut stream,
+                &Response {
+                    request_id: request.request_id,
+                    response: ResponseKind::Send {
+                        message_id: reply_for_server,
+                    },
+                },
+            )
+            .await
+            .unwrap();
+        });
+        assert_eq!(
+            BloomClient::new(path)
+                .send_attachment(expected, "/private/outgoing.bin".into())
+                .await
+                .unwrap(),
+            reply
         );
         server.await.unwrap();
     }

@@ -419,6 +419,8 @@ async fn main() -> Result<()> {
     )>();
     let (attachment_tx, mut attachment_rx) =
         mpsc::unbounded_channel::<(String, Result<(String, u64), ClientError>)>();
+    let (attachment_send_tx, mut attachment_send_rx) =
+        mpsc::unbounded_channel::<Result<MessageId, SendFailure>>();
     let (visible_tx, visible_rx) = watch::channel::<Option<bloom_domain::ConversationId>>(None);
 
     {
@@ -689,6 +691,10 @@ async fn main() -> Result<()> {
                 }
                 redraw.request();
             },
+            Some(result) = attachment_send_rx.recv() => {
+                app.finish_attachment_send(result);
+                redraw.request();
+            },
             Some((token, result)) = attachment_rx.recv() => {
                 let result = result.map_err(|error| match error {
                     ClientError::Server(ProtocolError::InvalidRequest)
@@ -789,6 +795,20 @@ async fn main() -> Result<()> {
                             diagnostics::request_result(Stage::Send, attempt, started.elapsed(), result.as_ref().err());
                             let result = result.map_err(SendFailure::from);
                             let _ = send_tx.send((attempt, target, result));
+                        });
+                    }
+                    bloom_tui::app::Action::SendAttachment { conversation, path } => {
+                        let client = client.clone();
+                        let tx = attachment_send_tx.clone();
+                        tokio::spawn(async move {
+                            let started = std::time::Instant::now();
+                            diagnostics::record("request begin stage=send_attachment");
+                            let result = client.send_attachment(conversation, path).await;
+                            diagnostics::attachment_send_result(
+                                started.elapsed(),
+                                result.as_ref().err(),
+                            );
+                            let _ = tx.send(result.map_err(SendFailure::from));
                         });
                     }
                     bloom_tui::app::Action::StartConversation { attempt, address, body } => {

@@ -12,7 +12,7 @@ import time
 import unicodedata
 import uuid
 
-VERSION = 8
+VERSION = 9
 MAX_FRAME = 1024 * 1024
 MAX_DRAFT_BYTES = 65_536
 SEARCH_SCAN_LIMIT = 20_000
@@ -557,6 +557,54 @@ def serve(client, args, state):
                         os.chmod(cached, 0o600)
                         response = {"result": "attachment_fetched",
                                     "path": cached, "bytes": 42}
+                elif op == "send_attachment":
+                    cid = body.get("conversation_id", {})
+                    path = body.get("path")
+                    with LOCK:
+                        candidate = next((x for x in state["conversations"] if x["id"] == cid), None)
+                    if candidate is None or cid.get("transport") != "openbubbles":
+                        raise LookupError
+                    try:
+                        valid = (isinstance(path, str) and os.path.isabs(path)
+                                 and not any(part in ('.', '..')
+                                             for part in path.split('/'))
+                                 and not os.path.islink(path) and os.path.isfile(path)
+                                 and 0 < os.path.getsize(path) <= 25 * 1024 * 1024)
+                        name = os.path.basename(path) if valid else ""
+                    except OSError:
+                        valid = False
+                        name = ""
+                    if not valid or not name:
+                        write(client, {"request_id": request_id,
+                                       "response": {"result": "error", "error": "invalid_request"}})
+                        continue
+                    if args.reject_first_send and not getattr(args, "used_send"):
+                        setattr(args, "used_send", True)
+                        write(client, {"request_id": request_id,
+                                       "response": {"result": "error", "error": "transport_unavailable"}})
+                        continue
+                    if args.delay:
+                        time.sleep(args.delay)
+                    now = int(time.time() * 1000)
+                    byte_len = os.path.getsize(path)
+                    with LOCK:
+                        candidate = next((x for x in state["conversations"] if x["id"] == candidate["id"]), None)
+                        if candidate is None:
+                            raise LookupError
+                        message = {"id": {"transport": "openbubbles", "value": uuid.uuid4().hex},
+                                   "conversation_id": candidate["id"], "remote_id": None, "sender": MY_HANDLE,
+                                   "parts": [{"type": "attachment",
+                                              "value": {"id": f"local:{uuid.uuid4().hex}",
+                                                        "mime_type": None, "file_name": name,
+                                                        "byte_len": byte_len}}],
+                                   "created_at": now, "sent_at": now, "delivery": "sent",
+                                   "from_me": True, "edited_at": None, "reactions": [], "unsent_at": None}
+                        state["messages"].append(message)
+                        candidate["preview"] = "You: [attachment]"
+                        candidate["last_message_at"] = now
+                        save(state, args.store)
+                    push_all({"event": "message", "conversation_id": candidate["id"], "message": message})
+                    response = {"result": "send", "message_id": message["id"]}
                 elif op in ("send", "start_conversation"):
                     is_start = op == "start_conversation"
                     parts = body.get("body", {}).get("parts", [])

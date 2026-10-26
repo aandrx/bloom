@@ -67,6 +67,24 @@ final class SendCommand extends Command {
   final String? chatGuid;
 }
 
+final class AttachmentSendCommand extends Command {
+  const AttachmentSendCommand({
+    required this.requestId,
+    required this.recipients,
+    required this.path,
+    this.chatGuid,
+  });
+
+  final int requestId;
+  final List<String> recipients;
+
+  /// Absolute local path. Never logged and never returned in a frame.
+  final String path;
+
+  /// When present, the message is threaded into this existing conversation.
+  final String? chatGuid;
+}
+
 final class SyncConversationsCommand extends Command {
   const SyncConversationsCommand({required this.requestId});
   final int requestId;
@@ -91,12 +109,13 @@ final class ShutdownCommand extends Command {
 /// Recover only the correlation ID from a rejected send frame.
 ///
 /// This lets an older daemon receive a negative send confirmation when paired
-/// with a newer sidecar, rather than waiting for its request timeout.
+/// with a newer sidecar, rather than waiting for its request timeout. It also
+/// covers attachment sends, which share the send waiter.
 int? rejectedSendRequestId(String line) {
   try {
     final decoded = jsonDecode(line);
     if (decoded is Map<String, dynamic> &&
-        decoded['type'] == 'send' &&
+        (decoded['type'] == 'send' || decoded['type'] == 'attachment_send') &&
         decoded['request_id'] is int) {
       return decoded['request_id'] as int;
     }
@@ -205,6 +224,36 @@ Command decodeCommand(String line) {
         );
       }
       return SyncConversationsCommand(requestId: requestId);
+    case 'attachment_send':
+      final requestId = decoded['request_id'];
+      final recipients = decoded['recipients'];
+      final path = decoded['path'];
+      if (requestId is! int ||
+          recipients is! List ||
+          path is! String ||
+          recipients.any(
+            (value) => value is! String || value.trim().isEmpty,
+          )) {
+        throw ProtocolException(
+          ProtocolCodes.invalidFrame,
+          'attachment_send requires integer request_id, string recipients array and string path',
+        );
+      }
+      final normalizedRecipients = recipients.cast<String>();
+      if (normalizedRecipients.isEmpty ||
+          normalizedRecipients.any((value) => value.isEmpty) ||
+          path.isEmpty) {
+        throw ProtocolException(
+          ProtocolCodes.invalidFrame,
+          'attachment_send recipients and path must not be empty',
+        );
+      }
+      return AttachmentSendCommand(
+        requestId: requestId,
+        recipients: List<String>.unmodifiable(normalizedRecipients),
+        path: path,
+        chatGuid: _optionalChatGuid(decoded),
+      );
     case 'attachment_fetch':
       final requestId = decoded['request_id'];
       final token = decoded['token'];

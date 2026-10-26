@@ -139,6 +139,58 @@ void main() {
       }
     });
 
+    test('accepts attachment_send with recipients, path and chat guid', () {
+      final command = decodeCommand(
+        jsonEncode(<String, Object?>{
+          'version': protocolVersion,
+          'type': 'attachment_send',
+          'request_id': 32,
+          'recipients': <String>['tel:+15550001111'],
+          'path': '/private/outgoing.bin',
+          'chat_guid': 'iMessage;-;+15550001111',
+        }),
+      );
+      expect(command, isA<AttachmentSendCommand>());
+      final send = command as AttachmentSendCommand;
+      expect(send.requestId, 32);
+      expect(send.recipients, <String>['tel:+15550001111']);
+      expect(send.path, '/private/outgoing.bin');
+      expect(send.chatGuid, 'iMessage;-;+15550001111');
+      for (final frame in <Map<String, Object?>>[
+        <String, Object?>{
+          'version': protocolVersion,
+          'type': 'attachment_send',
+          'request_id': 32,
+          'recipients': <String>[],
+          'path': '/private/outgoing.bin',
+        },
+        <String, Object?>{
+          'version': protocolVersion,
+          'type': 'attachment_send',
+          'request_id': 32,
+          'recipients': <String>['tel:+15550001111'],
+          'path': '',
+        },
+        <String, Object?>{
+          'version': protocolVersion,
+          'type': 'attachment_send',
+          'request_id': 32,
+          'recipients': <String>['tel:+15550001111'],
+        },
+      ]) {
+        expect(
+          () => decodeCommand(jsonEncode(frame)),
+          throwsA(
+            isA<ProtocolException>().having(
+              (e) => e.code,
+              'code',
+              ProtocolCodes.invalidFrame,
+            ),
+          ),
+        );
+      }
+    });
+
     test('rejects a scalar-only legacy send with a correlated response', () {
       final frame = decodeFrame(
         rejectedCommandFrame(
@@ -187,6 +239,25 @@ void main() {
       expect(frame['type'], 'error');
       expect(frame['request_id'], 44);
       expect(frame['code'], ProtocolCodes.invalidToken);
+    });
+
+    test('correlates a rejected attachment send with a negative confirmation',
+        () {
+      final frame = decodeFrame(
+        rejectedCommandFrame(
+          jsonEncode(<String, Object?>{
+            'version': protocolVersion,
+            'type': 'attachment_send',
+            'request_id': 46,
+            'recipients': <String>['tel:+15550001111'],
+          }),
+          ProtocolCodes.invalidFrame,
+        ),
+      );
+      expect(frame['type'], 'send_confirmation');
+      expect(frame['request_id'], 46);
+      expect(frame['accepted'], false);
+      expect(frame['error'], ProtocolCodes.invalidFrame);
     });
 
     test('attachment result carries its correlated path and bytes', () {

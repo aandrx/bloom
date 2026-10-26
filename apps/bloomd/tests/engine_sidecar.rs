@@ -1282,6 +1282,10 @@ FRAMES
 while IFS= read -r line; do
   printf '%s\n' "$line" >> '{log}'
   case "$line" in
+    *'"type":"attachment_send"'*)
+      id=$(printf '%s' "$line" | sed -n 's/.*"request_id":\([0-9]*\).*/\1/p')
+      printf '{{"version":1,"type":"send_confirmation","request_id":%s,"message_id":"attachment-%s","accepted":true}}\n' "$id" "$id"
+      ;;
     *'"type":"send"'*)
       id=$(printf '%s' "$line" | sed -n 's/.*"request_id":\([0-9]*\).*/\1/p')
       printf '{{"version":1,"type":"send_confirmation","request_id":%s,"message_id":"outbound-%s","accepted":true}}\n' "$id" "$id"
@@ -1579,6 +1583,133 @@ async fn the_daemon_sends_engine_form_recipients_exactly_once_prefixed() {
             "recipients must not be double prefixed: {frame}"
         );
     }
+}
+
+#[tokio::test]
+async fn send_attachment_records_one_outbound_part_and_rejects_bad_paths() {
+    let dir = tempfile::tempdir().unwrap();
+    let private = dir.path().join("private");
+    fs::create_dir(&private).unwrap();
+    fs::set_permissions(&private, fs::Permissions::from_mode(0o700)).unwrap();
+    let log = dir.path().join("frames.log");
+    let fake = fake_sidecar_recording(dir.path(), &log);
+
+    let store = Arc::new(Mutex::new(
+        EncryptedStore::open(private.join("store.db"), &TestSecrets).unwrap(),
+    ));
+    let hub = SubscriptionHub::with_default_capacity();
+    let engine = Arc::new(Engine::new(EngineConfig {
+        sync_chats: false,
+        dart_executable: fake,
+        script: PathBuf::from("ignored"),
+        state_dir: private.clone(),
+        library: PathBuf::from("ignored"),
+    }));
+    let (sink, mut events) = mpsc::channel(64);
+    let mut supervisor = Supervisor::new(engine.clone(), sink);
+    let service = Arc::new(Service::new(store.clone(), engine.clone(), hub));
+    let persistence = {
+        let service = service.clone();
+        tokio::spawn(async move {
+            while let Some(event) = events.recv().await {
+                let _ = service.persist(&event);
+            }
+        })
+    };
+    supervisor.start().await.expect("engine starts");
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while engine.my_handles().is_empty() && std::time::Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+
+    service
+        .start_conversation(
+            "person@example.test".to_owned(),
+            OutgoingBody {
+                parts: vec![MessagePart::Text("first".to_owned())],
+            },
+        )
+        .await
+        .expect("start conversation sends");
+    let conversation_id = {
+        let guard = store.lock().unwrap();
+        store::list_conversations(&guard)
+            .expect("store readable")
+            .into_iter()
+            .find(|conversation| {
+                conversation
+                    .participants
+                    .iter()
+                    .any(|participant| participant.handle.value() == "person@example.test")
+            })
+            .expect("conversation created")
+            .id
+    };
+
+    let source = private.join("report.txt");
+    fs::write(&source, b"hello").unwrap();
+    let source_text = source.to_string_lossy().into_owned();
+    let sent = service
+        .send_attachment(conversation_id.clone(), source_text.clone())
+        .await
+        .expect("attachment sends");
+    assert!(
+        sent.value().starts_with("attachment-"),
+        "the correlated confirmation names the attachment message: {sent:?}"
+    );
+
+    for bad in [
+        "relative.txt".to_owned(),
+        private.join("missing.txt").to_string_lossy().into_owned(),
+        private.to_string_lossy().into_owned(),
+    ] {
+        assert_eq!(
+            service.send_attachment(conversation_id.clone(), bad).await,
+            Err(bloom_ipc::ProtocolError::InvalidRequest),
+            "invalid paths are refused before the engine is called"
+        );
+    }
+
+    supervisor
+        .shutdown(Duration::from_secs(5))
+        .await
+        .expect("shutdown completes");
+    persistence.abort();
+
+    let frames = fs::read_to_string(&log).expect("frames recorded");
+    let attachment_frames: Vec<&str> = frames
+        .lines()
+        .filter(|line| line.contains("\"type\":\"attachment_send\""))
+        .collect();
+    assert_eq!(
+        attachment_frames.len(),
+        1,
+        "exactly one attachment frame reached the sidecar: {frames}"
+    );
+    let frame = attachment_frames[0];
+    assert!(
+        frame.contains("\"recipients\":[\"mailto:person@example.test\"]"),
+        "recipients are engine form: {frame}"
+    );
+    assert!(
+        frame.contains(&format!("\"path\":\"{source_text}\"")),
+        "the source path travels only in the command frame: {frame}"
+    );
+
+    let history = store::history(&store.lock().unwrap(), &conversation_id, 10).unwrap();
+    assert_eq!(history.len(), 2, "the text send and the attachment send");
+    let message = history.last().unwrap();
+    assert!(message.from_me);
+    match &message.parts()[0] {
+        MessagePart::Attachment(part) => {
+            assert_eq!(part.file_name(), Some("report.txt"));
+            assert_eq!(part.fetch_token(), None);
+        }
+        other => panic!("expected one attachment part, got {other:?}"),
+    }
+    let stored = serde_json::to_value(message).unwrap();
+    assert_eq!(stored["parts"][0]["value"]["byte_len"], 5);
+    assert!(stored["parts"][0]["value"]["mime_type"].is_null());
 }
 
 fn attachment_script(dir: &std::path::Path, name: &str, reply: &str) -> PathBuf {
