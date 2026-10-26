@@ -8,6 +8,7 @@ publish = false
 
 [dependencies]
 gpui = "=0.2.2"
+unicode-segmentation = "1"
 # xattr 0.2.3 (pulled in by gpui_http_client) still references libc::ENOATTR.
 # Keep the lockfile on a libc release that exports it.
 libc = "=0.2.186"
