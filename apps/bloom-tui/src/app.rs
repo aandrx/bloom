@@ -493,6 +493,8 @@ pub struct App {
     pub pending_attachment: Option<String>,
     /// Token currently awaiting a fetch result, used to ignore stale replies.
     pub attachment_in_flight: Option<String>,
+    /// Whether a successful fetch should also open the file externally.
+    pub open_after_attachment_fetch: bool,
     pub sync_in_flight: bool,
     pub send_feedback: Option<SendFeedback>,
     pub recoverable_send: Option<RecoveryDraft>,
@@ -680,6 +682,7 @@ impl Default for App {
             sync_requested: false,
             pending_attachment: None,
             attachment_in_flight: None,
+            open_after_attachment_fetch: false,
             sync_in_flight: false,
             send_feedback: None,
             recoverable_send: None,
@@ -3272,6 +3275,7 @@ impl App {
             ("/unread", "Jump to the first unread message"),
             ("/cancel", "Close the composer"),
             ("/attachment", "Save the newest attachment in this chat"),
+            ("/open", "Open the newest attachment externally"),
         ]
         .into_iter()
         .filter(|(name, _)| name.starts_with(token) || token == *name)
@@ -3309,8 +3313,10 @@ impl App {
     }
 
     /// Select the newest loaded attachment that carries a sidecar fetch token.
-    /// The action is explicit: `/attachment` never downloads on its own.
-    fn begin_attachment_fetch(&mut self) {
+    /// The action is explicit: neither `/attachment` nor `/open` downloads on its
+    /// own, and only `/open` asks the shell to launch an external viewer.
+    fn begin_attachment_fetch(&mut self, open_externally: bool) {
+        self.open_after_attachment_fetch = false;
         if self.pending_attachment.is_some() || self.attachment_in_flight.is_some() {
             self.notice = Some("Attachment fetch is already in progress.".into());
             self.draft.clear();
@@ -3346,27 +3352,57 @@ impl App {
             return;
         };
         self.error = None;
-        self.notice = Some("Fetching the newest attachment...".into());
+        self.notice = Some(if open_externally {
+            "Fetching the newest attachment to open...".into()
+        } else {
+            "Fetching the newest attachment...".into()
+        });
         self.draft.clear();
         self.draft_cursor = 0;
+        self.open_after_attachment_fetch = open_externally;
         self.pending_attachment = Some(token);
     }
 
-    pub fn finish_attachment_fetch(&mut self, token: &str, result: Result<(String, u64), String>) {
+    /// Settles a fetch. Returns the cache path when the caller must open it.
+    pub fn finish_attachment_fetch(
+        &mut self,
+        token: &str,
+        result: Result<(String, u64), String>,
+    ) -> Option<String> {
         if self.attachment_in_flight.as_deref() != Some(token) {
-            return;
+            return None;
         }
         self.attachment_in_flight = None;
+        let open = std::mem::take(&mut self.open_after_attachment_fetch);
         match result {
+            Ok((path, _bytes)) if open => {
+                self.error = None;
+                self.notice = Some(format!("Opening {path} externally..."));
+                Some(path)
+            }
             Ok((path, bytes)) => {
                 self.error = None;
                 self.notice = Some(format!("Attachment saved to {path} ({bytes} bytes)."));
+                None
             }
             Err(message) => {
                 self.notice = None;
                 self.error = Some(message);
+                None
             }
         }
+    }
+
+    /// Confirms that the external opener was started. Displaying the file is the
+    /// opener's job; Bloom cannot observe it.
+    pub fn finish_attachment_open(&mut self, path: &str) {
+        self.error = None;
+        self.notice = Some(format!("Opened {path} externally."));
+    }
+
+    pub fn fail_attachment_open(&mut self, message: String) {
+        self.notice = None;
+        self.error = Some(message);
     }
 
     fn execute_search_command(&mut self) {
@@ -3486,7 +3522,8 @@ impl App {
             }
             ["/nickname", ..] => self.execute_nickname_command(),
             ["/search", ..] => self.execute_search_command(),
-            ["/attachment"] => self.begin_attachment_fetch(),
+            ["/attachment"] => self.begin_attachment_fetch(false),
+            ["/open"] => self.begin_attachment_fetch(true),
             ["/new"] => {
                 self.error = None;
                 self.retire_active_draft();
@@ -5950,6 +5987,136 @@ mod tests {
             .error
             .as_deref()
             .is_some_and(|text| text.contains("unavailable")));
+    }
+
+    #[test]
+    fn open_command_requests_one_external_open_after_the_fetch() {
+        const TOKEN: &str = "fedcba9876543210fedcba9876543210";
+        let chat = conversation("opener@example.test", Some(20));
+        let mut message = message(&chat, "newer", 20, "newer");
+        message.parts = vec![bloom_domain::MessagePart::Attachment(
+            bloom_domain::AttachmentRef::new(
+                "local-metadata:open",
+                Some("image/jpeg".into()),
+                Some("photo.jpg".into()),
+                Some(3),
+            )
+            .unwrap()
+            .with_fetch_token(Some(TOKEN.into()))
+            .unwrap(),
+        )];
+        let mut app = App {
+            selected: Some(chat.id.clone()),
+            ..Default::default()
+        };
+        app.messages.insert(chat.id.clone(), vec![message]);
+
+        app.draft = "/open".into();
+        assert_eq!(
+            app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+            Action::FetchAttachment {
+                token: TOKEN.into()
+            }
+        );
+        assert!(app.open_after_attachment_fetch);
+
+        let path = "/tmp/bloom-cache/attachment.bin".to_owned();
+        assert_eq!(
+            app.finish_attachment_fetch(TOKEN, Ok((path.clone(), 3))),
+            Some(path.clone())
+        );
+        assert!(!app.open_after_attachment_fetch);
+        assert!(app
+            .notice
+            .as_deref()
+            .is_some_and(|text| text.contains("Opening")));
+
+        app.finish_attachment_open(&path);
+        assert!(app
+            .notice
+            .as_deref()
+            .is_some_and(|text| text.contains("Opened")));
+        assert!(app.error.is_none());
+
+        app.fail_attachment_open("No file opener is available (xdg-open).".into());
+        assert_eq!(
+            app.error.as_deref(),
+            Some("No file opener is available (xdg-open).")
+        );
+        assert!(app.notice.is_none());
+    }
+
+    #[test]
+    fn save_command_never_requests_an_external_open() {
+        const TOKEN: &str = "0123456789abcdef0123456789abcdef";
+        let chat = conversation("saver@example.test", Some(20));
+        let mut message = message(&chat, "newer", 20, "newer");
+        message.parts = vec![bloom_domain::MessagePart::Attachment(
+            bloom_domain::AttachmentRef::new(
+                "local-metadata:save",
+                Some("image/jpeg".into()),
+                Some("photo.jpg".into()),
+                Some(3),
+            )
+            .unwrap()
+            .with_fetch_token(Some(TOKEN.into()))
+            .unwrap(),
+        )];
+        let mut app = App {
+            selected: Some(chat.id.clone()),
+            ..Default::default()
+        };
+        app.messages.insert(chat.id.clone(), vec![message]);
+
+        app.draft = "/attachment".into();
+        assert_eq!(
+            app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+            Action::FetchAttachment {
+                token: TOKEN.into()
+            }
+        );
+        assert!(!app.open_after_attachment_fetch);
+        assert_eq!(
+            app.finish_attachment_fetch(TOKEN, Ok(("/tmp/photo.jpg".into(), 3))),
+            None
+        );
+        assert!(app
+            .notice
+            .as_deref()
+            .is_some_and(|text| text.contains("saved")));
+    }
+
+    #[test]
+    fn open_command_without_a_fetchable_attachment_clears_its_intent() {
+        let mut app = App {
+            draft: "/open".into(),
+            ..Default::default()
+        };
+        assert_eq!(
+            app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+            Action::None
+        );
+        assert!(!app.open_after_attachment_fetch);
+        assert!(app.error.is_some());
+    }
+
+    #[test]
+    fn a_stale_fetch_result_cannot_trigger_an_open() {
+        const TOKEN: &str = "0123456789abcdef0123456789abcdef";
+        const OTHER: &str = "fedcba9876543210fedcba9876543210";
+        let mut app = App {
+            attachment_in_flight: Some(OTHER.into()),
+            open_after_attachment_fetch: true,
+            ..Default::default()
+        };
+
+        assert_eq!(
+            app.finish_attachment_fetch(TOKEN, Ok(("/tmp/photo.jpg".into(), 3))),
+            None
+        );
+        assert!(app.open_after_attachment_fetch);
+        app.finish_attachment_fetch(OTHER, Err("unavailable".into()));
+        assert!(!app.open_after_attachment_fetch);
     }
 
     #[test]

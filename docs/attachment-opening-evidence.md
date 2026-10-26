@@ -80,8 +80,8 @@ written to logs or preferences. The command is listed in `/help` and the user
 guide. Actual-PTY coverage seeds an attachment with a token, invokes
 `/attachment`, and observes the saved-path result against the stateful fixture.
 
-No TUI action opens the saved file externally. C1e, the authorized live gate,
-now passes; see below.
+No TUI action opened the saved file externally at C1d. C1e, the authorized live
+gate, now passes; see below. The explicit external open follows in C1f.
 
 ## C1e live gate
 
@@ -212,6 +212,39 @@ issues for `bin`, `lib/attachment_cache.dart` and `test`. The vendored generated
 bindings still report 24 pre-existing analyzer warnings, unchanged by this work.
 No Rust source changed for C1e.
 
+## C1f explicit external open
+
+`/open` selects the same newest token as `/attachment`, fetches it, and then
+launches a desktop opener with the cache path. Nothing opens automatically, and
+`/attachment` still never opens anything.
+
+The path is accepted only when it is absolute, contains no `..`, is not a
+symlink, is a regular file, and is non-empty. It is passed as one argv element
+with null stdin/stdout/stderr; Bloom never builds a shell command, so a reported
+filename cannot become shell syntax. The opener is `xdg-open` unless the
+`BLOOM_OPENER` environment variable names another program (a name or path, never
+a command line). The child is reaped on a detached thread, and success means the
+opener process started, not that a viewer displayed the file. Failure messages
+name the reason without repeating the path.
+
+Observed gates: 160 library tests, 82 interaction tests, 12 daemon-session tests,
+8 input-safety tests, 3 launcher tests, 9 binary tests, and 68 fixture tests pass.
+A unit test launches a recorder script and proves the opener receives exactly one
+argument, the cache path. Three real-binary PTY tests cover the attachment
+surface: the existing `/attachment` save test now also waits before proving the
+recorder was never invoked, a new `/open` test compares the recorder's argument
+with the path the fixture daemon returned, and a new missing-opener test shows
+`No file opener is available`. The fixture daemon materializes a real cache file
+instead of returning a placeholder path.
+
+`/open` is offered by the typing menu for `/`; the `?` shortcut sheet was not
+changed and still does not list every slash command.
+
+Limits: no test launches a real desktop viewer, no live-fetched file has been
+opened through the TUI, and Bloom does not read, render, or verify the file's
+content. Token identity remains sidecar-generation scoped, and only the newest
+loaded attachment is selectable.
+
 ## C1b implementation evidence
 
 The sidecar-only registry and cache are implemented in
@@ -249,6 +282,7 @@ download has run.
 3. **C1c:** typed IPC fetch/open protocol and daemon dispatch, with no-store secret handling.
 4. **C1d:** TUI explicit save/open action plus PTY failure/success states against a synthetic fixture.
 5. **C1e:** one authorized live inbound attachment download; otherwise remain display-only. **Passed** on 2026-10-26: 325,019 bytes, mode `0600`, `"result": "passed"`.
+6. **C1f:** explicit external open through a desktop opener, with no automatic open and no shell.
 
 ## Exclusions
 

@@ -32,18 +32,28 @@ class ReadingFlows(unittest.TestCase):
         self.fixture.start_daemon()
         for index in range(60):
             self.send_message(index)
+        # A recorder instead of a desktop opener: the PTY test must prove the real
+        # command path without launching a viewer on the test machine.
+        self.opener_record = self.fixture.root / 'opened-path.txt'
+        self.opener_script = self.fixture.root / 'opener.sh'
+        self.opener_script.write_text(
+            '#!/bin/sh\nprintf "%s" "$1" > "$BLOOM_OPENER_RECORD"\n',
+            encoding='utf-8')
+        self.opener_script.chmod(0o755)
         self.start_tui()
         self.addCleanup(self.stop_tui)
         self.resize(100, 30)
         self.wait_for(lambda: 'READ_MARKER_059' in self.text())
 
-    def start_tui(self):
+    def start_tui(self, opener=None):
         with H['isolated_environment']({
             'BLOOM_SOCKET_PATH': str(self.fixture.socket_path),
             'XDG_CONFIG_HOME': str(self.fixture.root / 'config'),
             'XDG_STATE_HOME': str(self.fixture.root / 'state'),
             'XDG_DATA_HOME': str(self.fixture.root / 'data'),
             'NO_COLOR': '1',
+            'BLOOM_OPENER': opener or str(self.opener_script),
+            'BLOOM_OPENER_RECORD': str(self.opener_record),
         }):
             self.pid, self.master = pty.fork()
             if self.pid == 0:
@@ -867,7 +877,7 @@ class ReadingFlows(unittest.TestCase):
                              f'unsend must not imply deletion at {width}')
             self.artifact(f'edit-unsend-notes-{width}')
 
-    def test_attachment_command_saves_newest_loaded_attachment(self):
+    def seed_attachment(self):
         self.stop_tui()
         self.fixture.stop_daemon()
         state = self.fixture.persisted()
@@ -901,11 +911,47 @@ class ReadingFlows(unittest.TestCase):
         self.start_tui()
         self.resize(100, 30)
         self.wait_for(lambda: 'photo.jpg' in self.text())
+        return token
+
+    def test_attachment_command_saves_newest_loaded_attachment(self):
+        self.seed_attachment()
         self.key(b'/attachment')
         self.key(b'\r')
         self.wait_for(lambda: 'Attachment saved to' in self.text())
-        self.assertIn('bloom-fixture-', self.text(), 'the saved path must be visible')
+        self.assertIn('attachments/', self.text(),
+                      'the saved cache location must be visible')
+        # Settle first: a wrongly spawned opener could write its record after the
+        # notice appears, so an immediate check would not be a real negative proof.
+        self.pump(0.5)
+        self.assertFalse(self.opener_record.exists(),
+                         'saving must not launch an external opener')
         self.artifact('attachment-saved')
+
+    def test_open_command_fetches_then_launches_the_external_opener(self):
+        token = self.seed_attachment()
+        self.key(b'/open')
+        self.key(b'\r')
+        self.wait_for(lambda: 'Opened' in self.text())
+        expected = str(self.fixture.root / 'attachments' /
+                       f'bloom-fixture-{token}.bin')
+        self.wait_for(lambda: self.opener_record.exists() and
+                      self.opener_record.read_text(encoding='utf-8') == expected)
+        self.assertEqual(self.opener_record.read_text(encoding='utf-8'), expected)
+        self.assertIn('attachments/', self.text(),
+                      'the opened cache location must be visible')
+        self.artifact('attachment-opened')
+
+    def test_open_command_reports_a_missing_opener(self):
+        self.seed_attachment()
+        self.stop_tui()
+        self.start_tui(opener='/nonexistent/bloom-opener')
+        self.resize(100, 30)
+        self.wait_for(lambda: 'photo.jpg' in self.text())
+        self.key(b'/open')
+        self.key(b'\r')
+        self.wait_for(lambda: 'No file opener is available' in self.text())
+        self.assertFalse(self.opener_record.exists())
+        self.artifact('attachment-open-missing-opener')
 
 
 

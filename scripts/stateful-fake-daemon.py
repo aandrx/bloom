@@ -546,8 +546,17 @@ def serve(client, args, state):
                     if not isinstance(token, str) or not re.fullmatch(r"[0-9a-f]{32}", token):
                         response = {"result": "error", "error": "invalid_request"}
                     else:
+                        # A real cache file, so `/open` exercises its validation and
+                        # the external opener path instead of a placeholder.
+                        cache = os.path.join(os.path.dirname(os.path.abspath(args.store)),
+                                             "attachments")
+                        os.makedirs(cache, mode=0o700, exist_ok=True)
+                        cached = os.path.join(cache, f"bloom-fixture-{token}.bin")
+                        with open(cached, "wb") as stream:
+                            stream.write(b"fixture-payload".ljust(42, b"!"))
+                        os.chmod(cached, 0o600)
                         response = {"result": "attachment_fetched",
-                                    "path": f"/tmp/bloom-fixture-{token}.bin", "bytes": 42}
+                                    "path": cached, "bytes": 42}
                 elif op in ("send", "start_conversation"):
                     is_start = op == "start_conversation"
                     parts = body.get("body", {}).get("parts", [])

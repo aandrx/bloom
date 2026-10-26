@@ -6,6 +6,8 @@ pub mod diagnostics;
 pub mod drafts;
 #[cfg(unix)]
 pub mod launcher;
+#[cfg(unix)]
+pub mod open;
 pub mod transcript;
 pub mod ui;
 

@@ -697,7 +697,12 @@ async fn main() -> Result<()> {
                     }
                     _ => "Attachment could not be saved.".to_owned(),
                 });
-                app.finish_attachment_fetch(&token, result);
+                if let Some(path) = app.finish_attachment_fetch(&token, result) {
+                    match bloom_tui::open::open_external(&path) {
+                        Ok(()) => app.finish_attachment_open(&path),
+                        Err(error) => app.fail_attachment_open(error.message()),
+                    }
+                }
                 redraw.request();
             },
             Some((generation, conversation, target, result)) = context_rx.recv() => {
