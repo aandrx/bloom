@@ -176,7 +176,7 @@ After either a root-cause fix or containment:
 
 The 768-byte line is consistent with a foreign stdout writer: the installed engine library contains multiple Rust logger implementations that can write to stdout. Rather than print or rewrite their payload, the sidecar now marks every protocol line, and the daemon skips a bounded number of unmarked non-JSON lines with a redacted structural log. Unmarked JSON remains compatible; a malformed marked frame still fails closed. Synthetic tests cover both paths.
 
-This is containment, not a proven root cause, and the live staged-prefix gate has not been rerun. Phase 4 remains open until that run and its two-half lifecycle checks pass.
+This is containment, not a proven root cause. The live staged-prefix rerun passed: doctor resolved the prefix sidecar, one daemon and one engine started, a second launcher reused the daemon, cleanup removed the socket and processes, and hidden-checkout missing sidecar/Dart/library cases failed cleanly. The original unparsable line did not recur and the containment path was not exercised live. The fault remains intermittent; ABI and licensing review remain open.
 
 ## Track C: remaining rich messaging
 
