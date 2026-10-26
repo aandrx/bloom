@@ -84,6 +84,82 @@ guide. Actual-PTY coverage seeds an attachment with a token, invokes
 No TUI action opens the saved file externally, and no live attachment has been
 downloaded. C1e remains the authorized live gate.
 
+## C1e live gate
+
+The guarded probe is `scripts/live-attachment-probe`. It starts one daemon against
+the real registration, waits for a stored inbound attachment carrying a fetch
+token, requests that token once through IPC v8, and verifies the returned cache
+file is an absolute regular file under `XDG_CACHE_HOME/bloom/attachments`, has the
+reported nonzero size, and is mode `0600`. It never sends, imports history,
+renews, changes registration, opens the file, prints content or stores the token
+or path in evidence. The temporary store and cache are deleted.
+
+It requires this authorization:
+
+> Authorize one live inbound attachment test: start one daemon against my real OpenBubbles registration and state, allow it to consume pushes into a temporary store, wait for one real inbound attachment, download it once into a private temporary cache, verify the cached file structurally, then delete the store and cache. No sends, history import, renewal, registration changes, external opening, or content sharing are authorized.
+
+### Exact commands
+
+Read the authorization statement above first. Then:
+
+```sh
+cd $HOME/Documents/Projects/bloom
+cargo build -p bloomd
+
+STATE="$HOME/.var/app/app.openbubbles.OpenBubbles/data/bluebubbles"
+FLATPAK="$(flatpak info --show-location app.openbubbles.OpenBubbles)"
+LIB="$FLATPAK/files/bluebubbles/lib/librust_lib_bluebubbles.so"
+SCRIPT="$PWD/ext/bloom-engine-sidecar/dart/bin/bloom_engine.dart"
+DART="$(command -v dart || printf '%s' "$HOME/.cache/dart-sdk/dart-sdk/bin/dart")"
+
+test -d "$STATE"
+test -f "$LIB"
+test -f "$SCRIPT"
+test -x "$DART"
+```
+
+Close OpenBubbles, then run the read-only preflight:
+
+```sh
+BLOOM_ENGINE_STATE="$STATE" \
+BLOOM_ENGINE_LIBRARY="$LIB" \
+BLOOM_ENGINE_SCRIPT="$SCRIPT" \
+BLOOM_DART_EXECUTABLE="$DART" \
+scripts/live-attachment-probe --preflight
+```
+
+After it prints `preflight: no competing owner; required paths exist`, start
+exactly one authorized probe:
+
+```sh
+export BLOOM_LIVE_ATTACHMENT_ACK=one-shot-authorized
+scripts/live-attachment-probe \
+  --bloomd target/debug/bloomd \
+  --engine-state "$STATE" \
+  --engine-library "$LIB" \
+  --engine-script "$SCRIPT" \
+  --dart "$DART" \
+  --seconds 300 \
+  --evidence-dir "$HOME/bloom-live-attachment-evidence"
+```
+
+While it waits, send one photo or file to the account from another device. The
+probe only reads local stored metadata and the downloaded cache file; it does not
+display the content. A pass prints a structural summary with `"result": "passed"`,
+a nonzero byte count and `"file_mode": "0o600"`.
+
+Then verify cleanup:
+
+```sh
+unset BLOOM_LIVE_ATTACHMENT_ACK
+pgrep -x bloomd || true
+ps -eo pid,args | grep -E '[b]loom_engine\.dart' || true
+```
+
+Both process checks must print nothing. The temporary store, cache and probe root
+are deleted; do not copy them. The probe was exercised against a fake daemon, but
+no live attachment has been downloaded.
+
 ## C1b implementation evidence
 
 The sidecar-only registry and cache are implemented in

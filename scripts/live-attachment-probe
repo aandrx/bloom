@@ -1,0 +1,359 @@
+#!/usr/bin/env python3
+"""One-shot live inbound attachment download probe.
+
+Starts one daemon against the real OpenBubbles registration, waits for a stored
+inbound attachment with a sidecar fetch token, requests exactly that token through
+the v8 IPC path, and verifies the private cached file. It never sends, imports
+history, renews, changes registration, opens the file, or prints content/tokens.
+
+Usage: set BLOOM_LIVE_ATTACHMENT_ACK=one-shot-authorized and run with real
+BLOOM_ENGINE_STATE, BLOOM_ENGINE_LIBRARY, BLOOM_ENGINE_SCRIPT and a dart path.
+"""
+import argparse
+import hashlib
+import json
+import os
+from pathlib import Path
+import re
+import shutil
+import signal
+import socket
+import stat
+import struct
+import subprocess
+import sys
+import tempfile
+import time
+
+ACK = "one-shot-authorized"
+VERSION = 8
+MAX_FRAME = 1024 * 1024
+START_TIMEOUT = 120.0
+ATTACHMENT_TIMEOUT = 300.0
+PID_LINE = re.compile(r"engine child started pid=(?:Some\()?(\d+)")
+TOKEN = re.compile(r"^[0-9a-f]{32}$")
+
+
+class ProbeError(Exception):
+    pass
+
+
+def argv(pid):
+    try:
+        raw = Path(f"/proc/{pid}/cmdline").read_bytes()
+    except FileNotFoundError:
+        return []
+    return [part.decode("utf-8", "replace") for part in raw.split(b"\0") if part]
+
+
+def process_parent(pid):
+    try:
+        stat = Path(f"/proc/{pid}/stat").read_text()
+    except FileNotFoundError:
+        return None
+    fields = stat.rsplit(")", 1)[1].split()
+    return int(fields[1]) if fields else None
+
+
+def owners():
+    rows = []
+    for entry in Path("/proc").iterdir():
+        if not entry.name.isdigit():
+            continue
+        pid = int(entry.name)
+        if pid == os.getpid():
+            continue
+        args = argv(pid)
+        if not args:
+            continue
+        exe = Path(args[0]).name
+        if exe == "bloomd" or any(arg.endswith("bloom_engine.dart") for arg in args[1:]):
+            rows.append((pid, " ".join(args)))
+    return rows
+
+
+def openbubbles_running():
+    for entry in Path("/proc").iterdir():
+        if not entry.name.isdigit():
+            continue
+        pid = int(entry.name)
+        if pid == os.getpid():
+            continue
+        args = argv(pid)
+        if not args:
+            continue
+        exe = Path(args[0]).name
+        command = " ".join(args)
+        if exe == "OpenBubbles":
+            return pid, command
+        if exe in {"flatpak", "bwrap"} and "app.openbubbles.OpenBubbles" in args:
+            return pid, command
+        if "/app/" in args[0]:
+            return pid, command
+    return None
+
+
+def frame(value):
+    data = json.dumps(value, separators=(",", ":"), ensure_ascii=False).encode()
+    if not data or len(data) > MAX_FRAME:
+        raise ProbeError("invalid request frame size")
+    return bytes([VERSION]) + struct.pack(">I", len(data)) + data
+
+
+def read_exact(stream, length):
+    data = bytearray()
+    while len(data) < length:
+        chunk = stream.recv(length - len(data))
+        if not chunk:
+            raise ProbeError("daemon closed the IPC connection")
+        data.extend(chunk)
+    return bytes(data)
+
+
+def read_frame(stream, timeout):
+    stream.settimeout(timeout)
+    header = read_exact(stream, 5)
+    if header[0] != VERSION:
+        raise ProbeError("unexpected IPC version")
+    length = struct.unpack(">I", header[1:])[0]
+    if length == 0 or length > MAX_FRAME:
+        raise ProbeError("invalid IPC frame length")
+    return json.loads(read_exact(stream, length))
+
+
+def request(socket_path, payload, timeout=30.0):
+    with socket.socket(socket.AF_UNIX) as connection:
+        connection.settimeout(timeout)
+        connection.connect(str(socket_path))
+        connection.sendall(frame(payload))
+        reply = read_frame(connection, timeout)
+    return reply.get("response", {})
+
+
+def wait_socket(path, deadline, daemon):
+    while time.monotonic() < deadline:
+        if daemon.poll() is not None:
+            raise ProbeError("daemon exited during startup")
+        if path.exists():
+            return
+        time.sleep(0.1)
+    raise ProbeError("daemon never created its socket")
+
+
+def wait_engine(log_path, deadline, daemon):
+    while time.monotonic() < deadline:
+        if daemon.poll() is not None:
+            raise ProbeError("daemon exited while starting the engine")
+        text = log_path.read_text(errors="replace") if log_path.exists() else ""
+        pids = [int(match) for match in PID_LINE.findall(text)]
+        if pids and Path(f"/proc/{pids[-1]}").exists():
+            return pids[-1]
+        time.sleep(0.1)
+    raise ProbeError("engine child never appeared")
+
+
+def attachment_token(message):
+    for part in message.get("parts", []):
+        if part.get("type") != "attachment":
+            continue
+        value = part.get("value") or {}
+        token = value.get("fetch_token")
+        if isinstance(token, str) and TOKEN.fullmatch(token):
+            return token
+    return None
+
+
+def find_attachment(socket_path, deadline):
+    seen = 0
+    while time.monotonic() < deadline:
+        listed = request(socket_path, {
+            "request_id": 1,
+            "request": {"op": "list_conversations"},
+        })
+        conversations = listed.get("conversations", [])
+        for conversation in conversations:
+            cid = conversation.get("id")
+            history = request(socket_path, {
+                "request_id": 2,
+                "request": {"op": "history", "conversation_id": cid, "limit": 50},
+            })
+            if history.get("result") != "history":
+                continue
+            for message in history.get("messages", []):
+                seen += 1
+                token = attachment_token(message)
+                if token:
+                    return token, seen
+        time.sleep(2.0)
+    raise ProbeError(f"no inbound attachment with a fetch token appeared ({seen} messages seen)")
+
+
+def verify_cache(path_text, expected_bytes, cache_root):
+    path = Path(path_text)
+    if not path.is_absolute() or path.is_symlink():
+        raise ProbeError("returned cache path was not a safe absolute file")
+    resolved = path.resolve()
+    root = cache_root.resolve()
+    if root not in resolved.parents:
+        raise ProbeError("returned file was outside the private attachment cache")
+    info = path.stat()
+    if not stat.S_ISREG(info.st_mode):
+        raise ProbeError("returned cache path was not a regular file")
+    if info.st_size != expected_bytes or expected_bytes <= 0:
+        raise ProbeError("cached file size did not match the reported byte count")
+    if info.st_mode & 0o077:
+        raise ProbeError("cached file permissions were not private")
+    return info.st_mode & 0o777
+
+
+def stop_daemon(daemon):
+    if daemon.poll() is None:
+        daemon.send_signal(signal.SIGTERM)
+    try:
+        daemon.wait(timeout=30.0)
+    except subprocess.TimeoutExpired:
+        daemon.kill()
+        daemon.wait(timeout=10.0)
+
+
+def run(args, root):
+    if os.environ.get("BLOOM_LIVE_ATTACHMENT_ACK") != ACK:
+        raise ProbeError("live attachment probe is not authorized")
+    for label, value in [
+        ("bloomd", args.bloomd),
+        ("engine state", args.engine_state),
+        ("engine library", args.engine_library),
+        ("engine script", args.engine_script),
+        ("dart executable", args.dart),
+    ]:
+        if not Path(value).exists():
+            raise ProbeError(f"{label} does not exist")
+    if owners():
+        raise ProbeError("another Bloom or engine owner is running")
+    if openbubbles_running() is not None:
+        raise ProbeError("OpenBubbles is still running")
+
+    socket_path = root / "bloomd.sock"
+    store_path = root / "store.db"
+    cache_root = root / "cache/bloom/attachments"
+    log_path = root / "bloomd.log"
+    env = dict(os.environ)
+    env.update({
+        "BLOOM_SOCKET_PATH": str(socket_path),
+        "BLOOM_STORE_PATH": str(store_path),
+        "BLOOM_ENGINE_STATE": args.engine_state,
+        "BLOOM_ENGINE_LIBRARY": args.engine_library,
+        "BLOOM_ENGINE_SCRIPT": args.engine_script,
+        "BLOOM_DART_EXECUTABLE": args.dart,
+        "XDG_DATA_HOME": str(root / "data"),
+        "XDG_STATE_HOME": str(root / "state"),
+        "XDG_CONFIG_HOME": str(root / "config"),
+        "XDG_CACHE_HOME": str(root / "cache"),
+    })
+    log = open(log_path, "w", encoding="utf-8", buffering=1)
+    os.fchmod(log.fileno(), 0o600)
+    started = time.monotonic()
+    daemon = subprocess.Popen(
+        [args.bloomd],
+        env=env,
+        stdin=subprocess.DEVNULL,
+        stdout=log,
+        stderr=log,
+    )
+    result = {
+        "daemon_pid": daemon.pid,
+        "engine_pid": None,
+        "messages_seen": 0,
+        "bytes": None,
+        "file_mode": None,
+        "start_seconds": None,
+        "fetch_seconds": None,
+        "result": "failed",
+    }
+    try:
+        wait_socket(socket_path, time.monotonic() + START_TIMEOUT, daemon)
+        result["engine_pid"] = wait_engine(log_path, time.monotonic() + START_TIMEOUT, daemon)
+        result["start_seconds"] = round(time.monotonic() - started, 2)
+        token, seen = find_attachment(
+            socket_path, time.monotonic() + args.seconds
+        )
+        result["messages_seen"] = seen
+        fetched_at = time.monotonic()
+        response = request(socket_path, {
+            "request_id": 3,
+            "request": {"op": "fetch_attachment", "token": token},
+        }, timeout=180.0)
+        result["fetch_seconds"] = round(time.monotonic() - fetched_at, 2)
+        if response.get("result") != "attachment_fetched":
+            raise ProbeError("daemon did not return an attachment_fetched result")
+        result["bytes"] = response.get("bytes")
+        result["file_mode"] = oct(
+            verify_cache(response["path"], int(response["bytes"]), cache_root)
+        )
+        # Keep only structural evidence, never the path or token.
+        result["result"] = "passed"
+        return result
+    finally:
+        stop_daemon(daemon)
+        log.close()
+        if owners():
+            raise ProbeError("a Bloom or engine owner survived cleanup")
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--bloomd", default=str(Path(__file__).resolve().parents[1] / "target/debug/bloomd"))
+    parser.add_argument("--engine-state", default=os.environ.get("BLOOM_ENGINE_STATE", ""))
+    parser.add_argument("--engine-library", default=os.environ.get("BLOOM_ENGINE_LIBRARY", ""))
+    parser.add_argument("--engine-script", default=os.environ.get("BLOOM_ENGINE_SCRIPT", ""))
+    parser.add_argument("--dart", default=os.environ.get("BLOOM_DART_EXECUTABLE", "dart"))
+    parser.add_argument("--seconds", type=float, default=ATTACHMENT_TIMEOUT)
+    parser.add_argument("--evidence-dir", default="")
+    parser.add_argument("--preflight", action="store_true")
+    args = parser.parse_args()
+    if args.seconds <= 0:
+        parser.error("--seconds must be positive")
+    if args.preflight:
+        try:
+            if owners():
+                raise ProbeError("another Bloom or engine owner is running")
+            if openbubbles_running() is not None:
+                raise ProbeError("OpenBubbles is still running")
+            for label, value in [
+                ("bloomd", args.bloomd),
+                ("engine state", args.engine_state),
+                ("engine library", args.engine_library),
+                ("engine script", args.engine_script),
+                ("dart executable", args.dart),
+            ]:
+                if not value or not Path(value).exists():
+                    raise ProbeError(f"{label} does not exist")
+            print("preflight: no competing owner; required paths exist")
+            return 0
+        except ProbeError as error:
+            print(f"live attachment aborted: {error}", file=sys.stderr)
+            return 2
+    root = Path(tempfile.mkdtemp(prefix="bloom-live-attachment-")).resolve()
+    root.chmod(0o700)
+    try:
+        result = run(args, root)
+        target = Path(args.evidence_dir).expanduser() if args.evidence_dir \
+            else Path.home() / f"bloom-live-attachment-{int(time.time())}"
+        target.mkdir(parents=True, exist_ok=True, mode=0o700)
+        summary = target / "summary.json"
+        summary.write_text(json.dumps(result, indent=2) + "\n")
+        summary.chmod(0o600)
+        print(json.dumps(result, indent=2))
+        print(f"summary kept at {summary}")
+        return 0 if result["result"] == "passed" else 1
+    except ProbeError as error:
+        print(f"live attachment aborted: {error}", file=sys.stderr)
+        return 2
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
+        if owners():
+            print("warning: surviving Bloom owner detected", file=sys.stderr)
+
+
+if __name__ == "__main__":
+    sys.exit(main())
