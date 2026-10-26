@@ -1,0 +1,452 @@
+#!/usr/bin/env python3
+"""Guarded live test of the attachment chooser through the real TUI.
+
+Starts one daemon against the real OpenBubbles registration and state, waits for
+a replayed inbound attachment that carries a fetch token, drives the real TUI in
+a PTY to `/attachment`, selects the newest row in the chooser, and saves it into
+a private temporary cache. It never opens the file, sends a message, imports
+history, renews, changes registration, or prints attachment names, paths, tokens
+or content.
+
+Required authorization:
+  BLOOM_LIVE_ATTACHMENT_ACK=one-shot-authorized
+
+Run with an interpreter that has pyte, normally
+`~/.cache/bloom-tools/bin/python scripts/live-attachment-picker-probe`.
+"""
+
+import argparse
+import fcntl
+import json
+import os
+import pty
+import re
+import select
+import shutil
+import signal
+import socket
+import stat
+import struct
+import subprocess
+import sys
+import tempfile
+import termios
+import threading
+import time
+from pathlib import Path
+
+ACK = 'one-shot-authorized'
+VERSION = 8
+MAX_FRAME = 1 << 24
+TOKEN = re.compile(r'^[0-9a-f]{32}$')
+PID_LINE = re.compile(r'engine child started pid=(?:Some\()?(\d+)')
+SAVED = re.compile(r'Attachment saved to .*\((\d+) bytes\)')
+START_TIMEOUT = 60.0
+
+
+class ProbeError(RuntimeError):
+    pass
+
+
+def argv(pid):
+    try:
+        raw = Path(f'/proc/{pid}/cmdline').read_bytes()
+    except OSError:
+        return []
+    return [part.decode(errors='replace') for part in raw.split(b'\0') if part]
+
+
+def owners():
+    rows = []
+    for entry in Path('/proc').iterdir():
+        if not entry.name.isdigit():
+            continue
+        pid = int(entry.name)
+        if pid == os.getpid():
+            continue
+        command = argv(pid)
+        if not command:
+            continue
+        exe = Path(command[0]).name
+        if exe == 'bloomd' or any(arg.endswith('bloom_engine.dart') for arg in command[1:]):
+            rows.append(pid)
+    return rows
+
+
+def openbubbles_running():
+    for entry in Path('/proc').iterdir():
+        if not entry.name.isdigit():
+            continue
+        pid = int(entry.name)
+        if pid == os.getpid():
+            continue
+        command = argv(pid)
+        if not command:
+            continue
+        exe = Path(command[0]).name
+        if exe == 'OpenBubbles':
+            return pid
+        if exe in {'flatpak', 'bwrap'} and 'app.openbubbles.OpenBubbles' in command:
+            return pid
+        if '/app/' in command[0]:
+            return pid
+    return None
+
+
+def frame(value):
+    data = json.dumps(value, separators=(',', ':'), ensure_ascii=False).encode()
+    if not data or len(data) > MAX_FRAME:
+        raise ProbeError('invalid request frame size')
+    return bytes([VERSION]) + struct.pack('>I', len(data)) + data
+
+
+def read_exact(stream, length):
+    data = bytearray()
+    while len(data) < length:
+        chunk = stream.recv(length - len(data))
+        if not chunk:
+            raise ProbeError('daemon closed the IPC connection')
+        data.extend(chunk)
+    return bytes(data)
+
+
+def request(socket_path, payload, timeout=30.0):
+    with socket.socket(socket.AF_UNIX) as connection:
+        connection.settimeout(timeout)
+        connection.connect(str(socket_path))
+        connection.sendall(frame(payload))
+        header = read_exact(connection, 5)
+        if header[0] != VERSION:
+            raise ProbeError('unexpected IPC version')
+        length = struct.unpack('>I', header[1:])[0]
+        if length == 0 or length > MAX_FRAME:
+            raise ProbeError('invalid IPC frame length')
+        reply = json.loads(read_exact(connection, length))
+    return reply.get('response', {})
+
+
+def wait_socket(path, deadline, daemon):
+    while time.monotonic() < deadline:
+        if daemon.poll() is not None:
+            raise ProbeError('daemon exited during startup')
+        if path.exists():
+            return
+        time.sleep(0.1)
+    raise ProbeError('daemon never created its socket')
+
+
+def wait_engine(log_path, deadline, daemon):
+    while time.monotonic() < deadline:
+        if daemon.poll() is not None:
+            raise ProbeError('daemon exited while starting the engine')
+        text = log_path.read_text(errors='replace') if log_path.exists() else ''
+        pids = [int(match) for match in PID_LINE.findall(text)]
+        if pids and Path(f'/proc/{pids[-1]}').exists():
+            return pids[-1]
+        time.sleep(0.1)
+    raise ProbeError('engine child never appeared')
+
+
+def attachment_tokens(message):
+    tokens = 0
+    for part in message.get('parts', []):
+        if part.get('type') != 'attachment':
+            continue
+        value = part.get('value') or {}
+        token = value.get('fetch_token')
+        if isinstance(token, str) and TOKEN.fullmatch(token):
+            tokens += 1
+    return tokens
+
+
+def survey(socket_path, deadline):
+    """Count conversations and fetchable attachment parts without printing them."""
+    conversations = 0
+    fetchable = 0
+    while time.monotonic() < deadline:
+        listed = request(socket_path, {'request_id': 1, 'request': {'op': 'list_conversations'}})
+        chat_list = listed.get('conversations', [])
+        conversations = max(conversations, len(chat_list))
+        fetchable = 0
+        for conversation in chat_list:
+            history = request(socket_path, {
+                'request_id': 2,
+                'request': {'op': 'history', 'conversation_id': conversation.get('id'), 'limit': 50},
+            })
+            if history.get('result') != 'history':
+                continue
+            for message in history.get('messages', []):
+                fetchable += attachment_tokens(message)
+        if fetchable:
+            return conversations, fetchable
+        time.sleep(2.0)
+    return conversations, fetchable
+
+
+class Tui:
+    def __init__(self, binary, environment, width=220, height=30):
+        pid, master = pty.fork()
+        if pid == 0:
+            try:
+                os.execve(binary, [binary], environment)
+            finally:
+                os._exit(127)
+        self.pid = pid
+        self.master = master
+        import pyte
+        self.screen = pyte.Screen(width, height)
+        self.stream = pyte.ByteStream(self.screen)
+        fcntl.ioctl(master, termios.TIOCSWINSZ, struct.pack('HHHH', height, width, 0, 0))
+        os.kill(pid, signal.SIGWINCH)
+
+    def pump(self, seconds):
+        deadline = time.monotonic() + seconds
+        while time.monotonic() < deadline:
+            wait = min(0.03, max(0.0, deadline - time.monotonic()))
+            if select.select([self.master], [], [], wait)[0]:
+                try:
+                    data = os.read(self.master, 65536)
+                except OSError:
+                    return
+                if not data:
+                    return
+                self.stream.feed(data)
+
+    def text(self):
+        return '\n'.join(self.screen.display)
+
+    def send(self, data, wait=0.25):
+        os.write(self.master, data)
+        self.pump(wait)
+
+    def wait_for(self, needle, timeout, quiet=False):
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            if needle in self.text():
+                return True
+            self.pump(0.1)
+        return needle in self.text() if quiet else False
+
+    def stop(self):
+        try:
+            os.kill(self.pid, signal.SIGTERM)
+        except ProcessLookupError:
+            pass
+        try:
+            os.waitpid(self.pid, 0)
+        except ChildProcessError:
+            pass
+        try:
+            os.close(self.master)
+        except OSError:
+            pass
+
+
+def stop_daemon(daemon):
+    if daemon.poll() is None:
+        daemon.send_signal(signal.SIGTERM)
+    try:
+        daemon.wait(timeout=30.0)
+    except subprocess.TimeoutExpired:
+        daemon.kill()
+        daemon.wait(timeout=10.0)
+
+
+def cached_files(cache_root):
+    if not cache_root.is_dir():
+        return []
+    return sorted(
+        (entry for entry in cache_root.iterdir()
+         if entry.is_file() and not entry.is_symlink() and entry.suffix == '.bin'),
+        key=lambda entry: entry.stat().st_mtime,
+    )
+
+
+def run(args, root):
+    if os.environ.get('BLOOM_LIVE_ATTACHMENT_ACK') != ACK:
+        raise ProbeError('live attachment picker probe is not authorized')
+    for label, value in [
+        ('bloomd', args.bloomd),
+        ('tui', args.tui),
+        ('engine state', args.engine_state),
+        ('engine library', args.engine_library),
+        ('engine script', args.engine_script),
+        ('dart executable', args.dart),
+    ]:
+        if not value or not Path(value).exists():
+            raise ProbeError(f'{label} does not exist')
+    if owners():
+        raise ProbeError('another Bloom or engine owner is running')
+    if openbubbles_running() is not None:
+        raise ProbeError('OpenBubbles is still running')
+
+    socket_path = root / 'bloomd.sock'
+    store_path = root / 'store.db'
+    cache_root = root / 'cache/bloom/attachments'
+    log_path = root / 'bloomd.log'
+    daemon_env = dict(os.environ)
+    daemon_env.update({
+        'BLOOM_SOCKET_PATH': str(socket_path),
+        'BLOOM_STORE_PATH': str(store_path),
+        'BLOOM_ENGINE_STATE': args.engine_state,
+        'BLOOM_ENGINE_LIBRARY': args.engine_library,
+        'BLOOM_ENGINE_SCRIPT': args.engine_script,
+        'BLOOM_DART_EXECUTABLE': args.dart,
+        'XDG_DATA_HOME': str(root / 'data'),
+        'XDG_STATE_HOME': str(root / 'state'),
+        'XDG_CONFIG_HOME': str(root / 'config'),
+        'XDG_CACHE_HOME': str(root / 'cache'),
+    })
+    log = open(log_path, 'w', encoding='utf-8', buffering=1)
+    os.fchmod(log.fileno(), 0o600)
+    started = time.monotonic()
+    daemon = subprocess.Popen(
+        [args.bloomd],
+        env=daemon_env,
+        stdin=subprocess.DEVNULL,
+        stdout=log,
+        stderr=log,
+    )
+    tui = None
+    result = {
+        'conversations_seen': 0,
+        'fetchable_parts': 0,
+        'picker_opened': False,
+        'saved_bytes': None,
+        'file_mode': None,
+        'elapsed_seconds': None,
+        'result': 'failed',
+    }
+    try:
+        wait_socket(socket_path, time.monotonic() + START_TIMEOUT, daemon)
+        wait_engine(log_path, time.monotonic() + START_TIMEOUT, daemon)
+        conversations, fetchable = survey(socket_path, time.monotonic() + args.seconds)
+        result['conversations_seen'] = conversations
+        result['fetchable_parts'] = fetchable
+        if not fetchable:
+            raise ProbeError(f'no inbound attachment with a fetch token appeared ({conversations} conversations)')
+
+        tui_env = dict(os.environ)
+        tui_env.update({
+            'BLOOM_SOCKET_PATH': str(socket_path),
+            'XDG_DATA_HOME': str(root / 'data'),
+            'XDG_STATE_HOME': str(root / 'state'),
+            'XDG_CONFIG_HOME': str(root / 'config'),
+            'XDG_CACHE_HOME': str(root / 'cache'),
+            'NO_COLOR': '1',
+            'TERM': 'xterm-256color',
+            # The test never presses `o`; a stray opener must fail instead of
+            # displaying downloaded content.
+            'BLOOM_OPENER': '/nonexistent/bloom-live-picker-opener',
+        })
+        tui = Tui(args.tui, tui_env)
+        if not tui.wait_for('Write a message', 30.0):
+            raise ProbeError('the TUI never became ready')
+        # Let the first snapshot and history load land before choosing a chat.
+        tui.pump(2.0)
+
+        for _ in range(max(1, min(conversations, 12))):
+            tui.send(b'/attachment\r')
+            if tui.wait_for('Enter save', 4.0):
+                result['picker_opened'] = True
+                break
+            tui.send(b'\x1b', 0.3)
+            tui.send(b'\x02n', 0.6)
+        if not result['picker_opened']:
+            raise ProbeError('the chooser did not open in any of the loaded chats')
+
+        tui.send(b'\r')
+        if not tui.wait_for('Attachment saved to', 200.0, quiet=True):
+            raise ProbeError('the chooser did not settle a saved attachment')
+        match = SAVED.search(tui.text())
+        if not match:
+            raise ProbeError('saved notice did not report a byte count')
+        saved_bytes = int(match.group(1))
+
+        files = cached_files(cache_root)
+        if len(files) != 1:
+            raise ProbeError(f'expected one cached file, found {len(files)}')
+        info = files[0].stat()
+        if not stat.S_ISREG(info.st_mode):
+            raise ProbeError('cached path was not a regular file')
+        if info.st_size != saved_bytes or saved_bytes <= 0:
+            raise ProbeError('cached size did not match the reported byte count')
+        if info.st_mode & 0o077:
+            raise ProbeError('cached file permissions were not private')
+
+        result['saved_bytes'] = saved_bytes
+        result['file_mode'] = oct(info.st_mode & 0o777)
+        result['result'] = 'passed'
+        return result
+    finally:
+        result['elapsed_seconds'] = round(time.monotonic() - started, 2)
+        if tui is not None:
+            tui.stop()
+        stop_daemon(daemon)
+        log.close()
+        if owners():
+            raise ProbeError('a Bloom or engine owner survived cleanup')
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    repo = Path(__file__).resolve().parents[1]
+    parser.add_argument('--bloomd', default=str(repo / 'target/debug/bloomd'))
+    parser.add_argument('--tui', default=str(repo / 'target/debug/bloom-tui'))
+    parser.add_argument('--engine-state', default=os.environ.get('BLOOM_ENGINE_STATE', ''))
+    parser.add_argument('--engine-library', default=os.environ.get('BLOOM_ENGINE_LIBRARY', ''))
+    parser.add_argument('--engine-script', default=os.environ.get('BLOOM_ENGINE_SCRIPT', ''))
+    parser.add_argument('--dart', default=os.environ.get('BLOOM_DART_EXECUTABLE', 'dart'))
+    parser.add_argument('--seconds', type=float, default=420.0)
+    parser.add_argument('--preflight', action='store_true')
+    parser.add_argument('--evidence-dir', default='')
+    args = parser.parse_args()
+    if args.seconds <= 0:
+        parser.error('--seconds must be positive')
+
+    if args.preflight:
+        try:
+            if owners():
+                raise ProbeError('another Bloom or engine owner is running')
+            if openbubbles_running() is not None:
+                raise ProbeError('OpenBubbles is still running')
+            for label, value in [
+                ('bloomd', args.bloomd),
+                ('tui', args.tui),
+                ('engine state', args.engine_state),
+                ('engine library', args.engine_library),
+                ('engine script', args.engine_script),
+                ('dart executable', args.dart),
+            ]:
+                if not value or not Path(value).exists():
+                    raise ProbeError(f'{label} does not exist')
+            print('preflight: no competing owner; required paths exist')
+            return 0
+        except ProbeError as error:
+            print(f'live attachment picker aborted: {error}', file=sys.stderr)
+            return 2
+
+    root = Path(tempfile.mkdtemp(prefix='bloom-live-picker-')).resolve()
+    root.chmod(0o700)
+    try:
+        result = run(args, root)
+        target = Path(args.evidence_dir).expanduser() if args.evidence_dir \
+            else Path.home() / f'bloom-live-picker-{int(time.time())}'
+        target.mkdir(parents=True, exist_ok=True, mode=0o700)
+        summary = target / 'summary.json'
+        summary.write_text(json.dumps(result, indent=2) + '\n')
+        summary.chmod(0o600)
+        print(json.dumps(result, indent=2))
+        print(f'summary kept at {summary}')
+        return 0 if result['result'] == 'passed' else 1
+    except ProbeError as error:
+        print(f'live attachment picker aborted: {error}', file=sys.stderr)
+        return 2
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
+        if owners():
+            print('warning: surviving Bloom owner detected', file=sys.stderr)
+
+
+if __name__ == '__main__':
+    sys.exit(main())

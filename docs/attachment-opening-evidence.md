@@ -269,9 +269,52 @@ missing opener. The older-row test reseeds two attachments, moves the selection
 down, and asserts the fetched path carries the older token, proving the choice
 reaches IPC.
 
-Limits: no live-fetched attachment has been chosen through the chooser, and it
-cannot list attachments whose tokens died with a previous sidecar generation or
-that are outside the loaded transcript window.
+### C1g live run
+
+The guarded probe is `scripts/live-attachment-picker-probe`. It starts one daemon
+against the real registration and state with a temporary store, waits for a
+replayed inbound attachment carrying a fetch token, starts the real TUI in a PTY,
+opens `/attachment`, saves the selected row, and verifies the cache file. It never
+presses `o`, points `BLOOM_OPENER` at a nonexistent program, and prints no name,
+path, token or content.
+
+```sh
+export BLOOM_LIVE_ATTACHMENT_ACK=one-shot-authorized
+~/.cache/bloom-tools/bin/python scripts/live-attachment-picker-probe \
+  --engine-state "$STATE" --engine-library "$LIB" \
+  --engine-script "$SCRIPT" --dart "$DART" \
+  --seconds 420 --evidence-dir "$HOME/bloom-live-picker-evidence"
+```
+
+Run `--preflight` first, and only with OpenBubbles closed and no other Bloom owner
+running. The same authorization envelope as C1e applies: one test, a temporary
+store and cache, no sends, no history import into Bloom's real store, no renewal
+or registration change, and no external opening or content sharing.
+
+A live run on 2026-10-26 printed only structural fields:
+
+```json
+{
+  "conversations_seen": 2,
+  "fetchable_parts": 1,
+  "picker_opened": true,
+  "saved_bytes": 165257,
+  "file_mode": "0o600",
+  "elapsed_seconds": 16.53,
+  "result": "passed"
+}
+```
+
+That proves the real engine replay produced a live token, the real TUI rendered
+the chooser, Enter sent the v8 fetch, and the cache write was private with the
+reported byte count. Post-run checks found no daemon, engine or temporary root;
+the retained summary is mode `0600` and carries no path, token, name or content.
+
+Limits: this run had one candidate, so it does not prove live multi-choice
+selection; the live `o` open path was not exercised; the store was temporary, so
+no history was imported into Bloom's real store; no message was sent and no file
+was opened or displayed. Tokens remain sidecar-generation scoped, and the chooser
+cannot list attachments outside the loaded transcript window.
 
 ## C1b implementation evidence
 
