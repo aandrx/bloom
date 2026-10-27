@@ -193,7 +193,8 @@ Inbound reactions, text edits and whole-body unsends are accepted. Remaining wor
 
 - Outbound reactions are out of scope by user decision.
 - Outbound edits/unsend are optional. Gate: the pinned engine's send API accepts the corresponding message type through the sidecar, proven with a synthetic or authorized test. If it does not, stop.
-- If the gate passes: add an explicit capability, one confirmation path, durable intent, no automatic retry, and no claim of exactly-once delivery. Keep edits text-only and unsend whole-message until per-part tombstones exist.
+- Gate result: **structural pass**. The pinned upstream `edit`/`unsend` functions use `api.newMsg` and `api.send`, and the local bindings match. Unsend is part-scoped, so whole-message unsend is single-part only; outbound Bloom-sent messages need a persisted part map. No live mutation was sent. See [the outbound mutation gate](outbound-mutation-gate.md).
+- If the gate passes: add an explicit capability, one confirmation path, durable intent, no automatic retry, and no claim of exactly-once delivery. Keep edits text-only and unsend whole-message until per-part tombstones exist. Deferred until outbound delivery has a working live boundary.
 
 ### C3. Replies, typing and read receipts
 
