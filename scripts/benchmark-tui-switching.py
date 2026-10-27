@@ -10,6 +10,9 @@ been laid out at startup, so later samples are warm cache hits. That first
 sample is also recorded once as chat_first_visit, without changing the
 existing series. Returning to ALICE is not a cold case: it was laid out at
 startup and stays inside the four-entry cache with only two chats.
+
+Use --binary to compare build profiles with the same fixture; the default is
+the debug helper build.
 """
 import argparse
 import fcntl
@@ -33,6 +36,7 @@ F = runpy.run_path(str(HERE / 'stateful-fake-daemon.py'), run_name='helpers')
 
 def benchmark(args):
     fixture = H['MessagingFlows']()
+    binary = Path(args.binary)
     fixture.setUp()
     pid = master = None
     try:
@@ -63,7 +67,7 @@ def benchmark(args):
             pid, master = pty.fork()
             if pid == 0:
                 try:
-                    os.execv(str(H['BINARY']), [str(H['BINARY'])])
+                    os.execv(str(binary), [str(binary)])
                 except OSError:
                     os._exit(127)
         screen = H['SHOT']['pyte'].Screen(args.columns, 30)
@@ -130,7 +134,7 @@ def benchmark(args):
             }
         print(json.dumps({
             'boundary': 'input_to_readable_pyte_state_not_compositor',
-            'binary': 'target/debug/bloom-tui', 'columns': args.columns, 'rows': 30,
+            'binary': str(binary), 'columns': args.columns, 'rows': 30,
             'messages_per_chat': args.messages, 'body_repeat': args.body_repeat,
             'timings': summary,
         }, indent=2))
@@ -151,7 +155,15 @@ if __name__ == '__main__':
     parser.add_argument('--body-repeat', type=int, default=10)
     parser.add_argument('--samples', type=int, default=8)
     parser.add_argument('--columns', type=int, default=100)
+    parser.add_argument(
+        '--binary',
+        default=str(H['BINARY']),
+        help='TUI binary to measure (default: the debug helper build)',
+    )
     options = parser.parse_args()
+    options.binary = str(Path(options.binary).expanduser().resolve())
+    if not Path(options.binary).is_file():
+        parser.error('--binary must name an existing file')
     if not 2 <= options.messages <= 200:
         parser.error('--messages must be between 2 and the local-history limit of 200')
     if not 1 <= options.body_repeat <= 100:

@@ -14,11 +14,26 @@ Entry criteria to resume: a reproduced fault with its redacted line, or a concre
 
 ## 5. Launcher build profile
 
-Current decision is debug. The isolated probe measured first render at about 31 ms (medium) and 213 ms (long) in debug against 4 ms and 22 ms in release.
+Current decision is debug; this spike tested whether that remains the right default.
 
-Unit: one bounded spike, no product change. Build both profiles, run the existing switching probe in an isolated prefix, and record input-to-reconstructed-screen numbers with the same fixture. That probe does not measure compositor first paint, so neither the plan nor the report may call it first-render latency.
+Unit: one bounded spike, no product change. Build both profiles and run the existing switching probe against the same synthetic fixture. That probe measures input to readable reconstructed terminal state, not compositor first paint.
 
-Status: blocked. The release build succeeds, but the probe needs `pyte==0.8.2`, which is not installed and cannot be fetched offline. The probe also hardcodes `target/debug/bloom-tui`, so a release run needs an isolated copy with that path patched. Recorded, not silently skipped. Then either keep debug with the numbers restated, or propose a release launcher behind an explicit opt-in. Exit criteria: measurements recorded, decision restated, no test depends on a fixed profile.
+Status: measured. `pyte==0.8.2` is available in the E2E tools environment, and the probe now accepts `--binary`, so no patched copy is needed and no test depends on a fixed profile.
+
+Fixture: 200 messages per chat, 100 columns, fake daemon, one run per profile. Warm values exclude the first cold visit; "first visit" is the single cold BOB layout. These numbers are not directly comparable to the earlier 31/213 ms figures, which came from a different probe fixture.
+
+| Fixture | Profile | Warm chat next | First visit | Overlay median |
+| --- | --- | --- | --- | --- |
+| medium, body-repeat 10 | debug | 22.2 ms | 53.7 ms | 8-12 ms |
+| medium, body-repeat 10 | release | 8.7 ms | 27.8 ms | 9-10 ms |
+| long, body-repeat 100 | debug | 20.1 ms | 351.8 ms | 8-11 ms |
+| long, body-repeat 100 | release | 9.5 ms | 61.0 ms | 9-10 ms |
+
+Boundary: synthetic PTY reconstruction. It is not a live-account or compositor benchmark; there was one run per profile, and terminal scheduling contributes to the ~9-12 ms overlay floor.
+
+Decision: keep debug as the launcher default for now, and propose an explicit opt-in release launcher as a separate unit. Release roughly halves warm chat switching (22.2 to 8.7 ms medium; 20.1 to 9.5 ms long) and cuts the long cold visit from 351.8 to 61.0 ms. No launcher or product change was made in this spike; the probe default stays debug.
+
+Exit criteria met: measurements recorded, decision restated, no test depends on a fixed profile.
 
 ## 6. Rich messaging
 
