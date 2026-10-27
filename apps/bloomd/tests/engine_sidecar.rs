@@ -39,8 +39,9 @@ fn fake_sidecar(dir: &std::path::Path) -> PathBuf {
     let path = dir.join("fake_engine.sh");
     let script = r#"#!/bin/sh
 # Ignores its arguments; speaks the sidecar protocol on stdio.
+# The upstream MMCS Ford writer emits a bare 768-character hex line on stdout.
+awk 'BEGIN { for (i = 0; i < 384; i++) printf "8a"; printf "\n" }'
 cat <<'FRAMES'
-8 foreign engine diagnostic that must be skipped
 {"version":1,"type":"ready","engine_version":"fake","handles":["mailto:me@example.invalid"],"capabilities":{"send":true,"history":false,"recipient_lists":true}}
 {"version":1,"type":"inbound_message","sequence":1,"payload":{"variant":"iMessage","complete":true,"inst":{"id":"inbound-1","sender":"tel:+15550000001","conversation":{"participants":["tel:+15550000001","mailto:me@example.invalid"],"cv_name":null,"sender_guid":"iMessage;-;+15550000001","after_guid":null},"message":{"type":"normal","complete":true,"value":{"parts":[{"idx":0,"part":{"type":"text","text":"first"}}],"service":{"type":"iMessage","complete":true}}},"sent_timestamp_ms":1700000000000,"send_delivered":false,"verification_failed":false}}}
 {"version":1,"type":"inbound_message","sequence":2,"payload":{"variant":"iMessage","complete":true,"inst":{"id":"group-inbound-1","sender":"mailto:one@example.invalid","conversation":{"participants":["mailto:one@example.invalid","tel:+15550000002","mailto:me@example.invalid"],"cv_name":"Two people","sender_guid":"iMessage;-;group-with-two-people","after_guid":null},"message":{"type":"normal","complete":true,"value":{"parts":[{"idx":0,"part":{"type":"text","text":"group first"}}],"service":{"type":"iMessage","complete":true}}},"sent_timestamp_ms":1700000000001,"send_delivered":false,"verification_failed":false}}}
