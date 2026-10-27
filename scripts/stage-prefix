@@ -24,6 +24,7 @@ SKIP_SUFFIXES = ('.snapshot', '.dill')
 SHARED_LIBRARY_SUFFIXES = ('.so', '.dylib', '.dll')
 SCHEMA_VERSION = 1
 FILE_MODE = 0o755
+DOCUMENT_MODE = 0o644
 
 
 class UsageError(Exception):
@@ -162,6 +163,10 @@ def build_plan(options, source_root):
         raise Refused('prefix is not empty; pass --force to stage into it')
 
     plan = []
+    license_path = source_root / 'LICENSE'
+    if not license_path.is_file():
+        raise Refused('root LICENSE is missing')
+    plan.append((license_path, Path('LICENSE')))
     for name in BINARIES:
         plan.append((bin_dir / name, Path('bin') / name))
 
@@ -196,6 +201,12 @@ def build_plan(options, source_root):
     return prefix, plan, attribution
 
 
+def mode_for(relative):
+    if relative.name in ('LICENSE', 'NOTICE', 'ATTRIBUTION'):
+        return DOCUMENT_MODE
+    return FILE_MODE
+
+
 def is_shared_library(name):
     lowered = name.lower()
     return (lowered.endswith(SHARED_LIBRARY_SUFFIXES)
@@ -224,7 +235,7 @@ def main(argv):
 
     if options['dry_run']:
         for _, relative in plan:
-            print(f'would copy {relative.as_posix()} (mode {FILE_MODE:o})')
+            print(f'would copy {relative.as_posix()} (mode {mode_for(relative):o})')
         print('would write stage-manifest.json')
         print('dry run: nothing written')
         return 0
@@ -235,10 +246,10 @@ def main(argv):
             target = prefix / relative
             target.parent.mkdir(parents=True, exist_ok=True)
             shutil.copyfile(source, target)
-            target.chmod(FILE_MODE)
+            target.chmod(mode_for(relative))
         entries = [{'path': relative.as_posix(),
                     'sha256': digest(prefix / relative),
-                    'mode': FILE_MODE}
+                    'mode': mode_for(relative)}
                    for _, relative in plan]
         entries.sort(key=lambda entry: entry['path'])
         manifest = {'schema_version': SCHEMA_VERSION,

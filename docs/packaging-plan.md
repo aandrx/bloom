@@ -71,7 +71,7 @@ Decision: one resolver in `bloom_ipc`, used by the daemon, launcher, and TUI. Pr
 
 ## B-4c release paperwork
 
-[The 4c review](packaging-4c-release-paperwork.md) found missing Bloom LICENSE text, missing Apache-2.0/NOTICE artifacts for the vendored bindings, no Rust/Dart third-party notice bundle, unresolved SSPL/closed-engine obligations, and an exact-tag-only engine range. Distribution remains blocked; no distribution claim is made.
+[The 4c review](packaging-4c-release-paperwork.md) added the Bloom MIT LICENSE and the Apache-2.0 LICENSE/NOTICE for the vendored bindings. Distribution remains blocked by the absent Rust/Dart third-party notice bundle, unresolved SSPL/closed-engine obligations, and an exact-tag-only engine range; no distribution claim is made.
 
 ## Explicit unknowns and forbiddens
 

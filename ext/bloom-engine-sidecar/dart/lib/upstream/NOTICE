@@ -1,0 +1,14 @@
+Bloom engine sidecar
+Copyright (c) 2026 Bloom contributors
+
+This distribution includes generated Dart bindings from OpenBubbles:
+
+  https://github.com/OpenBubbles/openbubbles-app
+  Release tag: v1.15.0+205
+  Commit: 852c9910f456492f7f840ac4ff2a8bad7a1ee8c8
+
+The generated bindings under this directory are licensed under the Apache
+License, Version 2.0. A copy is in the LICENSE file beside this NOTICE.
+
+The OpenBubbles engine library is not included in this distribution. It is
+installed and licensed separately by the user.

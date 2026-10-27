@@ -27,6 +27,7 @@ class StagingTests(unittest.TestCase):
             path.write_text(f'#!/bin/sh\n# fake {name}\necho {name}\n')
             path.chmod(0o755)
         self.prefix = self.root / 'prefix'
+        (self.source / 'LICENSE').write_text('MIT License\n')
 
     def tearDown(self):
         self.temp.cleanup()
@@ -39,6 +40,8 @@ class StagingTests(unittest.TestCase):
         (dart / 'bin' / 'bloom_engine.dart').write_text('void main() {}\n')
         (dart / 'lib' / 'protocol.dart').write_text('class Protocol {}\n')
         (dart / 'lib' / 'upstream' / 'api.dart').write_text('class Api {}\n')
+        (dart / 'lib' / 'upstream' / 'LICENSE').write_text('Apache License\n')
+        (dart / 'lib' / 'upstream' / 'NOTICE').write_text('OpenBubbles\n')
         (dart / 'pubspec.yaml').write_text('name: bloom_engine_sidecar\n')
         (dart / 'pubspec.lock').write_text('packages: {}\n')
         (dart / '.dart_tool').mkdir()
@@ -66,6 +69,13 @@ class StagingTests(unittest.TestCase):
     def assert_mode(self, path):
         self.assertEqual(path.stat().st_mode & 0o777, 0o755, str(path))
 
+    def test_missing_root_license_is_refused(self):
+        (self.source / 'LICENSE').unlink()
+        result = self.run_script('--bin-dir', str(self.bin),
+                                 '--prefix', str(self.prefix))
+        self.assertEqual(result.returncode, 1)
+        self.assertIn('root LICENSE is missing', result.stderr)
+
     def test_happy_path_layout_modes_and_manifest_digests(self):
         result = self.run_script('--bin-dir', str(self.bin),
                                  '--prefix', str(self.prefix))
@@ -80,10 +90,11 @@ class StagingTests(unittest.TestCase):
         self.assertIsNone(manifest['attribution'])
         entries = manifest['entries']
         self.assertEqual([entry['path'] for entry in entries],
-                         ['bin/bloom', 'bin/bloom-tui', 'bin/bloomd'])
+                         ['LICENSE', 'bin/bloom', 'bin/bloom-tui', 'bin/bloomd'])
         for entry in entries:
             staged = self.prefix / entry['path']
-            self.assertEqual(entry['mode'], 0o755)
+            expected_mode = 0o644 if entry['path'] in ('LICENSE', 'NOTICE', 'ATTRIBUTION') else 0o755
+            self.assertEqual(entry['mode'], expected_mode)
             self.assertEqual(entry['sha256'],
                              hashlib.sha256(staged.read_bytes()).hexdigest())
 
@@ -96,9 +107,13 @@ class StagingTests(unittest.TestCase):
         engine = self.prefix / 'share' / 'bloom' / 'engine'
         self.assertTrue((engine / 'bin' / 'bloom_engine.dart').is_file())
         self.assertTrue((engine / 'lib' / 'upstream' / 'api.dart').is_file())
+        self.assertTrue((engine / 'lib' / 'upstream' / 'LICENSE').is_file())
+        self.assertTrue((engine / 'lib' / 'upstream' / 'NOTICE').is_file())
         self.assertTrue((engine / 'pubspec.yaml').is_file())
         self.assertTrue((engine / 'ATTRIBUTION').is_file())
         self.assert_mode(engine / 'bin' / 'bloom_engine.dart')
+        for name in ('ATTRIBUTION', 'lib/upstream/LICENSE', 'lib/upstream/NOTICE'):
+            self.assertEqual((engine / name).stat().st_mode & 0o777, 0o644, name)
         self.assertFalse((engine / '.dart_tool').exists())
         self.assertFalse((engine / 'build').exists())
         self.assertFalse((engine / '.packages').exists())

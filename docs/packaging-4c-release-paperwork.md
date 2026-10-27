@@ -1,9 +1,10 @@
 # B-4c release paperwork: licensing, engine range and the Cargo boundary
 
-Status: review complete. **Distribution is not ready.** No distribution claim is
-made, no engine library is bundled, and no live install was rerun for this unit.
-The review found missing license and notice artifacts and unresolved obligations
-around the external OpenBubbles engine.
+Status: review complete; Bloom MIT and upstream Apache-2.0/NOTICE artifacts are
+added and staged. **Distribution is still not ready.** No distribution claim is
+made, no engine library is bundled, and no live install was rerun. Remaining
+blockers are third-party notice coverage, the external-engine legal review and
+the exact-tag-only compatibility range.
 
 ## Question
 
@@ -19,32 +20,35 @@ provide?
 - `bloom-core` and `bloom-tui` were missing the workspace license field; that
   metadata is fixed and `cargo metadata --no-deps` now reports MIT for all seven
   workspace packages.
-- There is no root `LICENSE` file anywhere in the repository. The MIT declaration
-  has no accompanying license text or copyright notice, which is a distribution
-  blocker.
+- A root `LICENSE` now carries the MIT text with the copyright holder recorded as
+  "Bloom contributors". The holder should be confirmed before distribution; the
+  file is otherwise complete.
 
 ### Vendored upstream bindings
 
 - `ext/bloom-engine-sidecar/ATTRIBUTION` records generated Dart bindings from
   OpenBubbles v1.15.0+205, commit `852c9910f456492f7f840ac4ff2a8bad7a1ee8c8`,
   under Apache-2.0.
-- The repository contains no Apache-2.0 license text and no upstream NOTICE file.
-- The staging dry run copies `lib/upstream`, `pubspec.*` and `ATTRIBUTION` into
-  `share/bloom/engine`, but no license or notice file.
+- `lib/upstream/LICENSE` now carries the Apache-2.0 text and `lib/upstream/NOTICE`
+  records the OpenBubbles attribution. Both are staged with the bindings.
+- The staging dry run copies the root `LICENSE`, `lib/upstream`, `pubspec.*` and
+  `ATTRIBUTION` into the prefix and does not copy an engine library.
 
 ### Staged contents
 
 `python3 scripts/stage-prefix --bin-dir target/debug --prefix <tmp> --with-sidecar --dry-run` plans:
 
+- `LICENSE` (root MIT);
 - `bin/bloom`, `bin/bloom-tui`, `bin/bloomd`;
 - `share/bloom/engine/bin/bloom_engine.dart`, the owned Dart libraries, the
-  generated upstream bindings, `pubspec.yaml`, `pubspec.lock` and `ATTRIBUTION`;
+  generated upstream bindings with their `LICENSE` and `NOTICE`, `pubspec.yaml`,
+  `pubspec.lock` and `ATTRIBUTION`;
 - `stage-manifest.json` with copied paths, SHA-256 digests and the upstream tag or
   commit.
 
-It plans no license files and no engine library. `scripts/test-staging.py` passes
-13 synthetic tests, including refusal to stage a shared library or an engine
-library inside the prefix.
+It plans no engine library. `scripts/test-staging.py` passes 14 synthetic tests,
+including refusal to stage a shared library, refusal without a root LICENSE, and
+refusal to stage an engine library inside the prefix.
 
 ### The external engine
 
@@ -101,14 +105,14 @@ The documented runtime also requires the pinned engine state and library plus a
 
 ## Blockers before any distribution
 
-1. **Bloom license text.** Choose the copyright holder and add an MIT `LICENSE`
-   file; propagate it to the staged prefix.
-2. **Upstream license and notice.** Add the Apache-2.0 license text and any
-   upstream NOTICE required for the vendored bindings, and stage them with
-   `lib/upstream`.
-3. **Third-party notices.** Generate and review a Rust/Dart third-party license
-   bundle. At minimum, resolve the MPL-2.0 and Unicode-3.0 obligations and the
-   packages with compound expressions.
+1. **Bloom license text.** Resolved: the root MIT `LICENSE` is staged, and the
+   copyright holder is recorded as "Bloom contributors". Confirm that holder
+   before distribution.
+2. **Upstream license and notice.** Resolved: the Apache-2.0 `LICENSE` and the
+   attribution `NOTICE` are staged under `lib/upstream`.
+3. **Third-party notices.** Open: generate and review a Rust/Dart third-party
+   license bundle. At minimum, resolve the MPL-2.0 and Unicode-3.0 obligations
+   and the packages with compound expressions.
 4. **Engine obligations.** Obtain a legal review of distributing Bloom binaries
    and sidecar sources that interact with an SSPL/closed engine. Do not bundle the
    engine. The process boundary is an engineering control, not a legal opinion.
@@ -121,12 +125,12 @@ The documented runtime also requires the pinned engine state and library plus a
 
 ## Decision
 
-B-4c is a review, not a release. Distribution remains blocked by missing license
-and notice artifacts, unresolved third-party obligations, the unresolved
-SSPL/closed-engine review, and an unverified compatibility range. The safe
-statement is: Bloom source uses an MIT license declaration; the vendored bindings
-are Apache-2.0 from the pinned OpenBubbles tag; the engine is external,
-user-supplied, and not covered by Bloom's license.
+B-4c is a review, not a release. Distribution remains blocked by the missing
+third-party notice bundle, the unresolved SSPL/closed-engine review, and the
+exact-tag-only compatibility range. The Bloom MIT and upstream Apache-2.0/NOTICE
+artifacts are now present and staged. The safe statement is: Bloom source uses an
+MIT license; the vendored bindings are Apache-2.0 from the pinned OpenBubbles tag;
+the engine is external, user-supplied, and not covered by Bloom's license.
 
 No distribution claim, no Cargo-only installation claim, and no supported-version
 range beyond the pinned tag should be made.
@@ -134,7 +138,7 @@ range beyond the pinned tag should be made.
 ## Verification
 
 Observed with `cargo metadata`, a staging dry run, `scripts/test-staging.py`
-(13 passing tests), the sidecar `ATTRIBUTION` and README, Flutter Rust Bridge
-the Flutter Rust Bridge `entrypoint.dart`, the generated binding content hash, the sidecar's engine-version
+(14 passing tests), the sidecar `ATTRIBUTION` and README, the Flutter Rust Bridge
+`entrypoint.dart`, the generated binding content hash, the sidecar's engine-version
 constant, and the launcher doctor checks. No legal advice is given. No real install,
 engine start, account access or distribution was performed for this record.
