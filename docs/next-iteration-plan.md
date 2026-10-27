@@ -7,7 +7,7 @@ This plan follows the original roadmap rather than replacing it. It records what
 ## Current baseline
 
 - Text messaging, local history, paging, search, unread navigation, session undo, durable encrypted drafts, inbound attachment save/open/chooser, inbound reactions, inbound text edits and whole-body unsends, and generation-scoped engine recovery are implemented. Outbound attachment send has a synthetic slice with live delivery deferred; the outbound edit/unsend gate passes structurally.
-- The synthetic universal gate passes: workspace and timezone tests, strict Clippy, formatting, guards, 68 fixture, 13 input PTY, 8 messaging PTY, 26 reading PTY, 15 launcher, and 99 Dart tests. IPC is v9.
+- The synthetic universal gate passes: workspace and timezone tests, strict Clippy, formatting, guards, 68 fixture, 13 input PTY, 8 messaging PTY, 26 reading PTY, 15 launcher, and 105 Dart tests. IPC is v9.
 - Historical ingestion remains blocked at the engine boundary.
 - Packaging phases 1 to 3 are accepted; phase 4 is open because a daemon-owned sidecar occasionally emitted an unparsable frame.
 - The launcher defaults to release; `./scripts/bloom --debug` is the opt-in debug profile.
