@@ -47,4 +47,4 @@ TUI state and render tests cover late success and error replies after Latest, se
 
 The actual PTY regression opens a hit 1,420 rows back, keeps it visible through reconciliation and a new arrival, then returns to newest via End without changing the literal draft. It verifies prompt badge clearing without another key and sends the preserved draft to its original synthetic recipient. Separate PTY cases cover an already-loaded hit and an unloaded hit. The final checks and review boundaries are recorded above.
 
-No live account or engine access is authorized. The launcher stays on debug. Remote archives, participant and attachment search, durable drafts, and engine recovery remain outside this unit.
+No live account or engine access is authorized. The launcher stayed on debug at the time. Remote archives, participant and attachment search, durable drafts, and engine recovery remain outside this unit.

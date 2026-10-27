@@ -34,7 +34,7 @@ From the repository instead, run:
 ./scripts/bloom
 ```
 
-The repository launcher invokes Cargo's incremental build, starts `bloomd` unless a daemon is already answering on the socket, then opens the UI. Pass `--release` to build and run the optimized profile; debug remains the default. When you quit, it stops the daemon it started. Diagnostics go to `~/.local/share/bloom/bloomd.log` (or the corresponding state-home directory if configured). Paths are discovered automatically; override them in a trusted `.env` file at the repository root. The file is sourced as shell code, so keep it to path settings and never put secrets there.
+The repository launcher builds and runs the optimized release profile, starts `bloomd` unless a daemon is already answering on the socket, then opens the UI. Pass `--debug` for the debug profile. When you quit, it stops the daemon it started. Diagnostics go to `~/.local/share/bloom/bloomd.log` (or the corresponding state-home directory if configured). Paths are discovered automatically; override them in a trusted `.env` file at the repository root. The file is sourced as shell code, so keep it to path settings and never put secrets there.
 
 ## TUI diagnostics
 

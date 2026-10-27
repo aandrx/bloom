@@ -83,13 +83,15 @@ refusal to stage an engine library inside the prefix.
 - `ext/bloom-engine-sidecar/dart/lib/upstream/frb_generated.dart:69` carries a
   Rust content hash. Flutter Rust Bridge checks it at `RustLib.init`
   (`flutter_rust_bridge-2.3.0/lib/src/main_components/entrypoint.dart:103-112`); a mismatch throws before commands are served.
-- The sidecar does not catch that initialization failure, so a mismatched engine
-  exits with a stack trace rather than a bounded ready-frame error.
-- `bloom_engine.dart:29` reports a hardcoded `engineVersion` constant in the
-  `ready` frame. It is not read from the installed library.
+- The sidecar now catches that initialization failure before serving commands,
+  logs a bounded cause such as `content_hash_mismatch`, emits an
+  `engine_incompatible` error frame and exits 3. It does not print the raw
+  exception, which can contain a path or engine internals.
+- `bloom_engine.dart:29` still reports a hardcoded `engineVersion` constant in the
+  `ready` frame; it is not read from the installed library.
 - The doctor checks that the library path exists, but it does not verify the
-  content hash or a supported version. The first real check happens at sidecar
-  initialization.
+  content hash or a supported version. The sidecar initialization is the actual
+  preflight.
 - Supported range: exactly the pinned binding tag. Other engine tags are
   unverified, even if they load; a different FRB content hash should fail closed,
   but that failure is not surfaced cleanly and no compatibility matrix exists.
@@ -134,9 +136,10 @@ The documented runtime also requires the pinned engine state and library plus a
 4. **Engine obligations.** Obtain a legal review of distributing Bloom binaries
    and sidecar sources that interact with an SSPL/closed engine. Do not bundle the
    engine. The process boundary is an engineering control, not a legal opinion.
-5. **Engine preflight.** Add a bounded version or content-hash check before
-   serving commands, with a clear unsupported-engine failure. Treat the hardcoded
-   `engineVersion` as a label, not proof of what was loaded.
+5. **Engine preflight.** Resolved at sidecar initialization: an FRB content-hash
+   mismatch is caught, logged as a bounded cause and returned as
+   `engine_incompatible` before commands. The doctor remains path-only, and the
+   ready-frame `engineVersion` remains a label rather than proof.
 6. **Packaging gate.** Re-run the 4b staged-prefix and lifecycle checks after any
    packaging change. The phase 4 fault remains intermittent and the containment
    path was not exercised live.
@@ -157,8 +160,8 @@ range beyond the pinned tag should be made.
 ## Verification
 
 Observed with `cargo metadata`, a staging dry run, `scripts/test-staging.py`
-(15 passing tests), `scripts/test-third-party-notices.py`, the sidecar
-`ATTRIBUTION` and README, the Flutter Rust Bridge
+(15 passing tests), `scripts/test-third-party-notices.py`, 105 Dart tests
+including the engine-preflight classifier, the sidecar `ATTRIBUTION` and README, the Flutter Rust Bridge
 `entrypoint.dart`, the generated binding content hash, the sidecar's engine-version
 constant, and the launcher doctor checks. No legal advice is given. No real install,
 engine start, account access or distribution was performed for this record.

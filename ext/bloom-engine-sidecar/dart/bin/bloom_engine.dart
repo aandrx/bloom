@@ -17,6 +17,7 @@ import 'dart:math';
 import 'package:flutter_rust_bridge/flutter_rust_bridge_for_generated_io.dart';
 
 import '../lib/attachment_cache.dart';
+import '../lib/engine_preflight.dart';
 import '../lib/payload_codec.dart';
 import '../lib/protocol.dart';
 import '../lib/send_coordinator.dart';
@@ -224,7 +225,20 @@ Future<void> main(List<String> arguments) async {
     return;
   }
 
-  await RustLib.init(externalLibrary: ExternalLibrary.open(config.libraryPath));
+  try {
+    await RustLib.init(
+      externalLibrary: ExternalLibrary.open(config.libraryPath),
+    );
+  } catch (error) {
+    // The content-hash handshake is the compatibility gate. Do not print the
+    // exception text: it can contain the library path or engine internals.
+    stderr.writeln(
+      'engine preflight failed: ${classifyEngineInitFailure(error)}',
+    );
+    writeProtocolFrame(errorFrame(code: ProtocolCodes.engineIncompatible));
+    exitCode = 3;
+    return;
+  }
   final restored = await api.SharedPushState.restore(
     path: config.stateDirectory,
   );

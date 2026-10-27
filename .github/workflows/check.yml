@@ -79,9 +79,9 @@ jobs:
       - name: Resolve dependencies
         run: dart pub get
       - name: Formatting
-        run: dart format --output=none --set-exit-if-changed bin lib/attachment_cache.dart lib/attachment_send.dart lib/payload_codec.dart lib/protocol.dart lib/single_flight.dart test tool
+        run: dart format --output=none --set-exit-if-changed bin lib/attachment_cache.dart lib/attachment_send.dart lib/engine_preflight.dart lib/payload_codec.dart lib/protocol.dart lib/single_flight.dart test tool
       - name: Analyze
-        run: dart analyze bin lib/attachment_cache.dart lib/attachment_send.dart lib/payload_codec.dart lib/protocol.dart lib/single_flight.dart test tool
+        run: dart analyze bin lib/attachment_cache.dart lib/attachment_send.dart lib/engine_preflight.dart lib/payload_codec.dart lib/protocol.dart lib/single_flight.dart test tool
       - name: Tests
         run: dart test
       - name: Engine stays out of the repository

@@ -33,11 +33,10 @@ engine state.
 Resolve the sidecar dependencies once with
 `(cd ext/bloom-engine-sidecar/dart && dart pub get)`.
 
-From a checkout, `./scripts/bloom` invokes Cargo's incremental debug build,
+From a checkout, `./scripts/bloom` builds and runs the optimized release profile,
 starts `bloomd` unless one is already answering on the socket, opens the TUI, and
-stops the daemon it started on exit. Pass `--release` to build and run the
-optimized daemon and TUI instead; the default remains debug, and an already
-running daemon is reused. Daemon diagnostics go to
+stops the daemon it started on exit. Pass `--debug` for the debug profile when
+backtraces or fast iteration matter; an already running daemon is reused. Daemon diagnostics go to
 `~/.local/share/bloom/bloomd.log`. Paths are discovered automatically; put
 overrides in a trusted `.env` file at the repository root (`BLOOM_ENGINE_STATE`,
 `BLOOM_ENGINE_LIBRARY`, `BLOOM_ENGINE_SCRIPT`, `BLOOM_DART_EXECUTABLE`,

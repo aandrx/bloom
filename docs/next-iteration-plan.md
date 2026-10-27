@@ -7,10 +7,10 @@ This plan follows the original roadmap rather than replacing it. It records what
 ## Current baseline
 
 - Text messaging, local history, paging, search, unread navigation, session undo, durable encrypted drafts, inbound attachment save/open/chooser, inbound reactions, inbound text edits and whole-body unsends, and generation-scoped engine recovery are implemented. Outbound attachment send has a synthetic slice with live delivery deferred; the outbound edit/unsend gate passes structurally.
-- The synthetic universal gate passes: workspace and timezone tests, strict Clippy, formatting, guards, 68 fixture, 13 input PTY, 8 messaging PTY, 26 reading PTY, 8 launcher, and 99 Dart tests. IPC is v9.
+- The synthetic universal gate passes: workspace and timezone tests, strict Clippy, formatting, guards, 68 fixture, 13 input PTY, 8 messaging PTY, 26 reading PTY, 15 launcher, and 99 Dart tests. IPC is v9.
 - Historical ingestion remains blocked at the engine boundary.
 - Packaging phases 1 to 3 are accepted; phase 4 is open because a daemon-owned sidecar occasionally emitted an unparsable frame.
-- The launcher defaults to debug; `./scripts/bloom --release` is implemented as an opt-in release profile.
+- The launcher defaults to release; `./scripts/bloom --debug` is the opt-in debug profile.
 - GPUI and multi-service are deferred design tracks, not active implementation.
 
 ## Current UI follow-up: sidebar viewport scrolling (implemented)
@@ -180,7 +180,7 @@ After either a root-cause fix or containment:
 
 The 768-byte line is consistent with a foreign stdout writer: the installed engine library contains multiple Rust logger implementations that can write to stdout. Rather than print or rewrite their payload, the sidecar now marks every protocol line, and the daemon skips a bounded number of unmarked non-JSON lines with a redacted structural log. Unmarked JSON remains compatible; a malformed marked frame still fails closed. Synthetic tests cover both paths.
 
-This is containment, not a proven root cause. The live staged-prefix rerun passed: doctor resolved the prefix sidecar, one daemon and one engine started, a second launcher reused the daemon, cleanup removed the socket and processes, and hidden-checkout missing sidecar/Dart/library cases failed cleanly. The original unparsable line did not recur and the containment path was not exercised live. The fault remains intermittent. The [4c release-paperwork review](packaging-4c-release-paperwork.md) is complete: the Bloom MIT and upstream Apache-2.0/NOTICE files are added and staged; the Rust/Dart third-party notice bundle is generated and staged; distribution is still blocked by legal review of its fallbacks and compound notices, the SSPL/closed-engine review and an exact-tag-only compatibility range.
+This is containment, not a proven root cause. The live staged-prefix rerun passed: doctor resolved the prefix sidecar, one daemon and one engine started, a second launcher reused the daemon, cleanup removed the socket and processes, and hidden-checkout missing sidecar/Dart/library cases failed cleanly. The original unparsable line did not recur and the containment path was not exercised live. The fault remains intermittent. The [4c release-paperwork review](packaging-4c-release-paperwork.md) is complete: the Bloom MIT and upstream Apache-2.0/NOTICE files are added and staged; the Rust/Dart third-party notice bundle is generated and staged; distribution is still blocked by legal review of its fallbacks and compound notices, the SSPL/closed-engine review and an exact-tag-only compatibility range; the sidecar preflight now fails closed with bounded `engine_incompatible` diagnostics.
 
 ## Track C: remaining rich messaging
 

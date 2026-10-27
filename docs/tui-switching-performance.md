@@ -4,7 +4,7 @@
 
 ## Reproduction boundary
 
-Parent drove the real debug `bloom-tui` binary through a PTY against the isolated stateful synthetic daemon, with private XDG/socket/store paths. Two synthetic chats each had 200 messages. Input-to-readable-pyte-state latency was measured using `perf_counter`; this is not compositor presentation timing, a statistical cross-machine benchmark or a real-engine measurement. The checkout launcher also builds the debug profile, so release-only tuning would not address that default path.
+Parent drove the real debug `bloom-tui` binary through a PTY against the isolated stateful synthetic daemon, with private XDG/socket/store paths. Two synthetic chats each had 200 messages. Input-to-readable-pyte-state latency was measured using `perf_counter`; this is not compositor presentation timing, a statistical cross-machine benchmark or a real-engine measurement. The checkout launcher built the debug profile at the time, so release-only tuning would not have addressed that default path.
 
 Baseline, eight samples per action at 100x30:
 
@@ -66,7 +66,7 @@ An isolated measurement separates layout cost from process startup and IPC noise
 
 | Profile | 200 medium bodies (~350 chars) | 200 long bodies (~3,500 chars) |
 | --- | --- | --- |
-| debug (launcher default) | 31.3-35.1 ms | 212.7-216.4 ms |
+| debug (launcher default at the time) | 31.3-35.1 ms | 212.7-216.4 ms |
 | release, single run | 4.2 ms | 21.6 ms |
 
 The same renderer is therefore several times slower in the profile `scripts/bloom` builds: about eight times for medium bodies and about ten for long ones. The first-visit PTY sample is larger than this render alone (68.7 ms medium, 242.5 ms long), so the remainder also carries process startup, IPC and the probe's own polling. What the isolated number does establish is that the layout closure's work is intrinsic exact wrapping, not redundant formatting: two source-level candidates that removed provable work moved no measurement outside noise. Choosing a release launcher is a build-time and disk trade-off for the user, not a renderer bug, so the launcher still builds debug and no profile change was made here.

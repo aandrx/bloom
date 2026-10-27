@@ -10,11 +10,11 @@ Entry criteria to resume: a reproduced fault with its redacted line, or a concre
 
 - **4a, frame-fault root cause.** Keep the redacted summary. Reproduce with a bounded loop, then classify the line (digit, letter, space split) and map it to a writer by source inspection, not by printing payload. Done when the writer is named and a regression exists, or the fault is proven environmental and documented.
 - **4b, gate rerun in two verifiable halves.** First, staged-prefix checks: doctor passes, the resolved sidecar lives under the prefix, and the dependency-break cases fail cleanly. Second, lifecycle checks in the same run: socket appears, TUI reaches readiness, exactly one daemon and one engine exist, SIGTERM leaves no child and no stale socket, and the temporary store is removed by the harness after the run. Each half reports separately because staging is non-atomic and a partial prefix cannot prove lifecycle behaviour. ABI compatibility stays unverified unless observed.
-- **4c, release paperwork: review complete, distribution blocked.** [Record](packaging-4c-release-paperwork.md). The Bloom MIT `LICENSE` and the upstream Apache-2.0 `LICENSE`/`NOTICE` are added and staged. The Rust/Dart third-party notice bundle is generated and staged (485 Rust and 52 Dart packages, with 48 Rust fallbacks). Distribution is still blocked by legal review of the fallback/compound notices, the SSPL/closed-engine review, and an exact-tag-only engine range with no friendly preflight. Cargo alone does not install Dart, sidecar packages, the engine or a registration. No distribution claim.
+- **4c, release paperwork: review complete, distribution blocked.** [Record](packaging-4c-release-paperwork.md). The Bloom MIT `LICENSE` and the upstream Apache-2.0 `LICENSE`/`NOTICE` are added and staged. The Rust/Dart third-party notice bundle is generated and staged (485 Rust and 52 Dart packages, with 48 Rust fallbacks). Distribution is still blocked by legal review of the fallback/compound notices, the SSPL/closed-engine review, and an exact-tag-only engine range; the sidecar preflight now fails closed with bounded `engine_incompatible` diagnostics. Cargo alone does not install Dart, sidecar packages, the engine or a registration. No distribution claim.
 
 ## 5. Launcher build profile
 
-Current decision is debug; this spike tested whether that remains the right default.
+The launcher now defaults to release; this spike supplied the profile measurements behind that decision.
 
 Unit: one bounded spike, no product change. Build both profiles and run the existing switching probe against the same synthetic fixture. That probe measures input to readable reconstructed terminal state, not compositor first paint.
 
@@ -31,7 +31,7 @@ Fixture: 200 messages per chat, 100 columns, fake daemon, one run per profile. W
 
 Boundary: synthetic PTY reconstruction. It is not a live-account or compositor benchmark; there was one run per profile, and terminal scheduling contributes to the ~9-12 ms overlay floor.
 
-Decision: keep debug as the launcher default. The opt-in release launcher is implemented as `./scripts/bloom --release`: it builds with `--release` and runs the release daemon and TUI, while the default path still builds and runs debug. Release roughly halves warm chat switching (22.2 to 8.7 ms medium; 20.1 to 9.5 ms long) and cuts the long cold visit from 351.8 to 61.0 ms. The installed `bloom` command still uses the cargo profile it was built with; the flag applies to the repository launcher.
+Decision: release is now the launcher default. The earlier debug default accumulated about 31 GB of build artifacts; release is a few hundred MB and roughly halves warm chat switching (22.2 to 8.7 ms medium; 20.1 to 9.5 ms long), while cutting the long cold visit from 351.8 to 61.0 ms. `./scripts/bloom --debug` remains available for backtraces and fast iteration. The installed `bloom` command still uses the cargo profile it was built with; the flag applies to the repository launcher.
 
 Exit criteria met: measurements recorded, decision restated, no test depends on a fixed profile.
 

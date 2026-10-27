@@ -12,7 +12,13 @@ import tempfile
 import time
 import unittest
 
-BINARY = Path(__file__).resolve().parents[1] / 'target/debug/bloom'
+ROOT = Path(__file__).resolve().parents[1]
+# Prefer the release launcher, which is the supported default; CI still builds debug.
+BINARY = next(
+    (path for path in (ROOT / 'target/release/bloom', ROOT / 'target/debug/bloom')
+     if path.is_file()),
+    ROOT / 'target/debug/bloom',
+)
 
 
 class LauncherFlows(unittest.TestCase):
@@ -290,10 +296,20 @@ class CheckoutLauncherProfile(unittest.TestCase):
         self.assertEqual((self.root / 'tui.marker').read_text(), 'release')
         self.assertFalse((self.root / 'wrong-profile.marker').exists())
 
-    def test_default_still_builds_and_runs_the_debug_binaries(self):
+    def test_default_builds_and_runs_the_release_binaries(self):
+        self.install_profile('release')
+        self.install_wrong_profile('debug')
+        result = self.run_launcher()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn('release profile', result.stderr)
+        self.assertIn('--release', (self.root / 'cargo.args').read_text())
+        self.assertEqual((self.root / 'tui.marker').read_text(), 'release')
+        self.assertFalse((self.root / 'wrong-profile.marker').exists())
+
+    def test_debug_flag_builds_and_runs_the_debug_binaries(self):
         self.install_profile('debug')
         self.install_wrong_profile('release')
-        result = self.run_launcher()
+        result = self.run_launcher('--debug')
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn('debug profile', result.stderr)
         self.assertNotIn('--release', (self.root / 'cargo.args').read_text())
@@ -327,11 +343,12 @@ class CheckoutLauncherOptions(unittest.TestCase):
             timeout=10,
         )
 
-    def test_help_documents_the_release_opt_in(self):
+    def test_help_documents_the_release_default_and_debug_opt_in(self):
         result = self.run_launcher('--help')
         self.assertEqual(result.returncode, 0)
         self.assertIn('--release', result.stdout)
-        self.assertIn('default: debug', result.stdout)
+        self.assertIn('--debug', result.stdout)
+        self.assertIn('(default)', result.stdout)
 
     def test_unknown_option_is_refused_before_building(self):
         result = self.run_launcher('--bogus')

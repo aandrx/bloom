@@ -30,6 +30,7 @@ class ProtocolCodes {
   static const String noSenderHandle = 'no_sender_handle';
   static const String sendFailed = 'send_failed';
   static const String engineUnavailable = 'engine_unavailable';
+  static const String engineIncompatible = 'engine_incompatible';
   static const String invalidToken = 'invalid_token';
   static const String tooLarge = 'too_large';
   static const String timeout = 'timeout';

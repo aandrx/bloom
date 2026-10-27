@@ -1,6 +1,6 @@
 #!/bin/sh
 # Start Bloom: runs the daemon unless one is already answering, then opens the TUI.
-# The default is the debug profile; pass --release for the optimized profile.
+# The default is the optimized release profile; pass --debug for the debug profile.
 #
 # Everything is discovered automatically: the OpenBubbles Flatpak provides the
 # engine library and state, the sidecar script lives in this repository, and Dart
@@ -13,11 +13,12 @@ set -eu
 root=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 cd "$root"
 
-profile=debug
+profile=release
 usage() {
   cat <<'EOF'
-usage: scripts/bloom [--release]
-  --release  build and run the optimized daemon and TUI (default: debug)
+usage: scripts/bloom [--release|--debug]
+  --release  build and run the optimized daemon and TUI (default)
+  --debug    build and run the debug daemon and TUI
 EOF
 }
 if [ "$#" -gt 1 ]; then
@@ -27,6 +28,7 @@ fi
 case "${1:-}" in
   "") ;;
   --release) profile=release ;;
+  --debug) profile=debug ;;
   -h|--help) usage; exit 0 ;;
   *) usage >&2; exit 2 ;;
 esac
