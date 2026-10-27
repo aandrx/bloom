@@ -31,7 +31,8 @@ Start with [fresh-session handoff](handoff.md). The root [AGENTS.md](../AGENTS.m
 | [Outbound edit/unsend gate](outbound-mutation-gate.md) | Structural engine gate pass; part-scoped unsend, outbound part-map prerequisite; not implemented |
 | [Remaining plans](remaining-plans.md) | Packaging tail, launcher profile spike, and gated rich-messaging phases |
 | [Durable drafts plan](durable-drafts-plan.md) | Encrypted daemon-owned drafts, revision guard, retention; design only |
-| [Packaging plan](packaging-plan.md) | Standalone install layout, doctor diagnostics, phases, licensing boundary; design only |
+| [Packaging plan](packaging-plan.md) | Standalone install layout, doctor diagnostics, phases 1-3 accepted; phase 4 and 4c distribution blocked |
+| [B-4c release paperwork](packaging-4c-release-paperwork.md) | Licensing, engine-range and Cargo-boundary review; distribution blocked |
 | [Historical ingestion plan](historical-ingestion-plan.md) | Design-only gate for importing past messages; blocked at the engine boundary |
 | [Engine recovery plan](engine-recovery-plan.md) | Implemented generation-scoped engine restart, synthetic runtime evidence, invariants and live-verification limit |
 | [Attachment filename baseline](attachment-search-gap.md) | Historical ingestion gap, accepted prerequisites, and limits of old unsupported records |

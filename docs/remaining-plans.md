@@ -10,7 +10,7 @@ Entry criteria to resume: a reproduced fault with its redacted line, or a concre
 
 - **4a, frame-fault root cause.** Keep the redacted summary. Reproduce with a bounded loop, then classify the line (digit, letter, space split) and map it to a writer by source inspection, not by printing payload. Done when the writer is named and a regression exists, or the fault is proven environmental and documented.
 - **4b, gate rerun in two verifiable halves.** First, staged-prefix checks: doctor passes, the resolved sidecar lives under the prefix, and the dependency-break cases fail cleanly. Second, lifecycle checks in the same run: socket appears, TUI reaches readiness, exactly one daemon and one engine exist, SIGTERM leaves no child and no stale socket, and the temporary store is removed by the harness after the run. Each half reports separately because staging is non-atomic and a partial prefix cannot prove lifecycle behaviour. ABI compatibility stays unverified unless observed.
-- **4c, release paperwork.** Licensing review for a sidecar payload, supported engine range, and a statement that Cargo alone is not enough. No distribution claim before 4b passes.
+- **4c, release paperwork: review complete, distribution blocked.** [Record](packaging-4c-release-paperwork.md). Bloom declares MIT but has no LICENSE text; the vendored Apache-2.0 bindings lack license/NOTICE text; no Rust/Dart third-party notice bundle exists; SSPL/closed-engine obligations need legal review; the supported range is the pinned tag only, with an FRB content-hash check but no friendly preflight; Cargo alone does not install Dart, sidecar packages, the engine or a registration. No distribution claim.
 
 ## 5. Launcher build profile
 

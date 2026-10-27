@@ -67,7 +67,13 @@ Evidence: command lines, doctor output, exit codes, process lists before and aft
 
 Observed mismatch: the TUI client and launcher resolved `BLOOM_SOCKET_PATH`, then `BLOOM_SOCKET`, then the runtime default, while the daemon read only `BLOOM_SOCKET_PATH`. Setting only `BLOOM_SOCKET` pointed the client at a socket the daemon never binds.
 
-Decision: one resolver in `bloom_ipc`, used by the daemon, launcher, and TUI. Precedence is `BLOOM_SOCKET_PATH`, then `BLOOM_SOCKET`, then `default_socket_path()`. Blank or whitespace-only values are treated as unset, which matches how the daemon already behaved. The daemon gaining the alias is the only intended behaviour change. The doctor now uses a source-aware form of the same resolver: `bloom_ipc` returns the path plus which input won (`BLOOM_SOCKET_PATH`, the legacy `BLOOM_SOCKET`, or the runtime default), and the doctor prints that source. Duplicate parsing in the launcher is removed, so a doctor socket line can no longer describe a path the daemon would not bind.\n\n## Explicit unknowns and forbiddens
+Decision: one resolver in `bloom_ipc`, used by the daemon, launcher, and TUI. Precedence is `BLOOM_SOCKET_PATH`, then `BLOOM_SOCKET`, then `default_socket_path()`. Blank or whitespace-only values are treated as unset, which matches how the daemon already behaved. The daemon gaining the alias is the only intended behaviour change. The doctor now uses a source-aware form of the same resolver: `bloom_ipc` returns the path plus which input won (`BLOOM_SOCKET_PATH`, the legacy `BLOOM_SOCKET`, or the runtime default), and the doctor prints that source. Duplicate parsing in the launcher is removed, so a doctor socket line can no longer describe a path the daemon would not bind.
+
+## B-4c release paperwork
+
+[The 4c review](packaging-4c-release-paperwork.md) found missing Bloom LICENSE text, missing Apache-2.0/NOTICE artifacts for the vendored bindings, no Rust/Dart third-party notice bundle, unresolved SSPL/closed-engine obligations, and an exact-tag-only engine range. Distribution remains blocked; no distribution claim is made.
+
+## Explicit unknowns and forbiddens
 
 Unknown: distribution licensing obligations for a packaged sidecar payload, how the Dart runtime is provisioned, and which engine ABI range is supported. The sidecar reports `engine_version` at runtime, but no compatibility matrix exists.
 
