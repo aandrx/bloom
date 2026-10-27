@@ -6,12 +6,16 @@ This plan follows the original roadmap rather than replacing it. It records what
 
 ## Current baseline
 
-- Text messaging, local history, paging, search, unread navigation, session undo, durable encrypted drafts, inbound reactions, inbound text edits and whole-body unsends, and generation-scoped engine recovery are implemented.
-- The synthetic universal gate passes: workspace and timezone tests, strict Clippy, formatting, guards, 68 fixture, 13 input PTY, 8 messaging PTY, 17 reading PTY, 8 launcher, and 58 Dart tests.
+- Text messaging, local history, paging, search, unread navigation, session undo, durable encrypted drafts, inbound attachment save/open/chooser, inbound reactions, inbound text edits and whole-body unsends, and generation-scoped engine recovery are implemented. Outbound attachment send has a synthetic slice with live delivery deferred; the outbound edit/unsend gate passes structurally.
+- The synthetic universal gate passes: workspace and timezone tests, strict Clippy, formatting, guards, 68 fixture, 13 input PTY, 8 messaging PTY, 26 reading PTY, 8 launcher, and 99 Dart tests. IPC is v9.
 - Historical ingestion remains blocked at the engine boundary.
 - Packaging phases 1 to 3 are accepted; phase 4 is open because a daemon-owned sidecar occasionally emitted an unparsable frame.
-- The launcher stays on the debug profile.
+- The launcher defaults to debug; `./scripts/bloom --release` is implemented as an opt-in release profile.
 - GPUI and multi-service are deferred design tracks, not active implementation.
+
+## Current UI follow-up: sidebar viewport scrolling (implemented)
+
+[Sidebar viewport scrolling and click reliability](sidebar-scroll-plan.md) is implemented: wheel over the sidebar scrolls a persistent viewport without changing chat selection, a scrollbar shows position and supports track click/drag, every visible chat including the last row is clickable, selecting during new-chat composition parks the draft and cancels the mode, and keyboard selection scrolls into view. It needed no live credentials. The remaining tracks below resume.
 
 ## Track A: live engine recovery validation
 
@@ -242,6 +246,8 @@ Sequence from the existing research:
 Do not start GPUI and multi-service together. Finish recovery and packaging first, then choose one: GPUI if the product bottleneck is presentation; multi-service if it is reach.
 
 ## Sequence
+
+The sidebar viewport follow-up is implemented; the numbered tracks below resume.
 
 1. A: live recovery validation, after explicit authorization.
 2. B: packaging fault reproduction and containment, then the two-half gate.

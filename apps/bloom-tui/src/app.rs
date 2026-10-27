@@ -480,6 +480,18 @@ pub struct App {
     pub reading_anchor: Option<crate::transcript::ReadingAnchor>,
     #[doc(hidden)]
     pub transcript_viewport: Option<crate::transcript::TranscriptViewport>,
+    /// Sidebar viewport offset in conversations. Independent of the selection;
+    /// the wheel scrolls this instead of changing chats.
+    pub sidebar_scroll: usize,
+    /// Painted sidebar viewport metrics from the last frame, used for keyboard
+    /// reveal and scrollbar input.
+    pub sidebar_visible_entries: usize,
+    pub sidebar_max_offset: usize,
+    /// Set when the selection changes so the next paint reveals it. Wheel and
+    /// scrollbar input clear it so manual scrolling is never overridden.
+    pub sidebar_reveal_pending: bool,
+    /// True while the sidebar scrollbar thumb is being dragged.
+    pub sidebar_drag: bool,
     /// Set when the daemon reports a conversation listing change; the caller then
     /// re-reads the conversation list without disturbing the open thread.
     pub resync_conversations: bool,
@@ -718,6 +730,11 @@ impl Default for App {
             scroll: 0,
             reading_anchor: None,
             transcript_viewport: None,
+            sidebar_scroll: 0,
+            sidebar_visible_entries: 0,
+            sidebar_max_offset: 0,
+            sidebar_reveal_pending: true,
+            sidebar_drag: false,
             resync_conversations: false,
             filter: None,
             composing: true,
@@ -1121,6 +1138,108 @@ impl App {
             }
         }
         self.selected = id;
+        self.sidebar_reveal_pending = true;
+        self.reveal_sidebar_selection();
+    }
+
+    /// Store the painted sidebar viewport so keyboard navigation and scrollbar
+    /// drags use the same geometry the user sees.
+    pub fn record_sidebar_view(
+        &mut self,
+        offset: usize,
+        visible_entries: usize,
+        max_offset: usize,
+    ) {
+        self.sidebar_visible_entries = visible_entries;
+        self.sidebar_max_offset = max_offset;
+        self.sidebar_scroll = offset.min(max_offset);
+        self.sidebar_reveal_pending = false;
+    }
+
+    /// Scroll the sidebar by one conversation without changing the selection.
+    fn scroll_sidebar(&mut self, step: isize, hits: &HitMap) {
+        let max = hits.sidebar_max_offset;
+        // Accumulate from the live requested offset, not the last painted one:
+        // several wheel events can arrive before the next frame.
+        let current = self.sidebar_scroll.min(max);
+        self.sidebar_scroll = (current as isize + step).clamp(0, max as isize) as usize;
+        self.sidebar_reveal_pending = false;
+    }
+
+    fn reset_sidebar_scroll(&mut self) {
+        self.sidebar_scroll = 0;
+        self.sidebar_reveal_pending = false;
+    }
+
+    /// Map a scrollbar track row to an offset. The whole track is the target, so
+    /// a click near an end lands on the corresponding end of the list.
+    fn scroll_sidebar_to_row(&mut self, row: u16, hits: &HitMap) {
+        let Some(area) = hits.sidebar_scrollbar else {
+            return;
+        };
+        let max = hits.sidebar_max_offset;
+        if max == 0 {
+            self.sidebar_scroll = 0;
+            return;
+        }
+        let span = area.height.saturating_sub(1) as usize;
+        if span == 0 {
+            return;
+        }
+        let relative = row
+            .saturating_sub(area.y)
+            .min(area.height.saturating_sub(1)) as usize;
+        self.sidebar_scroll = (relative * max / span).min(max);
+        self.sidebar_reveal_pending = false;
+    }
+
+    /// Select a sidebar chat. A click is an explicit exit from new-chat
+    /// composition, so park that draft under its own owner before switching,
+    /// the same way the narrow drawer does.
+    fn select_sidebar_chat(&mut self, id: ConversationId) {
+        if self.new_conversation {
+            self.retarget_draft(None);
+            self.new_conversation = false;
+            self.pending_address = None;
+            self.command_menu = false;
+            self.select(Some(id));
+            self.resume_composer_draft();
+        } else {
+            self.select(Some(id));
+        }
+        self.focus = Focus::Sidebar;
+        self.close_context_menu();
+    }
+
+    /// Keep a keyboard-selected chat visible without moving the viewport on a
+    /// mouse click (the clicked row is already visible).
+    fn reveal_sidebar_selection(&mut self) {
+        if self.new_conversation || self.sidebar_visible_entries == 0 {
+            return;
+        }
+        self.sidebar_scroll = self.sidebar_scroll.min(self.sidebar_max_offset);
+        let Some(selected) = self.selected.as_ref() else {
+            return;
+        };
+        let Some(index) = self
+            .visible_ids()
+            .iter()
+            .position(|candidate| candidate == selected)
+        else {
+            return;
+        };
+        if index < self.sidebar_scroll {
+            self.sidebar_scroll = index;
+        } else if index
+            >= self
+                .sidebar_scroll
+                .saturating_add(self.sidebar_visible_entries)
+        {
+            self.sidebar_scroll = index
+                .saturating_add(1)
+                .saturating_sub(self.sidebar_visible_entries)
+                .min(self.sidebar_max_offset);
+        }
     }
 
     /// The owner the composer buffer belongs to in the current state, or `None`
@@ -2698,6 +2817,7 @@ impl App {
 
     fn step_filter_category(&mut self, delta: isize) {
         self.filter_category = (self.filter_category as isize + delta).rem_euclid(3) as usize;
+        self.reset_sidebar_scroll();
         self.reconcile_selection_with_visible();
     }
 
@@ -2926,6 +3046,7 @@ impl App {
         self.command_menu = false;
         self.filter_category = 0;
         self.filter = Some(String::new());
+        self.reset_sidebar_scroll();
         self.focus = Focus::Composer;
         self.composing = false;
         self.new_conversation = false;
@@ -2936,12 +3057,17 @@ impl App {
     pub fn cancel_filter(&mut self) {
         self.filter = None;
         self.filter_category = 0;
+        self.reset_sidebar_scroll();
+        // Closing the filter restores the unfiltered list; keep the selected
+        // chat painted instead of leaving it off the first page.
+        self.sidebar_reveal_pending = true;
         self.composing = true;
     }
 
     pub fn filter_input(&mut self, character: char) {
         if let Some(query) = self.filter.as_mut() {
             query.push(character);
+            self.reset_sidebar_scroll();
             self.reconcile_selection_with_visible();
         }
     }
@@ -2949,6 +3075,7 @@ impl App {
     pub fn filter_backspace(&mut self) {
         if let Some(query) = self.filter.as_mut() {
             query.pop();
+            self.reset_sidebar_scroll();
             self.reconcile_selection_with_visible();
         }
     }
@@ -2958,6 +3085,8 @@ impl App {
         let selected = self.selected.clone();
         self.filter = None;
         self.filter_category = 0;
+        self.reset_sidebar_scroll();
+        self.sidebar_reveal_pending = true;
         self.composing = true;
         selected
     }
@@ -4117,6 +4246,7 @@ impl App {
         }
         if let Some(query) = self.filter.as_mut() {
             query.push_str(&clean.replace('\n', " "));
+            self.reset_sidebar_scroll();
             self.reconcile_selection_with_visible();
             return;
         }
@@ -4995,24 +5125,37 @@ impl App {
             }
             return Action::None;
         }
+        if self.sidebar_drag {
+            match kind {
+                MouseEventKind::Drag(MouseButton::Left) => {
+                    self.scroll_sidebar_to_row(row, hits);
+                    return Action::None;
+                }
+                MouseEventKind::Up(MouseButton::Left) => {
+                    self.sidebar_drag = false;
+                    return Action::None;
+                }
+                _ => {}
+            }
+        }
         match kind {
             MouseEventKind::ScrollUp => {
                 if hits.sidebar.contains((column, row).into()) {
-                    self.select_step(-1);
+                    self.scroll_sidebar(-1, hits);
                 } else {
                     self.scroll_back(WHEEL_ROWS);
                 }
             }
             MouseEventKind::ScrollDown => {
                 if hits.sidebar.contains((column, row).into()) {
-                    self.select_step(1);
+                    self.scroll_sidebar(1, hits);
                 } else {
                     self.scroll_forward(WHEEL_ROWS);
                 }
             }
             MouseEventKind::Down(MouseButton::Right) => {
                 if let Some(Hit::SidebarChat(id)) = hits.at(column, row) {
-                    self.select(Some(id.clone()));
+                    self.select_sidebar_chat(id.clone());
                     self.open_context_menu(id);
                 } else {
                     self.close_context_menu();
@@ -5039,6 +5182,7 @@ impl App {
                 }
                 Some(Hit::FilterTab(index)) if self.filter_query().is_some() => {
                     self.filter_category = index.min(2);
+                    self.reset_sidebar_scroll();
                     self.reconcile_selection_with_visible();
                 }
                 Some(Hit::FilterRow(index)) if self.filter_query().is_some() => {
@@ -5052,10 +5196,12 @@ impl App {
                     }
                     self.context_confirm();
                 }
+                Some(Hit::SidebarScrollbar) => {
+                    self.sidebar_drag = true;
+                    self.scroll_sidebar_to_row(row, hits);
+                }
                 Some(Hit::SidebarChat(id)) => {
-                    self.select(Some(id));
-                    self.focus = Focus::Sidebar;
-                    self.close_context_menu();
+                    self.select_sidebar_chat(id);
                 }
                 Some(Hit::Composer) => {
                     self.focus = Focus::Composer;
@@ -5165,6 +5311,7 @@ impl App {
             KeyCode::Char(character) if !control && !alt => query.push(character),
             _ => return false,
         }
+        self.reset_sidebar_scroll();
         true
     }
 
@@ -7200,6 +7347,38 @@ mod tests {
     }
 
     #[test]
+    fn filtering_resets_the_sidebar_viewport_to_the_top() {
+        let chats: Vec<_> = (0..20)
+            .map(|index| conversation(&format!("chat {index:02}"), Some(20 - index as i64)))
+            .collect();
+        let mut app = App::default();
+        app.set_conversations(chats);
+        app.sidebar_scroll = 12;
+        app.sidebar_visible_entries = 4;
+        app.sidebar_max_offset = 16;
+        app.sidebar_reveal_pending = false;
+
+        app.begin_filter();
+        assert_eq!(app.sidebar_scroll, 0, "opening a filter starts at the top");
+        app.sidebar_scroll = 9;
+        app.filter_input('c');
+        assert_eq!(app.sidebar_scroll, 0, "typing a filter starts at the top");
+        app.sidebar_scroll = 9;
+        app.paste("h");
+        assert_eq!(
+            app.sidebar_scroll, 0,
+            "pasting into a filter starts at the top"
+        );
+        app.sidebar_scroll = 9;
+        app.cancel_filter();
+        assert_eq!(app.sidebar_scroll, 0, "closing a filter starts at the top");
+        assert!(
+            app.sidebar_reveal_pending,
+            "closing a filter must reveal the selected chat"
+        );
+    }
+
+    #[test]
     fn word_and_line_editing_gestures_match_a_shell() {
         let mut app = App::default();
         for character in "hello brave world".chars() {
@@ -7245,6 +7424,9 @@ mod tests {
                 (Rect::new(1, 1, 18, 1), first.id.clone()),
                 (Rect::new(1, 2, 18, 1), second.id.clone()),
             ],
+            sidebar_offset: 0,
+            sidebar_visible_entries: 1,
+            sidebar_max_offset: 3,
             transcript: Rect::new(21, 1, 60, 20),
             composer: Rect::new(21, 24, 60, 1),
             ..Default::default()
@@ -7263,12 +7445,20 @@ mod tests {
         );
         assert_eq!(app.selected, Some(second.id.clone()));
 
-        // The wheel over the chat list moves the selection instead.
-        app.handle_mouse(MouseEventKind::ScrollUp, 5, 2, &hits);
+        // The wheel over the chat list scrolls its viewport instead of moving
+        // the selection.
+        app.handle_mouse(MouseEventKind::ScrollDown, 5, 2, &hits);
         assert_eq!(
             app.selected,
-            Some(first.id.clone()),
-            "wheel moves selection"
+            Some(second.id.clone()),
+            "wheel must not change the selected chat"
+        );
+        assert_eq!(app.sidebar_scroll, 1, "wheel scrolls the sidebar viewport");
+        app.handle_mouse(MouseEventKind::ScrollDown, 5, 2, &hits);
+        app.handle_mouse(MouseEventKind::ScrollDown, 5, 2, &hits);
+        assert_eq!(
+            app.sidebar_scroll, 3,
+            "wheel events that arrive before a frame must accumulate"
         );
 
         // Clicking the composer hands focus back to it.

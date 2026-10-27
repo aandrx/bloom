@@ -3,6 +3,7 @@
 
 Build bloom-tui first; use a Python interpreter with pyte. No real engine/account.
 """
+import copy
 import fcntl
 import json
 import os
@@ -1033,6 +1034,100 @@ class ReadingFlows(unittest.TestCase):
         self.key(b'\r')
         self.wait_for(lambda: 'Attachment not sent: report.txt' in self.text())
         self.artifact('attachment-send-dot-segment')
+
+    def seed_many_chats(self, count=24):
+        self.stop_tui()
+        self.fixture.stop_daemon()
+        state = self.fixture.persisted()
+        base = state['conversations'][0]
+        me = next(participant for participant in base['participants'] if participant['is_me'])
+        now = int(time.time() * 1000) + 10_000
+        for index in range(count):
+            address = f'sidebar{index:02d}@example.invalid'
+            conversation = copy.deepcopy(base)
+            conversation['id'] = {'transport': 'openbubbles', 'value': address}
+            conversation['remote_id'] = 'iMessage;-;' + address
+            conversation['title'] = f'CHAT_{index:02d}'
+            conversation['participants'] = [
+                copy.deepcopy(me),
+                {'handle': {'kind': 'email', 'value': address},
+                 'display_name': f'CHAT_{index:02d}', 'is_me': False},
+            ]
+            conversation['last_message_at'] = now + index
+            state['conversations'].append(conversation)
+            state['messages'].append({
+                'id': {'transport': 'openbubbles', 'value': f'sidebar-{index:02d}'},
+                'conversation_id': conversation['id'],
+                'remote_id': None,
+                'sender': conversation['participants'][1]['handle'],
+                'parts': [{'type': 'text', 'value': f'CHAT_{index:02d}_BODY'}],
+                'created_at': now + index,
+                'sent_at': None,
+                'delivery': 'delivered',
+                'from_me': False,
+                'edited_at': None,
+                'reactions': [],
+                'unsent_at': None,
+            })
+        self.fixture.store_path.write_text(json.dumps(state))
+        self.fixture.start_daemon()
+        self.start_tui()
+        self.resize(100, 30)
+        self.wait_for(lambda: re.search(r'CHAT_\d\d', self.text()) is not None,
+                      timeout=15)
+
+    def test_sidebar_wheel_scrolls_without_changing_chat_and_bottom_row_clicks(self):
+        self.seed_many_chats()
+        divider = self.screen.display[0].find('│')
+        self.assertGreaterEqual(divider, 0)
+
+        def transcript():
+            return '\n'.join(line[divider + 1:]
+                             for line in self.screen.display[1:-5])
+
+        def sidebar_titles():
+            titles = []
+            for row, line in enumerate(self.screen.display):
+                left = line.split('│')[0]
+                match = re.search(r'CHAT_\d\d', left)
+                if match:
+                    titles.append((row, match.group(0)))
+            return titles
+
+        titles = sidebar_titles()
+        self.assertTrue(titles, 'the sidebar must paint chat names')
+        row, selected_title = titles[0]
+        self.key(f'\x1b[<0;6;{row + 1}M'.encode())
+        self.wait_for(lambda: f'{selected_title}_BODY' in transcript(), timeout=10)
+        selected_body = f'{selected_title}_BODY'
+
+        for _ in range(24):
+            self.key(b'\x1b[<64;5;5M')
+        self.pump(0.5)
+        self.assertIn(selected_body, transcript(),
+                      'wheel up must scroll the sidebar, not change chats')
+        titles = sidebar_titles()
+        self.assertEqual(titles[0][1], 'CHAT_23',
+                         'wheel up must reach the newest chat')
+
+        for _ in range(24):
+            self.key(b'\x1b[<65;5;5M')
+        self.pump(0.5)
+        self.assertIn(selected_body, transcript(),
+                      'wheel down must scroll the sidebar, not change chats')
+        titles = sidebar_titles()
+        self.assertNotIn('CHAT_23', [title for _, title in titles],
+                         'wheel down must leave the top view')
+        candidates = [entry for entry in titles if entry[1] != selected_title]
+        self.assertTrue(candidates, 'the bottom view must show another chat')
+        row, title = candidates[-1]
+        self.key(f'\x1b[<0;6;{row + 1}M'.encode())
+        self.wait_for(lambda: f'{title}_BODY' in transcript(), timeout=10)
+        self.assertIn(f'{title}_BODY', transcript(),
+                      'the last visible chat must be clickable at the bottom')
+        self.assertNotIn(selected_body, transcript(),
+                         'the click must switch the transcript')
+        self.artifact('sidebar-wheel-bottom')
 
 
 if __name__ == '__main__':

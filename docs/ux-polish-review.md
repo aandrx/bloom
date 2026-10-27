@@ -44,6 +44,10 @@ Prefer a readable full-width conversation with an explicit chat-navigation contr
 
 Acceptance: real-process narrow resize and keyboard/mouse selection, cancel and draft-safety flows; light/dark/monochrome render checks, tiny fallbacks, long names and large lists. Scope and exact breakpoint follow baseline review; do not promise a drawer before it passes these tests.
 
+### Sidebar viewport and click ownership (follow-up, implemented)
+
+User-reported: wheel over the left sidebar changes chats instead of scrolling; at the bottom the last visible chat cannot be clicked and the list returns to the first-chat view; while new-chat mode is active the selection can move without the list following. The unit is recorded in [sidebar viewport scrolling and click reliability](sidebar-scroll-plan.md). Implemented: wheel scrolls the viewport without changing selection, a scrollbar shows position and its track can be clicked or dragged, any visible chat including the last row is clickable, selecting while composing a new chat parks the draft and cancels the mode, and keyboard selection still scrolls into view. App/render tests and a real 24-chat PTY flow pass; no live account or engine was used.
+
 ## Implementation and independent review
 
 Implemented stable message/row reading anchors with renderer-owned geometry, exact ratatui wrapping measurements, explicit measured Latest/End control and painted-overlay wheel ownership. Added full-width narrow conversations and a searchable Chats navigator with an independent candidate/query; cancel never retargets the recipient or changes the parked composition. Confirm uses existing recipient-owned draft restoration, including unfinished new-chat bodies.

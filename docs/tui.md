@@ -95,9 +95,13 @@ closes navigation without clearing the parked message body.
 ## Mouse
 
 Mouse reporting is on. The wheel scrolls whatever is under the pointer: the
-transcript in the pane, the selection in the chat list. Left click selects a chat,
-focuses the composer, runs a command from the popup, toggles a settings row, or
-opens the header's `⚙` settings and `?` shortcuts controls. The hitboxes come from
+transcript in the pane, or the chat-list viewport in the sidebar. Wheel over the
+sidebar does not change the selected chat; a scrollbar appears when the list
+overflows, and clicking or dragging its track moves the viewport. Left click
+selects a chat, including the last row at the bottom, and cancels an unfinished
+new-chat composition while parking its draft. It also focuses the composer, runs
+a command from the popup, toggles a settings row, or opens the header's `⚙`
+settings and `?` shortcuts controls. The hitboxes come from
 the last frame that was drawn, so a click can only land on something visible.
 Overlays own wheel gestures at their painted location; unsupported panel scrolling
 is consumed rather than moving hidden history. Uncovered panes can still scroll.

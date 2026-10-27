@@ -2160,6 +2160,7 @@ pub fn spinner_frame(tick: u64) -> &'static str {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Hit {
     SidebarChat(bloom_domain::ConversationId),
+    SidebarScrollbar,
     Composer,
     Transcript,
     MenuRow(usize),
@@ -2196,6 +2197,11 @@ pub struct HitMap {
     pub composer: Rect,
     pub composer_positions: Vec<(u16, u16, usize)>,
     pub sidebar_rows: Vec<(Rect, bloom_domain::ConversationId)>,
+    pub sidebar_offset: usize,
+    pub sidebar_visible_entries: usize,
+    pub sidebar_max_offset: usize,
+    pub sidebar_entry_height: u16,
+    pub sidebar_scrollbar: Option<Rect>,
     /// The command popup's outer panel and its clickable rows.
     pub menu: Option<Rect>,
     pub menu_rows: Vec<(Rect, usize)>,
@@ -2420,6 +2426,12 @@ impl HitMap {
             .is_some_and(|area| Self::contains(area, column, row))
         {
             return Some(Hit::Latest);
+        }
+        if self
+            .sidebar_scrollbar
+            .is_some_and(|area| Self::contains(area, column, row))
+        {
+            return Some(Hit::SidebarScrollbar);
         }
         if let Some((_, id)) = self
             .sidebar_rows
@@ -2744,57 +2756,85 @@ fn render_cached_with_mode(
     // Match the transcript's header-to-content breathing room in the sidebar.
     let sidebar_spacer = u16::from(body[0].height >= 6);
     // The rail carries one item per chat: a name line and, unless the sidebar is
-    // compact, a preview of the newest message. The selection fills both lines.
+    // compact, a preview of the newest message. The viewport offset is explicit;
+    // the selection does not drive scrolling.
     const SELECTION_MARKER_WIDTH: usize = 2;
     let entry_height = if compact { 1u16 } else { 2u16 };
-    let entry_width = (body[0].width as usize).saturating_sub(SELECTION_MARKER_WIDTH);
-    let entries = visible
-        .iter()
-        .map(|conversation| {
-            let mut lines = vec![sidebar_name_line(app, conversation, entry_width, palette)];
-            if !compact {
-                lines.push(sidebar_preview_line(conversation, entry_width, palette));
-            }
-            ListItem::new(lines)
-        })
-        .collect::<Vec<_>>();
-    // Render with state so a selection deep in a long list scrolls into view
-    // rather than moving off-screen invisibly.
-    let selected_index = app
-        .selected
-        .as_ref()
-        .filter(|_| !app.new_conversation)
-        .and_then(|id| {
-            visible
-                .iter()
-                .position(|conversation| &conversation.id == id)
-        });
-    let mut list_state = ListState::default();
-    list_state.select(selected_index);
     let list_area = Rect::new(
         body[0].x,
         body[0].y + 1 + sidebar_spacer,
         body[0].width,
         body[0].height.saturating_sub(1 + sidebar_spacer),
     );
+    let visible_entries = if entry_height == 0 {
+        0
+    } else {
+        list_area.height as usize / entry_height as usize
+    };
+    let max_offset = visible.len().saturating_sub(visible_entries);
+    let mut offset = app.sidebar_scroll.min(max_offset);
+    if app.sidebar_reveal_pending && !app.new_conversation {
+        if let Some(index) = app.selected.as_ref().and_then(|id| {
+            visible
+                .iter()
+                .position(|conversation| &conversation.id == id)
+        }) {
+            if index < offset {
+                offset = index;
+            } else if index >= offset.saturating_add(visible_entries) {
+                offset = index
+                    .saturating_add(1)
+                    .saturating_sub(visible_entries)
+                    .min(max_offset);
+            }
+        }
+    }
+    let show_scrollbar = max_offset > 0 && list_area.height > 0 && list_area.width > 0;
+    let scrollbar_width = usize::from(show_scrollbar);
+    let entry_width =
+        (body[0].width as usize).saturating_sub(SELECTION_MARKER_WIDTH + scrollbar_width);
+    let entries = visible
+        .iter()
+        .map(|conversation| {
+            let selected = Some(&conversation.id) == app.selected.as_ref() && !app.new_conversation;
+            let marker = if selected { "▎ " } else { "  " };
+            let marker_style =
+                Style::default().fg(if selected { palette.cyan } else { palette.bg });
+            let mut name = sidebar_name_line(app, conversation, entry_width, palette);
+            name.spans.insert(0, Span::styled(marker, marker_style));
+            let mut lines = vec![name];
+            if !compact {
+                let mut preview = sidebar_preview_line(conversation, entry_width, palette);
+                preview.spans.insert(0, Span::styled(marker, marker_style));
+                lines.push(preview);
+            }
+            ListItem::new(lines).style(if selected {
+                Style::default().bg(palette.input_surface)
+            } else {
+                Style::default()
+            })
+        })
+        .collect::<Vec<_>>();
+    let mut list_state = ListState::default();
+    *list_state.offset_mut() = offset;
     frame.render_stateful_widget(
-        List::new(entries)
-            .style(Style::default().bg(palette.bg))
-            .highlight_style(Style::default().bg(palette.input_surface))
-            .highlight_symbol("▎ ")
-            .repeat_highlight_symbol(true),
+        List::new(entries).style(Style::default().bg(palette.bg)),
         list_area,
         &mut list_state,
     );
-    // The list scrolls itself, so derive each chat's rows from the state it drew
-    // with. A chat scrolled out of view simply gets no hitbox.
-    let offset = list_state.offset();
+    // The list offset is explicit, so the hitboxes and the painted rows use the
+    // same value. A chat scrolled out of view simply gets no hitbox.
+    let painted_offset = list_state.offset();
     hits.sidebar = body[0];
+    hits.sidebar_offset = painted_offset;
+    hits.sidebar_visible_entries = visible_entries;
+    hits.sidebar_max_offset = max_offset;
+    hits.sidebar_entry_height = entry_height;
     hits.sidebar_rows = visible
         .iter()
         .enumerate()
         .filter_map(|(index, conversation)| {
-            let row = (index.checked_sub(offset)? as u16).checked_mul(entry_height)?;
+            let row = (index.checked_sub(painted_offset)? as u16).checked_mul(entry_height)?;
             (body[0].width > 0 && row + entry_height <= list_area.height).then(|| {
                 (
                     Rect::new(
@@ -2808,6 +2848,28 @@ fn render_cached_with_mode(
             })
         })
         .collect();
+    hits.sidebar_scrollbar = if show_scrollbar {
+        Some(Rect::new(
+            list_area.x + list_area.width.saturating_sub(1),
+            list_area.y,
+            1,
+            list_area.height,
+        ))
+    } else {
+        None
+    };
+    if let Some(track) = hits.sidebar_scrollbar {
+        let mut scrollbar = ScrollbarState::new(visible.len())
+            .position(painted_offset)
+            .viewport_content_length(visible_entries);
+        frame.render_stateful_widget(
+            Scrollbar::new(ScrollbarOrientation::VerticalRight)
+                .style(Style::default().fg(palette.rule))
+                .thumb_style(Style::default().fg(palette.muted)),
+            track,
+            &mut scrollbar,
+        );
+    }
 
     frame.render_widget(
         Block::default()

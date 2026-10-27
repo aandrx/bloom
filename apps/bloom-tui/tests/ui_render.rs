@@ -5330,3 +5330,145 @@ fn attachment_picker_survives_a_tiny_viewport() {
         "the selected choice stays visible in the 11-column fallback: {joined}"
     );
 }
+
+#[test]
+fn sidebar_bottom_row_is_clickable_and_the_scrollbar_tracks_the_viewport() {
+    let conversations: Vec<_> = (0..30)
+        .map(|index| conversation(&format!("chat {index:02}"), 2, index))
+        .collect();
+    let mut app = App {
+        selected: Some(conversations[0].id.clone()),
+        ..Default::default()
+    };
+    app.set_conversations(conversations);
+    let first_id = app.visible_ids().first().cloned().unwrap();
+    let last_id = app.visible_ids().last().cloned().unwrap();
+    app.sidebar_reveal_pending = false;
+    app.sidebar_scroll = usize::MAX;
+
+    let backend = TestBackend::new(100, 30);
+    let mut terminal = Terminal::new(backend).unwrap();
+    let mut hits = ui::HitMap::default();
+    terminal
+        .draw(|frame| hits = ui::render(frame, &app))
+        .unwrap();
+
+    assert!(hits.sidebar_max_offset > 0, "the fixture must overflow");
+    assert!(
+        hits.sidebar_scrollbar.is_some(),
+        "an overflowing sidebar shows a scrollbar"
+    );
+    assert!(
+        !hits.sidebar_rows.iter().any(|(_, id)| id == &first_id),
+        "the top chat is scrolled out at the bottom"
+    );
+    let row = hits
+        .sidebar_rows
+        .iter()
+        .find(|(_, id)| id == &last_id)
+        .map(|(area, _)| *area)
+        .expect("the last chat is fully painted at the bottom");
+    assert_eq!(
+        hits.at(row.x, row.y),
+        Some(ui::Hit::SidebarChat(last_id.clone()))
+    );
+
+    app.handle_mouse(MouseEventKind::Down(MouseButton::Left), row.x, row.y, &hits);
+    assert_eq!(app.selected, Some(last_id));
+
+    let track = hits.sidebar_scrollbar.expect("track");
+    assert_eq!(hits.at(track.x, track.y), Some(ui::Hit::SidebarScrollbar));
+    app.handle_mouse(
+        MouseEventKind::Down(MouseButton::Left),
+        track.x,
+        track.y,
+        &hits,
+    );
+    assert_eq!(app.sidebar_scroll, 0, "track top maps to the list top");
+    assert!(app.sidebar_drag);
+    app.handle_mouse(
+        MouseEventKind::Drag(MouseButton::Left),
+        track.x,
+        track.y + track.height - 1,
+        &hits,
+    );
+    assert_eq!(app.sidebar_scroll, hits.sidebar_max_offset);
+    app.handle_mouse(
+        MouseEventKind::Up(MouseButton::Left),
+        track.x,
+        track.y,
+        &hits,
+    );
+    assert!(!app.sidebar_drag);
+}
+
+#[test]
+fn sidebar_scrollbar_is_hidden_when_every_chat_fits() {
+    let chats = vec![conversation("one", 2, 2), conversation("two", 2, 1)];
+    let mut app = App {
+        selected: Some(chats[0].id.clone()),
+        ..Default::default()
+    };
+    app.set_conversations(chats);
+    app.sidebar_reveal_pending = false;
+    let backend = TestBackend::new(100, 30);
+    let mut terminal = Terminal::new(backend).unwrap();
+    let mut hits = ui::HitMap::default();
+    terminal
+        .draw(|frame| hits = ui::render(frame, &app))
+        .unwrap();
+    assert_eq!(hits.sidebar_max_offset, 0);
+    assert!(hits.sidebar_scrollbar.is_none());
+}
+
+#[test]
+fn clicking_a_chat_during_new_chat_composition_parks_the_draft() {
+    let first = conversation("first", 2, 2);
+    let second = conversation("second", 2, 1);
+    let owner = bloom_tui::app::DraftOwner::NewChat(Some("new@example.test".into()));
+    let mut app = App {
+        selected: Some(first.id.clone()),
+        new_conversation: true,
+        pending_address: Some("new@example.test".into()),
+        active_draft_owner: Some(owner.clone()),
+        draft: "park me".into(),
+        ..Default::default()
+    };
+    app.set_conversations(vec![first, second.clone()]);
+
+    let backend = TestBackend::new(100, 30);
+    let mut terminal = Terminal::new(backend).unwrap();
+    let mut hits = ui::HitMap::default();
+    terminal
+        .draw(|frame| hits = ui::render(frame, &app))
+        .unwrap();
+    let row = hits
+        .sidebar_rows
+        .iter()
+        .find(|(_, id)| id == &second.id)
+        .map(|(area, _)| *area)
+        .expect("second chat row");
+    app.handle_mouse(MouseEventKind::Down(MouseButton::Left), row.x, row.y, &hits);
+    assert!(!app.new_conversation);
+    assert_eq!(app.selected, Some(second.id));
+    assert!(
+        app.drafts.contains_key(&owner),
+        "the unfinished new-chat body is parked under its owner"
+    );
+}
+
+#[test]
+fn keyboard_selection_reveals_the_selected_chat() {
+    let mut app = App::default();
+    let chats: Vec<_> = (0..30)
+        .map(|index| conversation(&format!("chat {index:02}"), 2, 30 - index))
+        .collect();
+    app.set_conversations(chats.clone());
+    app.selected = Some(chats[0].id.clone());
+    app.record_sidebar_view(0, 8, 22);
+    app.select(Some(chats[20].id.clone()));
+    assert_eq!(
+        app.sidebar_scroll, 13,
+        "selection below the window scrolls it into view"
+    );
+}

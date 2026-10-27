@@ -508,6 +508,13 @@ async fn main() -> Result<()> {
                 // Coalesce one follow-up frame instead of waiting for more input.
                 redraw.request();
             }
+            if hits.sidebar.width > 0 {
+                app.record_sidebar_view(
+                    hits.sidebar_offset,
+                    hits.sidebar_visible_entries,
+                    hits.sidebar_max_offset,
+                );
+            }
             let drawn_at = std::time::Instant::now();
             while let Some((sequence, received_at)) = inbound_redraws.pop_front() {
                 diagnostics::inbound_timing(
