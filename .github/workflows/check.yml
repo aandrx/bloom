@@ -19,6 +19,8 @@ jobs:
       - uses: actions/checkout@v5
       - name: No emptied or stubbed sources
         run: ./scripts/check-sources
+      - name: Third-party notice bundle
+        run: python3 scripts/test-third-party-notices.py
 
   rust:
     runs-on: ubuntu-24.04

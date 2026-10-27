@@ -28,6 +28,10 @@ class StagingTests(unittest.TestCase):
             path.chmod(0o755)
         self.prefix = self.root / 'prefix'
         (self.source / 'LICENSE').write_text('MIT License\n')
+        notices = self.source / 'third-party-notices'
+        (notices / 'licenses').mkdir(parents=True)
+        (notices / 'README.md').write_text('# notices\n')
+        (notices / 'licenses' / 'example-LICENSE').write_text('MIT\n')
 
     def tearDown(self):
         self.temp.cleanup()
@@ -69,6 +73,13 @@ class StagingTests(unittest.TestCase):
     def assert_mode(self, path):
         self.assertEqual(path.stat().st_mode & 0o777, 0o755, str(path))
 
+    def test_missing_third_party_notices_are_refused(self):
+        shutil.rmtree(self.source / 'third-party-notices')
+        result = self.run_script('--bin-dir', str(self.bin),
+                                 '--prefix', str(self.prefix))
+        self.assertEqual(result.returncode, 1)
+        self.assertIn('third-party notices bundle is missing', result.stderr)
+
     def test_missing_root_license_is_refused(self):
         (self.source / 'LICENSE').unlink()
         result = self.run_script('--bin-dir', str(self.bin),
@@ -90,10 +101,13 @@ class StagingTests(unittest.TestCase):
         self.assertIsNone(manifest['attribution'])
         entries = manifest['entries']
         self.assertEqual([entry['path'] for entry in entries],
-                         ['LICENSE', 'bin/bloom', 'bin/bloom-tui', 'bin/bloomd'])
+                         ['LICENSE', 'bin/bloom', 'bin/bloom-tui', 'bin/bloomd',
+                          'share/bloom/third-party-notices/README.md',
+                          'share/bloom/third-party-notices/licenses/example-LICENSE'])
         for entry in entries:
             staged = self.prefix / entry['path']
-            expected_mode = 0o644 if entry['path'] in ('LICENSE', 'NOTICE', 'ATTRIBUTION') else 0o755
+            expected_mode = 0o644 if (entry['path'] in ('LICENSE', 'NOTICE', 'ATTRIBUTION')
+                                       or 'third-party-notices/' in entry['path']) else 0o755
             self.assertEqual(entry['mode'], expected_mode)
             self.assertEqual(entry['sha256'],
                              hashlib.sha256(staged.read_bytes()).hexdigest())

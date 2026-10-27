@@ -1,0 +1,235 @@
+#!/usr/bin/env python3
+"""Generate a deterministic third-party notice bundle for Rust and Dart.
+
+Reads Cargo metadata and the resolved Dart package configuration. Copies unique
+license/notice files into third-party-notices/licenses, adds generic fallback
+texts for packages that declare a license but ship no file, and writes package
+manifests plus a README. No network access and no live install.
+"""
+import argparse
+import hashlib
+import json
+import re
+import shutil
+import subprocess
+import sys
+from pathlib import Path
+from urllib.parse import unquote, urlparse
+
+ROOT = Path(__file__).resolve().parents[1]
+SIDECAR = ROOT / 'ext' / 'bloom-engine-sidecar' / 'dart'
+FALLBACK_SOURCE = ROOT / 'scripts' / 'third-party-fallbacks'
+FALLBACK_IDS = ('MIT', 'Apache-2.0', 'MPL-2.0')
+LICENSE_NAME = re.compile(r'^(licen[cs]e|copying|notice|unlicense|copyright)', re.I)
+
+
+def run_json(command, cwd):
+    result = subprocess.run(command, cwd=cwd, capture_output=True, text=True)
+    if result.returncode != 0:
+        print(result.stderr, file=sys.stderr)
+        raise SystemExit(f'command failed: {" ".join(command)}')
+    return json.loads(result.stdout)
+
+
+def license_files(root):
+    return sorted(
+        (path for path in root.iterdir()
+         if path.is_file() and LICENSE_NAME.match(path.name)),
+        key=lambda path: path.name.lower(),
+    )
+
+
+def pubspec_value(root, key):
+    path = root / 'pubspec.yaml'
+    if not path.is_file():
+        return ''
+    match = re.search(rf'^{key}:\s*(\S+)', path.read_text(encoding='utf-8', errors='replace'), re.M)
+    return match.group(1) if match else ''
+
+
+def slug(value):
+    value = re.sub(r'[^A-Za-z0-9._-]+', '-', value).strip('-')
+    return value[:80] or 'license'
+
+
+def choose_fallback(expression):
+    if not expression:
+        return None
+    if 'MIT' in expression:
+        return 'MIT'
+    if 'Apache-2.0' in expression:
+        return 'Apache-2.0'
+    if 'MPL-2.0' in expression:
+        return 'MPL-2.0'
+    return None
+
+
+class Bundle:
+    def __init__(self, root):
+        self.root = root
+        if root.exists():
+            shutil.rmtree(root)
+        (root / 'licenses').mkdir(parents=True)
+        (root / 'fallbacks').mkdir()
+        self.license_counts = {'rust': 0, 'dart': 0}
+
+    def add_license(self, source, prefix):
+        data = source.read_bytes()
+        digest = hashlib.sha256(data).hexdigest()
+        name = f'{prefix}-{digest[:16]}-{slug(source.name)}'
+        target = self.root / 'licenses' / name
+        if not target.exists():
+            target.write_bytes(data)
+            target.chmod(0o644)
+            self.license_counts[prefix] += 1
+        return f'licenses/{name}'
+
+    def add_fallback(self, license_id):
+        source = FALLBACK_SOURCE / f'{license_id}.txt'
+        if not source.is_file():
+            raise SystemExit(f'missing fallback license text: {source}')
+        target = self.root / 'fallbacks' / f'{license_id}.txt'
+        if not target.exists():
+            shutil.copyfile(source, target)
+            target.chmod(0o644)
+        return f'fallbacks/{license_id}.txt'
+
+
+def package_row(name, version, license_expression, repository, refs, fallback):
+    notices = '<br>'.join(f'`{ref}`' for ref in refs) or '**no license file**'
+    return {
+        'name': name,
+        'version': version,
+        'license': license_expression or 'NO LICENSE DECLARED',
+        'repository': repository or '',
+        'notices': notices,
+        'fallback': fallback,
+    }
+
+
+def write_manifest(path, title, rows, extra):
+    lines = [f'# {title}', '']
+    lines.extend(extra)
+    lines.extend([
+        '',
+        '| Package | Version | License | Repository | Notices |',
+        '| --- | --- | --- | --- | --- |',
+    ])
+    for row in rows:
+        lines.append(
+            f"| {row['name']} | {row['version']} | {row['license']} | "
+            f"{row['repository']} | {row['notices']} |"
+        )
+    path.write_text('\n'.join(lines) + '\n', encoding='utf-8')
+    path.chmod(0o644)
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--output', default=str(ROOT / 'third-party-notices'))
+    args = parser.parse_args()
+
+    output = Path(args.output).expanduser().resolve()
+    if output == ROOT or output.is_relative_to(ROOT / 'apps') or output.is_relative_to(ROOT / 'crates'):
+        raise SystemExit('output must be a dedicated third-party directory')
+
+    bundle = Bundle(output)
+    metadata = run_json(['cargo', 'metadata', '--format-version', '1'], ROOT)
+    rust_rows = []
+    fallback_rows = []
+    rust_fallbacks = 0
+    for package in sorted(metadata['packages'], key=lambda item: (item['name'], item['version'])):
+        if package.get('source') is None:
+            continue
+        root = Path(package['manifest_path']).parent
+        files = license_files(root)
+        refs = [bundle.add_license(source, 'rust') for source in files]
+        fallback = None
+        if not refs:
+            fallback = choose_fallback(package.get('license'))
+            if fallback:
+                refs = [bundle.add_fallback(fallback)]
+                rust_fallbacks += 1
+                fallback_rows.append({
+                    'name': package['name'],
+                    'version': package['version'],
+                    'license': package.get('license') or 'NO LICENSE DECLARED',
+                    'repository': package.get('repository') or package.get('homepage') or '',
+                })
+        repository = package.get('repository') or package.get('homepage') or ''
+        rust_rows.append(package_row(
+            package['name'], package['version'], package.get('license'), repository, refs, fallback
+        ))
+
+    config_path = SIDECAR / '.dart_tool' / 'package_config.json'
+    if not config_path.is_file():
+        raise SystemExit('resolved Dart package configuration is missing')
+    config = json.loads(config_path.read_text(encoding='utf-8'))
+    dart_rows = []
+    for package in sorted(config['packages'], key=lambda item: item['name']):
+        if package['name'] == 'bloom_engine_sidecar':
+            continue
+        root = Path(unquote(urlparse(package['rootUri']).path))
+        files = license_files(root)
+        refs = [bundle.add_license(source, 'dart') for source in files]
+        version = package.get('version') or pubspec_value(root, 'version')
+        repository = pubspec_value(root, 'repository') or pubspec_value(root, 'homepage')
+        dart_rows.append(package_row(
+            package['name'], version, 'see notice files' if refs else 'NO FILE',
+            repository, refs, None
+        ))
+
+    write_manifest(output / 'rust-manifest.md', 'Rust third-party packages', rust_rows, [
+        f'Generated from `cargo metadata`; {len(rust_rows)} external packages.',
+        f'{rust_fallbacks} Rust packages had no package-specific license file and use a generic fallback text.',
+    ])
+    write_manifest(output / 'dart-manifest.md', 'Dart third-party packages', dart_rows, [
+        f'Resolved packages from the sidecar package configuration; {len(dart_rows)} external packages.',
+        'License files are copied from each resolved package; no Dart package-specific fallback is used.',
+    ])
+    fallback_lines = [
+        '# Fallback licenses',
+        '',
+        'These Rust packages declare a license expression but ship no package-specific',
+        'license file. The generic text in this directory is a fallback, not a',
+        'package-specific copyright notice; review it before distribution.',
+        '',
+        '| Package | Version | License | Repository |',
+        '| --- | --- | --- | --- |',
+    ]
+    for row in fallback_rows:
+        fallback_lines.append(
+            f"| {row['name']} | {row['version']} | {row['license']} | {row['repository']} |"
+        )
+    (output / 'fallbacks' / 'README.md').write_text('\n'.join(fallback_lines) + '\n', encoding='utf-8')
+    (output / 'fallbacks' / 'README.md').chmod(0o644)
+    readme = f"""# Third-party notices
+
+Generated by `scripts/generate-third-party-notices`. Do not edit by hand.
+
+- Rust: {len(rust_rows)} external packages, {bundle.license_counts['rust']} unique notice files copied.
+- Dart: {len(dart_rows)} external packages, {bundle.license_counts['dart']} unique notice files copied.
+- Fallbacks: {rust_fallbacks} Rust packages use `fallbacks/` because no
+  package-specific license file was present; their list is in
+  `fallbacks/README.md`. Dart packages without a license file are marked
+  `NO FILE` in their manifest.
+
+The manifests list every package with its version, declared license, repository
+and the notice files included here. `licenses/` is deduplicated by content.
+`fallbacks/` contains generic MIT, Apache-2.0 and MPL-2.0 texts; a fallback is
+not a substitute for a package-specific copyright notice and must be reviewed
+before distribution.
+
+The external OpenBubbles engine is not included. Its licensing and ABI range are
+separate release blockers. No legal advice is provided by this bundle.
+"""
+    (output / 'README.md').write_text(readme, encoding='utf-8')
+    (output / 'README.md').chmod(0o644)
+    print(f'generated {output}')
+    print(f'rust={len(rust_rows)} dart={len(dart_rows)} '
+          f'rust_notices={bundle.license_counts["rust"]} dart_notices={bundle.license_counts["dart"]} '
+          f'rust_fallbacks={rust_fallbacks}')
+
+
+if __name__ == '__main__':
+    main()

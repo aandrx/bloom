@@ -170,6 +170,13 @@ def build_plan(options, source_root):
     for name in BINARIES:
         plan.append((bin_dir / name, Path('bin') / name))
 
+    notices = source_root / 'third-party-notices'
+    if not notices.is_dir():
+        raise Refused('third-party notices bundle is missing')
+    for source in regular_files(notices):
+        relative = Path('share/bloom/third-party-notices') / source.relative_to(notices)
+        plan.append((source, relative))
+
     attribution = None
     sidecar = source_root / 'ext' / 'bloom-engine-sidecar' / 'dart'
     sidecar_root = source_root / 'ext' / 'bloom-engine-sidecar'
@@ -203,6 +210,8 @@ def build_plan(options, source_root):
 
 def mode_for(relative):
     if relative.name in ('LICENSE', 'NOTICE', 'ATTRIBUTION'):
+        return DOCUMENT_MODE
+    if 'third-party-notices' in relative.parts:
         return DOCUMENT_MODE
     return FILE_MODE
 
