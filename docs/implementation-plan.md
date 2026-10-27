@@ -94,11 +94,11 @@ Current install requires retained sidecar checkout, resolved Dart packages, Dart
 
 Acceptance: install into an isolated prefix, hide the source checkout, run from unrelated directories with synthetic engine/registration fixtures, test missing dependencies/version mismatch and safe failure. Verify executable/file permissions, reused-daemon lifecycle and terminal restoration. Bloom-owned sign-in is not part of this packaging step.
 
-### 5. Launcher build profile (debug default; opt-in release proposed)
+### 5. Launcher build profile (debug default; opt-in release implemented)
 
 The isolated switching probe was rerun on 2026-10-27 with `--binary` and the same synthetic fixture: 200 messages per chat, 100 columns, fake daemon. Warm chat switching was 22.2 ms in debug versus 8.7 ms in release for medium bodies, and 20.1 versus 9.5 ms for long bodies. The cold first visit was 53.7 versus 27.8 ms, and 351.8 versus 61.0 ms for long bodies. Overlay timings were ~9-12 ms in both and sit near the PTY floor. This measures input to readable reconstructed terminal state, not compositor paint. These numbers are not directly comparable to the earlier 31/213 ms figures because the fixture differs.
 
-The earlier choice to keep debug remains the launcher default, so development iteration stays fast. The spike proposes an explicit opt-in release launcher as a separate unit; no launcher or product change was made here.
+The earlier choice to keep debug remains the launcher default, so development iteration stays fast. The opt-in release profile is implemented as `./scripts/bloom --release`, which builds and runs the release daemon and TUI. The installed `bloom` command still uses the cargo profile it was built with.
 
 If it is revisited: an isolated install builds and runs both profiles, terminal restoration and reused-daemon behavior are unchanged, startup cost is documented, and no test suite depends on a fixed profile path.
 

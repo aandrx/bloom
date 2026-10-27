@@ -1,5 +1,6 @@
 #!/bin/sh
 # Start Bloom: runs the daemon unless one is already answering, then opens the TUI.
+# The default is the debug profile; pass --release for the optimized profile.
 #
 # Everything is discovered automatically: the OpenBubbles Flatpak provides the
 # engine library and state, the sidecar script lives in this repository, and Dart
@@ -11,6 +12,24 @@ set -eu
 
 root=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 cd "$root"
+
+profile=debug
+usage() {
+  cat <<'EOF'
+usage: scripts/bloom [--release]
+  --release  build and run the optimized daemon and TUI (default: debug)
+EOF
+}
+if [ "$#" -gt 1 ]; then
+  usage >&2
+  exit 2
+fi
+case "${1:-}" in
+  "") ;;
+  --release) profile=release ;;
+  -h|--help) usage; exit 0 ;;
+  *) usage >&2; exit 2 ;;
+esac
 
 # Local overrides live in .env so your shell stays clean. Only paths belong there,
 # never secrets. The file is sourced, so it must be trusted like any shell script.
@@ -36,8 +55,14 @@ socket=${BLOOM_SOCKET_PATH:-${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/bloom/bloomd.
 export BLOOM_SOCKET_PATH="$socket"
 log="${XDG_STATE_HOME:-$HOME/.local/share}/bloom/bloomd.log"
 
-echo "building bloom..." >&2
-CARGO_BUILD_JOBS=${CARGO_BUILD_JOBS:-2} cargo build -p bloomd -p bloom-tui
+echo "building bloom ($profile profile)..." >&2
+if [ "$profile" = release ]; then
+  CARGO_BUILD_JOBS=${CARGO_BUILD_JOBS:-2} cargo build --release -p bloomd -p bloom-tui
+  bin_dir=target/release
+else
+  CARGO_BUILD_JOBS=${CARGO_BUILD_JOBS:-2} cargo build -p bloomd -p bloom-tui
+  bin_dir=target/debug
+fi
 
 # A leftover socket file from a crashed daemon must not be mistaken for a live one,
 # so probe by connecting rather than testing for the file.
@@ -49,9 +74,9 @@ started_daemon=""
 if ! daemon_answers; then
   mkdir -p "$(dirname "$log")"
   # Keep daemon diagnostics out of the TUI: they would overwrite the screen.
-  target/debug/bloomd >>"$log" 2>&1 &
+  "$bin_dir/bloomd" >>"$log" 2>&1 &
   started_daemon=$!
-  echo "bloom: daemon started, log at $log" >&2
+  echo "bloom: daemon started ($profile profile), log at $log" >&2
 
   i=0
   while ! daemon_answers; do
@@ -68,6 +93,8 @@ if ! daemon_answers; then
     fi
     sleep 0.1
   done
+else
+  echo "bloom: reusing the existing daemon at $socket" >&2
 fi
 
 cleanup() {
@@ -78,4 +105,4 @@ cleanup() {
 }
 trap cleanup EXIT INT TERM
 
-target/debug/bloom-tui
+"$bin_dir/bloom-tui"

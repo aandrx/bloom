@@ -191,5 +191,158 @@ while True:
         self.assertFalse((self.root / 'daemon.pid').exists())
 
 
+class CheckoutLauncherProfile(unittest.TestCase):
+    """Run the checkout launcher against fake profile-specific binaries."""
+
+    repo = Path(__file__).resolve().parents[1]
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory(prefix='bloom-checkout-')
+        self.root = Path(self.temp.name)
+        self.addCleanup(self.temp.cleanup)
+        scripts = self.root / 'scripts'
+        scripts.mkdir()
+        for name in ('bloom', 'bloom-probe'):
+            target = scripts / name
+            shutil.copy2(self.repo / 'scripts' / name, target)
+            target.chmod(0o755)
+        (self.root / 'bin').mkdir()
+        cargo = self.root / 'bin/cargo'
+        cargo.write_text(
+            '#!/usr/bin/env python3\n'
+            'import sys\n'
+            'from pathlib import Path\n'
+            "Path('cargo.args').write_text(' '.join(sys.argv[1:]))\n"
+        )
+        cargo.chmod(0o755)
+        self.env = dict(
+            os.environ,
+            HOME=str(self.root),
+            PATH=f"{self.root / 'bin'}:{os.environ['PATH']}",
+            XDG_STATE_HOME=str(self.root / 'state'),
+            XDG_DATA_HOME=str(self.root / 'data'),
+            BLOOM_SOCKET_PATH=str(self.root / 'daemon.sock'),
+            CARGO_BUILD_JOBS='1',
+        )
+        self.addCleanup(self.kill_daemon)
+
+    def stub(self, profile, name, body):
+        path = self.root / 'target' / profile / name
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text('#!/usr/bin/env python3\n' + body)
+        path.chmod(0o755)
+
+    def install_profile(self, profile):
+        self.stub(profile, 'bloomd', (
+            'import os, signal, socket\n'
+            'from pathlib import Path\n'
+            "Path('daemon.pid').write_text(str(os.getpid()))\n"
+            'def stop(signum, frame):\n'
+            '    raise SystemExit(0)\n'
+            'signal.signal(signal.SIGTERM, stop)\n'
+            "server = socket.socket(socket.AF_UNIX)\n"
+            "server.bind(os.environ['BLOOM_SOCKET_PATH'])\n"
+            'server.listen(8)\n'
+            'while True:\n'
+            '    client, _ = server.accept()\n'
+            '    client.close()\n'
+        ))
+        self.stub(profile, 'bloom-tui', (
+            'from pathlib import Path\n'
+            f"Path('tui.marker').write_text('{profile}')\n"
+        ))
+
+    def install_wrong_profile(self, profile):
+        for name in ('bloomd', 'bloom-tui'):
+            self.stub(profile, name, (
+                'from pathlib import Path\n'
+                "Path('wrong-profile.marker').write_text('used')\n"
+                'raise SystemExit(1)\n'
+            ))
+
+    def run_launcher(self, *arguments):
+        return subprocess.run(
+            [str(self.root / 'scripts/bloom'), *arguments],
+            cwd=self.root,
+            env=self.env,
+            capture_output=True,
+            text=True,
+            timeout=15,
+        )
+
+    def kill_daemon(self):
+        path = self.root / 'daemon.pid'
+        if not path.exists():
+            return
+        try:
+            pid = int(path.read_text())
+            os.kill(pid, signal.SIGKILL)
+        except (ValueError, ProcessLookupError):
+            pass
+
+    def test_release_flag_builds_and_runs_the_release_binaries(self):
+        self.install_profile('release')
+        self.install_wrong_profile('debug')
+        result = self.run_launcher('--release')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn('release profile', result.stderr)
+        self.assertIn('--release', (self.root / 'cargo.args').read_text())
+        self.assertEqual((self.root / 'tui.marker').read_text(), 'release')
+        self.assertFalse((self.root / 'wrong-profile.marker').exists())
+
+    def test_default_still_builds_and_runs_the_debug_binaries(self):
+        self.install_profile('debug')
+        self.install_wrong_profile('release')
+        result = self.run_launcher()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn('debug profile', result.stderr)
+        self.assertNotIn('--release', (self.root / 'cargo.args').read_text())
+        self.assertEqual((self.root / 'tui.marker').read_text(), 'debug')
+        self.assertFalse((self.root / 'wrong-profile.marker').exists())
+
+    def test_existing_daemon_is_reused_without_starting_another(self):
+        self.install_profile('release')
+        listener = socket.socket(socket.AF_UNIX)
+        listener.bind(self.env['BLOOM_SOCKET_PATH'])
+        listener.listen(8)
+        self.addCleanup(listener.close)
+        result = self.run_launcher('--release')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn('reusing the existing daemon', result.stderr)
+        self.assertEqual((self.root / 'tui.marker').read_text(), 'release')
+        self.assertFalse((self.root / 'daemon.pid').exists())
+
+
+class CheckoutLauncherOptions(unittest.TestCase):
+    """The checkout launcher must expose the profile opt-in without starting."""
+
+    launcher = Path(__file__).resolve().parents[1] / 'scripts/bloom'
+
+    def run_launcher(self, *arguments):
+        return subprocess.run(
+            [str(self.launcher), *arguments],
+            cwd=self.launcher.parents[1],
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+
+    def test_help_documents_the_release_opt_in(self):
+        result = self.run_launcher('--help')
+        self.assertEqual(result.returncode, 0)
+        self.assertIn('--release', result.stdout)
+        self.assertIn('default: debug', result.stdout)
+
+    def test_unknown_option_is_refused_before_building(self):
+        result = self.run_launcher('--bogus')
+        self.assertEqual(result.returncode, 2)
+        self.assertIn('usage:', result.stderr)
+
+    def test_extra_arguments_are_refused(self):
+        result = self.run_launcher('--release', 'extra')
+        self.assertEqual(result.returncode, 2)
+        self.assertIn('usage:', result.stderr)
+
+
 if __name__ == '__main__':
     unittest.main(verbosity=2)

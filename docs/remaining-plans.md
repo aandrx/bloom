@@ -31,7 +31,7 @@ Fixture: 200 messages per chat, 100 columns, fake daemon, one run per profile. W
 
 Boundary: synthetic PTY reconstruction. It is not a live-account or compositor benchmark; there was one run per profile, and terminal scheduling contributes to the ~9-12 ms overlay floor.
 
-Decision: keep debug as the launcher default for now, and propose an explicit opt-in release launcher as a separate unit. Release roughly halves warm chat switching (22.2 to 8.7 ms medium; 20.1 to 9.5 ms long) and cuts the long cold visit from 351.8 to 61.0 ms. No launcher or product change was made in this spike; the probe default stays debug.
+Decision: keep debug as the launcher default. The opt-in release launcher is implemented as `./scripts/bloom --release`: it builds with `--release` and runs the release daemon and TUI, while the default path still builds and runs debug. Release roughly halves warm chat switching (22.2 to 8.7 ms medium; 20.1 to 9.5 ms long) and cuts the long cold visit from 351.8 to 61.0 ms. The installed `bloom` command still uses the cargo profile it was built with; the flag applies to the repository launcher.
 
 Exit criteria met: measurements recorded, decision restated, no test depends on a fixed profile.
 
