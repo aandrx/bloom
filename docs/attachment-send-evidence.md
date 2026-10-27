@@ -1,9 +1,11 @@
 # Outbound attachment send: engine gate
 
-Status: implemented against synthetic boundaries. The structural engine gate passes,
-the daemon and sidecar paths are covered by Rust and Dart tests, and the real TUI
-is covered by a PTY test. No live send has been attempted, so remote delivery
-remains unverified.
+Status: implemented against synthetic boundaries, with a live self-pair upload test.
+The structural engine gate passes, the daemon and sidecar paths are covered by Rust
+and Dart tests, and the real TUI is covered by a PTY test. The live self-pair test
+proved the engine upload and showed that the engine rejects a self-target send
+with `no_valid_targets`; no third party was contacted and live delivery remains
+unproven.
 
 ## Question
 
@@ -95,6 +97,50 @@ One file, no caption, no reply, no scheduling, no multiple attachments.
   and an interior-dot path).
   The success PTY test also checks the stored part name and byte length and that
   the source path is not painted.
+
+### Live self-pair upload run
+
+The guarded probes are `scripts/live-attachment-send-probe` and
+`ext/bloom-engine-sidecar/dart/tool/live_send_probe.dart`. They restore the real
+engine state, use one of the account's own mailto handles as recipient and its tel
+handle as sender, upload a 33-byte generated text file, and call the engine send.
+They print no handles, ids, paths or content. The run was authorized only for this
+self-pair; no third party was contacted.
+
+```sh
+BLOOM_LIVE_ATTACHMENT_SEND_ACK=one-shot-authorized \
+~/.cache/bloom-tools/bin/python scripts/live-attachment-send-probe
+```
+
+Observed summary:
+
+```json
+{
+  "result": "send_failed",
+  "handles": 2,
+  "mailto": 1,
+  "tel": 1,
+  "upload_events": 2,
+  "upload_attached": true,
+  "bytes": 33,
+  "error_type": "AnyhowException",
+  "error_code": "no_valid_targets"
+}
+```
+
+The account has one mailto and one tel handle, so no second handle of either
+scheme exists; the only non-third-party pair is the user's own handles. The upload
+completed with two progress events and a sendable attachment. `api.send` then
+threw and the bounded classifier reported `no_valid_targets`: the engine filtered
+the self target and had nothing left to send to. No delivery is claimed. The probe
+temporarily used the tel as sender and the mailto as recipient, deliberately
+bypassing `chooseSender`; the product path would choose the mailto sender for a
+mailto recipient and reject the pair earlier.
+
+This proves the real engine upload path works on this account for a small text
+file. It does not prove remote delivery, the sidecar `attachment_send` command, or
+the product sender selection. A complete live send needs an explicitly named
+third-party chat and a fresh authorization; the self-pair is not a valid target.
 
 ## Risks
 

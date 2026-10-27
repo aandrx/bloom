@@ -102,6 +102,8 @@ The isolated switching probe was rerun on 2026-10-27 with `--binary` and the sam
 
 The earlier choice to keep debug remains the launcher default, so development iteration stays fast. The opt-in release profile is implemented as `./scripts/bloom --release`, which builds and runs the release daemon and TUI. The installed `bloom` command still uses the cargo profile it was built with.
 
+Live check: a `./scripts/bloom --release` launch produced the release daemon, one engine, a release TUI and an active session; a second release TUI reused the daemon and exited 0 without disturbing it. After the owning TUI was quit, the launcher, release daemon, engine and TUI exited, the socket was removed, and no debug or replacement process remained.
+
 If it is revisited: an isolated install builds and runs both profiles, terminal restoration and reused-daemon behavior are unchanged, startup cost is documented, and no test suite depends on a fixed profile path.
 
 ### 6. Rich messaging and future GUI

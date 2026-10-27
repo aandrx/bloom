@@ -1,0 +1,167 @@
+#!/usr/bin/env python3
+"""Guarded live engine test for outbound attachment send.
+
+Uploads one small generated text file and sends it from one of the account's own
+handles to another of the same account. Both endpoints are the user's own; no
+third party is contacted. The probe never prints handles, message ids, paths or
+content. It requires one mailto handle and one tel handle; without both it stops
+before uploading.
+
+Required authorization:
+  BLOOM_LIVE_ATTACHMENT_SEND_ACK=one-shot-authorized
+
+Run with real BLOOM_ENGINE_STATE and BLOOM_ENGINE_LIBRARY. This does not use the
+daemon or TUI; it exercises the engine upload/send composition directly.
+"""
+
+import argparse
+import json
+import os
+import shutil
+import subprocess
+import sys
+import tempfile
+from pathlib import Path
+
+ACK = 'one-shot-authorized'
+SIDECAR = Path(__file__).resolve().parents[1] / 'ext/bloom-engine-sidecar/dart'
+PROBE = SIDECAR / 'tool/live_send_probe.dart'
+
+
+class ProbeError(RuntimeError):
+    pass
+
+
+def argv(pid):
+    try:
+        raw = Path(f'/proc/{pid}/cmdline').read_bytes()
+    except OSError:
+        return []
+    return [part.decode(errors='replace') for part in raw.split(b'\0') if part]
+
+
+def owners():
+    rows = []
+    for entry in Path('/proc').iterdir():
+        if not entry.name.isdigit():
+            continue
+        pid = int(entry.name)
+        if pid == os.getpid():
+            continue
+        command = argv(pid)
+        if not command:
+            continue
+        exe = Path(command[0]).name
+        if exe == 'bloomd' or any(arg.endswith('bloom_engine.dart') for arg in command[1:]):
+            rows.append(pid)
+    return rows
+
+
+def openbubbles_running():
+    for entry in Path('/proc').iterdir():
+        if not entry.name.isdigit():
+            continue
+        pid = int(entry.name)
+        if pid == os.getpid():
+            continue
+        command = argv(pid)
+        if not command:
+            continue
+        exe = Path(command[0]).name
+        if exe == 'OpenBubbles':
+            return pid
+        if exe in {'flatpak', 'bwrap'} and 'app.openbubbles.OpenBubbles' in command:
+            return pid
+    return None
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--state', default=os.environ.get('BLOOM_ENGINE_STATE', ''))
+    parser.add_argument('--library', default=os.environ.get('BLOOM_ENGINE_LIBRARY', ''))
+    parser.add_argument('--dart', default=os.environ.get('BLOOM_DART_EXECUTABLE', 'dart'))
+    parser.add_argument('--preflight', action='store_true')
+    args = parser.parse_args()
+
+    if args.preflight:
+        try:
+            if owners():
+                raise ProbeError('another Bloom or engine owner is running')
+            if openbubbles_running() is not None:
+                raise ProbeError('OpenBubbles is still running')
+            for label, value in [
+                ('engine state', args.state),
+                ('engine library', args.library),
+                ('dart executable', args.dart),
+                ('probe script', str(PROBE)),
+            ]:
+                if not value or not Path(value).exists():
+                    raise ProbeError(f'{label} does not exist')
+            print('preflight: no competing owner; required paths exist')
+            return 0
+        except ProbeError as error:
+            print(f'live attachment send aborted: {error}', file=sys.stderr)
+            return 2
+
+    try:
+        if os.environ.get('BLOOM_LIVE_ATTACHMENT_SEND_ACK') != ACK:
+            raise ProbeError('live attachment send probe is not authorized')
+        if owners():
+            raise ProbeError('another Bloom or engine owner is running')
+        if openbubbles_running() is not None:
+            raise ProbeError('OpenBubbles is still running')
+        for label, value in [
+            ('engine state', args.state),
+            ('engine library', args.library),
+            ('dart executable', args.dart),
+            ('probe script', str(PROBE)),
+        ]:
+            if not value or not Path(value).exists():
+                raise ProbeError(f'{label} does not exist')
+
+        root = Path(tempfile.mkdtemp(prefix='bloom-live-send-')).resolve()
+        root.chmod(0o700)
+        try:
+            payload = root / 'bloom-live-attachment-test.txt'
+            payload.write_text('Bloom live attachment send test.\n', encoding='utf-8')
+            payload.chmod(0o600)
+            environment = dict(os.environ)
+            environment['BLOOM_LIVE_ATTACHMENT_SEND_ACK'] = ACK
+            completed = subprocess.run(
+                [args.dart, 'run', str(PROBE), args.state, args.library, str(payload)],
+                cwd=SIDECAR,
+                env=environment,
+                stdin=subprocess.DEVNULL,
+                capture_output=True,
+                text=True,
+                timeout=120,
+            )
+        finally:
+            shutil.rmtree(root, ignore_errors=True)
+    except subprocess.TimeoutExpired:
+        print('live attachment send aborted: probe timed out', file=sys.stderr)
+        return 2
+    except ProbeError as error:
+        print(f'live attachment send aborted: {error}', file=sys.stderr)
+        return 2
+
+    if completed.returncode != 0 and not completed.stdout.strip():
+        print(f'live attachment send aborted: probe exit {completed.returncode}',
+              file=sys.stderr)
+        return 2
+    try:
+        summary = json.loads(completed.stdout.strip().splitlines()[-1])
+    except (ValueError, IndexError):
+        print('live attachment send aborted: probe returned no summary',
+              file=sys.stderr)
+        return 2
+    print(json.dumps(summary, indent=2))
+    if summary.get('result') == 'send_call_returned':
+        return 0
+    if summary.get('result') == 'no_self_pair':
+        return 3
+    return 1
+
+
+if __name__ == '__main__':
+    sys.exit(main())
