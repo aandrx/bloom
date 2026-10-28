@@ -45,13 +45,14 @@ database, private-key, cookie, keychain, or log file was found.
 
 ## Privacy and history findings
 
-- **Current machine-local path:** four current files contain the developer's
-  absolute home path: `docs/attachment-opening-evidence.md`,
-  `docs/next-iteration-plan.md`, `scripts/tui-review.sh`, and
-  `scripts/tui-shot.sh`. The values are intentionally omitted here. Replace them
-  with `$HOME` or repository-relative paths before publication.
-- **History retains that path:** earlier commits also contain the same local path.
-  Current-file cleanup does not remove it from already-published history.
+- **Current machine-local path: resolved.** The four affected files
+  (`docs/attachment-opening-evidence.md`, `docs/next-iteration-plan.md`,
+  `scripts/tui-review.sh`, and `scripts/tui-shot.sh`) now use repository-relative
+  commands or `$HOME` defaults. No machine-local home path remains in current
+  tracked text. Local development keeps the same defaults; `TUI_SHOT_TOOLS` and
+  `BLOOM_BROWSER` provide explicit overrides.
+- **History retains that path:** earlier commits still contain the old local path.
+  Current-tree cleanup does not remove it from already-published history.
 - **Commit metadata:** all commits use one personal author/committer email. It is
   visible in public Git history and must either be accepted or removed with a
   history rewrite.
@@ -82,7 +83,7 @@ database, private-key, cookie, keychain, or log file was found.
 | No engine binary or credential files tracked | Passed |
 | CI green | Passed at `aac3b77` |
 | Current text uses only synthetic account fixtures | Passed |
-| Machine-local paths removed from current files | Open |
+| Machine-local paths removed from current files | Passed; history remains open |
 | History privacy decision (path and author email) | Open |
 | Design previews reviewed | Open |
 | 4c legal and SSPL/closed-engine review | Blocked externally |
@@ -99,10 +100,10 @@ engine run.
 
 ## Next actions
 
-1. Replace current home paths with portable environment/repository-relative
-   values; rerun the affected script checks.
-2. Decide whether to rewrite history for the local path and personal author email.
+1. Decide whether to rewrite history for the local path and personal author email.
    A rewrite changes every hash and requires an explicit force-push decision.
+2. Verify the cleaned capture scripts in a fresh checkout; `tui-shot.sh` already
+   produced a synthetic PNG locally with its `$HOME` defaults.
 3. Review the design previews for incidental personal content.
 4. Complete the 4c legal/SSPL/engine review and define the source-only publication
    scope.

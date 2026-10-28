@@ -72,7 +72,7 @@ Forbidden: sending a message, forcing a sync, importing history, copying the sto
 Run from the repository root after reading the authorization statement. Do not set the token before you have decided to authorize the run.
 
 ```sh
-cd $HOME/Documents/Projects/bloom
+cd "$(git rev-parse --show-toplevel)"
 cargo build -p bloomd
 
 STATE="$HOME/.var/app/app.openbubbles.OpenBubbles/data/bluebubbles"

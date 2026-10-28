@@ -102,7 +102,7 @@ It requires this authorization:
 Read the authorization statement above first. Then:
 
 ```sh
-cd $HOME/Documents/Projects/bloom
+cd "$(git rev-parse --show-toplevel)"
 cargo build -p bloomd
 
 STATE="$HOME/.var/app/app.openbubbles.OpenBubbles/data/bluebubbles"

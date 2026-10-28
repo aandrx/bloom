@@ -21,10 +21,11 @@ cols=${2:-100}
 rows=${3:-30}
 keys=${4:-}
 
-tools=$HOME/.cache/bloom-tools/bin/python
+tools_root=${TUI_SHOT_TOOLS:-$HOME/.cache/bloom-tools}
+tools="$tools_root/bin/python"
 if [ ! -x "$tools" ]; then
-  python3 -m venv $HOME/.cache/bloom-tools
-  $HOME/.cache/bloom-tools/bin/pip install -q pyte
+  python3 -m venv "$tools_root"
+  "$tools_root/bin/pip" install -q pyte
 fi
 
 CARGO_BUILD_JOBS=${CARGO_BUILD_JOBS:-2} cargo build -p bloom-tui
@@ -46,7 +47,7 @@ BLOOM_SOCKET_PATH="$socket" "$tools" scripts/tui-shot.py \
 # Size the viewport to the content so the screenshot has no dead margin.
 width=$((cols * 9 + 34))
 height=$((rows * 18 + 36))
-browser=$HOME/.pi/agent/skills/browser-tools/browser.js
+browser=${BLOOM_BROWSER:-$HOME/.pi/agent/skills/browser-tools/browser.js}
 node "$browser" start --headless >/dev/null 2>&1 || true
 node "$browser" nav "file://$out/screen.html" >/dev/null 2>&1
 node "$browser" viewport "$width" "$height" >/dev/null 2>&1

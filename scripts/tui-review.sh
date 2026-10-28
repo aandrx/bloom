@@ -146,7 +146,7 @@ page='''<!doctype html><meta charset="utf-8"><title>Bloom TUI review</title><sty
 (out/'contact-sheet.html').write_text(page,encoding='utf-8')
 PY
 # Render the same sheet to PNG through the existing browser tooling.
-browser=$HOME/.pi/agent/skills/browser-tools/browser.js
+browser=${BLOOM_BROWSER:-$HOME/.pi/agent/skills/browser-tools/browser.js}
 [ -f "$browser" ] || fail "browser tool not found: $browser"
 node "$browser" start --headless >/dev/null 2>&1 || fail 'could not start browser'
 trap 'node "$browser" stop >/dev/null 2>&1 || true' EXIT INT TERM
