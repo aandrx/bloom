@@ -2,6 +2,22 @@
 
 Bloom is an experimental keyboard-first terminal messenger using an existing OpenBubbles registration. Text messaging, local stored history, automatic engine-child recovery, read-only inbound reaction display, and inbound attachment saving and opening are implemented; attachments use a chooser over loaded files with save or explicit external open, and saving and the chooser are live-verified on inbound files. Remote history import, Bloom-owned sign-in, outbound reactions, and edits/unsend are not; outbound attachment send is implemented with synthetic coverage, but live delivery is unverified.
 
+## Publication and support
+
+Preparation for an experimental source-only publication continues in this
+repository. This is not a packaged release or a compatibility guarantee. The
+[public-release checklist](docs/public-release-gate.md) records the remaining
+reviews and privacy limits. Repository visibility changes require a separate
+owner decision.
+
+The sidecar bindings are pinned to OpenBubbles `v1.15.0+205`. Initialization checks
+the bridge content hash and rejects a mismatch. Other engine versions are
+unverified, and a successful startup does not establish renewal or delivery
+reliability. The engine is user-supplied and is not covered by Bloom's MIT license.
+
+See [contributing and support](CONTRIBUTING.md) for safe local development and bug
+reports, and [the security policy](SECURITY.md) for private reporting precautions.
+
 ## Design reference
 
 The offline, illustrative prototype is at [`design/mockup/index.html`](design/mockup/index.html); preview PNGs are in [`design/previews/`](design/previews/). It is a static reference, not a live service.

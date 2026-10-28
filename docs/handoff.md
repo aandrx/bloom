@@ -10,6 +10,16 @@ The working route is a Rust TUI communicating with a local Rust daemon. The daem
 
 The TUI is the current client. Desktop/mobile previews are illustrative. GPUI, direct registration and the excluded Matrix proof are not active implementation work. External engine licensing and version/ABI compatibility remain explicit boundaries.
 
+## Publication preparation
+
+Keep the existing repository and local development checkout. The
+[public-release gate](public-release-gate.md) is the current publication checklist.
+Old GitHub commits remain a disclosed privacy risk; do not require recreation or
+perform another history rewrite. Source review and binary distribution have
+separate requirements. Security and support guidance are in
+[SECURITY.md](../SECURITY.md) and [CONTRIBUTING.md](../CONTRIBUTING.md).
+Preparation does not authorize visibility changes or live account access.
+
 ## Working features and limits
 
 - Conversation listing, known-participant contacts, local nicknames/titles/hiding, filtering, sender-grouped transcript, scrolling, light/dark/automatic themes, monochrome cues, mouse hitboxes and command pickers.

@@ -7,6 +7,8 @@ Start with [fresh-session handoff](handoff.md). The root [AGENTS.md](../AGENTS.m
 | Document | Purpose |
 | --- | --- |
 | [Project README](../README.md) | Product intent, prerequisites, installation and limitations |
+| [Security policy](../SECURITY.md) | Private reporting precautions, reporting-route status, and security support limits |
+| [Contributing and support](../CONTRIBUTING.md) | Synthetic verification, private local development, and safe bug reports |
 | [Handoff](handoff.md) | Fresh-session context, implementation map, safe tests and next decisions |
 | [Status](status.md) | Implemented/partial/missing features and evidence boundaries |
 | [System design](system-design.md) | Current Rust daemon/TUI, Dart child, store, identity and lifecycle architecture |
@@ -33,7 +35,7 @@ Start with [fresh-session handoff](handoff.md). The root [AGENTS.md](../AGENTS.m
 | [Durable drafts plan](durable-drafts-plan.md) | Encrypted daemon-owned drafts, revision guard, retention; design only |
 | [Packaging plan](packaging-plan.md) | Standalone install layout, doctor diagnostics, phases 1-3 accepted; phase 4 and 4c distribution blocked |
 | [B-4c release paperwork](packaging-4c-release-paperwork.md) | MIT, Apache-2.0/NOTICE and a third-party notice bundle added; distribution still blocked by legal and engine review |
-| [Public-release gate](public-release-gate.md) | Started: full-history secret/PII audit, licensing and visibility blockers; repository remains private |
+| [Public-release gate](public-release-gate.md) | Existing-repository source-publication checklist, retained-metadata risk, and separate packaging obligations |
 | [Historical ingestion plan](historical-ingestion-plan.md) | Design-only gate for importing past messages; blocked at the engine boundary |
 | [Engine recovery plan](engine-recovery-plan.md) | Implemented generation-scoped engine restart, synthetic runtime evidence, invariants and live-verification limit |
 | [Attachment filename baseline](attachment-search-gap.md) | Historical ingestion gap, accepted prerequisites, and limits of old unsupported records |

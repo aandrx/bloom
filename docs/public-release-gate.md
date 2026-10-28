@@ -1,34 +1,31 @@
 # Public-release gate
 
-Status: **started, not passed. Repository visibility remains private.**
+Status: preparation continues in the existing `aandrx/bloom` repository. Visibility
+remains private. The owner chose to keep this repository rather than recreate it.
+No further history rewrite, force push, or visibility change is part of this work.
 
-This gate covers a source-only public repository. It does not authorize a binary
-release, engine redistribution, a packaged install, or any live account operation.
-Making the repository public is a distribution decision and must wait for the
-blockers below.
+## Publication scope
 
-## Scope and evidence
+The candidate is an experimental source repository, not a binary release or a
+standalone installation package. It includes Bloom source, synthetic tests,
+generated bindings with their notices, and illustrative design references.
+The external engine, registration data, credentials, local databases, and live
+captures must stay outside Git.
 
-- Repository: `aandrx/bloom`, private, default branch `main`.
-- History scanned: all current history (217 commits at this checkpoint), after the history rewrite.
-- CI: `Check Bloom` green at `c6034a0` before the history rewrite (source guard,
-  engine sidecar, Rust tests, real-terminal synthetic suites, second timezone,
-  Clippy).
-- Engine binary: not tracked, not vendored, and absent from the staged prefix.
-- Submodules: none. Only `main` and its remote-tracking ref exist.
-- Largest tracked files are generated Dart bindings around 1.14 MB; design preview
-  PNGs are also tracked. No database, key, private-key, log, or `.so` file is
-  tracked.
-- Current file contents use synthetic example addresses and `+1555...` numbers.
-  Historical test fixtures use generic `/home/person`-style paths.
+Source publication still requires review of the material actually included.
+A process boundary or an experimental label does not establish redistribution
+rights. The [B-4c review](packaging-4c-release-paperwork.md) explicitly requires
+review of both Bloom binaries and sidecar sources that interact with the external
+engine. That source-publication question remains open. Binary packaging also
+needs its own staging and runtime checks. Neither publication scope requires
+implementing every unfinished product feature, but neither bypasses the applicable
+license and external-engine review.
 
-## Secret and credential audit
+## Recorded audit evidence
 
-Tool: `gitleaks 8.30.1`, full Git history (`--log-opts=--all`), default rules.
-
-Result: **5 findings, all false positives.** Every finding is a
-`generic-api-key` match on the synthetic test token
-`0123456789abcdef0123456789abcdef` (or the equivalent fixture token) in:
+The initial Gitleaks 8.30.1 scan covered 213 commits and 8.53 MB of Git data.
+A scan after the first rewrite covered 215 commits and 8.55 MB. Both used default
+rules and `--log-opts=--all`, with five findings on synthetic test tokens in:
 
 - `crates/bloom-ipc/src/client.rs`
 - `crates/bloom-domain/src/lib.rs`
@@ -36,87 +33,80 @@ Result: **5 findings, all false positives.** Every finding is a
 - `ext/bloom-engine-sidecar/dart/test/protocol_test.dart`
 - `scripts/test-tui-reading-e2e.py`
 
-No real credential, private key, API token, password, or environment secret was
-found. The scanner does not inspect binary image contents or external GitHub
-metadata, and this is not proof that no secret exists.
+These were reviewed as false positives. The scans found no real credential. They
+are dated evidence, not a scan of every later commit or proof of absence.
+Binary image contents and external GitHub metadata were outside scanner coverage.
 
-Deleted-file review found one removed source file, `apps/bloom-tui/src/auth.rs`;
-it was application code, not a credential store. No tracked or deleted `.env`,
-database, private-key, cookie, keychain, or log file was found.
+The current baseline is `2748896`, with 218 reachable commits and a successful
+`Check Bloom` run, `40733496753`. A final history scan is still required after
+publication preparation. Earlier short commit IDs in historical documents may
+refer to the pre-rewrite history.
 
-## Privacy and history findings
+## Privacy and local development
 
-- **Current machine-local path: resolved.** The four affected files
-  (`docs/attachment-opening-evidence.md`, `docs/next-iteration-plan.md`,
-  `scripts/tui-review.sh`, and `scripts/tui-shot.sh`) now use repository-relative
-  commands or `$HOME` defaults. No machine-local home path remains in current
-  tracked text. Local development keeps the same defaults; `TUI_SHOT_TOOLS` and
-  `BLOOM_BROWSER` provide explicit overrides.
-- **History paths and commit identity: resolved.** The history was rewritten
-  with `git-filter-repo` on 2026-10-28. All 215 commits now use the GitHub noreply
-  identity `aandrx <91489736+aandrx@users.noreply.github.com>` for author and
-  committer, and no machine-local home path remains in any commit. The current tree was
-  unchanged by the rewrite. A pre-rewrite bundle was retained outside the
-  repository until the force-pushed remote was verified, then deleted. The
-  fetched remote `main` contains only the noreply identity and no machine-local
-  home path. A force push removes old refs, but GitHub still serves the old
-  commits by SHA: three pre-rewrite SHAs were retrievable through the GitHub API
-  after the force push. GitHub Support purging unreachable objects or recreating
-  the repository is required before public visibility.
-- **Design previews:** the tracked PNG previews were not content-reviewed for
-  incidental personal data. Review them before publication or mark them as
-  synthetic references.
-- No real phone number, account handle, registration identifier, message content,
-  or credential was found in current tracked text. Historical fixtures remain
-  synthetic.
+Current documents and capture scripts use repository-relative commands or `$HOME`
+defaults. The reachable history uses the GitHub noreply author and committer
+identity. Earlier checks found no tracked engine binary or database. The design
+preview images have not yet received a publication privacy and provenance review.
+Labeling an image synthetic is not a substitute for inspecting it.
 
-## Licensing and distribution
+GitHub still served three old commits by exact SHA after the history rewrite.
+Those commits can expose the earlier local path and personal commit email. Normal
+branch history is clean, but a force push does not prove those old objects were
+purged, and it does not erase prior CI logs, caches, or existing clones.
 
-- Root `LICENSE`: MIT, copyright "Bloom contributors".
-- Vendored generated Dart bindings: Apache-2.0 `LICENSE` and `NOTICE` present.
-- Third-party notices: generated Rust/Dart bundle present, including 48 Rust
-  fallback notices.
-- The [B-4c release paperwork review](packaging-4c-release-paperwork.md) remains
-  the authority: legal review of fallback/compound notices, the SSPL/closed-engine
-  boundary, and the exact-tag-only engine range is still incomplete.
-- The installed OpenBubbles engine is external and unchanged. No engine binary may
-  be published, and ABI compatibility remains unverified.
+Keeping this repository does not require a purge or recreation as a technical
+prerequisite. Retained old metadata is a disclosed privacy risk for the owner's
+final visibility decision, not a credential finding. Do not claim it was erased.
+No additional history changes are planned.
 
-## Gate checklist
+The existing checkout remains the development checkout. There is no separate
+public build mode and no need to move local account state:
+
+- `.env` remains ignored. Use it for trusted local path overrides, not secrets.
+- `target/` and the sidecar's `.dart_tool/` remain ignored.
+- `./scripts/bloom` keeps its release default and `--debug` option. Both use the
+  real engine when run, so neither is a synthetic preview command.
+- `TUI_SHOT_TOOLS` and `BLOOM_BROWSER` keep local capture tools configurable.
+- Use the isolated synthetic tests in [CONTRIBUTING.md](../CONTRIBUTING.md) for
+  development without account access.
+
+## Publication checklist
 
 | Check | Status |
 | --- | --- |
-| Full-history secret scan | Passed with five synthetic false positives |
-| No engine binary or credential files tracked | Passed |
-| CI green | Passed at `aac3b77` |
-| Current text uses only synthetic account fixtures | Passed |
-| Machine-local paths removed from current files | Passed |
-| History paths removed | Passed by rewrite |
-| Personal commit email removed | Passed by rewrite |
-| Old unreachable GitHub objects purged or verified | Blocked: old commits still retrievable by SHA |
-| Design previews reviewed | Open |
-| 4c legal and SSPL/closed-engine review | Blocked externally |
-| ABI and engine support statement | Open |
-| Public support/security policy | Open |
-| Source-only publication scope approved | Open |
+| Existing repository retained | Owner decision recorded |
+| Current local paths and reachable commit email cleanup | Previously verified; preserve it |
+| Old GitHub objects and metadata | Residual privacy risk disclosed; not purged |
+| Final full-history secret scan | Open after preparation changes |
+| Design previews and source provenance | Open |
+| Included source licenses and notices | Files present; review still open |
+| External-engine relationship | Source and binary obligations still under review; engine must remain external |
+| Experimental engine support statement | Added to README; no broad compatibility promise |
+| Security and support guidance | Added in SECURITY.md and CONTRIBUTING.md |
+| Private vulnerability reporting | Unverified; API returned 404, not enabled by this task |
+| Fresh-checkout synthetic verification | Open |
+| Latest baseline CI | Passed at `2748896`; rerun after changes |
+| Final owner approval to change visibility | Required; not granted by preparation request |
 
-## Decision
+## Source publication versus product release
 
-**Do not make the repository public yet.** The technical history is clean of real
-credentials, machine-local paths and personal commit email, and no engine binary
-is vendored. Design-preview review, the 4c legal/SSPL review, ABI support and a
-public security/support policy remain unresolved, and old GitHub objects are still
-retrievable by SHA. The gate can be resumed without
-another live engine run.
+Unverified live delivery, renewal, and additional engine versions remain product
+limitations. They must be stated accurately but do not by themselves prevent an
+experimental source repository. The pinned bindings and initialization content
+hash check do not establish a general engine compatibility matrix.
+
+A packaged release remains separate. It needs the unresolved notice and external
+engine review in B-4c, packaging verification, and accurate runtime prerequisites.
+No engine library may be bundled under Bloom's MIT license.
 
 ## Next actions
 
-1. Purge unreachable GitHub objects through Support or recreate the repository
-   from the clean history, then verify old SHAs return not-found and clone fresh.
-2. Verify the cleaned capture scripts in a fresh checkout; `tui-shot.sh` already
-   produced a synthetic PNG locally with its `$HOME` defaults.
-3. Review the design previews for incidental personal content.
-4. Complete the 4c legal/SSPL/engine review and define the source-only publication
-   scope.
-5. Add a public security/support policy and a final public-readiness note.
-6. Re-run this gate, then decide whether to change GitHub visibility.
+1. Inspect every design preview for personal content and establish its provenance.
+2. Review licensing of included bindings, notices, and other copied material.
+   Separate source-publication questions from binary-package obligations. Obtain
+   qualified review where the rights or external-engine obligations are unclear.
+3. Establish and verify a private vulnerability reporting route before visibility
+   changes. Do not post a vulnerability or private evidence in a public issue.
+4. Test a fresh checkout with synthetic fixtures and rerun the final history scan.
+5. Present the remaining risks and scope for the owner's visibility approval.
