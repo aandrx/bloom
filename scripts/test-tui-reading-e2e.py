@@ -956,13 +956,14 @@ class ReadingFlows(unittest.TestCase):
     def test_attachment_picker_selects_the_older_loaded_attachment(self):
         older = self.seed_attachment(
             extra=('fedcba9876543210fedcba9876543210', 'report.pdf'))
+        self.resize(200, 30)
         self.key(b'/attachment')
         self.key(b'\r')
         self.wait_for(lambda: 'Enter save' in self.text())
         self.assertIn('report.pdf', self.text(), 'newest choice is listed')
         self.assertIn('photo.jpg', self.text(), 'older choice is listed')
         self.key(b'\x1b[B')  # Down
-        self.resize(200, 30)
+        self.wait_for(lambda: '› photo.jpg' in self.text())
         self.key(b'\r')
         self.wait_for(lambda: 'Attachment saved to' in self.text())
         self.wait_for(lambda: older in self.text())
