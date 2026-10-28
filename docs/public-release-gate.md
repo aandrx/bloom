@@ -55,9 +55,11 @@ database, private-key, cookie, keychain, or log file was found.
 - **History paths and commit identity: resolved.** The history was rewritten
   with `git-filter-repo` on 2026-10-28. All 215 commits now use the GitHub noreply
   identity `aandrx <91489736+aandrx@users.noreply.github.com>` for author and
-  committer, and no `$HOME` path remains in any commit. The current tree was
+  committer, and no machine-local home path remains in any commit. The current tree was
   unchanged by the rewrite. A pre-rewrite bundle was retained outside the
-  repository until the remote push is verified.
+  repository until the force-pushed remote was verified, then deleted. The
+  fetched remote `main` contains only the noreply identity and no machine-local
+  home path.
 - **Design previews:** the tracked PNG previews were not content-reviewed for
   incidental personal data. Review them before publication or mark them as
   synthetic references.
