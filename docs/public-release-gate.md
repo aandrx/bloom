@@ -10,7 +10,7 @@ blockers below.
 ## Scope and evidence
 
 - Repository: `aandrx/bloom`, private, default branch `main`.
-- History scanned: 215 commits, 8.55 MB of Git data, after the history rewrite.
+- History scanned: all current history (217 commits at this checkpoint), after the history rewrite.
 - CI: `Check Bloom` green at `c6034a0` before the history rewrite (source guard,
   engine sidecar, Rust tests, real-terminal synthetic suites, second timezone,
   Clippy).
@@ -59,7 +59,10 @@ database, private-key, cookie, keychain, or log file was found.
   unchanged by the rewrite. A pre-rewrite bundle was retained outside the
   repository until the force-pushed remote was verified, then deleted. The
   fetched remote `main` contains only the noreply identity and no machine-local
-  home path.
+  home path. A force push removes old refs, but GitHub still serves the old
+  commits by SHA: three pre-rewrite SHAs were retrievable through the GitHub API
+  after the force push. GitHub Support purging unreachable objects or recreating
+  the repository is required before public visibility.
 - **Design previews:** the tracked PNG previews were not content-reviewed for
   incidental personal data. Review them before publication or mark them as
   synthetic references.
@@ -90,6 +93,7 @@ database, private-key, cookie, keychain, or log file was found.
 | Machine-local paths removed from current files | Passed |
 | History paths removed | Passed by rewrite |
 | Personal commit email removed | Passed by rewrite |
+| Old unreachable GitHub objects purged or verified | Blocked: old commits still retrievable by SHA |
 | Design previews reviewed | Open |
 | 4c legal and SSPL/closed-engine review | Blocked externally |
 | ABI and engine support statement | Open |
@@ -101,13 +105,14 @@ database, private-key, cookie, keychain, or log file was found.
 **Do not make the repository public yet.** The technical history is clean of real
 credentials, machine-local paths and personal commit email, and no engine binary
 is vendored. Design-preview review, the 4c legal/SSPL review, ABI support and a
-public security/support policy remain unresolved. The gate can be resumed without
+public security/support policy remain unresolved, and old GitHub objects are still
+retrievable by SHA. The gate can be resumed without
 another live engine run.
 
 ## Next actions
 
-1. Verify the rewritten history on a fresh clone and confirm the remote has no
-   old objects or refs.
+1. Purge unreachable GitHub objects through Support or recreate the repository
+   from the clean history, then verify old SHAs return not-found and clone fresh.
 2. Verify the cleaned capture scripts in a fresh checkout; `tui-shot.sh` already
    produced a synthetic PNG locally with its `$HOME` defaults.
 3. Review the design previews for incidental personal content.
