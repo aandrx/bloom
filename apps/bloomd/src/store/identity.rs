@@ -40,6 +40,16 @@ pub fn reconcile_direct_conversation(
     incoming: &Conversation,
 ) -> Result<(Conversation, usize), StoreError> {
     let records = stored_conversations(&store._connection)?;
+    reconcile_direct_conversation_with_records(store, incoming, &records)
+}
+
+/// Reconcile against a caller-provided snapshot so bulk listing does not
+/// re-read and decode every conversation once per duplicate group.
+fn reconcile_direct_conversation_with_records(
+    store: &mut EncryptedStore,
+    incoming: &Conversation,
+    records: &[Conversation],
+) -> Result<(Conversation, usize), StoreError> {
     let Some(handle) = direct_handle(incoming) else {
         if incoming.kind == ConversationKind::Group
             && records.iter().any(|row| {
@@ -199,8 +209,8 @@ pub fn reconcile_stored_direct_conversations(
 ) -> Result<usize, StoreError> {
     let rows = stored_conversations(&store._connection)?;
     let mut groups = BTreeMap::<(String, String), Vec<Conversation>>::new();
-    for row in rows {
-        let Some(handle) = direct_handle(&row) else {
+    for row in &rows {
+        let Some(handle) = direct_handle(row) else {
             continue;
         };
         let Some(identity) = handle_key(handle) else {
@@ -209,23 +219,25 @@ pub fn reconcile_stored_direct_conversations(
         groups
             .entry((row.id.transport().as_str().to_owned(), identity))
             .or_default()
-            .push(row);
+            .push(row.clone());
     }
 
     let mut linked = 0usize;
-    for rows in groups.values_mut().filter(|rows| rows.len() > 1) {
-        rows.sort_by(|left, right| left.id.value().cmp(right.id.value()));
-        let Some(handle) = rows.first().and_then(direct_handle) else {
+    for group in groups.values_mut().filter(|group| group.len() > 1) {
+        group.sort_by(|left, right| left.id.value().cmp(right.id.value()));
+        let Some(handle) = group.first().and_then(direct_handle) else {
             continue;
         };
         let synthetic = synthetic_id(handle);
-        let incoming = rows
+        let incoming = group
             .iter()
             .find(|row| row.id.value() != synthetic)
-            .or_else(|| rows.first())
+            .or_else(|| group.first())
             .cloned();
         if let Some(incoming) = incoming {
-            linked = linked.saturating_add(reconcile_direct_conversation(store, &incoming)?.1);
+            linked = linked.saturating_add(
+                reconcile_direct_conversation_with_records(store, &incoming, &rows)?.1,
+            );
         }
     }
     Ok(linked)
@@ -545,6 +557,38 @@ mod tests {
         ));
         let rows = super::super::conversations::list_conversations(&store).unwrap();
         assert_eq!(rows, vec![existing]);
+    }
+
+    #[test]
+    fn bulk_reconcile_handles_each_independent_group() {
+        let (_dir, mut store) = setup();
+        for index in 0..25 {
+            let handle = format!("+1555{index:07}");
+            let first = format!("iMessage;-;{handle}");
+            let second = format!("iMessage;-;{handle}-engine");
+            super::super::conversations::upsert_conversation(
+                &mut store,
+                &direct(&first, &first, &handle, HandleKind::Tel, Some(index)),
+            )
+            .unwrap();
+            super::super::conversations::upsert_conversation(
+                &mut store,
+                &direct(&second, &second, &handle, HandleKind::Tel, Some(index)),
+            )
+            .unwrap();
+        }
+
+        assert_eq!(
+            reconcile_stored_direct_conversations(&mut store).unwrap(),
+            25
+        );
+        let conversations = super::super::conversations::list_conversations(&store).unwrap();
+        assert_eq!(conversations.len(), 25);
+        assert!(conversations.iter().all(|row| row.aliases.len() == 1));
+        assert_eq!(
+            reconcile_stored_direct_conversations(&mut store).unwrap(),
+            0
+        );
     }
 
     #[test]
