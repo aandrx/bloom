@@ -152,6 +152,38 @@ No answer above can be inferred from an SPDX expression or a generic fallback
 file. A qualified reviewer must decide the distribution obligations. The owner
 must decide the product distribution scope and required attribution.
 
+
+## Review matrix
+
+This matrix separates source-repository publication from object-code packaging.
+It records engineering evidence and questions, not legal conclusions.
+
+| Group | Included examples | Source-repository evidence | Binary-package question |
+| --- | --- | --- | --- |
+| MIT and Apache-2.0 alternatives | Most Rust crates | License texts in the generated bundle; Bloom retains its own MIT file | Preserve notices and verify every selected alternative |
+| MPL-2.0 and MPL-2.0+ | `as_variant`, `eyeball`, `eyeball-im`, `imbl`, `imbl-sized-chunks`, `readlock`, `readlock-tokio` | License text is present; dependencies are not vendored or locally modified | If object code is distributed, determine source-availability and modification duties |
+| Unicode-3.0 | 20 ICU4X, International Components for Unicode, emoji, and Unicode-ident packages | Unicode notice files are present in the bundle | Preserve the required notice text and determine any additional attribution |
+| CDLA-Permissive-2.0 | `webpki-root-certs` | License file is present | Review the specific community-data terms before binary distribution |
+| BSL-1.0 and alternatives | `xxhash-rust`, `ryu` | License files are present; `ryu` offers Apache-2.0 as an alternative | Select and preserve the applicable alternative |
+| LGPL alternative | `r-efi` | `MIT OR Apache-2.0 OR LGPL-2.1-or-later`; fallback uses MIT text | Choose a permissive alternative deliberately and document it |
+| Generic fallbacks | 48 Rust packages, including many Matrix, Gloo, JNI, and Ruma crates | Generic MIT/Apache/MPL text is present; package-specific copyright files are absent | Obtain package-specific attribution or qualified approval before binary distribution |
+| Bloom-owned source | Seven workspace crates and owned sidecar Dart code | Root MIT text and workspace metadata are present | Owner should confirm the copyright holder and package boundaries |
+| Spike source | `spike/gpui`, `spike/matrix` | No package-level license metadata; root-license coverage is not assumed | Decide whether to include, exclude, or add metadata |
+| Generated bindings | Five upstream Dart files | Apache-2.0 license, Bloom NOTICE, ATTRIBUTION, and modification headers | Verify the eventual package notice and source delivery if object code is distributed |
+| External engine | User-supplied OpenBubbles library | No engine binary is tracked or staged; no `rustpush` in the default daemon graph | Determine whether the external SSPL/closed components create obligations |
+
+Source-only publication avoids distributing the dependency object code and the
+engine. It does not automatically resolve notice sufficiency, asset rights, or
+the external-engine question. Binary packaging must be reviewed separately and
+is not part of the current publication scope.
+
+## Review status
+
+Mechanical inventory: complete. License files and generated binding headers:
+present. Package-specific fallback attribution, MPL source-availability if
+object code is distributed, the external-engine question, and the owner’s
+copyright/spike decisions remain open. No legal clearance has been obtained.
+
 ## Remaining owner and review decisions
 
 | Decision | Current evidence | Status |
