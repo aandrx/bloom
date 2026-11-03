@@ -1,3 +1,6 @@
+// Modified for Bloom distribution: this notice was added; local formatting may differ.
+// Upstream: OpenBubbles v1.15.0+205 (Apache-2.0); see sidecar ATTRIBUTION and
+// lib/upstream/NOTICE.
 // coverage:ignore-file
 // GENERATED CODE - DO NOT MODIFY BY HAND
 // ignore_for_file: type=lint

@@ -37,10 +37,20 @@ These were reviewed as false positives. The scans found no real credential. They
 are dated evidence, not a scan of every later commit or proof of absence.
 Binary image contents and external GitHub metadata were outside scanner coverage.
 
-The current baseline is `2748896`, with 218 reachable commits and a successful
-`Check Bloom` run, `40733496753`. A final history scan is still required after
-publication preparation. Earlier short commit IDs in historical documents may
-refer to the pre-rewrite history.
+A fresh clone of `40db26a` contains 220 reachable commits. Gitleaks 8.30.1,
+verified against the release checksum, scanned that complete reachable history
+with default rules and full redaction. It returned the same five synthetic-token
+findings at the previously reviewed commits, with no new findings. Reachable
+author and committer identities are noreply-only. A final candidate-tree scan
+still needs to include the subsequent preparation changes. Earlier short commit
+IDs in historical documents may refer to the pre-rewrite history.
+
+Fresh-checkout verification at `40db26a` passed workspace all-target tests, Tokyo
+TUI tests, strict Clippy, formatting, source guard, notice validation, 15 staging
+tests, and all five Python synthetic suites. CI run `41567860779` also passed all
+three jobs at that commit, including the Dart checks. These checks used no real
+engine or account state. Follow-up developer-tool changes need their own focused
+verification before being accepted.
 
 ## Privacy and local development
 
@@ -81,16 +91,28 @@ public build mode and no need to move local account state:
 | Existing repository retained | Owner decision recorded |
 | Current local paths and reachable commit email cleanup | Previously verified; preserve it |
 | Old GitHub objects and metadata | Residual privacy risk disclosed; not purged |
-| Final full-history secret scan | Open after preparation changes |
+| Full reachable-history secret scan | Passed at `40db26a`; subsequent candidate changes still need scanning |
 | Design previews and source provenance | Pixels, metadata, source, and reachable history reviewed; owner confirmation and custom-artwork origin remain open |
-| Included source licenses and notices | Files present; review still open |
+| Included source licenses and notices | Inventory and upstream license checked; binding modification notices applied by helper; owner rights and external-engine review remain open |
 | External-engine relationship | Source and binary obligations still under review; engine must remain external |
 | Experimental engine support statement | Added to README; no broad compatibility promise |
 | Security and support guidance | Added in SECURITY.md and CONTRIBUTING.md |
-| Private vulnerability reporting | Unverified; API returned 404, not enabled by this task |
-| Fresh-checkout synthetic verification | Open |
-| Latest baseline CI | Passed at `2748896`; rerun after changes |
+| Private vulnerability reporting | Policy and form prepared; enable and verify during separately authorized public launch |
+| Fresh-checkout synthetic verification | Passed at `40db26a`; subsequent helper changes need focused tests |
+| Latest baseline CI | Run `41567860779` passed at `40db26a`; rerun after follow-up changes |
 | Final owner approval to change visibility | Required; not granted by preparation request |
+
+## Reporting activation at publication
+
+GitHub documents private vulnerability reporting for public repositories. It
+cannot be verified as an outside reporting route while Bloom remains private.
+The prepared `.github/VULNERABILITY_REPORT.yml` does not enable the feature.
+After the owner separately authorizes public visibility, enable reporting in
+Settings, Advanced Security, and verify the reporter entry point before
+announcing the launch. An owner-approved private contact is an alternative, but
+none has been supplied. No settings or visibility were changed during preparation.
+
+Reference: [GitHub reporting configuration](https://docs.github.com/en/code-security/how-tos/report-and-fix-vulnerabilities/configure-vulnerability-reporting/configure-for-a-repository).
 
 ## Source publication versus product release
 
@@ -98,6 +120,12 @@ Unverified live delivery, renewal, and additional engine versions remain product
 limitations. They must be stated accurately but do not by themselves prevent an
 experimental source repository. The pinned bindings and initialization content
 hash check do not establish a general engine compatibility matrix.
+
+The [source license inventory](source-publication-licenses.md) records the checked
+Apache attribution, root MIT coverage, spike metadata limits, and unresolved
+external-engine interpretation. Missing license metadata in each subdirectory is
+not by itself absence of root-license coverage. This inventory is not legal
+clearance and does not invent copyright holders.
 
 A packaged release remains separate. It needs the unresolved notice and external
 engine review in B-4c, packaging verification, and accurate runtime prerequisites.
@@ -111,7 +139,10 @@ No engine library may be bundled under Bloom's MIT license.
 2. Review licensing of included bindings, notices, and other copied material.
    Separate source-publication questions from binary-package obligations. Obtain
    qualified review where the rights or external-engine obligations are unclear.
-3. Establish and verify a private vulnerability reporting route before visibility
-   changes. Do not post a vulnerability or private evidence in a public issue.
-4. Test a fresh checkout with synthetic fixtures and rerun the final history scan.
+3. Prepare the reporting launch step while private. After separately authorized
+   public visibility, enable and verify reporting before announcement. Do not
+   post a vulnerability or private evidence in a public issue.
+4. Verify the remaining developer-tool changes and scan the final candidate tree.
+   The fresh-checkout synthetic gate at `40db26a` is complete. Notice-current
+   changes still need a final scan and commit before publishing.
 5. Present the remaining risks and scope for the owner's visibility approval.

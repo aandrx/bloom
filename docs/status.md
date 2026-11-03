@@ -67,8 +67,14 @@ Old GitHub objects remain a disclosed privacy risk, not a mandatory recreation
 requirement. The [design preview review](design-preview-review.md) found no
 visible private identifiers or ancillary PNG metadata in all 12 images. Fixture and artwork
 origin confirmation, especially the custom background, remains open alongside
-included-source licensing, a verified private reporting route, and final scan and
-fresh-checkout checks.
+included-source licensing and the remaining candidate checks. A fresh clone at
+`40db26a` passed the full synthetic Rust and Python gate and a complete reachable-
+history secret scan with only the same five synthetic false positives. CI run
+`41567860779` passed. The [source license inventory](source-publication-licenses.md)
+records the checked binding bodies and applied modification notices; remaining
+rights questions still need owner or qualified review. GitHub private reporting requires public
+visibility; its policy and form are prepared for activation and verification at
+a separately authorized launch, not claimed enabled now.
 [Security](../SECURITY.md) and [contributing](../CONTRIBUTING.md) guidance are
 present. The local development setup is unchanged. Visibility remains private
 until a separate owner decision.

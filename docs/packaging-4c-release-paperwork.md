@@ -5,6 +5,8 @@ third-party notice bundle are added and staged. **Distribution is still not
 ready.** No distribution claim is made, no engine library is bundled, and no live
 install was rerun. Remaining blockers are legal review of the fallback/compound
 notices, the external-engine review and the exact-tag-only compatibility range.
+The source-side inventory and open owner decisions are in
+[source-publication licenses](source-publication-licenses.md).
 
 ## Question
 
@@ -30,7 +32,14 @@ provide?
   OpenBubbles v1.15.0+205, commit `852c9910f456492f7f840ac4ff2a8bad7a1ee8c8`,
   under Apache-2.0.
 - `lib/upstream/LICENSE` now carries the Apache-2.0 text and `lib/upstream/NOTICE`
-  records the OpenBubbles attribution. Both are staged with the bindings.
+  records the OpenBubbles attribution. Both are staged with the bindings. The
+  upstream root tree at the pinned commit has no `NOTICE`, so the current file is
+  Bloom's attribution rather than a reproduced upstream notice. A later byte
+  comparison found one exact upstream binding and four with reproducible
+  formatting differences. The reviewed refresh helper then added per-file
+  modification notices; all original bodies and attribution files remained
+  byte-identical. Details are in
+  [source-publication licenses](source-publication-licenses.md).
 - The staging dry run copies the root `LICENSE`, `lib/upstream`, `pubspec.*` and
   `ATTRIBUTION` into the prefix and does not copy an engine library.
 
@@ -43,7 +52,8 @@ provide?
   fallbacks for 48 Rust packages that ship no package-specific license file.
 - `rust-manifest.md` and `dart-manifest.md` list package, version, license,
   repository and every included notice reference. Files are deduplicated by
-  content hash. Dart packages without a license file are marked `NO FILE`.
+  content hash. `NO FILE` is a generator state for packages with no license file;
+  all 52 current Dart entries have notices, so it is not a current finding.
 - `fallbacks/README.md` lists the 48 packages that use a fallback. The fallbacks
   are not substitutes for package-specific copyright notices and remain part of
   the legal review.
@@ -56,13 +66,14 @@ provide?
 
 - `LICENSE` (root MIT);
 - `bin/bloom`, `bin/bloom-tui`, `bin/bloomd`;
+- `share/bloom/third-party-notices`, the generated Rust and Dart notice bundle;
 - `share/bloom/engine/bin/bloom_engine.dart`, the owned Dart libraries, the
   generated upstream bindings with their `LICENSE` and `NOTICE`, `pubspec.yaml`,
   `pubspec.lock` and `ATTRIBUTION`;
 - `stage-manifest.json` with copied paths, SHA-256 digests and the upstream tag or
   commit.
 
-It plans no engine library. `scripts/test-staging.py` passes 14 synthetic tests,
+It plans no engine library. `scripts/test-staging.py` passes 15 synthetic tests,
 including refusal to stage a shared library, refusal without a root LICENSE, and
 refusal to stage an engine library inside the prefix.
 
@@ -128,11 +139,12 @@ The documented runtime also requires the pinned engine state and library plus a
    copyright holder is recorded as "Bloom contributors". Confirm that holder
    before distribution.
 2. **Upstream license and notice.** Resolved: the Apache-2.0 `LICENSE` and the
-   attribution `NOTICE` are staged under `lib/upstream`.
+   attribution `NOTICE` are staged under `lib/upstream`. The pinned upstream root
+   has no `NOTICE`; the staged file is Bloom's attribution.
 3. **Third-party notices.** Artifact resolved: the Rust/Dart bundle is generated
    and staged, with manifests and unique notice files. Open: legal review of the
-   48 fallback notices, the MPL-2.0/Unicode-3.0 obligations, compound expressions,
-   and Dart packages with no license file.
+   48 fallback notices, the MPL-2.0/Unicode-3.0 obligations and compound
+   expressions. No current Dart manifest entry is marked `NO FILE`.
 4. **Engine obligations.** Obtain a legal review of distributing Bloom binaries
    and sidecar sources that interact with an SSPL/closed engine. Do not bundle the
    engine. The process boundary is an engineering control, not a legal opinion.

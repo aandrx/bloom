@@ -21,6 +21,8 @@ jobs:
         run: ./scripts/check-sources
       - name: Third-party notice bundle
         run: python3 scripts/test-third-party-notices.py
+      - name: Refresh bindings helper
+        run: python3 scripts/test-refresh-bindings.py
 
   rust:
     runs-on: ubuntu-24.04
