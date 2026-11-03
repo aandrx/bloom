@@ -70,7 +70,7 @@ owner confirmed the fictional fixtures and artwork, including the custom
 background. The [source license review](source-publication-licenses.md) has a
 mechanical inventory and applied binding notices; fallback attribution,
 MPL/Unicode terms, and the external-engine review still need qualified judgment.
-The remaining candidate checks remain open. A fresh clone at
+The [final publication scan](public-release-scan.md) passed at `650752c` with only the same five synthetic matches. Qualified licensing review and explicit visibility approval remain open. A fresh clone at
 `40db26a` passed the full synthetic Rust and Python gate and a complete reachable-
 history secret scan with only the same five synthetic false positives. CI run
 `41567860779` passed. The [source license inventory](source-publication-licenses.md)

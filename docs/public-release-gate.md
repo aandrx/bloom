@@ -93,7 +93,7 @@ public build mode and no need to move local account state:
 | Existing repository retained | Owner decision recorded |
 | Current local paths and reachable commit email cleanup | Previously verified; preserve it |
 | Old GitHub objects and metadata | Residual privacy risk disclosed; not purged |
-| Full reachable-history secret scan | Passed at `40db26a`; subsequent candidate changes still need scanning |
+| Full reachable-history secret scan | Passed at `650752c`; five reviewed synthetic matches, no new findings |
 | Design previews and source provenance | Pixels, metadata, source, and reachable history reviewed; owner confirmed fictional content and artwork ownership |
 | Included source licenses and notices | Mechanical inventory and binding notices complete; fallback/MPL/Unicode attribution and external-engine legal review remain open |
 | External-engine relationship | Source and binary obligations still under review; engine must remain external |
@@ -101,7 +101,7 @@ public build mode and no need to move local account state:
 | Security and support guidance | Added in SECURITY.md and CONTRIBUTING.md |
 | Private vulnerability reporting | Policy and form prepared; enable and verify during separately authorized public launch |
 | Fresh-checkout synthetic verification | Passed at `40db26a`; subsequent helper changes need focused tests |
-| Latest baseline CI | Run `41567860779` passed at `40db26a`; rerun after follow-up changes |
+| Latest baseline CI | Run `41681524228` passed at `650752c` |
 | Final owner approval to change visibility | Required; not granted by preparation request |
 
 ## Reporting activation at publication
@@ -144,6 +144,7 @@ No engine library may be bundled under Bloom's MIT license.
    public visibility, enable and verify reporting before announcement. Do not
    post a vulnerability or private evidence in a public issue.
 3. Verify the remaining developer-tool changes and scan the final candidate tree.
-   The fresh-checkout synthetic gate at `40db26a` is complete. Notice-current
-   changes still need a final scan and commit before publishing.
+   The fresh-checkout synthetic gate at `40db26a` is complete. The final scan at
+   `650752c` is recorded in [public-release scan](public-release-scan.md); commit
+   the report and rerun CI before publishing.
 4. Present the remaining risks and scope for the owner's visibility approval.
