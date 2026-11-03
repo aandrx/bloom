@@ -64,8 +64,11 @@ Source-publication preparation continues in this existing repository. The
 [public-release gate](public-release-gate.md) separates source review from binary
 packaging obligations. Current paths and reachable commit identities are cleaned.
 Old GitHub objects remain a disclosed privacy risk, not a mandatory recreation
-requirement. Preview provenance, included-source licensing, a verified private
-reporting route, and final scan and fresh-checkout checks remain open.
+requirement. The [design preview review](design-preview-review.md) found no
+visible private identifiers or ancillary PNG metadata in all 12 images. Fixture and artwork
+origin confirmation, especially the custom background, remains open alongside
+included-source licensing, a verified private reporting route, and final scan and
+fresh-checkout checks.
 [Security](../SECURITY.md) and [contributing](../CONTRIBUTING.md) guidance are
 present. The local development setup is unchanged. Visibility remains private
 until a separate owner decision.

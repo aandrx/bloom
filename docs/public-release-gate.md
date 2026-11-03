@@ -46,9 +46,12 @@ refer to the pre-rewrite history.
 
 Current documents and capture scripts use repository-relative commands or `$HOME`
 defaults. The reachable history uses the GitHub noreply author and committer
-identity. Earlier checks found no tracked engine binary or database. The design
-preview images have not yet received a publication privacy and provenance review.
-Labeling an image synthetic is not a substitute for inspecting it.
+identity. Earlier checks found no tracked engine binary or database. The
+[design preview review](design-preview-review.md) inspected all 12 tracked PNGs.
+No visible private identifiers or ancillary PNG metadata were found. The visible
+text matches inline mockup fixtures. Asset authorship and permissions remain
+unverified, especially for the custom background whose input is not tracked.
+Labeling an image synthetic is not a substitute for establishing rights.
 
 GitHub still served three old commits by exact SHA after the history rewrite.
 Those commits can expose the earlier local path and personal commit email. Normal
@@ -79,7 +82,7 @@ public build mode and no need to move local account state:
 | Current local paths and reachable commit email cleanup | Previously verified; preserve it |
 | Old GitHub objects and metadata | Residual privacy risk disclosed; not purged |
 | Final full-history secret scan | Open after preparation changes |
-| Design previews and source provenance | Open |
+| Design previews and source provenance | Pixels, metadata, source, and reachable history reviewed; owner confirmation and custom-artwork origin remain open |
 | Included source licenses and notices | Files present; review still open |
 | External-engine relationship | Source and binary obligations still under review; engine must remain external |
 | Experimental engine support statement | Added to README; no broad compatibility promise |
@@ -102,7 +105,9 @@ No engine library may be bundled under Bloom's MIT license.
 
 ## Next actions
 
-1. Inspect every design preview for personal content and establish its provenance.
+1. Resolve the design review's provenance questions with owner confirmation of
+   fixture content and artwork origins. Record the custom background's source
+   and permission, or replace that preview with documented project-owned artwork.
 2. Review licensing of included bindings, notices, and other copied material.
    Separate source-publication questions from binary-package obligations. Obtain
    qualified review where the rights or external-engine obligations are unclear.
