@@ -1,9 +1,8 @@
 # Source-publication licenses and notices
 
-Status: evidence record for the source-publication review. It separates what the
-repository contains from the decisions the owner and qualified reviewers still
-have to make. It is not legal clearance and does not change repository
-visibility.
+Status: review started 2026-10-28. This record separates verified inventory from
+the decisions the owner and qualified reviewers still have to make. It is not
+legal clearance and does not change repository visibility.
 
 This record covers the source tree. Binary packaging obligations are recorded
 separately in the [B-4c release paperwork](packaging-4c-release-paperwork.md).
@@ -110,6 +109,48 @@ The inventory facts above are separate from the legal question of what those
 components require. A process boundary is an engineering control, not a legal
 exemption, and no legal signoff has been obtained. The external-engine review is
 still open for both source and binary publication.
+
+
+## Mechanical review
+
+The generated Rust manifest resolves 485 packages with 34 distinct license
+expressions. The largest groups are MIT or Apache-2.0 combinations. The review
+identified 20 packages with Unicode-3.0 terms, 7 with MPL-2.0 or MPL-2.0+ terms,
+and individual packages using CDLA-Permissive-2.0, BSL-1.0, Zlib, ISC, BSD,
+Unlicense, CC0, and LGPL as an alternative. These are inventory facts, not an
+opinion that every combination is compatible with Bloom's chosen distribution.
+
+The bundle records 48 Rust packages that ship no package-specific license file.
+The generic fallback texts do not contain package-specific copyright notices.
+The 52 resolved Dart packages all have notice files. Dart packages are resolved by
+the operator for `dart pub get`, not vendored in this repository.
+
+Source publication includes Bloom source, the generated bindings, and the notice
+bundle. It does not include dependency source or the external engine. Binary
+distribution has additional obligations, including whatever source-availability
+or notice rules apply to the compiled dependency set.
+
+### Questions for qualified review
+
+1. Do the package-specific notices and generic fallbacks sufficiently satisfy
+   attribution and copyright-notice requirements for every permissive expression?
+2. For MPL-2.0 dependencies, does the planned distribution include object code
+   that triggers source-availability duties, and are any dependencies modified?
+3. Are the Unicode-3.0, CDLA-Permissive-2.0, BSL-1.0, and compound expressions
+   compatible with the intended distribution, and what attribution text is needed?
+4. Do the generated binding headers and retained Apache license meet Apache-2.0
+   modification and notice conditions for this distribution? The original bodies
+   are unchanged except for the headers.
+5. Does publishing a sidecar that interacts with an external SSPL-linked engine
+   create obligations for Bloom source, or is the external engine solely the
+   installer's responsibility? Engineering process separation is not a legal
+   conclusion.
+6. Who is the intended copyright holder for Bloom source, and should the separate
+   spike packages carry their own license metadata or be excluded?
+
+No answer above can be inferred from an SPDX expression or a generic fallback
+file. A qualified reviewer must decide the distribution obligations. The owner
+must decide the product distribution scope and required attribution.
 
 ## Remaining owner and review decisions
 

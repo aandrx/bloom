@@ -67,8 +67,10 @@ Old GitHub objects remain a disclosed privacy risk, not a mandatory recreation
 requirement. The [design preview review](design-preview-review.md) found no
 visible private identifiers or ancillary PNG metadata in all 12 images. The
 owner confirmed the fictional fixtures and artwork, including the custom
-background. Included-source licensing and the remaining candidate checks remain
-open. A fresh clone at
+background. The [source license review](source-publication-licenses.md) has a
+mechanical inventory and applied binding notices; fallback attribution,
+MPL/Unicode terms, and the external-engine review still need qualified judgment.
+The remaining candidate checks remain open. A fresh clone at
 `40db26a` passed the full synthetic Rust and Python gate and a complete reachable-
 history secret scan with only the same five synthetic false positives. CI run
 `41567860779` passed. The [source license inventory](source-publication-licenses.md)

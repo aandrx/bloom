@@ -95,7 +95,7 @@ public build mode and no need to move local account state:
 | Old GitHub objects and metadata | Residual privacy risk disclosed; not purged |
 | Full reachable-history secret scan | Passed at `40db26a`; subsequent candidate changes still need scanning |
 | Design previews and source provenance | Pixels, metadata, source, and reachable history reviewed; owner confirmed fictional content and artwork ownership |
-| Included source licenses and notices | Inventory and upstream license checked; binding modification notices applied by helper; owner rights and external-engine review remain open |
+| Included source licenses and notices | Mechanical inventory and binding notices complete; fallback/MPL/Unicode attribution and external-engine legal review remain open |
 | External-engine relationship | Source and binary obligations still under review; engine must remain external |
 | Experimental engine support statement | Added to README; no broad compatibility promise |
 | Security and support guidance | Added in SECURITY.md and CONTRIBUTING.md |
@@ -135,9 +135,11 @@ No engine library may be bundled under Bloom's MIT license.
 
 ## Next actions
 
-1. Review licensing of included bindings, notices, and other copied material.
-   Separate source-publication questions from binary-package obligations. Obtain
-   qualified review where the rights or external-engine obligations are unclear.
+1. Complete the licensing review in [source-publication licenses](source-publication-licenses.md).
+   Resolve the fallback-attribution, MPL source-availability, Unicode/compound
+   expression, and external-engine questions with qualified review. The mechanical
+   inventory and binding modification notices are complete; they are not legal
+   clearance.
 2. Prepare the reporting launch step while private. After separately authorized
    public visibility, enable and verify reporting before announcement. Do not
    post a vulnerability or private evidence in a public issue.
