@@ -90,8 +90,9 @@ A missing recipe does not prove that the images came from another source.
 
 The custom-background preview shows a different abstract illustration, not an
 identifiable photograph. The input asset for it is not in the tracked design
-files. Its origin and redistribution rights remain unverified. The pixel review
-found no visible privacy issue in it.
+files. The owner confirmed on 2026-10-28 that the preview content is fictional
+and that the owner holds the artwork rights. This is owner confirmation, not an
+independent legal opinion. The pixel review found no visible privacy issue in it.
 
 The root MIT license is present. There is no design-specific provenance note
 identifying the creators of the illustration and icons, whether any were copied,
@@ -102,16 +103,15 @@ remove an attribution obligation if an asset was copied.
 ## Publication outcome
 
 The pixel and PNG-metadata review found no privacy issue requiring redaction.
-No image, design source, or development tool was changed. The combined provenance
-check remains open for the following reasons:
+No image, design source, or development tool was changed. The owner confirmed the
+fictional fixtures and artwork ownership on 2026-10-28; the provenance check is
+resolved for publication purposes, subject to the remaining legal review:
 
-1. The owner must confirm the sample text and names are illustrative and identify
-   the origin of any borrowed artwork or icons, with applicable permission or
-   attribution. This review does not presume copying merely because records are
-   absent.
-2. The custom-background input needs its source and permission recorded. If its
-   origin cannot be established, replace that preview with a capture using
-   documented project-owned artwork. This need not remove local background
+1. Resolved: the owner confirmed the sample text and names are illustrative and
+   that the preview artwork is owned by the owner.
+2. The custom-background input asset is not tracked, but the owner confirmed its
+   artwork rights. No replacement is required. Keep using documented project
+   artwork for future previews; this does not remove local background
    customization or change the development application.
 
 A future capture recipe would improve reproducibility but is not proof of legal

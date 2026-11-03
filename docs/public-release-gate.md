@@ -59,9 +59,11 @@ defaults. The reachable history uses the GitHub noreply author and committer
 identity. Earlier checks found no tracked engine binary or database. The
 [design preview review](design-preview-review.md) inspected all 12 tracked PNGs.
 No visible private identifiers or ancillary PNG metadata were found. The visible
-text matches inline mockup fixtures. Asset authorship and permissions remain
-unverified, especially for the custom background whose input is not tracked.
-Labeling an image synthetic is not a substitute for establishing rights.
+text matches inline mockup fixtures. On 2026-10-28 the owner confirmed that the
+sample content is fictional and that the preview artwork, including the input for
+the custom background, is owner-held. This is owner confirmation, not an
+independent legal opinion. Labeling an image synthetic is not a substitute for
+establishing rights.
 
 GitHub still served three old commits by exact SHA after the history rewrite.
 Those commits can expose the earlier local path and personal commit email. Normal
@@ -92,7 +94,7 @@ public build mode and no need to move local account state:
 | Current local paths and reachable commit email cleanup | Previously verified; preserve it |
 | Old GitHub objects and metadata | Residual privacy risk disclosed; not purged |
 | Full reachable-history secret scan | Passed at `40db26a`; subsequent candidate changes still need scanning |
-| Design previews and source provenance | Pixels, metadata, source, and reachable history reviewed; owner confirmation and custom-artwork origin remain open |
+| Design previews and source provenance | Pixels, metadata, source, and reachable history reviewed; owner confirmed fictional content and artwork ownership |
 | Included source licenses and notices | Inventory and upstream license checked; binding modification notices applied by helper; owner rights and external-engine review remain open |
 | External-engine relationship | Source and binary obligations still under review; engine must remain external |
 | Experimental engine support statement | Added to README; no broad compatibility promise |
@@ -133,16 +135,13 @@ No engine library may be bundled under Bloom's MIT license.
 
 ## Next actions
 
-1. Resolve the design review's provenance questions with owner confirmation of
-   fixture content and artwork origins. Record the custom background's source
-   and permission, or replace that preview with documented project-owned artwork.
-2. Review licensing of included bindings, notices, and other copied material.
+1. Review licensing of included bindings, notices, and other copied material.
    Separate source-publication questions from binary-package obligations. Obtain
    qualified review where the rights or external-engine obligations are unclear.
-3. Prepare the reporting launch step while private. After separately authorized
+2. Prepare the reporting launch step while private. After separately authorized
    public visibility, enable and verify reporting before announcement. Do not
    post a vulnerability or private evidence in a public issue.
-4. Verify the remaining developer-tool changes and scan the final candidate tree.
+3. Verify the remaining developer-tool changes and scan the final candidate tree.
    The fresh-checkout synthetic gate at `40db26a` is complete. Notice-current
    changes still need a final scan and commit before publishing.
-5. Present the remaining risks and scope for the owner's visibility approval.
+4. Present the remaining risks and scope for the owner's visibility approval.
