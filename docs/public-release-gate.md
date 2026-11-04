@@ -1,8 +1,9 @@
 # Public-release gate
 
-Status: preparation continues in the existing `aandrx/bloom` repository. Visibility
-remains private. The owner chose to keep this repository rather than recreate it.
-No further history rewrite, force push, or visibility change is part of this work.
+Status: the existing `aandrx/bloom` repository is now a **public, source-only**
+repository, published after explicit owner approval. Binary packaging and engine
+distribution remain separate and unapproved. The licensing review is still open;
+this publication is not a legal-clearance or support claim.
 
 ## Publication scope
 
@@ -90,29 +91,26 @@ public build mode and no need to move local account state:
 
 | Check | Status |
 | --- | --- |
-| Existing repository retained | Owner decision recorded |
+| Existing repository retained and published source-only | Owner approved public visibility |
 | Current local paths and reachable commit email cleanup | Previously verified; preserve it |
-| Old GitHub objects and metadata | Residual privacy risk disclosed; not purged |
+| Old GitHub objects and metadata | Residual path/email risk accepted by owner; GitHub Support ticket pending |
 | Full reachable-history secret scan | Passed at `650752c`; five reviewed synthetic matches, no new findings |
 | Design previews and source provenance | Pixels, metadata, source, and reachable history reviewed; owner confirmed fictional content and artwork ownership |
-| Included source licenses and notices | Mechanical inventory and binding notices complete; fallback/MPL/Unicode attribution and external-engine legal review remain open |
+| Included source licenses and notices | Mechanical inventory and binding notices complete; fallback/MPL/Unicode attribution and external-engine legal review remain open after publication |
 | External-engine relationship | Source and binary obligations still under review; engine must remain external |
 | Experimental engine support statement | Added to README; no broad compatibility promise |
 | Security and support guidance | Added in SECURITY.md and CONTRIBUTING.md |
-| Private vulnerability reporting | Policy and form prepared; enable and verify during separately authorized public launch |
+| Private vulnerability reporting | Enabled and API-verified after publication; reporter entry point present |
 | Fresh-checkout synthetic verification | Passed at `40db26a`; subsequent helper changes need focused tests |
-| Latest baseline CI | Run `41681524228` passed at `650752c` |
-| Final owner approval to change visibility | Required; not granted by preparation request |
+| Latest baseline CI | Run `41711274261` passed at `2286cf2` |
+| Final owner approval to change visibility | Granted; repository is public |
 
-## Reporting activation at publication
+## Reporting activation
 
-GitHub documents private vulnerability reporting for public repositories. It
-cannot be verified as an outside reporting route while Bloom remains private.
-The prepared `.github/VULNERABILITY_REPORT.yml` does not enable the feature.
-After the owner separately authorizes public visibility, enable reporting in
-Settings, Advanced Security, and verify the reporter entry point before
-announcing the launch. An owner-approved private contact is an alternative, but
-none has been supplied. No settings or visibility were changed during preparation.
+Private vulnerability reporting is enabled on the public repository. The
+repository API returns `{"enabled":true}`, and the public security page exposes
+the reporter entry point. The prepared form is active. No settings were changed
+before the owner authorized publication.
 
 Reference: [GitHub reporting configuration](https://docs.github.com/en/code-security/how-tos/report-and-fix-vulnerabilities/configure-vulnerability-reporting/configure-for-a-repository).
 
@@ -140,11 +138,8 @@ No engine library may be bundled under Bloom's MIT license.
    expression, and external-engine questions with qualified review. The mechanical
    inventory and binding modification notices are complete; they are not legal
    clearance.
-2. Prepare the reporting launch step while private. After separately authorized
-   public visibility, enable and verify reporting before announcement. Do not
-   post a vulnerability or private evidence in a public issue.
-3. Verify the remaining developer-tool changes and scan the final candidate tree.
-   The fresh-checkout synthetic gate at `40db26a` is complete. The final scan at
-   `650752c` is recorded in [public-release scan](public-release-scan.md); commit
-   the report and rerun CI before publishing.
-4. Present the remaining risks and scope for the owner's visibility approval.
+2. Monitor the GitHub Support ticket for old cached commit objects. If Support
+   purges them, verify the old SHAs return not-found. The owner accepted the
+   residual risk for this publication.
+3. Rerun CI after this publication record. Keep the source-only limitation and the
+   unapproved binary/engine distribution explicit.

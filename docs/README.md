@@ -35,7 +35,7 @@ Start with [fresh-session handoff](handoff.md). The root [AGENTS.md](../AGENTS.m
 | [Durable drafts plan](durable-drafts-plan.md) | Encrypted daemon-owned drafts, revision guard, retention; design only |
 | [Packaging plan](packaging-plan.md) | Standalone install layout, doctor diagnostics, phases 1-3 accepted; phase 4 and 4c distribution blocked |
 | [B-4c release paperwork](packaging-4c-release-paperwork.md) | MIT, Apache-2.0/NOTICE and a third-party notice bundle added; distribution still blocked by legal and engine review |
-| [Public-release gate](public-release-gate.md) | Existing-repository source-publication checklist, retained-metadata risk, and separate packaging obligations |
+| [Public-release gate](public-release-gate.md) | Public source-only publication record, accepted retained-metadata risk, and separate packaging obligations |
 | [Public-release scan](public-release-scan.md) | Final technical secret, PII, file-hygiene, license, notice, link, and CI scan at `650752c` |
 | [Source license inventory](source-publication-licenses.md) | Checked MIT and Apache source evidence, notice scope, and remaining owner/legal decisions |
 | [Design preview review](design-preview-review.md) | All 12 PNGs inspected for visible private content and metadata, with inventory hashes and provenance limits |

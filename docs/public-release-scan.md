@@ -1,7 +1,8 @@
 # Final publication scan
 
-Status: technical scan passed at `650752c` on 2026-10-28. This does not authorize
-publication or replace legal review. The repository remains private.
+Status: technical scan passed at `650752c` on 2026-10-28. The repository was
+subsequently published source-only with the owner's approval. The scan does not
+replace legal review, and the support-ticket retention risk remains.
 
 ## Scope
 

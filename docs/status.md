@@ -70,16 +70,15 @@ owner confirmed the fictional fixtures and artwork, including the custom
 background. The [source license review](source-publication-licenses.md) has a
 mechanical inventory and applied binding notices; fallback attribution,
 MPL/Unicode terms, and the external-engine review still need qualified judgment.
-The [final publication scan](public-release-scan.md) passed at `650752c` with only the same five synthetic matches. Qualified licensing review and explicit visibility approval remain open. A fresh clone at
+The [final publication scan](public-release-scan.md) passed at `650752c` with only the same five synthetic matches. Qualified licensing review remains open; visibility approval was granted. A fresh clone at
 `40db26a` passed the full synthetic Rust and Python gate and a complete reachable-
 history secret scan with only the same five synthetic false positives. CI run
 `41567860779` passed. The [source license inventory](source-publication-licenses.md)
 records the checked binding bodies and applied modification notices; remaining
-rights questions still need owner or qualified review. GitHub private reporting requires public
-visibility; its policy and form are prepared for activation and verification at
-a separately authorized launch, not claimed enabled now.
+rights questions still need owner or qualified review. GitHub private vulnerability reporting is enabled on the now-public source-only
+repository and was API-verified. The form is active; no binary or engine package
+is released.
 [Security](../SECURITY.md) and [contributing](../CONTRIBUTING.md) guidance are
-present. The local development setup is unchanged. Visibility remains private
-until a separate owner decision.
+present. The local development setup is unchanged. The repository is public as a source-only publication; binary packaging and engine distribution remain unapproved. The licensing review and Support-ticket follow-up remain open.
 
 Optional mutation guards in `scripts/check-guards` require clean files and restore their mutations; they are not CI evidence or permission to reset working changes. Inspect the manifest and current tests before running them.
