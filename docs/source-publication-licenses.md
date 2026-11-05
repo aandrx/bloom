@@ -184,17 +184,30 @@ present. Package-specific fallback attribution, MPL source-availability if
 object code is distributed, the external-engine question, and the owner’s
 copyright/spike decisions remain open. No legal clearance has been obtained.
 
+
+## Source-only publication boundary
+
+The public repository currently ships Bloom source, generated bindings, tests, and
+the generated notice bundle. It does not ship dependency object code, a package,
+or the external engine. That narrower scope matters for MPL source-availability
+and engine-distribution questions, but it does not establish that the current
+notices are sufficient or that the external-engine interaction is cleared.
+
+The source-only repository must not be described as a legally cleared release or
+as a binary distribution. No binary package or engine artifact is currently
+published.
+
 ## Remaining owner and review decisions
 
 | Decision | Current evidence | Status |
 | --- | --- | --- |
-| Copyright holder wording in root `LICENSE` | Recorded as "Bloom contributors" | Owner confirmation |
+| Copyright holder wording in root `LICENSE` | Recorded as "Bloom contributors" | Owner confirmation still required |
 | Owned Dart package license copy | Root MIT applies; no package file | Optional portability improvement |
 | Binding modification status | One exact copy; four match Dart 3.13.4 formatting of pinned originals | File-level notices applied by helper; bodies verified unchanged |
-| Spike package metadata | No package-level license metadata | Owner decision |
-| Fallback and compound notices | Generated bundle and manifests present | Binary review still open |
-| External engine obligations | Engine external; no `rustpush` in default graph | Review still open |
-| Visibility change and launch | Gate still blocked on separate decisions | Not granted by this record |
+| Spike package metadata | No package-level license metadata | Owner decision; spikes remain public source |
+| Fallback and compound notices | Generated bundle and manifests present | Qualified review still open for source and binary |
+| External engine obligations | Engine external; no `rustpush` in default graph | Qualified review still open |
+| Visibility change and launch | Public source-only repository | Owner approved; binary/engine not approved |
 
 ## Verification
 
