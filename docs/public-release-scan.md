@@ -54,9 +54,10 @@ Run `41681524228` passed all three jobs at `650752c`.
 
 ## Residual risks
 
-GitHub may still serve pre-rewrite commit SHAs containing the earlier local path
-and personal email. That risk was disclosed in the release gate and accepted as
-part of retaining this repository. It was not purged or verified absent.
+GitHub still served pre-rewrite commit SHAs containing the earlier local path and
+personal email after the Support ticket was marked addressed. Three known old
+commit URLs returned HTTP 200 anonymously in the post-support check. The owner
+accepted that residual exposure; it was not purged or verified absent.
 No final claim is made about third-party redistribution rights, the external
 SSPL/closed engine, or repository visibility.
 

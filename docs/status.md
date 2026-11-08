@@ -79,6 +79,9 @@ rights questions still need owner or qualified review. GitHub private vulnerabil
 repository and was API-verified. The form is active; no binary or engine package
 is released.
 [Security](../SECURITY.md) and [contributing](../CONTRIBUTING.md) guidance are
-present. The local development setup is unchanged. The repository is public as a source-only publication; binary packaging and engine distribution remain unapproved. The licensing review and Support-ticket follow-up remain open.
+present. The local development setup is unchanged. The repository is public as a source-only publication; binary packaging and engine
+distribution remain unapproved. The licensing review remains open. The Support
+ticket was marked addressed, but old commit URLs still returned 200 anonymously;
+the owner accepted the residual exposure.
 
 Optional mutation guards in `scripts/check-guards` require clean files and restore their mutations; they are not CI evidence or permission to reset working changes. Inspect the manifest and current tests before running them.

@@ -93,7 +93,7 @@ public build mode and no need to move local account state:
 | --- | --- |
 | Existing repository retained and published source-only | Owner approved public visibility |
 | Current local paths and reachable commit email cleanup | Previously verified; preserve it |
-| Old GitHub objects and metadata | Residual path/email risk accepted by owner; GitHub Support ticket pending |
+| Old GitHub objects and metadata | Support ticket addressed, but old SHAs still return HTTP 200 anonymously; no purge verified. Owner accepted the residual risk. |
 | Full reachable-history secret scan | Passed at `650752c`; five reviewed synthetic matches, no new findings |
 | Design previews and source provenance | Pixels, metadata, source, and reachable history reviewed; owner confirmed fictional content and artwork ownership |
 | Included source licenses and notices | Mechanical inventory and binding notices complete; fallback/MPL/Unicode attribution and external-engine legal review remain open after publication |
@@ -138,8 +138,9 @@ No engine library may be bundled under Bloom's MIT license.
    expression, and external-engine questions with qualified review. The mechanical
    inventory and binding modification notices are complete; they are not legal
    clearance.
-2. Monitor the GitHub Support ticket for old cached commit objects. If Support
-   purges them, verify the old SHAs return not-found. The owner accepted the
-   residual risk for this publication.
+2. Follow up with GitHub Support if desired: after the ticket was marked
+   addressed, three old commit URLs still returned HTTP 200 anonymously. Ask
+   whether object purging was declined or incomplete, and verify old SHAs return
+   not-found if Support acts. The owner accepted the residual risk meanwhile.
 3. Rerun CI after this publication record. Keep the source-only limitation and the
    unapproved binary/engine distribution explicit.
