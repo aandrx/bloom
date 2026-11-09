@@ -393,19 +393,27 @@ impl Service {
                 conversation_persistence_failed = false;
             }
             let is_conversation = matches!(&event, TransportEvent::Conversation { .. });
-            let reconnect = matches!(
+            let reconnect_candidate = matches!(
                 &event,
                 TransportEvent::Session {
+                    generation,
                     state: SessionState::Active,
                     ..
+                } if *generation == self.readiness.current_generation()
+            );
+            let persisted = match self.persist(&event) {
+                Ok(persisted) => persisted,
+                Err(error) => {
+                    if is_conversation {
+                        conversation_persistence_failed = true;
+                    }
+                    eprintln!("bloomd: dropping event that failed to persist: {error}");
+                    false
                 }
-            ) && self.readiness.begin_reconnect();
-            if let Err(error) = self.persist(&event) {
-                if is_conversation {
-                    conversation_persistence_failed = true;
-                }
-                eprintln!("bloomd: dropping event that failed to persist: {error}");
-            }
+            };
+            // Reserve the refresh only after the event was accepted for this
+            // generation. A stale Active must not consume the reconnect slot.
+            let reconnect = persisted && reconnect_candidate && self.readiness.begin_reconnect();
             if reconnect {
                 // A session can return on the same engine generation after a
                 // transport loss. Re-run the required refresh; sends stay gated
@@ -2299,6 +2307,37 @@ mod readiness_gate_tests {
         assert!(
             service.readiness().can_send(),
             "a session event from the replaced engine generation must be ignored"
+        );
+    }
+
+    #[tokio::test]
+    async fn stale_active_does_not_consume_a_reconnect_refresh_slot() {
+        let (_directory, service) = harness(true);
+        let token = service.readiness().begin(2).unwrap();
+        service.readiness().mark_engine_ready(token);
+        assert!(service.readiness().finish(token, Finish::Complete(0)));
+        service.readiness().session_lost();
+
+        let (sender, receiver) = tokio::sync::mpsc::channel(4);
+        let task = tokio::spawn(service.clone().persist_events(receiver));
+        sender
+            .send(TransportEvent::Session {
+                generation: 1,
+                state: SessionState::Active,
+                reason: None,
+            })
+            .await
+            .unwrap();
+        drop(sender);
+        task.await.unwrap();
+
+        assert_eq!(
+            service.readiness().snapshot().bounded_error,
+            Some(bloom_ipc::ReadinessError::Disconnected)
+        );
+        assert!(
+            service.readiness().begin_reconnect(),
+            "a stale Active must not reserve the reconnect slot"
         );
     }
 

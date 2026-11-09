@@ -1162,6 +1162,33 @@ done
     path
 }
 
+fn fake_sidecar_sync_serial(dir: &std::path::Path) -> PathBuf {
+    let path = dir.join("fake_engine_sync_serial.sh");
+    let script = r#"#!/bin/sh
+cat <<'FRAMES'
+{"version":1,"type":"ready","engine_version":"fake","handles":["mailto:me@example.invalid"],"capabilities":{"send":true,"history":false}}
+FRAMES
+while IFS= read -r line; do
+  case "$line" in
+    *'"type":"sync_conversations"'*)
+      id=$(printf '%s' "$line" | sed -n 's/.*"request_id":\([0-9]*\).*/\1/p')
+      printf 'start %s\n' "$id" >> "$0.log"
+      sleep 0.1
+      printf 'end %s\n' "$id" >> "$0.log"
+      printf '{"version":1,"type":"sync_result","request_id":%s,"status":"complete","conversations":0}\n' "$id"
+      ;;
+    *'"type":"shutdown"'*)
+      printf '{"version":1,"type":"shutdown_ack","request_id":1}\n'
+      exit 0
+      ;;
+  esac
+done
+"#;
+    fs::write(&path, script).unwrap();
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o700)).unwrap();
+    path
+}
+
 #[tokio::test]
 async fn explicit_startup_refresh_opens_readiness_after_persistence() {
     let dir = tempfile::tempdir().unwrap();
@@ -1215,6 +1242,63 @@ async fn explicit_startup_refresh_opens_readiness_after_persistence() {
         .shutdown(Duration::from_secs(5))
         .await
         .expect("shutdown completes");
+    assert!(!report.drain_incomplete);
+    persistence.abort();
+}
+
+#[tokio::test]
+async fn overlapping_manual_syncs_are_serialized_not_interleaved() {
+    let dir = tempfile::tempdir().unwrap();
+    let private = dir.path().join("private");
+    fs::create_dir(&private).unwrap();
+    fs::set_permissions(&private, fs::Permissions::from_mode(0o700)).unwrap();
+    let fake = fake_sidecar_sync_serial(dir.path());
+    let log = PathBuf::from(format!("{}.log", fake.display()));
+
+    let store = EncryptedStore::open(private.join("store.db"), &TestSecrets).unwrap();
+    let store = Arc::new(Mutex::new(store));
+    let hub = SubscriptionHub::with_default_capacity();
+    let readiness = Readiness::new_ready(1, hub.clone());
+    let engine = Arc::new(Engine::new(EngineConfig {
+        sync_chats: false,
+        dart_executable: fake,
+        script: PathBuf::from("ignored"),
+        state_dir: private.clone(),
+        library: PathBuf::from("ignored"),
+    }));
+    let (sink, mut events) = mpsc::channel(64);
+    let mut supervisor = Supervisor::new(engine.clone(), sink);
+    let service = Arc::new(Service::with_engine_slot_and_readiness(
+        store.clone(),
+        bloomd::engine::engine_slot(engine),
+        hub,
+        readiness.clone(),
+    ));
+    let service_for_persist = service.clone();
+    let persistence = tokio::spawn(async move {
+        while let Some(event) = events.recv().await {
+            service_for_persist.persist(&event).unwrap();
+        }
+    });
+    supervisor.start().await.expect("engine starts");
+    let (first, second) = tokio::join!(service.sync_conversations(), service.sync_conversations());
+    assert!(
+        first.is_ok(),
+        "first serialized sync should complete: {first:?}"
+    );
+    assert!(second.is_ok(), "second sync should complete: {second:?}");
+    let log = fs::read_to_string(&log).expect("sync log exists");
+    let lines: Vec<&str> = log.lines().collect();
+    assert_eq!(
+        lines,
+        vec!["start 1", "end 1", "start 2", "end 2"],
+        "sync requests must not overlap"
+    );
+    assert!(readiness.can_send());
+    let report = supervisor
+        .shutdown(Duration::from_secs(5))
+        .await
+        .expect("shutdown");
     assert!(!report.drain_incomplete);
     persistence.abort();
 }

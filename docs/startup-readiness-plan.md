@@ -1,6 +1,6 @@
 # Startup readiness plan
 
-Status: P1 implementation in progress. P2-P4 are PENDING. P1 is implemented and awaiting final independent review; no live engine was run. Work targets branch `feat/startup-readiness-ui` at baseline `ead2c43`. The main development checkout stays untouched.
+Status: P1 accepted. P2-P4 are PENDING and were not started. P1 passed the synthetic daemon and fake-sidecar gate; no live engine was run. Work targets branch `feat/startup-readiness-ui` at baseline `ead2c43`. The main development checkout stays untouched.
 
 The plan records the requested proposal for review, not authorization to implement it. Each unit is independently verifiable, and each unit needs its own acceptance before the next starts. An independent plan review is required before P1 starts.
 
@@ -51,15 +51,15 @@ Acceptance:
 - [x] A stale generation, operation, or revision, a late result, and a timeout all leave the gate closed (readiness and sidecar timeout tests).
 - [x] An empty listing unlocks as complete, and a partial, failed, or limited refresh does not.
 - [x] A missing cloud client yields unavailable with the gate closed, distinct from a valid empty complete listing (sidecar fixture test).
-- [ ] No send is queued or retried automatically, and a dispatched send on disconnect is reported uncertain.
-- [ ] Retries are serial and coalesced, and a timeout neither cancels the current sidecar operation nor starts overlapping work (coalescing covered; concurrent serial proof remains).
+- [x] No send is queued or retried automatically, and a dispatched send on disconnect is reported uncertain (gate rejection and late-confirmation tests).
+- [x] Retries are serial and coalesced, and a timeout neither cancels the current sidecar operation nor starts overlapping work (reconnect coalescing plus overlapping manual-sync serial test).
 - [x] A second TUI receives the same revisioned state without lost or reordered events.
-- [ ] Metadata and manual sync gate new outbound work, while routine local reconcile and inbound updates do not.
+- [x] Metadata and manual sync gate new outbound work, while routine local reconcile and inbound updates do not (manual-sync and inbound/local gate tests).
 - [x] Protocol version 10 is updated across daemon, TUI, fake fixtures, and tests in one change.
 
 Failure cases: empty store with a valid empty listing, missing cloud client, refresh failure, limited result, timeout, stale generation, stale operation, stale revision, lost subscription, and a second client during bootstrap. Done when the focused daemon, IPC, client, subscription, and Dart protocol tests pass and the parent inspects the diff.
 
-Implementation evidence (2026-11-09): workspace tests, strict Clippy, formatting, source guard, 20 engine_sidecar tests including empty, populated, missing-client, and timeout startup refresh, 231 daemon library tests, 43 IPC tests, 128 TUI tests, 68 stateful fake-daemon tests, and the input, messaging, and reading PTY suites passed. The engine readiness/session distinction, recovery invalidation, populated-store refresh, second-client replay, generation-tagged session filtering, reconnect coalescing, direct IPC bootstrap, missing-client unavailable outcome, and explicit timeout outcome were fixed and covered. The final reviewer found no remaining security or correctness blocker after the stale-session fix. Remaining P1 acceptance gaps are a concurrent send-versus-generation race proof and an explicit serial retry proof; the coalesced reconnect path is tested. P1 is implemented but not accepted until the final review signs off.
+Implementation evidence (2026-11-09): workspace tests, strict Clippy, formatting, source guard, 21 engine_sidecar tests including empty, populated, missing-client, timeout startup refresh, and overlapping manual-sync serialization, 232 daemon library tests, 43 IPC tests, 128 TUI tests, 68 stateful fake-daemon tests, and the input, messaging, and reading PTY suites passed. The engine readiness/session distinction, recovery invalidation, populated-store refresh, second-client replay, generation-tagged session filtering, reconnect coalescing, direct IPC bootstrap, missing-client unavailable outcome, explicit timeout outcome, and stale-Active reconnect ordering were fixed and covered. Final independent review found no P1 blocker. Accepted in-flight behavior: a send that already passed the gate before a generation invalidation can complete on that engine; new sends are rejected, nothing is queued or retried, and an unconfirmed dispatched send remains uncertain.
 
 ## P2: mandatory startup checklist
 
@@ -133,7 +133,7 @@ Only parent-verified evidence enters this table. A unit stays PENDING until its 
 
 | Unit | Status | Commit | Test command and result | Review | Remaining limits |
 | --- | --- | --- | --- | --- | --- |
-| P1 | IMPLEMENTED; FINAL REVIEW PENDING | P1 implementation commit | workspace, Clippy, 20 sidecar, 231 lib, 68 stateful, Python PTY pass | R1/R2/R4 confirmed; R3 tests added; final sign-off pending | concurrent send-versus-generation race and serial retry proofs |
+| P1 | ACCEPTED | P1 implementation commit | workspace, Clippy, 21 sidecar, 232 lib, 43 IPC, 128 TUI, 68 stateful, Python PTY pass | final review no blocker; stale-Active fix regression-tested | an admitted in-flight send may complete after invalidation; no new send, queue, or retry |
 | P2 | PENDING | none | not run | none | depends on P1 |
 | P3 | PENDING | none | not run | none | depends on P1 |
 | P4 | PENDING | none | not run | none | scheduled after P3; independently testable |
@@ -152,7 +152,7 @@ An independent read-only plan review found the three gaps below. The amendments 
 
 Parent also clarified immediate rejection rather than waiting/queueing, corrected the IPC client module path, and specified the final verification commands. Do not close an implementation finding by changing the test to match the code.
 
-Implementation review (P1): R4, independent engine readiness was derived from metadata completion. It now comes from the Active session event, with a separate regression. R5, no populated-store startup-refresh test existed. A populated fake-sidecar regression was added. R6, reconnect closed the gate permanently within one generation. An Active session after a disconnected state now starts the same serialized refresh; initial Active does not duplicate it. R7, stale session events from a replaced generation could close the new gate; sessions now carry their generation and are ignored when stale. R8, reconnect coalescing and stale-session filtering now have regression tests. R9, direct IPC bootstrap, missing-client unavailable, and explicit timeout outcomes now have tests. The reviewer also noted unused Timeout/Persisting states and no direct IPC-bootstrap/timeout tests; those remain explicit acceptance gaps, not hidden passes.
+Implementation review (P1): R4, independent engine readiness was derived from metadata completion. It now comes from the Active session event, with a separate regression. R5, no populated-store startup-refresh test existed. A populated fake-sidecar regression was added. R6, reconnect closed the gate permanently within one generation. An Active session after a disconnected state now starts the same serialized refresh; initial Active does not duplicate it. R7, stale session events from a replaced generation could close the new gate; sessions now carry their generation and are ignored when stale. R8, reconnect coalescing and stale-session filtering now have regression tests. R9, direct IPC bootstrap, missing-client unavailable, and explicit timeout outcomes now have tests. R10, a stale Active could reserve a reconnect refresh before the stale-generation filter; reconnect reservation now happens only after persistence and generation validation, with a regression test. The reviewer also noted unused Timeout/Persisting states and no direct IPC-bootstrap/timeout tests; those remain explicit acceptance gaps, not hidden passes.
 
 ## Final acceptance matrix
 
