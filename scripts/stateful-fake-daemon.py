@@ -12,7 +12,7 @@ import time
 import unicodedata
 import uuid
 
-VERSION = 9
+VERSION = 10
 MAX_FRAME = 1024 * 1024
 MAX_DRAFT_BYTES = 65_536
 SEARCH_SCAN_LIMIT = 20_000

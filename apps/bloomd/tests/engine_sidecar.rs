@@ -11,6 +11,7 @@ use bloom_transport::Transport;
 use bloomd::{
     engine::{Engine, EngineConfig},
     ipc::{RequestHandler, SubscriptionHub},
+    readiness::Readiness,
     service::Service,
     store::{self, EncryptedStore},
     supervisor::Supervisor,
@@ -1111,6 +1112,136 @@ done
     fs::write(&path, script).unwrap();
     fs::set_permissions(&path, fs::Permissions::from_mode(0o700)).unwrap();
     path
+}
+
+#[tokio::test]
+async fn explicit_startup_refresh_opens_readiness_after_persistence() {
+    let dir = tempfile::tempdir().unwrap();
+    let private = dir.path().join("private");
+    fs::create_dir(&private).unwrap();
+    fs::set_permissions(&private, fs::Permissions::from_mode(0o700)).unwrap();
+    let fake = fake_sidecar_sync(dir.path());
+
+    let store = EncryptedStore::open(private.join("store.db"), &TestSecrets).unwrap();
+    let store = Arc::new(Mutex::new(store));
+    let hub = SubscriptionHub::with_default_capacity();
+    let readiness = Readiness::new_starting(hub.clone());
+    let engine = Arc::new(Engine::new(EngineConfig {
+        sync_chats: false,
+        dart_executable: fake,
+        script: PathBuf::from("ignored"),
+        state_dir: private.clone(),
+        library: PathBuf::from("ignored"),
+    }));
+    let (sink, mut events) = mpsc::channel(64);
+    let mut supervisor = Supervisor::new(engine.clone(), sink);
+    let service = Arc::new(Service::with_engine_slot_and_readiness(
+        store.clone(),
+        bloomd::engine::engine_slot(engine),
+        hub,
+        readiness.clone(),
+    ));
+    let service_for_persist = service.clone();
+    let persistence = tokio::spawn(async move {
+        while let Some(event) = events.recv().await {
+            service_for_persist.persist(&event).unwrap();
+        }
+    });
+    supervisor.start().await.expect("engine starts");
+
+    assert!(!readiness.can_send());
+    service.run_sync_for_generation(1).await;
+    let snapshot = readiness.snapshot();
+    assert!(snapshot.can_send, "a complete refresh opens the gate");
+    assert!(snapshot.engine_ready);
+    assert_eq!(snapshot.observed_records, 1);
+    assert_eq!(
+        store::list_conversations(&store.lock().unwrap())
+            .unwrap()
+            .len(),
+        1,
+        "readiness must follow the ordered persistence barrier"
+    );
+
+    let report = supervisor
+        .shutdown(Duration::from_secs(5))
+        .await
+        .expect("shutdown completes");
+    assert!(!report.drain_incomplete);
+    persistence.abort();
+}
+
+#[tokio::test]
+async fn explicit_startup_refresh_runs_with_a_populated_store() {
+    use bloom_domain::{
+        Conversation, ConversationId, ConversationKind, Handle, HandleKind, Participant,
+        TransportId,
+    };
+
+    let dir = tempfile::tempdir().unwrap();
+    let private = dir.path().join("private");
+    fs::create_dir(&private).unwrap();
+    fs::set_permissions(&private, fs::Permissions::from_mode(0o700)).unwrap();
+    let fake = fake_sidecar_sync(dir.path());
+
+    let store = EncryptedStore::open(private.join("store.db"), &TestSecrets).unwrap();
+    let store = Arc::new(Mutex::new(store));
+    let transport = TransportId::new("openbubbles").unwrap();
+    let existing = Conversation {
+        id: ConversationId::new(transport.clone(), "iMessage;-;existing@example.invalid").unwrap(),
+        remote_id: "iMessage;-;existing@example.invalid".into(),
+        kind: ConversationKind::Direct,
+        title: None,
+        participants: vec![Participant {
+            handle: Handle::new(HandleKind::Email, "existing@example.invalid").unwrap(),
+            display_name: None,
+            is_me: false,
+        }],
+        created_at: 1,
+        last_message_at: Some(1),
+        aliases: Vec::new(),
+        preview: None,
+    };
+    store::upsert_conversation(&mut store.lock().unwrap(), &existing).unwrap();
+
+    let hub = SubscriptionHub::with_default_capacity();
+    let readiness = Readiness::new_starting(hub.clone());
+    let engine = Arc::new(Engine::new(EngineConfig {
+        sync_chats: false,
+        dart_executable: fake,
+        script: PathBuf::from("ignored"),
+        state_dir: private.clone(),
+        library: PathBuf::from("ignored"),
+    }));
+    let (sink, mut events) = mpsc::channel(64);
+    let mut supervisor = Supervisor::new(engine.clone(), sink);
+    let service = Arc::new(Service::with_engine_slot_and_readiness(
+        store.clone(),
+        bloomd::engine::engine_slot(engine),
+        hub,
+        readiness.clone(),
+    ));
+    let service_for_persist = service.clone();
+    let persistence = tokio::spawn(async move {
+        while let Some(event) = events.recv().await {
+            service_for_persist.persist(&event).unwrap();
+        }
+    });
+    supervisor.start().await.expect("engine starts");
+    service.run_sync_for_generation(1).await;
+    assert!(readiness.can_send(), "populated store still refreshes");
+    assert_eq!(
+        store::list_conversations(&store.lock().unwrap())
+            .unwrap()
+            .len(),
+        2
+    );
+    let report = supervisor
+        .shutdown(Duration::from_secs(5))
+        .await
+        .expect("shutdown");
+    assert!(!report.drain_incomplete);
+    persistence.abort();
 }
 
 #[tokio::test]

@@ -7,8 +7,8 @@ use bloom_domain::{
 };
 use bloom_ipc::{
     client::ClientError, read_request, write_event, write_response, ConversationSyncStatus,
-    DraftKey, DraftWriteOutcome, DurableDraft, Event, EventKind, ProtocolError, RequestKind,
-    Response, ResponseKind,
+    DraftKey, DraftWriteOutcome, DurableDraft, Event, EventKind, ProtocolError, ReadinessOutcome,
+    ReadinessPhase, ReadinessSnapshot, RequestKind, Response, ResponseKind,
 };
 use bloom_tui::daemon::{
     pump_session, pump_session_with_interval, snapshot, ConnectionState, Snapshot,
@@ -205,6 +205,27 @@ impl FakeDaemon {
                                         &Response {
                                             request_id,
                                             response: ResponseKind::History { messages },
+                                        },
+                                    )
+                                    .await;
+                                }
+                                RequestKind::Readiness => {
+                                    let snapshot = ReadinessSnapshot {
+                                        generation: 1,
+                                        operation: 1,
+                                        revision: 1,
+                                        phase: ReadinessPhase::Ready,
+                                        outcome: Some(ReadinessOutcome::Complete),
+                                        observed_records: conversations.len() as u32,
+                                        can_send: true,
+                                        engine_ready: true,
+                                        bounded_error: None,
+                                    };
+                                    let _ = write_response(
+                                        &mut stream,
+                                        &Response {
+                                            request_id,
+                                            response: ResponseKind::Readiness { snapshot },
                                         },
                                     )
                                     .await;

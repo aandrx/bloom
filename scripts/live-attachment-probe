@@ -3,7 +3,7 @@
 
 Starts one daemon against the real OpenBubbles registration, waits for a stored
 inbound attachment with a sidecar fetch token, requests exactly that token through
-the v9 IPC path, and verifies the private cached file. It never sends, imports
+the v10 IPC path, and verifies the private cached file. It never sends, imports
 history, renews, changes registration, opens the file, or prints content/tokens.
 
 Usage: set BLOOM_LIVE_ATTACHMENT_ACK=one-shot-authorized and run with real
@@ -26,7 +26,7 @@ import tempfile
 import time
 
 ACK = "one-shot-authorized"
-VERSION = 9
+VERSION = 10
 MAX_FRAME = 1024 * 1024
 START_TIMEOUT = 120.0
 ATTACHMENT_TIMEOUT = 300.0

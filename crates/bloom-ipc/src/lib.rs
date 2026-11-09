@@ -20,9 +20,9 @@ use std::{fmt, io};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use unicode_segmentation::UnicodeSegmentation;
 
-/// Bumped to 9 for typed outbound attachment send. Version 8 peers are rejected
-/// at the frame byte, so they cannot silently ignore the new request.
-pub const PROTOCOL_VERSION: u16 = 9;
+/// Bumped to 10 for authoritative daemon readiness. Version 9 peers are rejected
+/// at the frame byte, so they cannot silently ignore the new request and event.
+pub const PROTOCOL_VERSION: u16 = 10;
 /// Largest accepted `message_context` limit. Dispatch rejects larger limits
 /// instead of clamping them.
 pub const MAX_MESSAGE_CONTEXT_LIMIT: u32 = 200;
@@ -345,6 +345,9 @@ pub enum RequestKind {
         conversation_id: ConversationId,
         path: String,
     },
+    /// Read the daemon's current revisioned readiness state. This is a local
+    /// query and never starts or retries a metadata refresh.
+    Readiness,
 }
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Response {
@@ -389,6 +392,9 @@ pub enum ResponseKind {
         path: String,
         bytes: u64,
     },
+    Readiness {
+        snapshot: ReadinessSnapshot,
+    },
     Error {
         error: ProtocolError,
     },
@@ -400,11 +406,64 @@ pub enum ConversationSyncStatus {
     Limited,
     Failed,
 }
+/// Coarse stage of the daemon's required startup metadata refresh. The phase is
+/// presentation state; [`ReadinessSnapshot::can_send`] is the only send gate.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReadinessPhase {
+    Starting,
+    Refreshing,
+    Persisting,
+    Ready,
+    Limited,
+    Failed,
+    Recovering,
+    Stopped,
+}
+/// Terminal result of one required refresh. A snapshot has no outcome while the
+/// refresh is still in progress.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReadinessOutcome {
+    Complete,
+    Limited,
+    Failed,
+    Unavailable,
+}
+/// Bounded, payload-free reason attached to a closed readiness gate.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReadinessError {
+    Unavailable,
+    Failed,
+    Limited,
+    Disconnected,
+    Timeout,
+    Protocol,
+    Internal,
+}
+/// Revisioned readiness state. `revision` increases on every accepted change, so
+/// a second client can discard an older replayed or queried snapshot.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReadinessSnapshot {
+    pub generation: u64,
+    pub operation: u64,
+    pub revision: u64,
+    pub phase: ReadinessPhase,
+    pub outcome: Option<ReadinessOutcome>,
+    pub observed_records: u32,
+    pub can_send: bool,
+    pub engine_ready: bool,
+    pub bounded_error: Option<ReadinessError>,
+}
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ProtocolError {
     InvalidRequest,
     NotFound,
+    /// The daemon's readiness gate is closed. The request was rejected before
+    /// any preparation, upload, draft, or store mutation.
+    NotReady,
     SessionExpired,
     AccountThrottled,
     RecipientUnreachable,
@@ -439,6 +498,9 @@ pub enum EventKind {
     },
     Session {
         state: SessionState,
+    },
+    Readiness {
+        snapshot: ReadinessSnapshot,
     },
 }
 
@@ -808,7 +870,69 @@ mod tests {
             ResponseKind::MessageContext { messages } => assert_eq!(messages, vec![message]),
             _ => panic!("expected message context"),
         }
-        assert_eq!(PROTOCOL_VERSION, 9);
+        assert_eq!(PROTOCOL_VERSION, 10);
+    }
+
+    #[test]
+    fn readiness_request_response_and_event_round_trip() {
+        let snapshot = ReadinessSnapshot {
+            generation: 2,
+            operation: 4,
+            revision: 7,
+            phase: ReadinessPhase::Limited,
+            outcome: Some(ReadinessOutcome::Limited),
+            observed_records: 12,
+            can_send: false,
+            engine_ready: true,
+            bounded_error: Some(ReadinessError::Limited),
+        };
+        let request = Request {
+            request_id: 31,
+            request: RequestKind::Readiness,
+        };
+        let decoded: Request =
+            serde_json::from_slice(&serde_json::to_vec(&request).unwrap()).unwrap();
+        assert!(matches!(decoded.request, RequestKind::Readiness));
+
+        let response = Response {
+            request_id: 31,
+            response: ResponseKind::Readiness {
+                snapshot: snapshot.clone(),
+            },
+        };
+        let encoded = serde_json::to_value(&response).unwrap();
+        assert_eq!(encoded["response"]["result"], "readiness");
+        assert_eq!(encoded["response"]["snapshot"]["phase"], "limited");
+        let decoded: Response = serde_json::from_value(encoded).unwrap();
+        assert!(
+            decoded.response
+                == ResponseKind::Readiness {
+                    snapshot: snapshot.clone()
+                }
+        );
+
+        let event = Event {
+            event: EventKind::Readiness {
+                snapshot: snapshot.clone(),
+            },
+        };
+        let decoded: Event = serde_json::from_slice(&serde_json::to_vec(&event).unwrap()).unwrap();
+        assert!(decoded.event == EventKind::Readiness { snapshot });
+    }
+
+    #[test]
+    fn not_ready_is_a_bounded_protocol_error() {
+        let encoded = serde_json::to_value(ProtocolError::NotReady).unwrap();
+        assert_eq!(encoded, serde_json::json!("not_ready"));
+    }
+
+    #[tokio::test]
+    async fn rejects_v9_before_header_or_payload() {
+        let mut input = [9u8].as_slice();
+        assert_eq!(
+            read_request(&mut input).await.err().unwrap(),
+            CodecError::WrongVersion
+        );
     }
 
     #[test]

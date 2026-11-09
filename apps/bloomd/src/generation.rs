@@ -41,6 +41,9 @@ pub struct RecoveryLoop<B> {
     policy: RecoveryPolicy,
     stable_after: Duration,
     build: B,
+    on_recover: Option<Box<dyn FnMut() + Send>>,
+    on_started: Option<Box<dyn FnMut() + Send>>,
+    on_failed: Option<Box<dyn FnMut() + Send>>,
 }
 
 impl<B> RecoveryLoop<B>
@@ -65,6 +68,9 @@ where
             policy,
             stable_after: STABLE_AFTER,
             build,
+            on_recover: None,
+            on_started: None,
+            on_failed: None,
         }
     }
 
@@ -72,6 +78,26 @@ where
     /// budget. Tests use a short window; production keeps [`STABLE_AFTER`].
     pub fn with_stability(mut self, stable_after: Duration) -> Self {
         self.stable_after = stable_after;
+        self
+    }
+
+    /// Run before the failed generation is stopped, so readiness can be
+    /// invalidated before its transport drains.
+    pub fn with_recovery_hook(mut self, hook: impl FnMut() + Send + 'static) -> Self {
+        self.on_recover = Some(Box::new(hook));
+        self
+    }
+
+    /// Run after a replacement has started and been published into the slot.
+    pub fn with_started_hook(mut self, hook: impl FnMut() + Send + 'static) -> Self {
+        self.on_started = Some(Box::new(hook));
+        self
+    }
+
+    /// Run when a replacement fails to start, so readiness cannot remain in an
+    /// in-progress phase with no engine behind it.
+    pub fn with_failed_hook(mut self, hook: impl FnMut() + Send + 'static) -> Self {
+        self.on_failed = Some(Box::new(hook));
         self
     }
 
@@ -113,6 +139,12 @@ where
                 self.supervisor = Some(supervisor);
             }
 
+            // Invalidate readiness before the old transport drains. The builder
+            // then starts a new operation for the replacement generation.
+            if let Some(hook) = self.on_recover.as_mut() {
+                hook();
+            }
+
             // Finish the old generation explicitly before any replacement is
             // built, so at most one generation is live at a time.
             let _ = self.stop_current().await;
@@ -120,6 +152,9 @@ where
             let delay = match self.policy.record_failure(FailureKind::ChildExited(None)) {
                 Ok(delay) => delay,
                 Err(reason) => {
+                    if let Some(hook) = self.on_failed.as_mut() {
+                        hook();
+                    }
                     self.stop_current().await;
                     return Outcome::GiveUp(reason);
                 }
@@ -135,11 +170,17 @@ where
                     *self.slot.write().expect("engine slot lock is not poisoned") =
                         Arc::clone(&engine);
                     self.supervisor = Some(supervisor);
+                    if let Some(hook) = self.on_started.as_mut() {
+                        hook();
+                    }
                 }
                 Err(_) => {
                     // The replacement never became usable. Stop whatever it
                     // opened, keep no live supervisor, and let the policy bound
-                    // the next attempt.
+                    // the next attempt. Readiness must not remain in progress.
+                    if let Some(hook) = self.on_failed.as_mut() {
+                        hook();
+                    }
                     let _ = supervisor.shutdown(DRAIN_TIMEOUT).await;
                     self.supervisor = None;
                 }
@@ -640,5 +681,66 @@ mod tests {
         let outcome = handle.await.unwrap();
         assert!(matches!(outcome, Outcome::Cancelled { .. }));
         assert_eq!(parts.send_total(), 0);
+    }
+    #[tokio::test]
+    async fn recovery_resets_readiness_and_ignores_the_old_generation() {
+        use crate::readiness::{Finish, Readiness, ReadinessToken};
+        use std::sync::atomic::AtomicU64;
+
+        let parts = Parts::new();
+        let (first_transport, mut supervisor, engine) = parts.make_generation();
+        supervisor.start().await.unwrap();
+        let slot = engine_slot(engine);
+        let hub = crate::ipc::SubscriptionHub::new(8);
+        let readiness = Readiness::new_starting(hub);
+        let generations = Arc::new(AtomicU64::new(1));
+        let old = readiness.begin(1).unwrap();
+        readiness.mark_engine_ready(old);
+        assert!(readiness.finish(old, Finish::Complete(0)));
+        assert!(readiness.can_send());
+
+        let current = Arc::new(Mutex::new(None::<ReadinessToken>));
+        let builder = {
+            let parts = Arc::clone(&parts);
+            let readiness = readiness.clone();
+            let generations = generations.clone();
+            let current = current.clone();
+            move || {
+                let generation = generations.fetch_add(1, Ordering::SeqCst) + 1;
+                *current.lock().unwrap() = readiness.begin(generation);
+                parts.make_replacement()
+            }
+        };
+        let mut recovery = RecoveryLoop::new(slot, supervisor, tiny_policy(3), builder)
+            .with_recovery_hook({
+                let readiness = readiness.clone();
+                move || readiness.begin_recovery()
+            });
+        let (cancel_tx, mut cancel_rx) = watch::channel(false);
+        let handle = tokio::spawn(async move { recovery.run(&mut cancel_rx).await });
+
+        first_transport.close();
+        eventually("one replacement", || {
+            parts.builder_calls.load(Ordering::SeqCst) == 1
+        })
+        .await;
+
+        let snapshot = readiness.snapshot();
+        assert_eq!(snapshot.generation, 2);
+        assert!(!snapshot.can_send);
+        assert!(!snapshot.engine_ready);
+        assert!(!readiness.finish(old, Finish::Complete(0)));
+        assert!(!readiness.can_send());
+        let new = current
+            .lock()
+            .unwrap()
+            .expect("replacement began readiness");
+        readiness.mark_engine_ready(new);
+        assert!(readiness.finish(new, Finish::Complete(0)));
+        assert!(readiness.can_send());
+
+        cancel_tx.send(true).unwrap();
+        let outcome = handle.await.unwrap();
+        assert!(matches!(outcome, Outcome::Cancelled { .. }));
     }
 }

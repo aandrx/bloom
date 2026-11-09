@@ -4,7 +4,7 @@ use std::{future::Future, pin::Pin, time::Duration};
 use bloom_domain::{Conversation, ConversationId, Message, MessageId, OutgoingBody};
 use bloom_ipc::{
     DraftKey, DraftLoad, DraftWriteOutcome, DurableDraft, HistoryCursor, MessageSearchHit,
-    ParticipantFilter, ProtocolError, RequestKind, Response, ResponseKind,
+    ParticipantFilter, ProtocolError, ReadinessSnapshot, RequestKind, Response, ResponseKind,
 };
 use tokio::{io::AsyncWrite, time::timeout};
 
@@ -91,6 +91,9 @@ pub trait RequestHandler: Send + Sync {
     fn fetch_attachment(&self, _token: String) -> HandlerFuture<'_, (String, u64)> {
         Box::pin(async { Err(ProtocolError::Unsupported) })
     }
+    fn readiness(&self) -> HandlerFuture<'_, ReadinessSnapshot> {
+        Box::pin(async { Err(ProtocolError::Unsupported) })
+    }
 }
 
 /// Serve sequential requests. Codec errors and idle timeouts close this connection.
@@ -135,8 +138,7 @@ async fn serve_inner<H: RequestHandler>(
         };
         if first && matches!(&request.request, RequestKind::Subscribe) {
             if let Some(hub) = hub {
-                let receiver = hub.subscribe();
-                let initial = hub.latest_session();
+                let (receiver, initial) = hub.subscribe_with_replay();
                 serve_subscriber(connection, request.request_id, receiver, initial).await;
                 return;
             }
@@ -295,6 +297,10 @@ async fn serve_inner<H: RequestHandler>(
                     }
                 }
             }
+            RequestKind::Readiness => match handler.readiness().await {
+                Ok(snapshot) => ResponseKind::Readiness { snapshot },
+                Err(error) => ResponseKind::Error { error },
+            },
             RequestKind::Subscribe => ResponseKind::Error {
                 error: if hub.is_some() {
                     ProtocolError::InvalidRequest

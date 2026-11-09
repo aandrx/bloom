@@ -1,7 +1,7 @@
 use crate::{
     read_event, read_response, write_request, CodecError, ConversationSyncStatus, DraftKey,
     DraftLoad, DraftWriteOutcome, DurableDraft, Event, HistoryCursor, MessageSearchHit,
-    ParticipantFilter, Request, RequestKind, ResponseKind,
+    ParticipantFilter, ReadinessSnapshot, Request, RequestKind, ResponseKind,
 };
 use bloom_domain::{Conversation, ConversationId, Message, MessageId, OutgoingBody};
 use std::{
@@ -362,6 +362,15 @@ impl BloomClient {
         }
     }
 
+    /// Read the daemon's current revisioned readiness state. This is a local
+    /// query and never starts or retries a metadata refresh.
+    pub async fn readiness(&self) -> Result<ReadinessSnapshot, ClientError> {
+        match self.request(RequestKind::Readiness).await? {
+            ResponseKind::Readiness { snapshot } => Ok(snapshot),
+            _ => Err(ClientError::UnexpectedResponse),
+        }
+    }
+
     pub async fn subscribe(&self) -> Result<EventStream, ClientError> {
         let id = Self::id();
         let mut stream = self.connect().await?;
@@ -621,7 +630,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn attachment_fetch_uses_v9_and_returns_the_typed_result() {
+    async fn attachment_fetch_uses_v10_and_returns_the_typed_result() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("attachment");
         let listener = UnixListener::bind(&path).unwrap();
@@ -654,6 +663,41 @@ mod tests {
                 .unwrap(),
             ("/private/cache/token.bin".to_owned(), 42)
         );
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn readiness_query_returns_the_typed_snapshot() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("readiness");
+        let listener = UnixListener::bind(&path).unwrap();
+        let expected = ReadinessSnapshot {
+            generation: 1,
+            operation: 2,
+            revision: 3,
+            phase: crate::ReadinessPhase::Ready,
+            outcome: Some(crate::ReadinessOutcome::Complete),
+            observed_records: 0,
+            can_send: true,
+            engine_ready: true,
+            bounded_error: None,
+        };
+        let reply = expected.clone();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let request = crate::read_request(&mut stream).await.unwrap();
+            assert!(matches!(request.request, RequestKind::Readiness));
+            write_response(
+                &mut stream,
+                &Response {
+                    request_id: request.request_id,
+                    response: ResponseKind::Readiness { snapshot: reply },
+                },
+            )
+            .await
+            .unwrap();
+        });
+        assert_eq!(BloomClient::new(path).readiness().await.unwrap(), expected);
         server.await.unwrap();
     }
 

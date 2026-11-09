@@ -154,6 +154,7 @@ struct ReadFrameContext {
 
 pub struct Engine {
     config: EngineConfig,
+    generation: u64,
     id: TransportId,
     incoming: Mutex<Option<mpsc::Receiver<TransportEvent>>>,
     outgoing: Mutex<Option<mpsc::Sender<TransportEvent>>>,
@@ -177,10 +178,16 @@ pub struct Engine {
 
 impl Engine {
     pub fn new(config: EngineConfig) -> Self {
+        Self::with_generation(config, 1)
+    }
+
+    /// Build an engine tagged with the daemon generation that owns it.
+    pub fn with_generation(config: EngineConfig, generation: u64) -> Self {
         let (outgoing, incoming) = mpsc::channel(EVENT_CAPACITY);
         let (reader_done, _) = tokio::sync::watch::channel(true);
         Self {
             config,
+            generation,
             id: transport_id(),
             incoming: Mutex::new(Some(incoming)),
             outgoing: Mutex::new(Some(outgoing)),
@@ -201,6 +208,10 @@ impl Engine {
             reader_done,
             lifecycle_lock: tokio::sync::Mutex::new(()),
         }
+    }
+
+    pub fn generation(&self) -> u64 {
+        self.generation
     }
 
     /// Addresses this account can send from, as reported by the engine.

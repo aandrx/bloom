@@ -42,22 +42,24 @@ Proposed file groups: daemon `main`, `engine`, `service`, `generation`, and `sub
 
 Acceptance:
 
-- [ ] One correlated refresh runs per generation with a populated store, and the test fails when the refresh is skipped.
+- [x] One correlated refresh runs per generation with a populated store, and the test fails when the refresh is skipped.
 - [ ] IPC accepts a connection and reports bootstrap progress before the refresh finishes.
-- [ ] Engine readiness and metadata readiness are separate observable states.
-- [ ] The ordered persistence barrier yields complete, failed, limited, or unavailable exactly once.
-- [ ] Send, new chat, and attachment each stop before preparation, upload, draft creation, and store mutation when the gate is closed.
+- [x] Engine readiness and metadata readiness are separate observable states.
+- [x] The ordered persistence barrier yields complete, failed, limited, or unavailable exactly once.
+- [x] Send, new chat, and attachment each stop before preparation, upload, draft creation, and store mutation when the gate is closed.
 - [ ] The gate and engine share one generation, and recovery invalidates readiness before the old generation drains.
 - [ ] A stale generation, operation, or revision, a late result, and a timeout all leave the gate closed.
-- [ ] An empty listing unlocks as complete, and a partial, failed, or limited refresh does not.
+- [x] An empty listing unlocks as complete, and a partial, failed, or limited refresh does not.
 - [ ] A missing cloud client yields unavailable with the gate closed, distinct from a valid empty complete listing.
 - [ ] No send is queued or retried automatically, and a dispatched send on disconnect is reported uncertain.
 - [ ] Retries are serial and coalesced, and a timeout neither cancels the current sidecar operation nor starts overlapping work.
-- [ ] A second TUI receives the same revisioned state without lost or reordered events.
+- [x] A second TUI receives the same revisioned state without lost or reordered events.
 - [ ] Metadata and manual sync gate new outbound work, while routine local reconcile and inbound updates do not.
-- [ ] Protocol version 10 is updated across daemon, TUI, fake fixtures, and tests in one change.
+- [x] Protocol version 10 is updated across daemon, TUI, fake fixtures, and tests in one change.
 
 Failure cases: empty store with a valid empty listing, missing cloud client, refresh failure, limited result, timeout, stale generation, stale operation, stale revision, lost subscription, and a second client during bootstrap. Done when the focused daemon, IPC, client, subscription, and Dart protocol tests pass and the parent inspects the diff.
+
+Implementation evidence (2026-11-09): workspace tests, strict Clippy, formatting, source guard, 18 engine_sidecar tests including an empty and populated startup refresh, 227 daemon library tests, 43 IPC tests, 128 TUI tests, 68 stateful fake-daemon tests, and the input, messaging, and reading PTY suites passed. The engine readiness/session distinction, recovery invalidation, populated-store refresh, and second-client replay were fixed after independent review. No live engine was run. Remaining P1 acceptance gaps are the direct IPC-before-refresh progress check, explicit timeout outcome, a send-versus-generation race test, missing-client sidecar-fixture proof, and serial/coalesced retry test. P1 is implemented but not accepted.
 
 ## P2: mandatory startup checklist
 
@@ -131,7 +133,7 @@ Only parent-verified evidence enters this table. A unit stays PENDING until its 
 
 | Unit | Status | Commit | Test command and result | Review | Remaining limits |
 | --- | --- | --- | --- | --- | --- |
-| P1 | PENDING | none | not run | none | schema and error variants not agreed |
+| P1 | IMPLEMENTED; NOT ACCEPTED | P1 implementation commit | workspace, Clippy, 18 sidecar, 68 stateful, Python PTY pass | initial review findings fixed; targeted re-review pending | direct IPC bootstrap, timeout, generation-race and missing-client/serial-retry acceptance gaps |
 | P2 | PENDING | none | not run | none | depends on P1 |
 | P3 | PENDING | none | not run | none | depends on P1 |
 | P4 | PENDING | none | not run | none | scheduled after P3; independently testable |
@@ -149,6 +151,8 @@ An independent read-only plan review found the three gaps below. The amendments 
 | R3 | Second client local bootstrap not tested | P2 requires its own delayed snapshot and draft-load checks without another listing | Two-client fixture: daemon is ready, second TUI cannot offer Open Bloom until its reads finish |
 
 Parent also clarified immediate rejection rather than waiting/queueing, corrected the IPC client module path, and specified the final verification commands. Do not close an implementation finding by changing the test to match the code.
+
+Implementation review (P1): R4, independent engine readiness was derived from metadata completion. It now comes from the Active session event, with a separate regression. R5, no populated-store startup-refresh test existed. A populated fake-sidecar regression was added. R6, reconnect closed the gate permanently within one generation. An Active session after a disconnected state now starts the same serialized refresh; initial Active does not duplicate it. The reviewer also noted unused Timeout/Persisting states and no direct IPC-bootstrap/timeout tests; those remain explicit acceptance gaps, not hidden passes.
 
 ## Final acceptance matrix
 

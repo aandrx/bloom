@@ -5702,7 +5702,7 @@ impl App {
             EventKind::ConversationsChanged => {
                 self.latest_conversations_revision = revision;
             }
-            EventKind::Session { .. } => {}
+            EventKind::Session { .. } | EventKind::Readiness { .. } => {}
         }
         match event {
             EventKind::Message {
@@ -5755,6 +5755,9 @@ impl App {
             }
             EventKind::ConversationsChanged => self.resync_conversations = true,
             EventKind::Session { state } => self.session = format!("{state:?}"),
+            // P2 owns the startup checklist. P1 publishes the state; the current
+            // client deliberately ignores it without changing any UI behavior.
+            EventKind::Readiness { .. } => {}
         }
         self.resolve_completed_start();
     }
