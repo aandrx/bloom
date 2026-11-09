@@ -109,6 +109,7 @@ impl Service {
                 }
             }
             Err(TransportError::TransportUnavailable) => Finish::Unavailable,
+            Err(TransportError::Timeout) => Finish::Timeout,
             Err(_) => Finish::Failed,
         };
         self.readiness.finish(token, finish);
@@ -187,7 +188,12 @@ impl Service {
                 });
                 Ok(true)
             }
-            TransportEvent::Session { state, .. } => {
+            TransportEvent::Session {
+                generation, state, ..
+            } => {
+                if *generation != self.readiness.current_generation() {
+                    return Ok(false);
+                }
                 self.hub.publish(Event {
                     event: EventKind::Session {
                         state: state.clone(),
@@ -543,6 +549,7 @@ impl RequestHandler for Service {
                     }
                 }
                 Err(TransportError::TransportUnavailable) => Finish::Unavailable,
+                Err(TransportError::Timeout) => Finish::Timeout,
                 Err(_) => Finish::Failed,
             };
             self.readiness.finish(token, finish);
@@ -1011,6 +1018,7 @@ fn map_transport_error(error: TransportError) -> ProtocolError {
         TransportError::RecipientUnreachable => ProtocolError::RecipientUnreachable,
         TransportError::NotRegistered => ProtocolError::NotRegistered,
         TransportError::TransportUnavailable => ProtocolError::TransportUnavailable,
+        TransportError::Timeout => ProtocolError::Protocol,
         TransportError::Unsupported => ProtocolError::Unsupported,
         TransportError::Protocol => ProtocolError::Protocol,
         TransportError::Internal => ProtocolError::Internal,
@@ -2251,6 +2259,7 @@ mod readiness_gate_tests {
             .unwrap();
         service
             .persist(&TransportEvent::Session {
+                generation: 1,
                 state: SessionState::Active,
                 reason: None,
             })
@@ -2263,11 +2272,34 @@ mod readiness_gate_tests {
         let (_directory, service) = harness(true);
         service
             .persist(&TransportEvent::Session {
+                generation: 1,
                 state: SessionState::Disconnected,
                 reason: None,
             })
             .unwrap();
         assert!(!service.readiness().can_send());
+    }
+
+    #[tokio::test]
+    async fn stale_session_from_the_previous_generation_cannot_close_the_gate() {
+        let (_directory, service) = harness(true);
+        let token = service.readiness().begin(2).unwrap();
+        service.readiness().mark_engine_ready(token);
+        assert!(service.readiness().finish(token, Finish::Complete(0)));
+        assert!(service.readiness().can_send());
+
+        service
+            .persist(&TransportEvent::Session {
+                generation: 1,
+                state: SessionState::Disconnected,
+                reason: None,
+            })
+            .unwrap();
+
+        assert!(
+            service.readiness().can_send(),
+            "a session event from the replaced engine generation must be ignored"
+        );
     }
 
     #[tokio::test]

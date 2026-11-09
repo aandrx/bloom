@@ -143,6 +143,7 @@ struct ReadFrameContext {
     attachment_waiters: AttachmentWaiters,
     sync_events: Arc<tokio::sync::Mutex<()>>,
     id: TransportId,
+    generation: u64,
     my_handles: Arc<Mutex<Vec<String>>>,
     recipient_lists_supported: Arc<AtomicBool>,
     started: Arc<AtomicBool>,
@@ -170,6 +171,7 @@ pub struct Engine {
     sync_waiters: SyncWaiters,
     sync_events: Arc<tokio::sync::Mutex<()>>,
     sync_lock: tokio::sync::Mutex<()>,
+    sync_timeout: Duration,
     attachment_waiters: AttachmentWaiters,
     reader_stop: Arc<tokio::sync::Notify>,
     reader_done: tokio::sync::watch::Sender<bool>,
@@ -203,6 +205,7 @@ impl Engine {
             sync_waiters: Arc::new(Mutex::new(HashMap::new())),
             sync_events: Arc::new(tokio::sync::Mutex::new(())),
             sync_lock: tokio::sync::Mutex::new(()),
+            sync_timeout: Duration::from_secs(120),
             attachment_waiters: Arc::new(Mutex::new(HashMap::new())),
             reader_stop: Arc::new(tokio::sync::Notify::new()),
             reader_done,
@@ -212,6 +215,13 @@ impl Engine {
 
     pub fn generation(&self) -> u64 {
         self.generation
+    }
+
+    /// Override the bounded metadata-sync deadline. Tests use a short deadline;
+    /// production keeps the two-minute default.
+    pub fn with_sync_timeout(mut self, timeout: Duration) -> Self {
+        self.sync_timeout = timeout;
+        self
     }
 
     /// Addresses this account can send from, as reported by the engine.
@@ -370,11 +380,11 @@ impl Engine {
             self.sync_waiters.lock().unwrap().remove(&request_id);
             return Err(TransportError::TransportUnavailable);
         }
-        match tokio::time::timeout(Duration::from_secs(120), rx).await {
+        match tokio::time::timeout(self.sync_timeout, rx).await {
             Ok(Ok(result)) => result,
             _ => {
                 self.sync_waiters.lock().unwrap().remove(&request_id);
-                Err(TransportError::Protocol)
+                Err(TransportError::Timeout)
             }
         }
     }
@@ -572,6 +582,7 @@ impl Engine {
         let sync_waiters = self.sync_waiters.clone();
         let attachment_waiters = self.attachment_waiters.clone();
         let sync_events = self.sync_events.clone();
+        let generation = self.generation;
         let started = self.started.clone();
         let stdin = self.stdin.clone();
         let child = self.child.clone();
@@ -589,6 +600,7 @@ impl Engine {
                     attachment_waiters,
                     sync_events,
                     id,
+                    generation,
                     my_handles,
                     recipient_lists_supported,
                     started,
@@ -759,6 +771,7 @@ async fn cleanup_reader(context: &ReadFrameContext) {
     let _ = tokio::time::timeout(
         READER_STOP_TIMEOUT,
         context.outgoing.send(TransportEvent::Session {
+            generation: context.generation,
             state: SessionState::Disconnected,
             reason: None,
         }),
@@ -774,6 +787,7 @@ async fn process_frames(stdout: tokio::process::ChildStdout, context: ReadFrameC
         attachment_waiters,
         sync_events,
         id,
+        generation,
         my_handles: my_handles_store,
         recipient_lists_supported,
         started: _,
@@ -874,6 +888,7 @@ async fn process_frames(stdout: tokio::process::ChildStdout, context: ReadFrameC
                 recipient_lists_supported.store(supports_recipient_lists, Ordering::SeqCst);
                 if outgoing
                     .send(TransportEvent::Session {
+                        generation,
                         state: SessionState::Active,
                         reason: None,
                     })
@@ -923,6 +938,7 @@ async fn process_frames(stdout: tokio::process::ChildStdout, context: ReadFrameC
                     .unwrap_or(SessionState::Disconnected);
                 if outgoing
                     .send(TransportEvent::Session {
+                        generation,
                         state,
                         reason: None,
                     })
@@ -1063,7 +1079,8 @@ fn map_attachment_error(code: &str) -> TransportError {
     match code {
         "invalid_token" => TransportError::Protocol,
         "unavailable" => TransportError::TransportUnavailable,
-        "too_large" | "timeout" => TransportError::Protocol,
+        "too_large" => TransportError::Protocol,
+        "timeout" => TransportError::Timeout,
         _ => TransportError::Internal,
     }
 }

@@ -26,6 +26,7 @@ pub enum Finish {
     Limited(u32),
     Failed,
     Unavailable,
+    Timeout,
 }
 
 #[derive(Clone)]
@@ -207,6 +208,13 @@ impl Readiness {
                     state.can_send = false;
                     state.bounded_error = Some(ReadinessError::Unavailable);
                 }
+                Finish::Timeout => {
+                    state.phase = ReadinessPhase::Failed;
+                    state.outcome = Some(ReadinessOutcome::Failed);
+                    state.observed_records = 0;
+                    state.can_send = false;
+                    state.bounded_error = Some(ReadinessError::Timeout);
+                }
             }
             true
         })
@@ -331,6 +339,32 @@ mod tests {
         assert!(snapshot.can_send);
         assert!(snapshot.engine_ready);
         assert_eq!(snapshot.bounded_error, None);
+    }
+
+    #[test]
+    fn timeout_keeps_the_gate_closed_with_a_bounded_reason() {
+        let hub = SubscriptionHub::new(4);
+        let readiness = Readiness::new_ready(1, hub);
+        let token = readiness.begin(1).unwrap();
+        readiness.mark_engine_ready(token);
+        assert!(readiness.finish(token, Finish::Timeout));
+        let snapshot = readiness.snapshot();
+        assert!(!snapshot.can_send);
+        assert_eq!(snapshot.phase, ReadinessPhase::Failed);
+        assert_eq!(snapshot.outcome, Some(ReadinessOutcome::Failed));
+        assert_eq!(snapshot.bounded_error, Some(ReadinessError::Timeout));
+    }
+
+    #[test]
+    fn reconnect_refresh_only_starts_once_until_it_finishes() {
+        let hub = SubscriptionHub::new(4);
+        let readiness = Readiness::new_ready(1, hub);
+        readiness.session_lost();
+        assert!(readiness.begin_reconnect());
+        assert!(
+            !readiness.begin_reconnect(),
+            "duplicate Active events must coalesce into one reconnect refresh"
+        );
     }
 
     #[test]

@@ -25,6 +25,7 @@ pub enum TransportError {
     RecipientUnreachable,
     NotRegistered,
     TransportUnavailable,
+    Timeout,
     Unsupported,
     Protocol,
     Internal,
@@ -37,6 +38,7 @@ impl fmt::Display for TransportError {
             Self::RecipientUnreachable => "recipient unreachable",
             Self::NotRegistered => "not registered",
             Self::TransportUnavailable => "transport unavailable",
+            Self::Timeout => "transport timeout",
             Self::Unsupported => "operation unsupported",
             Self::Protocol => "protocol error",
             Self::Internal => "internal transport error",
@@ -159,6 +161,7 @@ pub enum TransportEvent {
         at: i64,
     },
     Session {
+        generation: u64,
         state: SessionState,
         reason: Option<SessionReason>,
     },
@@ -351,6 +354,7 @@ mod tests {
     fn typed_errors_reasons_and_debug_are_safe() {
         assert_eq!(format!("{:?}", SessionReason::Protocol), "Protocol");
         let event = TransportEvent::Session {
+            generation: 1,
             state: SessionState::Failed,
             reason: Some(SessionReason::Authentication),
         };

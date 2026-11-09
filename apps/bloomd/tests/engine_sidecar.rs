@@ -86,6 +86,7 @@ async fn malformed_stdout_terminates_engine_and_rejects_later_sends() {
             if matches!(
                 events.recv().await,
                 Some(bloom_transport::TransportEvent::Session {
+                    generation: 1,
                     state: bloom_domain::SessionState::Disconnected,
                     ..
                 })
@@ -1114,6 +1115,53 @@ done
     path
 }
 
+/// A sidecar with no usable cloud client: the explicit sync must report a
+/// terminal failure, never a valid empty listing. This is the daemon-side
+/// counterpart of the Dart engine's missing-client branch.
+fn fake_sidecar_sync_unavailable(dir: &std::path::Path) -> PathBuf {
+    let path = dir.join("fake_engine_sync_unavailable.sh");
+    let script = r#"#!/bin/sh
+cat <<'FRAMES'
+{"version":1,"type":"ready","engine_version":"fake","handles":["mailto:me@example.invalid"],"capabilities":{"send":true,"history":false}}
+FRAMES
+while IFS= read -r line; do
+  case "$line" in
+    *'"type":"sync_conversations"'*)
+      id=$(printf '%s' "$line" | sed -n 's/.*"request_id":\([0-9]*\).*/\1/p')
+      printf '{"version":1,"type":"sync_result","request_id":%s,"status":"failed"}\n' "$id"
+      ;;
+    *'"type":"shutdown"'*)
+      printf '{"version":1,"type":"shutdown_ack","request_id":1}\n'
+      exit 0
+      ;;
+  esac
+done
+"#;
+    fs::write(&path, script).unwrap();
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o700)).unwrap();
+    path
+}
+
+fn fake_sidecar_sync_silent(dir: &std::path::Path) -> PathBuf {
+    let path = dir.join("fake_engine_sync_silent.sh");
+    let script = r#"#!/bin/sh
+cat <<'FRAMES'
+{"version":1,"type":"ready","engine_version":"fake","handles":["mailto:me@example.invalid"],"capabilities":{"send":true,"history":false}}
+FRAMES
+while IFS= read -r line; do
+  case "$line" in
+    *'"type":"shutdown"'*)
+      printf '{"version":1,"type":"shutdown_ack","request_id":1}\n'
+      exit 0
+      ;;
+  esac
+done
+"#;
+    fs::write(&path, script).unwrap();
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o700)).unwrap();
+    path
+}
+
 #[tokio::test]
 async fn explicit_startup_refresh_opens_readiness_after_persistence() {
     let dir = tempfile::tempdir().unwrap();
@@ -1167,6 +1215,123 @@ async fn explicit_startup_refresh_opens_readiness_after_persistence() {
         .shutdown(Duration::from_secs(5))
         .await
         .expect("shutdown completes");
+    assert!(!report.drain_incomplete);
+    persistence.abort();
+}
+
+#[tokio::test]
+async fn explicit_startup_refresh_timeout_closes_the_gate_with_a_bounded_error() {
+    let dir = tempfile::tempdir().unwrap();
+    let private = dir.path().join("private");
+    fs::create_dir(&private).unwrap();
+    fs::set_permissions(&private, fs::Permissions::from_mode(0o700)).unwrap();
+    let fake = fake_sidecar_sync_silent(dir.path());
+
+    let store = EncryptedStore::open(private.join("store.db"), &TestSecrets).unwrap();
+    let store = Arc::new(Mutex::new(store));
+    let hub = SubscriptionHub::with_default_capacity();
+    let readiness = Readiness::new_starting(hub.clone());
+    let engine = Arc::new(
+        Engine::new(EngineConfig {
+            sync_chats: false,
+            dart_executable: fake,
+            script: PathBuf::from("ignored"),
+            state_dir: private.clone(),
+            library: PathBuf::from("ignored"),
+        })
+        .with_sync_timeout(Duration::from_millis(100)),
+    );
+    let (sink, mut events) = mpsc::channel(64);
+    let mut supervisor = Supervisor::new(engine.clone(), sink);
+    let service = Arc::new(Service::with_engine_slot_and_readiness(
+        store.clone(),
+        bloomd::engine::engine_slot(engine),
+        hub,
+        readiness.clone(),
+    ));
+    let service_for_persist = service.clone();
+    let persistence = tokio::spawn(async move {
+        while let Some(event) = events.recv().await {
+            service_for_persist.persist(&event).unwrap();
+        }
+    });
+    supervisor.start().await.expect("engine starts");
+    service.run_sync_for_generation(1).await;
+
+    let snapshot = readiness.snapshot();
+    assert!(!snapshot.can_send);
+    assert_eq!(snapshot.phase, bloom_ipc::ReadinessPhase::Failed);
+    assert_eq!(
+        snapshot.bounded_error,
+        Some(bloom_ipc::ReadinessError::Timeout)
+    );
+
+    let report = supervisor
+        .shutdown(Duration::from_secs(5))
+        .await
+        .expect("shutdown");
+    assert!(!report.drain_incomplete);
+    persistence.abort();
+}
+
+#[tokio::test]
+async fn missing_cloud_client_is_unavailable_not_an_empty_complete_listing() {
+    let dir = tempfile::tempdir().unwrap();
+    let private = dir.path().join("private");
+    fs::create_dir(&private).unwrap();
+    fs::set_permissions(&private, fs::Permissions::from_mode(0o700)).unwrap();
+    let fake = fake_sidecar_sync_unavailable(dir.path());
+
+    let store = EncryptedStore::open(private.join("store.db"), &TestSecrets).unwrap();
+    let store = Arc::new(Mutex::new(store));
+    let hub = SubscriptionHub::with_default_capacity();
+    let readiness = Readiness::new_starting(hub.clone());
+    let engine = Arc::new(Engine::new(EngineConfig {
+        sync_chats: false,
+        dart_executable: fake,
+        script: PathBuf::from("ignored"),
+        state_dir: private.clone(),
+        library: PathBuf::from("ignored"),
+    }));
+    let (sink, mut events) = mpsc::channel(64);
+    let mut supervisor = Supervisor::new(engine.clone(), sink);
+    let service = Arc::new(Service::with_engine_slot_and_readiness(
+        store.clone(),
+        bloomd::engine::engine_slot(engine),
+        hub,
+        readiness.clone(),
+    ));
+    let service_for_persist = service.clone();
+    let persistence = tokio::spawn(async move {
+        while let Some(event) = events.recv().await {
+            service_for_persist.persist(&event).unwrap();
+        }
+    });
+    supervisor.start().await.expect("engine starts");
+    service.run_sync_for_generation(1).await;
+
+    let snapshot = readiness.snapshot();
+    assert!(!snapshot.can_send);
+    assert_eq!(snapshot.phase, bloom_ipc::ReadinessPhase::Failed);
+    assert_eq!(
+        snapshot.outcome,
+        Some(bloom_ipc::ReadinessOutcome::Unavailable)
+    );
+    assert_eq!(
+        snapshot.bounded_error,
+        Some(bloom_ipc::ReadinessError::Unavailable)
+    );
+    assert!(
+        store::list_conversations(&store.lock().unwrap())
+            .unwrap()
+            .is_empty(),
+        "an unavailable refresh must not fabricate an empty successful listing"
+    );
+
+    let report = supervisor
+        .shutdown(Duration::from_secs(5))
+        .await
+        .expect("shutdown");
     assert!(!report.drain_incomplete);
     persistence.abort();
 }

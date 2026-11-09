@@ -426,6 +426,21 @@ mod tests {
         fn list_conversations(&self) -> HandlerFuture<'_, Vec<Conversation>> {
             Box::pin(async { Err(ProtocolError::AccountThrottled) })
         }
+        fn readiness(&self) -> HandlerFuture<'_, ReadinessSnapshot> {
+            Box::pin(async {
+                Ok(ReadinessSnapshot {
+                    generation: 0,
+                    operation: 0,
+                    revision: 0,
+                    phase: bloom_ipc::ReadinessPhase::Starting,
+                    outcome: None,
+                    observed_records: 0,
+                    can_send: false,
+                    engine_ready: false,
+                    bounded_error: None,
+                })
+            })
+        }
         fn sync_conversations(
             &self,
         ) -> HandlerFuture<'_, (bloom_ipc::ConversationSyncStatus, u32)> {
@@ -662,6 +677,35 @@ mod tests {
             3,
             "only valid draft requests reach the handler"
         );
+    }
+
+    #[tokio::test]
+    async fn readiness_is_queryable_before_the_refresh_finishes() {
+        let (_dir, listener, path) = socket();
+        let server = tokio::spawn(async move {
+            serve(listener.accept().await.unwrap(), &ErrorHandler).await;
+        });
+        let mut client = UnixStream::connect(path).await.unwrap();
+        write_request(
+            &mut client,
+            &Request {
+                request_id: 76,
+                request: RequestKind::Readiness,
+            },
+        )
+        .await
+        .unwrap();
+        let response = read_response(&mut client).await.unwrap();
+        assert_eq!(response.request_id, 76);
+        match response.response {
+            ResponseKind::Readiness { snapshot } => {
+                assert_eq!(snapshot.phase, bloom_ipc::ReadinessPhase::Starting);
+                assert!(!snapshot.can_send);
+            }
+            _ => panic!("expected readiness response"),
+        }
+        drop(client);
+        server.await.unwrap();
     }
 
     #[tokio::test]
