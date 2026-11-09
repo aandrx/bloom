@@ -2,7 +2,7 @@
 
 Status: P1 accepted. P2-P4 are PENDING and were not started. P1 passed the synthetic daemon and fake-sidecar gate; no live engine was run. Work targets branch `feat/startup-readiness-ui` at baseline `ead2c43`. The main development checkout stays untouched.
 
-The plan records the requested proposal for review, not authorization to implement it. Each unit is independently verifiable, and each unit needs its own acceptance before the next starts. An independent plan review is required before P1 starts.
+P1 was implemented under explicit authorization and is accepted. P2-P4 remain proposal-only until separately authorized. Each unit is independently verifiable, and each unit needs its own acceptance before the next starts.
 
 ## Scope
 
@@ -133,7 +133,7 @@ Only parent-verified evidence enters this table. A unit stays PENDING until its 
 
 | Unit | Status | Commit | Test command and result | Review | Remaining limits |
 | --- | --- | --- | --- | --- | --- |
-| P1 | ACCEPTED | P1 implementation commit | workspace, Clippy, 21 sidecar, 232 lib, 43 IPC, 128 TUI, 68 stateful, Python PTY pass | final review no blocker; stale-Active fix regression-tested | an admitted in-flight send may complete after invalidation; no new send, queue, or retry |
+| P1 | ACCEPTED | P1 commits 3a4714e..4d0fbb7 | workspace, Clippy, 21 sidecar, 232 lib, 43 IPC, 128 TUI, 68 stateful, Python PTY pass | final review no blocker; stale-Active fix regression-tested | an admitted in-flight send may complete after invalidation; no new send, queue, or retry |
 | P2 | PENDING | none | not run | none | depends on P1 |
 | P3 | PENDING | none | not run | none | depends on P1 |
 | P4 | PENDING | none | not run | none | scheduled after P3; independently testable |
