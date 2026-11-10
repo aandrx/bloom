@@ -4254,6 +4254,10 @@ impl App {
             // printing a wall of text as an error.
             ["/exit"] | ["/quit"] => {
                 self.error = None;
+                // The command text is not a message draft. Retire the active
+                // buffer and its saved copy so shutdown cannot persist `/exit`
+                // under the chat; other chats and parked sends are untouched.
+                self.retire_active_draft();
                 self.quit_requested = true;
             }
             ["/help"] => {
