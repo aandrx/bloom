@@ -4,13 +4,14 @@ use anyhow::Result;
 use bloom_domain::{MessageId, MessagePart, OutgoingBody};
 use bloom_ipc::{
     client::{BloomClient, ClientError},
-    EventKind, ProtocolError,
+    EventKind, ProtocolError, ReadinessSnapshot,
 };
 use bloom_tui::app::{App, SendFailure, Theme, OLDER_PAGE_LIMIT, SEARCH_RESULT_LIMIT};
 use bloom_tui::config::Config;
-use bloom_tui::daemon::{self, ActivityToken, ConnectionState, Snapshot, SnapshotRequest};
+use bloom_tui::daemon::{self, ActivityToken, ConnectionState, SnapshotNotice, SnapshotRequest};
 use bloom_tui::diagnostics::{self, Stage};
 use bloom_tui::drafts::{DraftCoordinator, DraftOperation, DraftResult};
+use bloom_tui::startup::BootstrapTicket;
 use bloom_tui::ui;
 use bloom_tui::RedrawScheduler;
 use crossterm::{
@@ -91,13 +92,13 @@ fn spawn_draft(
 }
 
 fn observe_startup_draft(app: &mut App, coordinator: &DraftCoordinator) {
-    if app.startup.opened() {
+    if app.startup.opened() || !app.startup.snapshot_ready() {
         return;
     }
-    if app.latest_snapshot_revision == 0 {
-        return;
-    }
-    match app.current_persistable_owner() {
+    let owner = app.current_persistable_owner();
+    // A completion for an earlier owner cannot satisfy the current checklist.
+    app.startup.observe_draft_owner(owner.as_ref());
+    match owner {
         None => app.observe_startup_draft_ready(),
         Some(key) if coordinator.is_loaded(&key) => app.observe_startup_draft_ready(),
         Some(_) if coordinator.error().is_some() => {
@@ -105,6 +106,36 @@ fn observe_startup_draft(app: &mut App, coordinator: &DraftCoordinator) {
         }
         Some(_) => {}
     }
+}
+
+/// Launch the one ticketed post-readiness startup read, if startup scheduled one.
+/// The ticket is the only thing that lets its reply complete the local check.
+fn launch_bootstrap_read(
+    app: &mut App,
+    client: &BloomClient,
+    snapshots: &mpsc::UnboundedSender<SnapshotNotice>,
+    failures: &mpsc::UnboundedSender<BootstrapTicket>,
+) -> bool {
+    let Some(request) = app.begin_bootstrap_snapshot_request() else {
+        return false;
+    };
+    let ticket = request
+        .bootstrap
+        .expect("a bootstrap request always carries its ticket");
+    let client = client.clone();
+    let snapshots = snapshots.clone();
+    let failures = failures.clone();
+    tokio::spawn(async move {
+        match daemon::snapshot(&client, request).await {
+            Ok(snapshot) => {
+                let _ = snapshots.send(SnapshotNotice::Completed(snapshot));
+            }
+            Err(_) => {
+                let _ = failures.send(ticket);
+            }
+        }
+    });
+    true
 }
 
 fn observe_drafts(app: &App, coordinator: &mut DraftCoordinator) {
@@ -412,8 +443,13 @@ async fn main() -> Result<()> {
     app.apply_read_positions(&read_positions);
 
     let (event_tx, mut event_rx) = mpsc::unbounded_channel::<EventKind>();
-    let (snapshot_tx, mut snapshot_rx) = mpsc::unbounded_channel::<Snapshot>();
+    let (snapshot_tx, mut snapshot_rx) = mpsc::unbounded_channel::<SnapshotNotice>();
     let (snapshot_fail_tx, mut snapshot_fail_rx) = mpsc::unbounded_channel::<ActivityToken>();
+    let (bootstrap_fail_tx, mut bootstrap_fail_rx) = mpsc::unbounded_channel::<BootstrapTicket>();
+    // A retry's readiness fetch is the only thing that can schedule its bootstrap
+    // read, so its result must reach the loop even when it fails.
+    let (retry_readiness_tx, mut retry_readiness_rx) =
+        mpsc::unbounded_channel::<Result<ReadinessSnapshot, ClientError>>();
     let (status_tx, mut status_rx) = mpsc::unbounded_channel::<ConnectionState>();
     let (send_tx, mut send_rx) = mpsc::unbounded_channel::<(
         u64,
@@ -628,19 +664,57 @@ async fn main() -> Result<()> {
                     redraw.request();
                 }
             }
-            Some(snapshot) = snapshot_rx.recv() => {
-                app.apply_snapshot(snapshot);
-                app.observe_startup_snapshot();
-                app.advance_search_jump();
-                redraw.request();
-                if app.selected != last_visible {
-                    last_visible = app.selected.clone();
-                    let request = app.begin_snapshot_request();
-                    let _ = visible_tx.send(request);
+            Some(notice) = snapshot_rx.recv() => {
+                match notice {
+                    SnapshotNotice::Started(request) => {
+                        // The session consumed this watch request, so only now does
+                        // it own local activity. A coalesced-away request never
+                        // reaches this branch and cannot leave a spinner behind.
+                        if app.start_snapshot_activity(&request) {
+                            redraw.request();
+                        }
+                    }
+                    SnapshotNotice::Completed(snapshot) => {
+                        app.apply_snapshot(snapshot);
+                        launch_bootstrap_read(
+                            &mut app,
+                            &client,
+                            &snapshot_tx,
+                            &bootstrap_fail_tx,
+                        );
+                        app.advance_search_jump();
+                        redraw.request();
+                        if app.selected != last_visible {
+                            last_visible = app.selected.clone();
+                            let request = app.prepare_snapshot_request();
+                            let _ = visible_tx.send(request);
+                        }
+                    }
                 }
             }
             Some(token) = snapshot_fail_rx.recv() => {
                 app.fail_snapshot_activity(token);
+                redraw.request();
+            }
+            Some(ticket) = bootstrap_fail_rx.recv() => {
+                app.fail_startup_bootstrap(ticket);
+                redraw.request();
+            }
+            Some(result) = retry_readiness_rx.recv() => {
+                // A failed fetch becomes a bounded startup failure and drops any
+                // ticket, so the overlay offers Retry instead of stalling.
+                if app.startup.observe_retry_readiness(result) {
+                    // The retry's readiness fetch is what schedules its bootstrap
+                    // read, so launch it here: the event and snapshot paths may
+                    // already have run before this result arrived, and with no
+                    // selected conversation the poller would never read.
+                    launch_bootstrap_read(
+                        &mut app,
+                        &client,
+                        &snapshot_tx,
+                        &bootstrap_fail_tx,
+                    );
+                }
                 redraw.request();
             }
             Some(conversations) = conversation_rx.recv() => {
@@ -656,7 +730,7 @@ async fn main() -> Result<()> {
                     // The reconnect's initial snapshot carries the old epoch's
                     // token, so ask for one fresh local read under the new epoch.
                     resnapshot_on_connect = false;
-                    let request = app.begin_snapshot_request();
+                    let request = app.prepare_snapshot_request();
                     let _ = visible_tx.send(request);
                 }
                 redraw.request();
@@ -677,6 +751,12 @@ async fn main() -> Result<()> {
                         | EventKind::ConversationsChanged
                 );
                 app.apply_event(event);
+                launch_bootstrap_read(
+                    &mut app,
+                    &client,
+                    &snapshot_tx,
+                    &bootstrap_fail_tx,
+                );
                 if is_inbound {
                     last_sync_activity = Some(received_at);
                     app.set_syncing(true);
@@ -696,7 +776,9 @@ async fn main() -> Result<()> {
                     let token = request.token;
                     tokio::spawn(async move {
                         match daemon::snapshot(&client, request).await {
-                            Ok(snapshot) => { let _ = snapshots.send(snapshot); }
+                            Ok(snapshot) => {
+                                let _ = snapshots.send(SnapshotNotice::Completed(snapshot));
+                            }
                             Err(_) => {
                                 if let Some(token) = token {
                                     let _ = failures.send(token);
@@ -806,7 +888,7 @@ async fn main() -> Result<()> {
                 tokio::spawn(async move {
                     match daemon::snapshot(&client, request).await {
                         Ok(snapshot) => {
-                            let _ = snapshots.send(snapshot);
+                            let _ = snapshots.send(SnapshotNotice::Completed(snapshot));
                         }
                         Err(_) => {
                             if let Some(token) = token {
@@ -985,9 +1067,9 @@ async fn main() -> Result<()> {
                     bloom_tui::app::Action::RetryStartup => {
                         app.begin_startup_retry();
                         let client = client.clone();
-                        let events = event_tx.clone();
                         let snapshots = snapshot_tx.clone();
                         let failures = snapshot_fail_tx.clone();
+                        let readiness = retry_readiness_tx.clone();
                         let sync_tx = sync_tx.clone();
                         let request = app.begin_snapshot_request();
                         let token = request.token;
@@ -997,12 +1079,13 @@ async fn main() -> Result<()> {
                                 .await
                                 .map_err(|error| sync_failure_message(&error));
                             let _ = sync_tx.send(sync_result);
-                            if let Ok(readiness) = client.readiness().await {
-                                let _ = events.send(EventKind::Readiness { snapshot: readiness });
-                            }
+                            // Forward the fetch result either way: a silent error
+                            // would leave no readiness identity and therefore no
+                            // bootstrap ticket, wedging the checklist.
+                            let _ = readiness.send(client.readiness().await);
                             match daemon::snapshot(&client, request).await {
                                 Ok(snapshot) => {
-                                    let _ = snapshots.send(snapshot);
+                                    let _ = snapshots.send(SnapshotNotice::Completed(snapshot));
                                 }
                                 Err(_) => {
                                     if let Some(token) = token {
@@ -1017,7 +1100,7 @@ async fn main() -> Result<()> {
                 // A selection change is a request for a fresh read, not an event.
                 if app.selected != last_visible {
                     last_visible = app.selected.clone();
-                    let request = app.begin_snapshot_request();
+                    let request = app.prepare_snapshot_request();
                     let _ = visible_tx.send(request);
                 }
                 redraw.request();
@@ -1052,10 +1135,11 @@ async fn main() -> Result<()> {
         // Async acknowledgments, live events and metadata can also select a thread.
         if app.selected != last_visible {
             last_visible = app.selected.clone();
-            let request = app.begin_snapshot_request();
+            let request = app.prepare_snapshot_request();
             let _ = visible_tx.send(request);
         }
-        if let Some((generation, conversation, target, token)) = app.begin_search_context_request()
+        if let Some((generation, conversation, target, token)) =
+            app.begin_connected_search_context_request()
         {
             let client = client.clone();
             let tx = context_tx.clone();

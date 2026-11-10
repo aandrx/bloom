@@ -5,6 +5,7 @@
 //! re-snapshots before trusting new events. There is no durable event cursor, so
 //! resync is always a fresh read.
 
+use crate::startup::BootstrapTicket;
 use bloom_domain::{Conversation, ConversationId, Message};
 use bloom_ipc::{client::BloomClient, client::ClientError, EventKind};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -61,6 +62,9 @@ pub struct ActivityToken {
 pub struct SnapshotRequest {
     pub conversation: Option<ConversationId>,
     pub token: Option<ActivityToken>,
+    /// Set only for the explicitly scheduled post-readiness startup read. The
+    /// ticket is client-local and never travels over IPC.
+    pub bootstrap: Option<BootstrapTicket>,
 }
 
 impl From<Option<ConversationId>> for SnapshotRequest {
@@ -68,8 +72,18 @@ impl From<Option<ConversationId>> for SnapshotRequest {
         Self {
             conversation,
             token: None,
+            bootstrap: None,
         }
     }
+}
+
+/// Ordered progress for a snapshot the session actually started. `Started` is
+/// emitted only when the reader consumes a watch request, so a request that the
+/// watch channel coalesced away never registers local activity.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SnapshotNotice {
+    Started(SnapshotRequest),
+    Completed(Snapshot),
 }
 
 /// A consistent read of what the daemon currently holds.
@@ -83,6 +97,8 @@ pub struct Snapshot {
     pub history: Vec<Message>,
     /// The activity request that produced this snapshot, if any.
     pub token: Option<ActivityToken>,
+    /// The bootstrap ticket this read carried, copied unchanged from its request.
+    pub bootstrap: Option<BootstrapTicket>,
 }
 
 /// Read conversations and, when one is selected, that conversation's history.
@@ -101,6 +117,7 @@ pub async fn snapshot(
 ) -> Result<Snapshot, ClientError> {
     let revision = next_revision();
     let token = request.token;
+    let bootstrap = request.bootstrap;
     let Some(requested_id) = request.conversation else {
         // Nothing is selected, so there is no history to read until the list names
         // the conversation to show.
@@ -118,6 +135,7 @@ pub async fn snapshot(
             conversations,
             history,
             token,
+            bootstrap,
         });
     };
 
@@ -178,6 +196,7 @@ pub async fn snapshot(
         conversations,
         history,
         token,
+        bootstrap,
     })
 }
 
@@ -195,7 +214,7 @@ pub async fn pump_session(
     client: &BloomClient,
     visible: watch::Receiver<SnapshotRequest>,
     events: &mpsc::UnboundedSender<EventKind>,
-    snapshots: &mpsc::UnboundedSender<Snapshot>,
+    snapshots: &mpsc::UnboundedSender<SnapshotNotice>,
     status: &mpsc::UnboundedSender<ConnectionState>,
 ) -> Result<(), ClientError> {
     // Report authoritative readiness before the first local snapshot. The
@@ -220,7 +239,7 @@ pub async fn pump_session_with_interval(
     client: &BloomClient,
     mut visible: watch::Receiver<SnapshotRequest>,
     events: &mpsc::UnboundedSender<EventKind>,
-    snapshots: &mpsc::UnboundedSender<Snapshot>,
+    snapshots: &mpsc::UnboundedSender<SnapshotNotice>,
     status: &mpsc::UnboundedSender<ConnectionState>,
     interval: std::time::Duration,
 ) -> Result<(), ClientError> {
@@ -231,9 +250,12 @@ pub async fn pump_session_with_interval(
         let guard = visible.borrow();
         guard.clone()
     };
+    // The session is the only place that knows a watch request was consumed.
+    // Announce it before the read so the UI can show activity without guessing.
+    let _ = snapshots.send(SnapshotNotice::Started(requested.clone()));
     let initial = snapshot(client, requested.clone()).await?;
     let mut current = requested;
-    let _ = snapshots.send(initial);
+    let _ = snapshots.send(SnapshotNotice::Completed(initial));
 
     let mut stream = client.subscribe().await?;
     let _ = status.send(ConnectionState::Connected);
@@ -253,13 +275,22 @@ pub async fn pump_session_with_interval(
             let Some(id) = requested.conversation.clone() else {
                 continue;
             };
-            let Ok(refreshed) = snapshot(&polling_client, requested).await else {
+            // Reconciliation is untracked: it must never replay a selection token
+            // or bootstrap ticket that belongs to another request.
+            let untracked = SnapshotRequest {
+                conversation: Some(id.clone()),
+                token: None,
+                bootstrap: None,
+            };
+            let Ok(refreshed) = snapshot(&polling_client, untracked).await else {
                 continue;
             };
             let still_visible = { polling_visible.borrow().conversation.as_ref() == Some(&id) };
             if still_visible
                 && refreshed.visible.as_ref() == Some(&id)
-                && polling_snapshots.send(refreshed).is_err()
+                && polling_snapshots
+                    .send(SnapshotNotice::Completed(refreshed))
+                    .is_err()
             {
                 break;
             }
@@ -288,10 +319,13 @@ pub async fn pump_session_with_interval(
                 };
                 if requested != current {
                     // Re-read from the store; a selection change is not an event.
+                    // Announce the consumed request before awaiting so activity is
+                    // registered only for the request this session actually reads.
+                    let _ = snapshots.send(SnapshotNotice::Started(requested.clone()));
                     match snapshot(client, requested.clone()).await {
                         Ok(refreshed) => {
                             current = requested;
-                            let _ = snapshots.send(refreshed);
+                            let _ = snapshots.send(SnapshotNotice::Completed(refreshed));
                         }
                         Err(error) => break Err(error),
                     }

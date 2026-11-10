@@ -3532,6 +3532,7 @@ fn reading_anchor_survives_appends_edits_duplicates_snapshots_and_reflow() {
     assert_eq!(app.reading_anchor.as_ref().unwrap().message, anchor.message);
     app.apply_snapshot(bloom_tui::daemon::Snapshot {
         token: None,
+        bootstrap: None,
         revision: 10,
         conversations: vec![only.clone()],
         visible: Some(only.id.clone()),
@@ -3655,6 +3656,7 @@ fn alias_reconciliation_is_the_same_reading_context_even_before_history_arrives(
         .collect();
     app.apply_snapshot(bloom_tui::daemon::Snapshot {
         token: None,
+        bootstrap: None,
         revision: 20,
         visible: Some(canonical.id.clone()),
         conversations: vec![canonical.clone()],
@@ -6039,6 +6041,7 @@ fn passive_rail_keeps_anchors_across_arrival_prepend_reconcile_and_resize() {
 
     app.apply_snapshot(bloom_tui::daemon::Snapshot {
         token: None,
+        bootstrap: None,
         revision: 30,
         conversations: vec![only.clone()],
         visible: Some(only.id.clone()),

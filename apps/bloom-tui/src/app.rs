@@ -1014,6 +1014,19 @@ impl App {
     fn retire_activity_epoch(&mut self) {
         self.activity_epoch = self.activity_epoch.wrapping_add(1);
         self.activity.clear();
+        // A loading exact-context lookup cannot survive the connection that was
+        // serving it. Keep the conversation, target, selection, draft and reading
+        // state, but restart the lookup under a fresh generation so a late reply
+        // from the retired epoch is inert. A completed preview is local state and
+        // stays visible across the disconnect.
+        if let Some(context) = self.search_context.as_mut() {
+            if context.loading {
+                self.search_context_generation = self.search_context_generation.wrapping_add(1);
+                context.generation = self.search_context_generation;
+                context.requested = false;
+                context.activity = None;
+            }
+        }
     }
 
     pub fn conversation_activity(
@@ -1043,9 +1056,53 @@ impl App {
             .is_some_and(|id| self.has_local_activity(id))
     }
 
+    /// Prepare a snapshot read for the current selection without registering local
+    /// activity yet. Watch-channel coalescing can discard a prepared request before
+    /// the session reads it, so activity is only registered by
+    /// [`Self::start_snapshot_activity`] when the reader actually consumes it.
+    pub fn prepare_snapshot_request(&mut self) -> crate::daemon::SnapshotRequest {
+        let conversation = self.selected.clone();
+        let token = conversation.as_ref().map(|_| self.next_activity_token());
+        crate::daemon::SnapshotRequest {
+            conversation,
+            token,
+            bootstrap: None,
+        }
+    }
+
+    /// Register activity for a snapshot request the daemon session has consumed.
+    /// A retired epoch is rejected, and an older request never replaces a newer
+    /// token already registered for the same conversation.
+    pub fn start_snapshot_activity(&mut self, request: &crate::daemon::SnapshotRequest) -> bool {
+        let Some(token) = request.token else {
+            return false;
+        };
+        if token.epoch != self.activity_epoch {
+            return false;
+        }
+        let Some(conversation) = request.conversation.as_ref() else {
+            return false;
+        };
+        if self
+            .activity
+            .get(conversation)
+            .and_then(|activity| activity.snapshot)
+            .is_some_and(|current| current.epoch == token.epoch && current.request >= token.request)
+        {
+            return false;
+        }
+        self.prune_activity(Some(conversation));
+        self.activity
+            .entry(conversation.clone())
+            .or_default()
+            .snapshot = Some(token);
+        true
+    }
+
     /// Begin a snapshot read for the current selection and return the request the
     /// daemon session must carry. A reselection of the same chat gets a new token,
-    /// so an older reply cannot clear it.
+    /// so an older reply cannot clear it. Direct reads register immediately; watch
+    /// reads use [`Self::prepare_snapshot_request`] instead.
     pub fn begin_snapshot_request(&mut self) -> crate::daemon::SnapshotRequest {
         let conversation = self.selected.clone();
         let token = conversation
@@ -1054,7 +1111,20 @@ impl App {
         crate::daemon::SnapshotRequest {
             conversation,
             token,
+            bootstrap: None,
         }
+    }
+
+    /// Take the one explicitly scheduled post-readiness startup read. It carries a
+    /// client-local ticket and no per-chat activity token, so an empty listing can
+    /// still complete the local check.
+    pub fn begin_bootstrap_snapshot_request(&mut self) -> Option<crate::daemon::SnapshotRequest> {
+        let bootstrap = self.startup.take_pending_bootstrap()?;
+        Some(crate::daemon::SnapshotRequest {
+            conversation: self.selected.clone(),
+            token: None,
+            bootstrap: Some(bootstrap),
+        })
     }
 
     pub fn fail_snapshot_activity(&mut self, token: crate::daemon::ActivityToken) -> bool {
@@ -1065,12 +1135,20 @@ impl App {
         self.startup.observe_readiness(snapshot);
     }
 
+    /// Test-only compatibility for surfaces that predate the bootstrap ticket.
+    /// Production acknowledges startup only from [`Self::apply_snapshot`].
+    #[doc(hidden)]
     pub fn observe_startup_snapshot(&mut self) {
         self.startup.observe_snapshot();
     }
 
     pub fn observe_startup_draft_ready(&mut self) {
-        self.startup.observe_draft_ready();
+        let owner = self.current_persistable_owner();
+        self.startup.observe_draft_ready(owner);
+    }
+
+    pub fn fail_startup_bootstrap(&mut self, ticket: crate::startup::BootstrapTicket) -> bool {
+        self.startup.fail_bootstrap(ticket)
     }
 
     pub fn begin_startup_retry(&mut self) {
@@ -1112,11 +1190,16 @@ impl App {
         if let Some(token) = snapshot.token {
             self.take_activity_any(token);
         }
+        let bootstrap = snapshot.bootstrap;
         if snapshot.revision <= self.latest_snapshot_revision {
+            // A ticketed read that loses the revision race cannot complete startup.
+            // Startup schedules at most one replacement for the same attempt.
+            if let Some(ticket) = bootstrap {
+                self.startup.reject_bootstrap(ticket);
+            }
             return;
         }
         self.latest_snapshot_revision = snapshot.revision;
-        self.startup.observe_snapshot();
         if let Some(id) = snapshot.visible.clone() {
             // Carry paged state across an identity alias before merging. The
             // snapshot names the canonical conversation while the cached messages and
@@ -1167,6 +1250,11 @@ impl App {
         if snapshot.revision > self.latest_conversations_revision {
             self.latest_conversations_revision = snapshot.revision;
             self.set_conversations(snapshot.conversations);
+        }
+        // Only after the revision gate and the full apply may a ticketed read
+        // acknowledge startup. An untracked periodic or selection read never does.
+        if let Some(ticket) = bootstrap {
+            self.startup.accept_bootstrap(ticket);
         }
         self.resolve_completed_start();
     }
@@ -2767,7 +2855,21 @@ impl App {
             .filter(|id| self.messages.contains_key(*id))
     }
 
-    /// Take the pending exact-context lookup so the shell spawns it once.
+    /// Dispatch a pending exact-context lookup only while the daemon connection is
+    /// live. A disconnected or connecting client keeps the request pending so the
+    /// reconnect path can issue exactly one replacement under the new epoch.
+    pub fn begin_connected_search_context_request(
+        &mut self,
+    ) -> Option<(u64, ConversationId, MessageId, crate::daemon::ActivityToken)> {
+        if self.connection_state != ConnectionState::Connected {
+            return None;
+        }
+        self.begin_search_context_request()
+    }
+
+    /// Take the pending exact-context lookup so the shell spawns it once. Callers
+    /// that actually dispatch must use [`Self::begin_connected_search_context_request`]
+    /// so a disconnected client keeps the lookup pending for the reconnect path.
     pub fn begin_search_context_request(
         &mut self,
     ) -> Option<(u64, ConversationId, MessageId, crate::daemon::ActivityToken)> {
@@ -6531,6 +6633,7 @@ pub fn message_text(message: &Message) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::startup::BootstrapTicket;
     use bloom_domain::{
         ConversationKind, DeliveryState, Handle, HandleKind, MessageId, Participant, TransportId,
     };
@@ -7313,6 +7416,7 @@ mod tests {
         app.upsert(a.id.clone(), message(&a, "stale", 1, "stale"));
         app.apply_snapshot(Snapshot {
             token: None,
+            bootstrap: None,
             revision: crate::daemon::next_revision(),
             visible: Some(a.id.clone()),
             conversations: vec![a.clone(), b.clone()],
@@ -7334,6 +7438,7 @@ mod tests {
         let new = crate::daemon::next_revision();
         app.apply_snapshot(Snapshot {
             token: None,
+            bootstrap: None,
             revision: new,
             visible: Some(chat.id.clone()),
             conversations: vec![chat.clone()],
@@ -7341,6 +7446,7 @@ mod tests {
         });
         app.apply_snapshot(Snapshot {
             token: None,
+            bootstrap: None,
             revision: old,
             visible: Some(chat.id.clone()),
             conversations: vec![chat.clone()],
@@ -7356,6 +7462,7 @@ mod tests {
         });
         app.apply_snapshot(Snapshot {
             token: None,
+            bootstrap: None,
             revision: pending_read,
             visible: Some(chat.id.clone()),
             conversations: vec![chat.clone()],
@@ -7366,6 +7473,7 @@ mod tests {
 
         app.apply_snapshot(Snapshot {
             token: None,
+            bootstrap: None,
             revision: crate::daemon::next_revision(),
             visible: Some(chat.id.clone()),
             conversations: vec![chat.clone()],
@@ -7383,6 +7491,7 @@ mod tests {
         });
         app.apply_snapshot(Snapshot {
             token: None,
+            bootstrap: None,
             revision: unrelated_read,
             visible: Some(chat.id.clone()),
             conversations: vec![chat.clone()],
@@ -8227,6 +8336,7 @@ mod tests {
         app.set_conversations(vec![chat.clone()]);
         app.apply_snapshot(crate::daemon::Snapshot {
             token: None,
+            bootstrap: None,
             revision: crate::daemon::next_revision(),
             visible: Some(chat.id.clone()),
             conversations: vec![chat.clone()],
@@ -8279,6 +8389,7 @@ mod tests {
         // line before it has been on screen.
         app.apply_snapshot(crate::daemon::Snapshot {
             token: None,
+            bootstrap: None,
             revision: crate::daemon::next_revision(),
             visible: Some(chat.id.clone()),
             conversations: vec![chat.clone()],
@@ -8339,6 +8450,7 @@ mod tests {
 
         app.apply_snapshot(crate::daemon::Snapshot {
             token: None,
+            bootstrap: None,
             revision: crate::daemon::next_revision(),
             visible: Some(canonical.id.clone()),
             conversations: vec![canonical.clone()],
@@ -8387,6 +8499,7 @@ mod tests {
 
         app.apply_snapshot(crate::daemon::Snapshot {
             token: None,
+            bootstrap: None,
             revision: crate::daemon::next_revision(),
             visible: Some(canonical.id.clone()),
             conversations: vec![canonical.clone()],
@@ -8419,6 +8532,7 @@ mod tests {
 
         app.apply_snapshot(crate::daemon::Snapshot {
             token: None,
+            bootstrap: None,
             revision: crate::daemon::next_revision(),
             visible: Some(canonical.id.clone()),
             conversations: vec![retired.clone(), canonical.clone()],
@@ -8477,6 +8591,7 @@ mod tests {
 
         app.apply_snapshot(Snapshot {
             token: None,
+            bootstrap: None,
             revision: crate::daemon::next_revision(),
             visible: Some(chat.id.clone()),
             conversations: vec![chat.clone()],
@@ -8499,6 +8614,7 @@ mod tests {
         app.set_conversations(vec![chat.clone()]);
         app.apply_snapshot(crate::daemon::Snapshot {
             token: None,
+            bootstrap: None,
             revision: crate::daemon::next_revision(),
             visible: Some(chat.id.clone()),
             conversations: vec![chat.clone()],
@@ -9144,6 +9260,7 @@ mod tests {
 
         app.apply_snapshot(Snapshot {
             token: None,
+            bootstrap: None,
             revision: 1,
             conversations: vec![source, target.clone()],
             visible: Some(target.id.clone()),
@@ -9474,6 +9591,7 @@ mod tests {
         let newest = message(&conversation, "m1", 10, "unseen");
         app.apply_snapshot(Snapshot {
             token: None,
+            bootstrap: None,
             revision: 1,
             conversations: vec![conversation.clone()],
             visible: Some(conversation.id.clone()),
@@ -9960,6 +10078,7 @@ mod tests {
 
         app.apply_snapshot(Snapshot {
             token: Some(first),
+            bootstrap: None,
             revision: crate::daemon::next_revision(),
             visible: Some(chat.id.clone()),
             conversations: vec![chat.clone()],
@@ -9972,6 +10091,7 @@ mod tests {
 
         app.apply_snapshot(Snapshot {
             token: Some(second),
+            bootstrap: None,
             revision: crate::daemon::next_revision(),
             visible: Some(chat.id.clone()),
             conversations: vec![chat.clone()],
@@ -10024,6 +10144,7 @@ mod tests {
 
         app.apply_snapshot(Snapshot {
             token: Some(snapshot),
+            bootstrap: None,
             revision: crate::daemon::next_revision(),
             visible: Some(first.id.clone()),
             conversations: vec![first.clone(), second.clone()],
@@ -10047,6 +10168,7 @@ mod tests {
         let snapshot = app.begin_snapshot_request().token.expect("snapshot token");
         app.apply_snapshot(Snapshot {
             token: Some(snapshot),
+            bootstrap: None,
             revision: crate::daemon::next_revision(),
             visible: Some(chat.id.clone()),
             conversations: vec![chat.clone()],
@@ -10083,6 +10205,7 @@ mod tests {
 
         app.apply_snapshot(Snapshot {
             token: Some(old),
+            bootstrap: None,
             revision: crate::daemon::next_revision(),
             visible: Some(first.id.clone()),
             conversations: vec![first.clone(), second.clone()],
@@ -10095,6 +10218,7 @@ mod tests {
 
         app.apply_snapshot(Snapshot {
             token: Some(current),
+            bootstrap: None,
             revision: crate::daemon::next_revision(),
             visible: Some(first.id.clone()),
             conversations: vec![first.clone(), second.clone()],
@@ -10141,6 +10265,7 @@ mod tests {
         assert_ne!(old.epoch, current.epoch, "reconnect starts a fresh epoch");
         app.apply_snapshot(Snapshot {
             token: Some(old),
+            bootstrap: None,
             revision: crate::daemon::next_revision(),
             visible: Some(chat.id.clone()),
             conversations: vec![chat.clone()],
@@ -10152,6 +10277,366 @@ mod tests {
         );
         app.fail_snapshot_activity(current);
         assert!(!app.has_local_activity(&chat.id));
+    }
+
+    fn context_fixture() -> (App, Conversation, Conversation, MessageSearchHit) {
+        let mut app = App::default();
+        let source = conversation("context-source@example.test", Some(20));
+        let target = conversation("context-target@example.test", Some(10));
+        app.set_conversations(vec![source.clone(), target.clone()]);
+        app.select(Some(source.id.clone()));
+        app.messages.insert(
+            target.id.clone(),
+            vec![message(&target, "normal", 50, "normal history")],
+        );
+        let hit = search_hit(&target, "needle", "needle");
+        (app, source, target, hit)
+    }
+
+    #[test]
+    fn disconnect_resets_a_loading_context_and_preserves_local_state() {
+        let (mut app, _, target, hit) = context_fixture();
+        let (generation, conversation, target_id, _) = start_context_lookup(&mut app, hit);
+        app.draft = "keep this draft".into();
+        app.draft_cursor = 7;
+        app.reading_anchor = Some(crate::transcript::ReadingAnchor {
+            conversation: conversation.clone(),
+            message: target_id.clone(),
+            row: 0,
+        });
+        let selected = app.selected.clone();
+
+        app.observe_connection_state(ConnectionState::Disconnected);
+
+        let context = app.search_context.as_ref().expect("context stays pending");
+        assert!(context.loading);
+        assert!(!context.requested, "the old dispatch is no longer pending");
+        assert!(context.activity.is_none());
+        assert_ne!(
+            context.generation, generation,
+            "a new generation retires replies"
+        );
+        assert_eq!(context.conversation, conversation);
+        assert_eq!(context.target, target_id);
+        assert!(app.activity.is_empty());
+        assert_eq!(app.selected, selected);
+        assert_eq!(app.draft, "keep this draft");
+        assert_eq!(app.draft_cursor, 7);
+        assert_eq!(
+            app.reading_anchor.as_ref().map(|anchor| &anchor.message),
+            Some(&target_id)
+        );
+        assert!(app.search_context_active());
+        assert_eq!(
+            app.messages.get(&target.id),
+            Some(&vec![message(&target, "normal", 50, "normal history")]),
+            "normal history is untouched"
+        );
+    }
+
+    #[test]
+    fn context_dispatch_waits_for_a_connected_session() {
+        let (mut app, _, _, hit) = context_fixture();
+        start_context_lookup(&mut app, hit);
+        app.observe_connection_state(ConnectionState::Disconnected);
+
+        assert!(
+            app.begin_connected_search_context_request().is_none(),
+            "a disconnected client must not dispatch"
+        );
+        assert!(app.activity.is_empty(), "no activity without a dispatch");
+
+        app.observe_connection_state(ConnectionState::Connecting);
+        assert!(
+            app.begin_connected_search_context_request().is_none(),
+            "a connecting client must not dispatch"
+        );
+        assert!(app.activity.is_empty());
+
+        app.observe_connection_state(ConnectionState::Connected);
+        let (_, _, _, token) = app
+            .begin_connected_search_context_request()
+            .expect("a connected client dispatches once");
+        assert_eq!(token.epoch, app.activity_epoch);
+        assert!(
+            app.begin_connected_search_context_request().is_none(),
+            "the replacement is dispatched exactly once"
+        );
+    }
+
+    #[test]
+    fn reconnect_replaces_a_loading_context_once_and_old_replies_are_inert() {
+        let (mut app, _, target, hit) = context_fixture();
+        let (old_generation, conversation, target_id, old_token) =
+            start_context_lookup(&mut app, hit);
+        app.observe_connection_state(ConnectionState::Disconnected);
+        app.observe_connection_state(ConnectionState::Connected);
+
+        let (new_generation, new_conversation, new_target, new_token) = app
+            .begin_connected_search_context_request()
+            .expect("one replacement after reconnect");
+        assert_ne!(new_generation, old_generation);
+        assert_ne!(new_token.epoch, old_token.epoch);
+        assert_eq!(new_conversation, conversation);
+        assert_eq!(new_target, target_id);
+
+        assert!(
+            !app.finish_message_context(
+                old_generation,
+                conversation.clone(),
+                target_id.clone(),
+                old_token,
+                vec![message(&target, "needle", 20, "old success")],
+            ),
+            "an old success cannot replace the new lookup"
+        );
+        assert!(app.search_context.as_ref().expect("context").loading);
+        assert_eq!(
+            app.search_context.as_ref().expect("context").activity,
+            Some(new_token)
+        );
+
+        let notice = app.notice.clone();
+        app.fail_message_context(
+            old_generation,
+            conversation.clone(),
+            target_id.clone(),
+            old_token,
+        );
+        assert_eq!(app.notice, notice, "an old failure is inert");
+        assert!(app.search_context.as_ref().expect("context").loading);
+
+        let rows = vec![
+            message(&target, "before", 10, "before"),
+            message(&target, "needle", 20, "replacement"),
+        ];
+        assert!(app.finish_message_context(
+            new_generation,
+            new_conversation,
+            new_target,
+            new_token,
+            rows.clone()
+        ));
+        assert_eq!(app.displayed_messages(), rows.as_slice());
+        assert!(!app.search_context.as_ref().expect("context").loading);
+    }
+
+    #[test]
+    fn replacement_context_failure_restores_normal_history_with_a_notice() {
+        let (mut app, _, target, hit) = context_fixture();
+        start_context_lookup(&mut app, hit);
+        app.observe_connection_state(ConnectionState::Disconnected);
+        app.observe_connection_state(ConnectionState::Connected);
+        let (generation, conversation, target_id, token) = app
+            .begin_connected_search_context_request()
+            .expect("one replacement after reconnect");
+
+        app.fail_message_context(generation, conversation, target_id, token);
+
+        assert!(!app.search_context_active());
+        assert_eq!(
+            app.displayed_messages(),
+            std::slice::from_ref(&message(&target, "normal", 50, "normal history"))
+        );
+        assert!(app
+            .notice
+            .as_deref()
+            .is_some_and(|notice| notice.contains("Search context could not be loaded")));
+    }
+
+    #[test]
+    fn completed_context_preview_survives_disconnect() {
+        let (mut app, _, target, hit) = context_fixture();
+        let (generation, conversation, target_id, token) = start_context_lookup(&mut app, hit);
+        let rows = vec![message(&target, "needle", 20, "completed preview")];
+        assert!(app.finish_message_context(
+            generation,
+            conversation.clone(),
+            target_id.clone(),
+            token,
+            rows.clone()
+        ));
+        let generation = app.search_context.as_ref().expect("context").generation;
+
+        app.observe_connection_state(ConnectionState::Disconnected);
+
+        let context = app.search_context.as_ref().expect("preview stays");
+        assert!(!context.loading);
+        assert_eq!(context.generation, generation);
+        assert_eq!(context.messages, rows);
+        assert_eq!(context.conversation, conversation);
+        assert_eq!(context.target, target_id);
+        assert!(app.search_context_active());
+        assert!(app.activity.is_empty());
+    }
+
+    #[test]
+    fn navigation_cancellation_cannot_revive_a_reconnected_context() {
+        let (mut app, _, target, hit) = context_fixture();
+        let (old_generation, conversation, target_id, old_token) =
+            start_context_lookup(&mut app, hit);
+        app.observe_connection_state(ConnectionState::Disconnected);
+        app.observe_connection_state(ConnectionState::Connected);
+        let (new_generation, new_conversation, new_target, new_token) = app
+            .begin_connected_search_context_request()
+            .expect("replacement");
+
+        app.scroll_to_newest();
+        assert!(app.search_context.is_none());
+        assert!(!app.finish_message_context(
+            old_generation,
+            conversation.clone(),
+            target_id.clone(),
+            old_token,
+            vec![message(&target, "needle", 20, "old")]
+        ));
+        assert!(!app.finish_message_context(
+            new_generation,
+            new_conversation,
+            new_target,
+            new_token,
+            vec![message(&target, "needle", 20, "replacement")]
+        ));
+        assert!(app.search_context.is_none());
+    }
+
+    #[test]
+    fn alias_migration_cannot_revive_a_reconnected_context() {
+        let old = conversation("context-alias-old@example.test", Some(10));
+        let mut canonical = conversation("context-alias-new@example.test", Some(10));
+        canonical.aliases = vec![old.id.clone()];
+        let mut app = App::default();
+        app.set_conversations(vec![old.clone()]);
+        app.select(Some(old.id.clone()));
+        let (old_generation, old_conversation, target, old_token) =
+            start_context_lookup(&mut app, search_hit(&old, "needle", "needle"));
+        app.observe_connection_state(ConnectionState::Disconnected);
+        app.observe_connection_state(ConnectionState::Connected);
+        let (
+            replacement_generation,
+            replacement_conversation,
+            replacement_target,
+            replacement_token,
+        ) = app
+            .begin_connected_search_context_request()
+            .expect("replacement");
+
+        app.set_conversations(vec![canonical.clone()]);
+
+        assert!(!app.finish_message_context(
+            old_generation,
+            old_conversation,
+            target.clone(),
+            old_token,
+            vec![message(&old, "needle", 20, "old")]
+        ));
+        assert!(!app.finish_message_context(
+            replacement_generation,
+            replacement_conversation,
+            replacement_target,
+            replacement_token,
+            vec![message(&canonical, "needle", 20, "retired replacement")]
+        ));
+        let context = app
+            .search_context
+            .as_ref()
+            .expect("alias restart stays pending");
+        assert!(context.loading);
+        assert!(!context.requested);
+        let (generation, conversation, target_id, token) = app
+            .begin_connected_search_context_request()
+            .expect("canonical replacement");
+        assert_eq!(conversation, canonical.id);
+        assert_eq!(target_id, target);
+        assert!(app.finish_message_context(
+            generation,
+            conversation,
+            target_id,
+            token,
+            vec![message(&canonical, "needle", 20, "canonical")]
+        ));
+    }
+
+    #[test]
+    fn prepared_snapshot_activity_starts_only_when_consumed() {
+        let mut app = App::default();
+        let chat = conversation("prepared-snapshot", Some(10));
+        app.set_conversations(vec![chat.clone()]);
+        app.select(Some(chat.id.clone()));
+
+        let request = app.prepare_snapshot_request();
+        let token = request.token.expect("a prepared selection carries a token");
+        assert!(
+            !app.has_local_activity(&chat.id),
+            "preparing or failing to send must not create activity"
+        );
+
+        assert!(app.start_snapshot_activity(&request));
+        assert!(app.has_local_activity(&chat.id));
+        assert_eq!(
+            app.conversation_activity(&chat.id)
+                .and_then(|activity| activity.snapshot),
+            Some(token)
+        );
+
+        app.apply_snapshot(Snapshot {
+            token: Some(token),
+            bootstrap: None,
+            revision: crate::daemon::next_revision(),
+            visible: Some(chat.id.clone()),
+            conversations: vec![chat.clone()],
+            history: Vec::new(),
+        });
+        assert!(!app.has_local_activity(&chat.id));
+    }
+
+    #[test]
+    fn stale_started_snapshot_cannot_replace_a_newer_token() {
+        let mut app = App::default();
+        let chat = conversation("stale-started", Some(10));
+        app.set_conversations(vec![chat.clone()]);
+        app.select(Some(chat.id.clone()));
+
+        let older = app.prepare_snapshot_request();
+        let newer = app.prepare_snapshot_request();
+        assert!(app.start_snapshot_activity(&newer));
+        assert!(!app.start_snapshot_activity(&older));
+        assert_eq!(
+            app.conversation_activity(&chat.id)
+                .and_then(|activity| activity.snapshot),
+            newer.token
+        );
+
+        app.observe_connection_state(ConnectionState::Disconnected);
+        assert!(
+            !app.start_snapshot_activity(&newer),
+            "a retired epoch cannot register activity"
+        );
+        assert!(app.activity.is_empty());
+    }
+
+    #[test]
+    fn untracked_snapshot_does_not_clear_selection_activity() {
+        let mut app = App::default();
+        let chat = conversation("untracked-reconcile", Some(10));
+        app.set_conversations(vec![chat.clone()]);
+        app.select(Some(chat.id.clone()));
+        let request = app.prepare_snapshot_request();
+        assert!(app.start_snapshot_activity(&request));
+
+        app.apply_snapshot(Snapshot {
+            token: None,
+            bootstrap: None,
+            revision: crate::daemon::next_revision(),
+            visible: Some(chat.id.clone()),
+            conversations: vec![chat.clone()],
+            history: Vec::new(),
+        });
+
+        assert!(
+            app.has_local_activity(&chat.id),
+            "periodic reconciliation cannot complete a pending selection token"
+        );
     }
 
     #[test]
@@ -10222,6 +10707,7 @@ mod tests {
         assert_eq!(app.unread_count(&chat.id), before);
         app.apply_snapshot(Snapshot {
             token: Some(token),
+            bootstrap: None,
             revision: crate::daemon::next_revision(),
             visible: Some(chat.id.clone()),
             conversations: vec![chat.clone(), other.clone()],
@@ -10229,5 +10715,136 @@ mod tests {
         });
         assert_eq!(app.selected, Some(chat.id.clone()));
         assert_eq!(app.unread_count(&chat.id), before);
+    }
+
+    fn ready_readiness() -> bloom_ipc::ReadinessSnapshot {
+        bloom_ipc::ReadinessSnapshot {
+            generation: 1,
+            operation: 1,
+            revision: 1,
+            phase: bloom_ipc::ReadinessPhase::Ready,
+            outcome: Some(bloom_ipc::ReadinessOutcome::Complete),
+            observed_records: 1,
+            can_send: true,
+            engine_ready: true,
+            bounded_error: None,
+        }
+    }
+
+    fn loading_app() -> App {
+        let mut app = App {
+            startup: StartupState::loading(),
+            ..Default::default()
+        };
+        app.observe_startup_connection(ConnectionState::Connected);
+        app.observe_startup_readiness(ready_readiness());
+        app
+    }
+
+    fn snapshot_for(
+        chat: &Conversation,
+        revision: u64,
+        bootstrap: Option<BootstrapTicket>,
+    ) -> Snapshot {
+        Snapshot {
+            token: None,
+            bootstrap,
+            revision,
+            visible: Some(chat.id.clone()),
+            conversations: vec![chat.clone()],
+            history: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn untracked_snapshot_never_acknowledges_startup() {
+        let mut app = loading_app();
+        let chat = conversation("bootstrap-untracked", Some(10));
+        app.apply_snapshot(snapshot_for(&chat, crate::daemon::next_revision(), None));
+        assert!(!app.startup.snapshot_ready());
+        assert!(!app.startup.can_confirm());
+        assert!(!app.outbound_allowed());
+    }
+
+    #[test]
+    fn ticketed_snapshot_acknowledges_startup_after_apply() {
+        let mut app = loading_app();
+        let chat = conversation("bootstrap-ticketed", Some(10));
+        let request = app
+            .begin_bootstrap_snapshot_request()
+            .expect("ready readiness schedules a read");
+        assert!(
+            request.token.is_none(),
+            "bootstrap reads carry no activity token"
+        );
+        let ticket = request.bootstrap.expect("bootstrap ticket");
+        app.apply_snapshot(snapshot_for(
+            &chat,
+            crate::daemon::next_revision(),
+            Some(ticket),
+        ));
+        assert!(app.startup.snapshot_ready());
+        app.observe_startup_draft_ready();
+        assert!(app.startup.can_confirm());
+        assert!(app.open_bloom());
+        assert!(app.outbound_allowed());
+    }
+
+    #[test]
+    fn stale_ticketed_snapshot_schedules_one_replacement() {
+        let mut app = loading_app();
+        let chat = conversation("bootstrap-stale", Some(10));
+        let request = app
+            .begin_bootstrap_snapshot_request()
+            .expect("ready readiness schedules a read");
+        let ticket = request.bootstrap.expect("bootstrap ticket");
+        let newer = crate::daemon::next_revision();
+        app.apply_snapshot(snapshot_for(&chat, newer, None));
+        app.apply_snapshot(snapshot_for(&chat, newer, Some(ticket)));
+        assert!(
+            !app.startup.snapshot_ready(),
+            "a rejected ticketed read cannot complete startup"
+        );
+        let replacement = app
+            .begin_bootstrap_snapshot_request()
+            .expect("one replacement is scheduled");
+        assert_eq!(replacement.bootstrap, Some(ticket));
+        app.apply_snapshot(snapshot_for(
+            &chat,
+            crate::daemon::next_revision(),
+            replacement.bootstrap,
+        ));
+        assert!(app.startup.snapshot_ready());
+    }
+
+    #[test]
+    fn retry_invalidates_an_in_flight_ticket() {
+        let mut app = loading_app();
+        let chat = conversation("bootstrap-retry", Some(10));
+        let request = app
+            .begin_bootstrap_snapshot_request()
+            .expect("ready readiness schedules a read");
+        let old = request.bootstrap.expect("bootstrap ticket");
+        app.begin_startup_retry();
+        app.apply_snapshot(snapshot_for(
+            &chat,
+            crate::daemon::next_revision(),
+            Some(old),
+        ));
+        assert!(!app.startup.snapshot_ready());
+        assert!(!app.startup.can_confirm());
+
+        app.observe_startup_connection(ConnectionState::Connected);
+        app.observe_startup_readiness(ready_readiness());
+        let fresh = app
+            .begin_bootstrap_snapshot_request()
+            .expect("retry schedules a fresh read");
+        app.apply_snapshot(snapshot_for(
+            &chat,
+            crate::daemon::next_revision(),
+            fresh.bootstrap,
+        ));
+        app.observe_startup_draft_ready();
+        assert!(app.startup.can_confirm());
     }
 }

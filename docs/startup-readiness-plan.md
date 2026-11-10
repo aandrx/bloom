@@ -2,7 +2,7 @@
 
 Status: P1-P4 accepted. All units passed synthetic daemon and fake-sidecar gates; no live engine was run. Work targets branch `feat/startup-readiness-ui` at baseline `ead2c43`. The main development checkout stays untouched.
 
-P1 was implemented under explicit authorization and is accepted. P2-P4 remain proposal-only until separately authorized. Each unit is independently verifiable, and each unit needs its own acceptance before the next starts.
+P1-P4 were each implemented under explicit authorization and are accepted. Each unit is independently verifiable, and each unit needed its own acceptance before the next started. The planning prose retained in the unit sections below (proposed files, failure cases, "done when" wording, original checklists) is a historical planning record; the checked acceptance boxes, dated evidence lines, and progress table record what was actually verified. The four verified Greptile findings are implemented in this worktree and locally verified: startup ticket correlation, search-context reconnect restart, consumed-selection activity ownership, and documentation reconciliation. A fresh Greptile re-review is still pending, and acceptance of the remediation is not claimed here.
 
 ## Scope
 
@@ -88,7 +88,7 @@ Acceptance:
 
 Failure cases: each failed check, timeout, limited metadata, missing client, late daemon event, second client with a delayed snapshot or draft load, queued input burst, click-through, reconnect during the checklist, and quit during loading. Done when the TUI input safety, daemon session, and UI render tests pass and the parent inspects the diff.
 
-Implementation evidence: Rust workspace, strict Clippy, formatting, source guard, TUI 430 tests, and synthetic PTY suites passed: stateful 68, input 15, messaging 8, reading 26, launcher 15. Final independent review found no P2 blocker. It confirmed the startup overlay gate, zero-dispatch refusal paths, second-client bootstrap, draft/recipient/cursor preservation, reconnect reset, and compact 44x12 rendering. The review also found and the branch fixed a reconnect Enter latch and a restarted-daemon readiness revision reset. No live engine was run. P2 is accepted; P3 and P4 remain untouched.
+Implementation evidence: Rust workspace, strict Clippy, formatting, source guard, TUI 430 tests, and synthetic PTY suites passed: stateful 68, input 15, messaging 8, reading 26, launcher 15. Final independent review found no P2 blocker. It confirmed the startup overlay gate, zero-dispatch refusal paths, second-client bootstrap, draft/recipient/cursor preservation, reconnect reset, and compact 44x12 rendering. The review also found and the branch fixed a reconnect Enter latch and a restarted-daemon readiness revision reset. No live engine was run. P2 is accepted. Historical note: at the time of this evidence P3 and P4 were still untouched; both were subsequently implemented and accepted.
 
 
 
@@ -137,7 +137,7 @@ Implementation evidence: Rust workspace, strict Clippy, formatting, source guard
 
 ## Progress and evidence
 
-Only parent-verified evidence enters this table. A unit stays PENDING until its acceptance is checked and the parent inspects the diff and test output.
+Only parent-verified evidence enters this table. A unit stayed PENDING until its acceptance was checked and the parent inspected the diff and test output.
 
 | Unit | Status | Commit | Test command and result | Review | Remaining limits |
 | --- | --- | --- | --- | --- | --- |
@@ -150,7 +150,7 @@ Iteration rule: check off a box only with parent-verified evidence. Do not mark 
 
 ## Reviewer feedback resolutions
 
-An independent read-only plan review found the three gaps below. The amendments resolve planning gaps, not runtime behavior. Targeted independent re-review confirmed all three amendments and found no remaining plan blockers. This is plan acceptance only. Product implementation and all acceptance boxes remain PENDING.
+An independent read-only plan review found the three gaps below. The amendments resolve planning gaps, not runtime behavior. Targeted independent re-review confirmed all three amendments and found no remaining plan blockers. This was plan acceptance only, recorded before implementation. At that point product implementation and all acceptance boxes were PENDING; the progress table above now records the later P1-P4 acceptance.
 
 | ID | Finding | Plan amendment | Required implementation proof |
 | --- | --- | --- | --- |
@@ -181,7 +181,7 @@ Evidence comes from a synthetic real daemon with a fake child and a real PTY. Us
 
 ## Verification commands
 
-The commands below are future implementation acceptance, not work already performed by this documentation PR. Rebuild both runtime packages before PTY runs. `AGENTS.md` and `.github/workflows/check.yml` remain the command authorities.
+The commands below are the acceptance commands used for P1-P4. They are not evidence by themselves; the dated evidence lines and the progress table record what was actually run. Rebuild both runtime packages before PTY runs. `AGENTS.md` and `.github/workflows/check.yml` remain the command authorities.
 
 ```sh
 cargo fmt --all -- --check
@@ -204,8 +204,8 @@ python scripts/test-tui-reading-e2e.py
 
 From `ext/bloom-engine-sidecar/dart`, run `dart pub get`, the owned-source format and analysis commands in CI, and `dart test`. Extend CI's explicit owned-source allowlist if a new owned Dart file is introduced; never broaden it to format or edit generated upstream bindings.
 
-At P1, add a test that v9/v10 client-daemon mismatches fail closed without sending. For the plan PR, an existing green CI run is baseline health only, not evidence that any proposed feature or acceptance criterion is implemented.
+Historical planning instruction: at P1, add a test that v9/v10 client-daemon mismatches fail closed without sending. While this document was a plan PR, an existing green CI run was baseline health only, not evidence that any proposed feature or acceptance criterion was implemented.
 
 Existing suites that must stay green include daemon `service`, `engine_sidecar`, and `engine_recovery`; client and subscription tests; Dart protocol and single-flight tests; TUI `input_safety`, `daemon_session`, `ui_render`, and `interaction`; and Python `test-tui-input`, `test-tui-messaging`, `test-tui-reading`, `test-launcher`, and the fake daemon fixtures. The 105 Dart test count is historical and is not a fixed target.
 
-This documentation change is checked now by link, source reference, and diff only. Full product tests are FUTURE work and are not claimed as run. A final independent reviewer and a parent inspection of actual PTY captures are required before the draft pull request is ready or merged. No auto-merge. Live validation needs separate authorization and is not a prerequisite for honest synthetic acceptance. No document may claim the account is fully synced.
+Documentation-only edits are checked by link, source reference, and diff. P1-P4 acceptance rests on the dated synthetic evidence above, produced with a synthetic daemon, a fake sidecar, and real PTY captures; no live engine was run. A final independent reviewer and a parent inspection of actual PTY captures were required before each unit was accepted. No auto-merge. Live validation needs separate authorization and was not a prerequisite for honest synthetic acceptance. No document may claim the account is fully synced. The current Greptile remediation is still pending and is not accepted or verified.

@@ -41,7 +41,7 @@ Start with [fresh-session handoff](handoff.md). The root [AGENTS.md](../AGENTS.m
 | [Design preview review](design-preview-review.md) | All 12 PNGs inspected for visible private content and metadata, with inventory hashes and provenance limits |
 | [Historical ingestion plan](historical-ingestion-plan.md) | Design-only gate for importing past messages; blocked at the engine boundary |
 | [Engine recovery plan](engine-recovery-plan.md) | Implemented generation-scoped engine restart, synthetic runtime evidence, invariants and live-verification limit |
-| [Startup readiness plan](startup-readiness-plan.md) | Proposed four-unit startup readiness, truthful per-chat activity and passive transcript rail design; all units pending, no implementation |
+| [Startup readiness plan](startup-readiness-plan.md) | Accepted and implemented four-unit startup readiness: authoritative send gate, startup checklist, truthful per-chat activity and passive transcript rail; verified with synthetic daemon/fake-sidecar and PTY gates, no live engine run, live validation separately authorized |
 | [Attachment filename baseline](attachment-search-gap.md) | Historical ingestion gap, accepted prerequisites, and limits of old unsupported records |
 | [Attachment opening evidence](attachment-opening-evidence.md) | Bridge/API evidence for inbound attachment download, safety design, and live-verification limits |
 | [Multi-service research and proposed plan](multi-service-research.md) | Deferred Slack/Discord feasibility, policy/access limits, service-native navigation and staged acceptance gates; not implemented connectors |

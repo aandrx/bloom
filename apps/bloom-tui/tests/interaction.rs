@@ -663,6 +663,7 @@ fn drafts_follow_their_chat_even_when_a_snapshot_establishes_the_selection() {
     // selection must still establish draft ownership.
     app.apply_snapshot(Snapshot {
         token: None,
+        bootstrap: None,
         revision: 1,
         visible: Some(alice.id.clone()),
         conversations: vec![alice.clone(), bob.clone()],
@@ -2047,6 +2048,7 @@ fn following_the_newest_row_marks_read_but_reading_back_does_not() {
 
     app.apply_snapshot(Snapshot {
         token: None,
+        bootstrap: None,
         revision: 1,
         conversations: vec![chat.clone()],
         visible: Some(chat.id.clone()),
@@ -2066,6 +2068,7 @@ fn following_the_newest_row_marks_read_but_reading_back_does_not() {
     app.scroll = 3;
     app.apply_snapshot(Snapshot {
         token: None,
+        bootstrap: None,
         revision: 2,
         conversations: vec![chat.clone()],
         visible: Some(chat.id.clone()),
@@ -2083,6 +2086,7 @@ fn following_the_newest_row_marks_read_but_reading_back_does_not() {
     app.help_open = true;
     app.apply_snapshot(Snapshot {
         token: None,
+        bootstrap: None,
         revision: 3,
         conversations: vec![chat.clone()],
         visible: Some(chat.id.clone()),
