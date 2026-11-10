@@ -12,7 +12,7 @@ use unicode_segmentation::UnicodeSegmentation;
 
 #[cfg(test)]
 #[path = "ui_cache_tests.rs"]
-mod cache_tests;
+mod ui_cache_tests;
 
 fn monochrome_from(value: Option<std::ffi::OsString>) -> bool {
     value.is_some_and(|value| !value.is_empty())
@@ -70,6 +70,14 @@ const LIGHT: Palette = Palette {
 };
 
 const COMFORTABLE_RAIL_MIN_WIDTH: u16 = 70;
+
+/// The transcript reserves exactly one column for the passive reading rail
+/// before wrapping and cache measurement, so showing or hiding the rail can
+/// never change how messages wrap.
+const TRANSCRIPT_RAIL_WIDTH: u16 = 1;
+/// Below this content width the rail glyphs are hidden. The column stays
+/// reserved; a two-column message area is not worth a track.
+const TRANSCRIPT_RAIL_MIN_WIDTH: u16 = 3;
 
 pub fn uses_chat_drawer(width: u16) -> bool {
     width < COMFORTABLE_RAIL_MIN_WIDTH
@@ -2604,6 +2612,54 @@ fn reaction_summary(message: &Message) -> Option<String> {
     )
 }
 
+/// A passive scrollbar track and thumb over the painted transcript rows. It is
+/// derived from the final viewport, never from message count or remote history.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct TranscriptRail {
+    track: Rect,
+    thumb: Rect,
+}
+
+/// Geometry for the passive rail. `view.top` is the final paint offset after
+/// clamping and the no-orphan-byline adjustment, and `view.rows` is the wrapped
+/// extent of the same local buffer the paragraph paints.
+fn transcript_rail(
+    content: Rect,
+    view: &crate::transcript::TranscriptViewport,
+) -> Option<TranscriptRail> {
+    if content.width < TRANSCRIPT_RAIL_MIN_WIDTH {
+        return None;
+    }
+    let track_height = usize::from(content.height);
+    if track_height < 2 {
+        return None;
+    }
+    let rows = view.rows;
+    let height = view.height.min(track_height);
+    let range = rows.saturating_sub(height);
+    if rows == 0 || height == 0 || rows <= height || range == 0 {
+        return None;
+    }
+    let track = Rect::new(
+        content.right().saturating_sub(TRANSCRIPT_RAIL_WIDTH),
+        content.y,
+        TRANSCRIPT_RAIL_WIDTH,
+        content.height,
+    );
+    // u128 keeps the proportional products from overflowing on any platform.
+    let thumb_length = ((track_height as u128 * height as u128) / rows as u128)
+        .clamp(1, (track_height - 1) as u128) as usize;
+    let thumb_offset = ((track_height - thumb_length) as u128 * view.top.min(range) as u128
+        / range as u128) as usize;
+    let thumb = Rect::new(
+        track.x,
+        content.y.saturating_add(thumb_offset as u16),
+        track.width,
+        thumb_length as u16,
+    );
+    Some(TranscriptRail { track, thumb })
+}
+
 fn transcript_window(
     layout: &TranscriptLayout,
     scroll: u16,
@@ -3351,8 +3407,17 @@ fn render_cached_with_mode(
             Rect::new(left, context_row, available, 1),
         );
     }
-    let layout = cache.layout(app, content.width.max(1), palette, new_message, || {
-        let transcript_width = content.width.max(1) as usize;
+    // Reserve the rightmost column before any measurement. The original `content`
+    // rectangle still owns Latest and panel geometry.
+    let message_width = content.width.saturating_sub(TRANSCRIPT_RAIL_WIDTH).max(1);
+    let message_area = Rect::new(
+        content.x,
+        content.y,
+        message_width.min(content.width),
+        content.height,
+    );
+    let layout = cache.layout(app, message_width, palette, new_message, || {
+        let transcript_width = message_width as usize;
         let mut lines = Vec::new();
         let mut header_lines: Vec<usize> = Vec::new();
         let mut message_lines = Vec::new();
@@ -3529,7 +3594,7 @@ fn render_cached_with_mode(
         for line in &lines {
             let count = Paragraph::new(line.clone())
                 .wrap(Wrap { trim: false })
-                .line_count(content.width.max(1))
+                .line_count(message_width)
                 .max(1);
             line_starts.push(rows);
             rows += count;
@@ -3594,6 +3659,11 @@ fn render_cached_with_mode(
     if let Some(view) = viewport.as_mut() {
         view.top = usize::from(scroll);
     }
+    // The rail is derived from the final viewport: clamped top, byline-adjusted,
+    // and only the local history or bounded search-context buffer it paints.
+    let rail = viewport
+        .as_ref()
+        .and_then(|view| transcript_rail(content, view));
     hits.transcript_view = viewport;
     // Use the existing breathing row, not the feedback/error footer or a message
     // row. Panels and tiny layouts never acquire a hidden latest hitbox.
@@ -3699,8 +3769,38 @@ fn render_cached_with_mode(
                 .wrap(Wrap { trim: false })
                 .scroll((relative_scroll, 0))
                 .style(Style::default().bg(palette.surface)),
-            content,
+            message_area,
         );
+    }
+    // The reserved column is painted even when glyphs are hidden, so the rail's
+    // visibility cannot change the transcript's wrapping or background.
+    if content.width > 0 && content.height > 0 {
+        frame.render_widget(
+            Block::default().style(Style::default().bg(palette.surface)),
+            Rect::new(
+                content.right().saturating_sub(TRANSCRIPT_RAIL_WIDTH),
+                content.y,
+                TRANSCRIPT_RAIL_WIDTH,
+                content.height,
+            ),
+        );
+    }
+    if let Some(rail) = rail {
+        let mut lines = Vec::with_capacity(usize::from(rail.track.height));
+        for offset in 0..usize::from(rail.track.height) {
+            let y = rail.track.y.saturating_add(offset as u16);
+            let in_thumb = y >= rail.thumb.y && y < rail.thumb.bottom();
+            let (glyph, color) = if in_thumb {
+                ("█", palette.muted)
+            } else {
+                ("│", palette.rule)
+            };
+            lines.push(Line::from(Span::styled(
+                glyph,
+                Style::default().fg(color).bg(palette.surface),
+            )));
+        }
+        frame.render_widget(Paragraph::new(lines), rail.track);
     }
     let new_recipient_open = app.new_conversation && app.pending_address.is_none();
     let filter_open = app.filter_query().is_some();

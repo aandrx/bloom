@@ -1,6 +1,6 @@
 # Startup readiness plan
 
-Status: P1, P2, and P3 accepted. P4 is PENDING and was not started. Accepted units passed synthetic daemon and fake-sidecar gates; no live engine was run. Work targets branch `feat/startup-readiness-ui` at baseline `ead2c43`. The main development checkout stays untouched.
+Status: P1-P4 accepted. All units passed synthetic daemon and fake-sidecar gates; no live engine was run. Work targets branch `feat/startup-readiness-ui` at baseline `ead2c43`. The main development checkout stays untouched.
 
 P1 was implemented under explicit authorization and is accepted. P2-P4 remain proposal-only until separately authorized. Each unit is independently verifiable, and each unit needs its own acceptance before the next starts.
 
@@ -122,16 +122,18 @@ Proposed files: TUI `ui.rs`, `transcript.rs`, and anchor/render/reading tests.
 
 Acceptance:
 
-- [ ] The rail reserves one column before wrap and width measurement.
-- [ ] The thumb uses final painted rows, top, and height after the byline adjustment.
-- [ ] The rail reflects loaded and context extent, not message count or remote history.
-- [ ] Anchors survive arrival, prepend, reconciliation, and resize.
-- [ ] Latest keeps its current behavior.
-- [ ] Overlays own wheel and click input, and the rail does not steal them.
-- [ ] The rail hides when content fits, the range is zero, or the layout is tiny.
-- [ ] Drag, track click, and remote autoload are absent.
+- [x] The rail reserves one column before wrap and width measurement.
+- [x] The thumb uses final painted rows, top, and height after the byline adjustment.
+- [x] The rail reflects loaded and context extent, not message count or remote history.
+- [x] Anchors survive arrival, prepend, reconciliation, and resize.
+- [x] Latest keeps its current behavior.
+- [x] Overlays own wheel and click input, and the rail does not steal them.
+- [x] The rail hides when content fits, the range is zero, or the layout is tiny.
+- [x] Drag, track click, and remote autoload are absent.
 
 Failure cases: 100, 66, 44, and 24 column widths, tiny layout, light and dark themes, `NO_COLOR`, page load, search context, arrival, and resize. Done when the UI render and interaction tests pass and the parent inspects the diff.
+
+Implementation evidence: Rust workspace, strict Clippy, formatting, source guard, 456 TUI tests, and 132 synthetic PTY tests passed (stateful 68, input 15, messaging 8, reading 26, launcher 15). Final review found no P4 blocker. It confirmed the rail-reduced cache width, final byline-adjusted thumb geometry, local/context-only extent, anchors and Latest preservation, passive rail input, overlay ownership, hide rules, and rail-aware PTY slicing. Two optional harness nits remain: marker helpers are still rail-inclusive, and one width-model docstring is inverted. No live engine was run.
 
 ## Progress and evidence
 
@@ -142,7 +144,7 @@ Only parent-verified evidence enters this table. A unit stays PENDING until its 
 | P1 | ACCEPTED | P1 commits 3a4714e..4d0fbb7 | workspace, Clippy, 21 sidecar, 232 lib, 43 IPC, 128 TUI, 68 stateful, Python PTY pass | final review no blocker; stale-Active fix regression-tested | an admitted in-flight send may complete after invalidation; no new send, queue, or retry |
 | P2 | ACCEPTED | P2 implementation commit | TUI 430, PTY 132 (stateful 68, input 15, messaging 8, reading 26, launcher 15), workspace, Clippy, fmt, source guard | final review no blockers; latch and reconnect revision fixes regression-tested | no live engine; reconnected Enter is deliberately latched; readiness revision reset on disconnect |
 | P3 | ACCEPTED | P3 implementation commit | TUI 430 (188 lib + interaction 82 + render 133 + daemon 14 + input 13), PTY 132, workspace, Clippy, fmt, source guard | final review no blockers; one optional dead-code nit | no live engine; no real-daemon reconnect timing |
-| P4 | PENDING | none | not run | none | scheduled after P3; independently testable |
+| P4 | ACCEPTED | P4 implementation commit | TUI 456, PTY 132, workspace, Clippy, fmt, source guard | final review no blockers; two optional harness nits | no live engine; wide-character PTY coverage is synthetic only |
 
 Iteration rule: check off a box only with parent-verified evidence. Do not mark a unit accepted from an agent summary, a green local run alone, or a spinner that disappeared.
 
