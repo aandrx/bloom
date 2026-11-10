@@ -552,6 +552,8 @@ pub struct App {
     pub error: Option<String>,
     pub notice: Option<String>,
     pub sync_requested: bool,
+    /// Set when `/exit` or `/quit` asks the shell to use the generic quit path.
+    pub quit_requested: bool,
     /// Newest attachment token selected by `/attachment`, consumed by the shell.
     pub pending_attachment: Option<String>,
     /// Token currently awaiting a fetch result, used to ignore stale replies.
@@ -794,6 +796,7 @@ impl Default for App {
             error: None,
             notice: None,
             sync_requested: false,
+            quit_requested: false,
             pending_attachment: None,
             attachment_in_flight: None,
             open_after_attachment_fetch: false,
@@ -3914,6 +3917,8 @@ impl App {
             ("/attachment", "Choose an attachment to save or open"),
             ("/attach", "Send a local file to this chat"),
             ("/open", "Open the newest attachment externally"),
+            ("/exit", "Exit Bloom"),
+            ("/quit", "Exit Bloom"),
         ]
         .into_iter()
         .filter(|(name, _)| name.starts_with(token) || token == *name)
@@ -4247,6 +4252,14 @@ impl App {
         match words.as_slice() {
             // `/help` opens the same popup the composer shows, rather than
             // printing a wall of text as an error.
+            ["/exit"] | ["/quit"] => {
+                self.error = None;
+                // The command text is not a message draft. Retire the active
+                // buffer and its saved copy so shutdown cannot persist `/exit`
+                // under the chat; other chats and parked sends are untouched.
+                self.retire_active_draft();
+                self.quit_requested = true;
+            }
             ["/help"] => {
                 self.error = None;
                 self.draft = "/".to_owned();
@@ -4380,6 +4393,9 @@ impl App {
     }
 
     fn take_pending_action(&mut self) -> Action {
+        if std::mem::take(&mut self.quit_requested) {
+            return Action::Quit;
+        }
         if !self.outbound_allowed() && self.pending_attachment_send.is_some() {
             self.pending_attachment_send = None;
             self.attachment_send_in_flight = None;
