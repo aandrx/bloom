@@ -241,6 +241,7 @@ fn context_loading_and_ready_switch_layouts_and_latest_geometry() {
         target: app.messages[&id][5].id().clone(),
         loading: true,
         requested: true,
+        activity: None,
         messages: Vec::new(),
     });
     let loading = equivalent(&app, 100, 30, &mut cache, false);
@@ -261,6 +262,7 @@ fn context_loading_and_ready_switch_layouts_and_latest_geometry() {
         target,
         loading: false,
         requested: true,
+        activity: None,
         messages: rows.clone(),
     });
     let ready = equivalent(&app, 100, 30, &mut cache, false);

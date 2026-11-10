@@ -1,6 +1,6 @@
 # Startup readiness plan
 
-Status: P1 and P2 accepted. P3 and P4 are PENDING and were not started. Both accepted units passed synthetic daemon and fake-sidecar gates; no live engine was run. Work targets branch `feat/startup-readiness-ui` at baseline `ead2c43`. The main development checkout stays untouched.
+Status: P1, P2, and P3 accepted. P4 is PENDING and was not started. Accepted units passed synthetic daemon and fake-sidecar gates; no live engine was run. Work targets branch `feat/startup-readiness-ui` at baseline `ead2c43`. The main development checkout stays untouched.
 
 P1 was implemented under explicit authorization and is accepted. P2-P4 remain proposal-only until separately authorized. Each unit is independently verifiable, and each unit needs its own acceptance before the next starts.
 
@@ -102,15 +102,17 @@ Proposed files: TUI `app.rs`, `main.rs`, `daemon.rs`, and `ui.rs`, with activity
 
 Acceptance:
 
-- [ ] Snapshot, older page, and context requests each carry a conversation and epoch token.
-- [ ] Only the matching token clears busy state on success, failure, cancel, or disconnect.
-- [ ] A late reply from an old request leaves a newer request busy.
-- [ ] Alias and reselection keep activity attached to the right conversation.
-- [ ] The drawer spinner and selected header text describe local loading only.
-- [ ] Global metadata refresh and persisted inbound events do not claim per-chat remote sync.
-- [ ] Unread badges and selection survive activity changes, and the activity map is bounded.
+- [x] Snapshot, older page, and context requests each carry a conversation and epoch token.
+- [x] Only the matching token clears busy state on success, failure, cancel, or disconnect.
+- [x] A late reply from an old request leaves a newer request busy.
+- [x] Alias and reselection keep activity attached to the right conversation.
+- [x] The drawer spinner and selected header text describe local loading only.
+- [x] Global metadata refresh and persisted inbound events do not claim per-chat remote sync.
+- [x] Unread badges and selection survive activity changes, and the activity map is bounded.
 
 Failure cases: late reply, cancel, disconnect, reselection, alias, overlapping requests for two chats, and a burst of inbound events. Done when the app activity unit tests and TUI render tests pass.
+
+Implementation evidence: Rust workspace, strict Clippy, formatting, source guard, 430 TUI tests, and 132 synthetic PTY tests passed (stateful 68, input 15, messaging 8, reading 26, launcher 15). Final independent review found no P3 blocker. It confirmed exact token clearing for snapshot, older, and context reads; A to B to A reselection; alias retirement; epoch reset on disconnect; bounded activity; one-row drawer spinner; selected "Loading local messages"; and distinct metadata `Syncing` versus persisted-event `Updated` copy. No live engine was run. The reviewer noted one optional dead-code eviction fallback that is unreachable at the current capacity.
 
 ## P4: passive transcript rail
 
@@ -139,7 +141,7 @@ Only parent-verified evidence enters this table. A unit stays PENDING until its 
 | --- | --- | --- | --- | --- | --- |
 | P1 | ACCEPTED | P1 commits 3a4714e..4d0fbb7 | workspace, Clippy, 21 sidecar, 232 lib, 43 IPC, 128 TUI, 68 stateful, Python PTY pass | final review no blocker; stale-Active fix regression-tested | an admitted in-flight send may complete after invalidation; no new send, queue, or retry |
 | P2 | ACCEPTED | P2 implementation commit | TUI 430, PTY 132 (stateful 68, input 15, messaging 8, reading 26, launcher 15), workspace, Clippy, fmt, source guard | final review no blockers; latch and reconnect revision fixes regression-tested | no live engine; reconnected Enter is deliberately latched; readiness revision reset on disconnect |
-| P3 | PENDING | none | not run | none | depends on P1 |
+| P3 | ACCEPTED | P3 implementation commit | TUI 430 (188 lib + interaction 82 + render 133 + daemon 14 + input 13), PTY 132, workspace, Clippy, fmt, source guard | final review no blockers; one optional dead-code nit | no live engine; no real-daemon reconnect timing |
 | P4 | PENDING | none | not run | none | scheduled after P3; independently testable |
 
 Iteration rule: check off a box only with parent-verified evidence. Do not mark a unit accepted from an agent summary, a green local run alone, or a spinner that disappeared.

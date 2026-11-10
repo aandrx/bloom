@@ -8,7 +8,7 @@ use bloom_ipc::{
 };
 use bloom_tui::app::{App, SendFailure, Theme, OLDER_PAGE_LIMIT, SEARCH_RESULT_LIMIT};
 use bloom_tui::config::Config;
-use bloom_tui::daemon::{self, ConnectionState, Snapshot};
+use bloom_tui::daemon::{self, ActivityToken, ConnectionState, Snapshot, SnapshotRequest};
 use bloom_tui::diagnostics::{self, Stage};
 use bloom_tui::drafts::{DraftCoordinator, DraftOperation, DraftResult};
 use bloom_tui::ui;
@@ -413,6 +413,7 @@ async fn main() -> Result<()> {
 
     let (event_tx, mut event_rx) = mpsc::unbounded_channel::<EventKind>();
     let (snapshot_tx, mut snapshot_rx) = mpsc::unbounded_channel::<Snapshot>();
+    let (snapshot_fail_tx, mut snapshot_fail_rx) = mpsc::unbounded_channel::<ActivityToken>();
     let (status_tx, mut status_rx) = mpsc::unbounded_channel::<ConnectionState>();
     let (send_tx, mut send_rx) = mpsc::unbounded_channel::<(
         u64,
@@ -425,6 +426,7 @@ async fn main() -> Result<()> {
     let (sync_tx, mut sync_rx) = mpsc::unbounded_channel();
     let (older_tx, mut older_rx) = mpsc::unbounded_channel::<(
         bloom_domain::ConversationId,
+        ActivityToken,
         Result<Vec<bloom_domain::Message>, ClientError>,
     )>();
     let (search_tx, mut search_rx) =
@@ -433,13 +435,14 @@ async fn main() -> Result<()> {
         u64,
         bloom_domain::ConversationId,
         MessageId,
+        ActivityToken,
         Result<Vec<bloom_domain::Message>, ClientError>,
     )>();
     let (attachment_tx, mut attachment_rx) =
         mpsc::unbounded_channel::<(String, Result<(String, u64), ClientError>)>();
     let (attachment_send_tx, mut attachment_send_rx) =
         mpsc::unbounded_channel::<Result<MessageId, SendFailure>>();
-    let (visible_tx, visible_rx) = watch::channel::<Option<bloom_domain::ConversationId>>(None);
+    let (visible_tx, visible_rx) = watch::channel::<SnapshotRequest>(SnapshotRequest::default());
 
     {
         let client = client.clone();
@@ -496,6 +499,7 @@ async fn main() -> Result<()> {
     });
 
     let mut last_visible = app.selected.clone();
+    let mut resnapshot_on_connect = false;
     let mut redraw = RedrawScheduler::default();
     let mut settings_save = SettingsSaveState::default();
     let mut hits = ui::HitMap::default();
@@ -625,15 +629,19 @@ async fn main() -> Result<()> {
                 }
             }
             Some(snapshot) = snapshot_rx.recv() => {
-                app.thread_loading = false;
                 app.apply_snapshot(snapshot);
                 app.observe_startup_snapshot();
                 app.advance_search_jump();
                 redraw.request();
                 if app.selected != last_visible {
                     last_visible = app.selected.clone();
-                    let _ = visible_tx.send(last_visible.clone());
+                    let request = app.begin_snapshot_request();
+                    let _ = visible_tx.send(request);
                 }
+            }
+            Some(token) = snapshot_fail_rx.recv() => {
+                app.fail_snapshot_activity(token);
+                redraw.request();
             }
             Some(conversations) = conversation_rx.recv() => {
                 app.set_conversations(conversations);
@@ -641,8 +649,16 @@ async fn main() -> Result<()> {
             },
             Some(state) = status_rx.recv() => {
                 app.connection = state.label().to_owned();
-                app.connection_state = state;
                 app.observe_startup_connection(state);
+                if state == ConnectionState::Disconnected {
+                    resnapshot_on_connect = true;
+                } else if state == ConnectionState::Connected && resnapshot_on_connect {
+                    // The reconnect's initial snapshot carries the old epoch's
+                    // token, so ask for one fresh local read under the new epoch.
+                    resnapshot_on_connect = false;
+                    let request = app.begin_snapshot_request();
+                    let _ = visible_tx.send(request);
+                }
                 redraw.request();
                 if app.is_animating() { next_animation = tokio::time::Instant::now() + Duration::from_millis(33); }
             }
@@ -675,11 +691,16 @@ async fn main() -> Result<()> {
                     let client = client.clone();
                     let tx = conversation_tx.clone();
                     let snapshots = snapshot_tx.clone();
-                    let selected = app.selected.clone();
+                    let failures = snapshot_fail_tx.clone();
+                    let request = app.begin_snapshot_request();
+                    let token = request.token;
                     tokio::spawn(async move {
-                        match daemon::snapshot(&client, selected).await {
+                        match daemon::snapshot(&client, request).await {
                             Ok(snapshot) => { let _ = snapshots.send(snapshot); }
                             Err(_) => {
+                                if let Some(token) = token {
+                                    let _ = failures.send(token);
+                                }
                                 if let Ok(conversations) = daemon::conversations(&client).await {
                                     let _ = tx.send(conversations);
                                 }
@@ -692,10 +713,15 @@ async fn main() -> Result<()> {
                 app.finish_send_receipt(attempt, conversation, result);
                 redraw.request();
             },
-            Some((conversation, result)) = older_rx.recv() => {
+            Some((conversation, token, result)) = older_rx.recv() => {
                 match result {
                     Ok(page) => {
-                        app.finish_load_older(conversation.clone(), page, OLDER_PAGE_LIMIT);
+                        app.finish_load_older(
+                            conversation.clone(),
+                            token,
+                            page,
+                            OLDER_PAGE_LIMIT,
+                        );
                         if app
                             .search_jump
                             .as_ref()
@@ -711,6 +737,7 @@ async fn main() -> Result<()> {
                             .is_some_and(|(id, _)| id == &conversation);
                         app.fail_load_older(
                             conversation,
+                            token,
                             "Older messages could not be loaded.".into(),
                         );
                         if jump_here {
@@ -749,13 +776,19 @@ async fn main() -> Result<()> {
                 }
                 redraw.request();
             },
-            Some((generation, conversation, target, result)) = context_rx.recv() => {
+            Some((generation, conversation, target, token, result)) = context_rx.recv() => {
                 match result {
                     Ok(messages) => {
-                        app.finish_message_context(generation, conversation, target, messages);
+                        app.finish_message_context(
+                            generation,
+                            conversation,
+                            target,
+                            token,
+                            messages,
+                        );
                     }
                     Err(_) => {
-                        app.fail_message_context(generation, conversation, target);
+                        app.fail_message_context(generation, conversation, target, token);
                     }
                 }
                 redraw.request();
@@ -767,10 +800,19 @@ async fn main() -> Result<()> {
                 // messages cannot leave the transcript stale.
                 let client = client.clone();
                 let snapshots = snapshot_tx.clone();
-                let selected = app.selected.clone();
+                let failures = snapshot_fail_tx.clone();
+                let request = app.begin_snapshot_request();
+                let token = request.token;
                 tokio::spawn(async move {
-                    if let Ok(snapshot) = daemon::snapshot(&client, selected).await {
-                        let _ = snapshots.send(snapshot);
+                    match daemon::snapshot(&client, request).await {
+                        Ok(snapshot) => {
+                            let _ = snapshots.send(snapshot);
+                        }
+                        Err(_) => {
+                            if let Some(token) = token {
+                                let _ = failures.send(token);
+                            }
+                        }
                     }
                 });
                 redraw.request();
@@ -945,8 +987,10 @@ async fn main() -> Result<()> {
                         let client = client.clone();
                         let events = event_tx.clone();
                         let snapshots = snapshot_tx.clone();
+                        let failures = snapshot_fail_tx.clone();
                         let sync_tx = sync_tx.clone();
-                        let selected = app.selected.clone();
+                        let request = app.begin_snapshot_request();
+                        let token = request.token;
                         tokio::spawn(async move {
                             let sync_result = client
                                 .sync_conversations()
@@ -956,8 +1000,15 @@ async fn main() -> Result<()> {
                             if let Ok(readiness) = client.readiness().await {
                                 let _ = events.send(EventKind::Readiness { snapshot: readiness });
                             }
-                            if let Ok(snapshot) = daemon::snapshot(&client, selected).await {
-                                let _ = snapshots.send(snapshot);
+                            match daemon::snapshot(&client, request).await {
+                                Ok(snapshot) => {
+                                    let _ = snapshots.send(snapshot);
+                                }
+                                Err(_) => {
+                                    if let Some(token) = token {
+                                        let _ = failures.send(token);
+                                    }
+                                }
                             }
                         });
                     }
@@ -966,8 +1017,8 @@ async fn main() -> Result<()> {
                 // A selection change is a request for a fresh read, not an event.
                 if app.selected != last_visible {
                     last_visible = app.selected.clone();
-                    app.thread_loading = last_visible.is_some();
-                    let _ = visible_tx.send(last_visible.clone());
+                    let request = app.begin_snapshot_request();
+                    let _ = visible_tx.send(request);
                 }
                 redraw.request();
                 if app.is_animating() { next_animation = tokio::time::Instant::now() + Duration::from_millis(33); }
@@ -1001,10 +1052,11 @@ async fn main() -> Result<()> {
         // Async acknowledgments, live events and metadata can also select a thread.
         if app.selected != last_visible {
             last_visible = app.selected.clone();
-            app.thread_loading = last_visible.is_some();
-            let _ = visible_tx.send(last_visible.clone());
+            let request = app.begin_snapshot_request();
+            let _ = visible_tx.send(request);
         }
-        if let Some((generation, conversation, target)) = app.begin_search_context_request() {
+        if let Some((generation, conversation, target, token)) = app.begin_search_context_request()
+        {
             let client = client.clone();
             let tx = context_tx.clone();
             tokio::spawn(async move {
@@ -1015,14 +1067,14 @@ async fn main() -> Result<()> {
                         bloom_ipc::MAX_MESSAGE_CONTEXT_LIMIT,
                     )
                     .await;
-                let _ = tx.send((generation, conversation, target, result));
+                let _ = tx.send((generation, conversation, target, token, result));
             });
             redraw.request();
         }
         if app.older_requested {
             // Keep the request pending while another page is in flight, so a
             // gesture is not silently dropped by the single-request rule.
-            if let Some((conversation, cursor)) = app.begin_load_older() {
+            if let Some((conversation, cursor, token)) = app.begin_load_older() {
                 app.older_requested = false;
                 let client = client.clone();
                 let tx = older_tx.clone();
@@ -1030,7 +1082,7 @@ async fn main() -> Result<()> {
                     let result = client
                         .history_before(conversation.clone(), OLDER_PAGE_LIMIT, cursor)
                         .await;
-                    let _ = tx.send((conversation, result));
+                    let _ = tx.send((conversation, token, result));
                 });
                 redraw.request();
             } else if !app.can_load_older() {

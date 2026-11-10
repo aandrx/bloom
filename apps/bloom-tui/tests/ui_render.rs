@@ -608,7 +608,7 @@ fn empty_offline_view_prioritizes_connection_recovery() {
 }
 
 #[test]
-fn syncing_catch_up_shows_a_spinner_and_word_in_the_header() {
+fn inbound_catch_up_says_updated_without_a_sync_spinner() {
     let selected = conversation("Weekend crew", 3, 40);
     for (width, height) in [(100u16, 30u16), (60, 18)] {
         let mut app = App {
@@ -622,19 +622,41 @@ fn syncing_catch_up_shows_a_spinner_and_word_in_the_header() {
         app.set_conversations(vec![selected.clone()]);
         let grid = buffer(&app, width, height);
         let header = format!("{}\n{}", row_text(&grid, 0), row_text(&grid, 1));
-        assert!(header.contains("Syncing"), "{width}: {header:?}");
+        assert!(header.contains("Updated"), "{width}: {header:?}");
         assert!(
-            !header.contains("Active"),
-            "catch-up replaces the idle session label: {header:?}"
+            !header.contains("Syncing"),
+            "persisted inbound events must not claim a remote sync: {header:?}"
         );
-        // The braille spinner proves the header is animating, not a static dot.
         assert!(
-            header
+            !header
                 .chars()
                 .any(|c| ('\u{2800}'..'\u{2900}').contains(&c)),
-            "a spinner must accompany Syncing: {header:?}"
+            "Updated must not paint a sync spinner: {header:?}"
         );
     }
+}
+
+#[test]
+fn manual_sync_keeps_its_own_spinner_and_word() {
+    let selected = conversation("Weekend crew", 3, 40);
+    let mut app = App {
+        selected: Some(selected.id.clone()),
+        connection: "Connected".into(),
+        connection_state: ConnectionState::Connected,
+        session: "Active".into(),
+        sync_in_flight: true,
+        ..Default::default()
+    };
+    app.set_conversations(vec![selected.clone()]);
+    let grid = buffer(&app, 100, 30);
+    let header = row_text(&grid, 0);
+    assert!(header.contains("Syncing"), "{header:?}");
+    assert!(
+        header
+            .chars()
+            .any(|c| ('\u{2800}'..'\u{2900}').contains(&c)),
+        "manual sync keeps a spinner: {header:?}"
+    );
 }
 
 #[test]
@@ -3302,9 +3324,10 @@ fn older_page_keeps_every_visible_message_on_screen_when_the_thread_fits() {
         app.older_requested,
         "the fitting thread is already at its oldest row"
     );
-    let (id, _) = app.begin_load_older().expect("a cursor");
+    let (id, _, token) = app.begin_load_older().expect("a cursor");
     app.finish_load_older(
         id,
+        token,
         // Enough to push the whole thread past the viewport once merged.
         (0..40)
             .map(|index| {
@@ -3404,9 +3427,10 @@ fn older_page_requests_fire_only_at_the_top_and_preserve_the_reading_anchor() {
         .message
         .clone();
 
-    let (id, _) = app.begin_load_older().expect("an older page cursor");
+    let (id, _, token) = app.begin_load_older().expect("an older page cursor");
     app.finish_load_older(
         id,
+        token,
         (0..10)
             .map(|index| {
                 message(
@@ -3507,6 +3531,7 @@ fn reading_anchor_survives_appends_edits_duplicates_snapshots_and_reflow() {
     tracked_frame(&mut app, 100, 24);
     assert_eq!(app.reading_anchor.as_ref().unwrap().message, anchor.message);
     app.apply_snapshot(bloom_tui::daemon::Snapshot {
+        token: None,
         revision: 10,
         conversations: vec![only.clone()],
         visible: Some(only.id.clone()),
@@ -3629,6 +3654,7 @@ fn alias_reconciliation_is_the_same_reading_context_even_before_history_arrives(
         })
         .collect();
     app.apply_snapshot(bloom_tui::daemon::Snapshot {
+        token: None,
         revision: 20,
         visible: Some(canonical.id.clone()),
         conversations: vec![canonical.clone()],
@@ -3974,7 +4000,12 @@ fn start_context_lookup(
     app: &mut App,
     conversation: &Conversation,
     target: &str,
-) -> (u64, ConversationId, MessageId) {
+) -> (
+    u64,
+    ConversationId,
+    MessageId,
+    bloom_tui::daemon::ActivityToken,
+) {
     let request = start_search(app, "needle");
     app.finish_search(request, vec![search_hit(conversation, target, "needle")]);
     app.begin_search_jump().expect("search jump");
@@ -4536,7 +4567,7 @@ fn search_context_paints_its_rows_not_latest_and_labels_loading_and_exit() {
         message(&chat, "normal-newest", 90, "NORMAL_LATEST_ROW", false),
     );
     let normal_history = app.messages[&chat.id].clone();
-    let (generation, conversation, target) = start_context_lookup(&mut app, &chat, "target");
+    let (generation, conversation, target, token) = start_context_lookup(&mut app, &chat, "target");
 
     let loading = rendered(&app);
     assert!(loading.contains("Search context"), "{loading}");
@@ -4548,7 +4579,13 @@ fn search_context_paints_its_rows_not_latest_and_labels_loading_and_exit() {
         message(&chat, "target", 20, "CONTEXT_TARGET_ROW", false),
         message(&chat, "after", 30, "CONTEXT_AFTER_ROW", false),
     ];
-    assert!(app.finish_message_context(generation, conversation.clone(), target, rows.clone()));
+    assert!(app.finish_message_context(
+        generation,
+        conversation.clone(),
+        target,
+        token,
+        rows.clone()
+    ));
     let (buffer, hits) = tracked_frame(&mut app, 100, 24);
     let painted: String = (0..24).map(|y| row_text(&buffer, y)).collect();
     assert!(painted.contains("CONTEXT_TARGET_ROW"), "{painted}");
@@ -4594,11 +4631,12 @@ fn short_search_context_still_has_a_measured_latest_control() {
         chat.id.clone(),
         message(&chat, "normal-newest", 90, "normal newest", false),
     );
-    let (generation, conversation, target) = start_context_lookup(&mut app, &chat, "target");
+    let (generation, conversation, target, token) = start_context_lookup(&mut app, &chat, "target");
     assert!(app.finish_message_context(
         generation,
         conversation,
         target,
+        token,
         vec![message(&chat, "target", 20, "short target", false)]
     ));
 
@@ -5532,4 +5570,98 @@ fn startup_checklist_is_the_only_surface_until_all_five_checks_pass() {
     assert!(failed.contains("Retry (r)"));
     assert!(failed.contains("Quit (q)"));
     assert!(!failed.contains("Open Bloom"));
+}
+
+#[test]
+fn only_the_busy_drawer_row_shows_a_local_spinner() {
+    let busy = conversation("Busy chat", 2, 20);
+    let idle = conversation("Idle chat", 2, 10);
+    let mut app = App {
+        selected: Some(busy.id.clone()),
+        connection: "Connected".into(),
+        connection_state: ConnectionState::Connected,
+        session: "Active".into(),
+        ..Default::default()
+    };
+    app.set_conversations(vec![busy.clone(), idle.clone()]);
+    app.begin_snapshot_request();
+    app.open_chat_drawer();
+
+    let grid = buffer(&app, 100, 30);
+    let busy_row = (0..grid.area.height)
+        .map(|y| row_text(&grid, y))
+        .find(|row| row.contains("Busy chat"))
+        .expect("busy drawer row");
+    let idle_row = (0..grid.area.height)
+        .map(|y| row_text(&grid, y))
+        .find(|row| row.contains("Idle chat"))
+        .expect("idle drawer row");
+    assert!(
+        busy_row
+            .chars()
+            .any(|c| ('\u{2800}'..'\u{2900}').contains(&c)),
+        "the busy conversation owns the only spinner: {busy_row:?}"
+    );
+    assert!(
+        !idle_row
+            .chars()
+            .any(|c| ('\u{2800}'..'\u{2900}').contains(&c)),
+        "an idle conversation must not look busy: {idle_row:?}"
+    );
+}
+
+#[test]
+fn selected_header_says_loading_local_messages_for_local_activity() {
+    let chat = conversation("Local loading chat", 2, 20);
+    let mut app = App {
+        selected: Some(chat.id.clone()),
+        connection: "Connected".into(),
+        connection_state: ConnectionState::Connected,
+        session: "Active".into(),
+        ..Default::default()
+    };
+    app.set_conversations(vec![chat.clone()]);
+    app.begin_snapshot_request();
+
+    let grid = buffer(&app, 120, 30);
+    let header = row_text(&grid, 0);
+    assert!(
+        header.contains("Loading local messages"),
+        "the selected header describes local loading: {header:?}"
+    );
+    assert!(
+        !header.contains("Syncing"),
+        "local loading is not a remote sync: {header:?}"
+    );
+}
+
+#[test]
+fn global_metadata_sync_keeps_its_messaging_alongside_local_loading() {
+    let chat = conversation("Metadata chat", 2, 20);
+    let mut app = App {
+        selected: Some(chat.id.clone()),
+        connection: "Connected".into(),
+        connection_state: ConnectionState::Connected,
+        session: "Active".into(),
+        sync_in_flight: true,
+        ..Default::default()
+    };
+    app.set_conversations(vec![chat.clone()]);
+
+    let grid = buffer(&app, 120, 30);
+    let header = row_text(&grid, 0);
+    assert!(header.contains("Syncing"), "{header:?}");
+    assert!(
+        !header.contains("Loading local messages"),
+        "metadata refresh alone is not per-chat local loading: {header:?}"
+    );
+
+    app.begin_snapshot_request();
+    let grid = buffer(&app, 120, 30);
+    let header = row_text(&grid, 0);
+    assert!(header.contains("Syncing"), "{header:?}");
+    assert!(
+        header.contains("Loading local messages"),
+        "local activity is reported separately from metadata: {header:?}"
+    );
 }

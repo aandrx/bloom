@@ -662,6 +662,7 @@ fn drafts_follow_their_chat_even_when_a_snapshot_establishes_the_selection() {
     // An initial snapshot selects the first chat before any key is pressed; that
     // selection must still establish draft ownership.
     app.apply_snapshot(Snapshot {
+        token: None,
         revision: 1,
         visible: Some(alice.id.clone()),
         conversations: vec![alice.clone(), bob.clone()],
@@ -2045,6 +2046,7 @@ fn following_the_newest_row_marks_read_but_reading_back_does_not() {
     app.select(Some(chat.id.clone()));
 
     app.apply_snapshot(Snapshot {
+        token: None,
         revision: 1,
         conversations: vec![chat.clone()],
         visible: Some(chat.id.clone()),
@@ -2063,6 +2065,7 @@ fn following_the_newest_row_marks_read_but_reading_back_does_not() {
 
     app.scroll = 3;
     app.apply_snapshot(Snapshot {
+        token: None,
         revision: 2,
         conversations: vec![chat.clone()],
         visible: Some(chat.id.clone()),
@@ -2079,6 +2082,7 @@ fn following_the_newest_row_marks_read_but_reading_back_does_not() {
     app.scroll = 0;
     app.help_open = true;
     app.apply_snapshot(Snapshot {
+        token: None,
         revision: 3,
         conversations: vec![chat.clone()],
         visible: Some(chat.id.clone()),

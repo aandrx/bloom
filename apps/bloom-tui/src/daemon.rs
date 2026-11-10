@@ -46,6 +46,32 @@ impl ConnectionState {
     }
 }
 
+/// A per-request token. The request id is unique within an epoch, and the epoch
+/// advances on disconnect so a reply from a retired connection can never clear
+/// current activity.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct ActivityToken {
+    pub request: u64,
+    pub epoch: u64,
+}
+
+/// What the session should read for the current selection. The token travels with
+/// the request so the reply can clear exactly its own activity slot.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SnapshotRequest {
+    pub conversation: Option<ConversationId>,
+    pub token: Option<ActivityToken>,
+}
+
+impl From<Option<ConversationId>> for SnapshotRequest {
+    fn from(conversation: Option<ConversationId>) -> Self {
+        Self {
+            conversation,
+            token: None,
+        }
+    }
+}
+
 /// A consistent read of what the daemon currently holds.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Snapshot {
@@ -55,6 +81,8 @@ pub struct Snapshot {
     pub visible: Option<ConversationId>,
     pub conversations: Vec<Conversation>,
     pub history: Vec<Message>,
+    /// The activity request that produced this snapshot, if any.
+    pub token: Option<ActivityToken>,
 }
 
 /// Read conversations and, when one is selected, that conversation's history.
@@ -69,10 +97,11 @@ pub struct Snapshot {
 /// this snapshot.
 pub async fn snapshot(
     client: &BloomClient,
-    requested: Option<ConversationId>,
+    request: SnapshotRequest,
 ) -> Result<Snapshot, ClientError> {
     let revision = next_revision();
-    let Some(requested_id) = requested else {
+    let token = request.token;
+    let Some(requested_id) = request.conversation else {
         // Nothing is selected, so there is no history to read until the list names
         // the conversation to show.
         let conversations = client.list_conversations().await?;
@@ -88,6 +117,7 @@ pub async fn snapshot(
             visible,
             conversations,
             history,
+            token,
         });
     };
 
@@ -147,6 +177,7 @@ pub async fn snapshot(
         visible,
         conversations,
         history,
+        token,
     })
 }
 
@@ -162,7 +193,7 @@ pub async fn conversations(client: &BloomClient) -> Result<Vec<Conversation>, Cl
 /// Returns when the subscription ends or fails. The caller owns reconnect policy.
 pub async fn pump_session(
     client: &BloomClient,
-    visible: watch::Receiver<Option<ConversationId>>,
+    visible: watch::Receiver<SnapshotRequest>,
     events: &mpsc::UnboundedSender<EventKind>,
     snapshots: &mpsc::UnboundedSender<Snapshot>,
     status: &mpsc::UnboundedSender<ConnectionState>,
@@ -187,7 +218,7 @@ pub async fn pump_session(
 
 pub async fn pump_session_with_interval(
     client: &BloomClient,
-    mut visible: watch::Receiver<Option<ConversationId>>,
+    mut visible: watch::Receiver<SnapshotRequest>,
     events: &mpsc::UnboundedSender<EventKind>,
     snapshots: &mpsc::UnboundedSender<Snapshot>,
     status: &mpsc::UnboundedSender<ConnectionState>,
@@ -200,8 +231,8 @@ pub async fn pump_session_with_interval(
         let guard = visible.borrow();
         guard.clone()
     };
-    let initial = snapshot(client, requested).await?;
-    let mut current = initial.visible.clone();
+    let initial = snapshot(client, requested.clone()).await?;
+    let mut current = requested;
     let _ = snapshots.send(initial);
 
     let mut stream = client.subscribe().await?;
@@ -219,11 +250,13 @@ pub async fn pump_session_with_interval(
         loop {
             ticker.tick().await;
             let requested = { polling_visible.borrow().clone() };
-            let Some(id) = requested else { continue };
-            let Ok(refreshed) = snapshot(&polling_client, Some(id.clone())).await else {
+            let Some(id) = requested.conversation.clone() else {
                 continue;
             };
-            let still_visible = { polling_visible.borrow().as_ref() == Some(&id) };
+            let Ok(refreshed) = snapshot(&polling_client, requested).await else {
+                continue;
+            };
+            let still_visible = { polling_visible.borrow().conversation.as_ref() == Some(&id) };
             if still_visible
                 && refreshed.visible.as_ref() == Some(&id)
                 && polling_snapshots.send(refreshed).is_err()
@@ -255,9 +288,9 @@ pub async fn pump_session_with_interval(
                 };
                 if requested != current {
                     // Re-read from the store; a selection change is not an event.
-                    match snapshot(client, requested).await {
+                    match snapshot(client, requested.clone()).await {
                         Ok(refreshed) => {
-                            current = refreshed.visible.clone();
+                            current = requested;
                             let _ = snapshots.send(refreshed);
                         }
                         Err(error) => break Err(error),

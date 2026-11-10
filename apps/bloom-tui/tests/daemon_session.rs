@@ -12,7 +12,10 @@ use bloom_ipc::{
 };
 use bloom_tui::{
     app::App,
-    daemon::{pump_session, pump_session_with_interval, snapshot, ConnectionState, Snapshot},
+    daemon::{
+        pump_session, pump_session_with_interval, snapshot, ConnectionState, Snapshot,
+        SnapshotRequest,
+    },
     startup::StartupState,
 };
 use std::{
@@ -554,7 +557,7 @@ async fn explicit_selection_reads_history_before_the_slow_list_returns() {
     daemon.delay_list(Duration::from_millis(300));
     let requested = conversation("second@example.com", 10).id;
 
-    let snap = snapshot(&client, Some(requested.clone()))
+    let snap = snapshot(&client, Some(requested.clone()).into())
         .await
         .expect("an explicit selection snapshots");
 
@@ -598,7 +601,7 @@ async fn list_failure_is_not_held_up_by_a_concurrent_history_read() {
     let requested = conversation("second@example.com", 10).id;
 
     let started = std::time::Instant::now();
-    let result = snapshot(&client, Some(requested)).await;
+    let result = snapshot(&client, Some(requested).into()).await;
     let elapsed = started.elapsed();
 
     assert_eq!(result, Err(ClientError::Server(ProtocolError::Internal)));
@@ -616,7 +619,7 @@ async fn missing_requested_conversation_falls_back_to_the_first_thread_history()
     let client = bloom_ipc::client::BloomClient::new(daemon.socket());
     let missing = conversation("missing@example.com", 1).id;
 
-    let snap = snapshot(&client, Some(missing.clone()))
+    let snap = snapshot(&client, Some(missing.clone()).into())
         .await
         .expect("a missing selection still snapshots the first thread");
 
@@ -652,7 +655,7 @@ async fn missing_requested_conversation_falls_back_to_the_first_thread_history()
 async fn selected_thread_catches_up_from_store_even_without_an_inbound_event() {
     let daemon = FakeDaemon::start(false);
     let client = bloom_ipc::client::BloomClient::new(daemon.socket());
-    let (visible_tx, visible_rx) = watch::channel::<Option<ConversationId>>(None);
+    let (visible_tx, visible_rx) = watch::channel::<SnapshotRequest>(SnapshotRequest::default());
     let (event_tx, mut event_rx) = mpsc::unbounded_channel::<EventKind>();
     let (snapshot_tx, mut snapshot_rx) = mpsc::unbounded_channel::<Snapshot>();
     let (status_tx, mut status_rx) = mpsc::unbounded_channel::<ConnectionState>();
@@ -669,7 +672,7 @@ async fn selected_thread_catches_up_from_store_even_without_an_inbound_event() {
     });
     let initial = next_snapshot(&mut snapshot_rx).await;
     let selected = initial.conversations[0].clone();
-    visible_tx.send(Some(selected.id.clone())).unwrap();
+    visible_tx.send(Some(selected.id.clone()).into()).unwrap();
     let selected_snapshot = next_snapshot(&mut snapshot_rx).await;
     assert_eq!(selected_snapshot.visible.as_ref(), Some(&selected.id));
     assert_eq!(initial.visible.as_ref(), Some(&selected.id));
@@ -707,7 +710,7 @@ async fn selected_thread_catches_up_from_store_even_without_an_inbound_event() {
 async fn live_events_are_not_blocked_by_a_slow_history_reconciliation() {
     let daemon = FakeDaemon::start(false);
     let client = bloom_ipc::client::BloomClient::new(daemon.socket());
-    let (visible_tx, visible_rx) = watch::channel::<Option<ConversationId>>(None);
+    let (visible_tx, visible_rx) = watch::channel::<SnapshotRequest>(SnapshotRequest::default());
     let (event_tx, mut event_rx) = mpsc::unbounded_channel::<EventKind>();
     let (snapshot_tx, mut snapshot_rx) = mpsc::unbounded_channel::<Snapshot>();
     let (status_tx, mut status_rx) = mpsc::unbounded_channel::<ConnectionState>();
@@ -725,7 +728,7 @@ async fn live_events_are_not_blocked_by_a_slow_history_reconciliation() {
     let initial = next_snapshot(&mut snapshot_rx).await;
     wait_for_status(&mut status_rx, ConnectionState::Connected).await;
     let selected = initial.conversations[0].clone();
-    visible_tx.send(Some(selected.id.clone())).unwrap();
+    visible_tx.send(Some(selected.id.clone()).into()).unwrap();
     let selected_snapshot = next_snapshot(&mut snapshot_rx).await;
     assert_eq!(selected_snapshot.visible.as_ref(), Some(&selected.id));
     let previous_reads = daemon.history_requests().len();
@@ -759,8 +762,8 @@ async fn a_second_tui_completes_its_own_readiness_and_snapshot() {
     let daemon = FakeDaemon::start(false);
     let client_a = bloom_ipc::client::BloomClient::new(daemon.socket());
     let client_b = bloom_ipc::client::BloomClient::new(daemon.socket());
-    let (_visible_a, visible_a) = watch::channel::<Option<ConversationId>>(None);
-    let (_visible_b, visible_b) = watch::channel::<Option<ConversationId>>(None);
+    let (_visible_a, visible_a) = watch::channel::<SnapshotRequest>(SnapshotRequest::default());
+    let (_visible_b, visible_b) = watch::channel::<SnapshotRequest>(SnapshotRequest::default());
     let (events_a, mut event_a) = mpsc::unbounded_channel::<EventKind>();
     let (events_b, mut event_b) = mpsc::unbounded_channel::<EventKind>();
     let (snapshots_a, mut snapshot_a) = mpsc::unbounded_channel::<Snapshot>();
@@ -833,7 +836,7 @@ async fn startup_readiness_is_reported_before_the_client_snapshot() {
     let daemon = FakeDaemon::start(false);
     let client = bloom_ipc::client::BloomClient::new(daemon.socket());
 
-    let (_visible_tx, visible_rx) = watch::channel::<Option<ConversationId>>(None);
+    let (_visible_tx, visible_rx) = watch::channel::<SnapshotRequest>(SnapshotRequest::default());
     let (event_tx, mut event_rx) = mpsc::unbounded_channel::<EventKind>();
     let (snapshot_tx, mut snapshot_rx) = mpsc::unbounded_channel::<Snapshot>();
     let (status_tx, mut status_rx) = mpsc::unbounded_channel::<ConnectionState>();
@@ -876,7 +879,7 @@ async fn session_snapshots_events_and_resyncs_the_selected_thread() {
     let daemon = FakeDaemon::start(false);
     let client = bloom_ipc::client::BloomClient::new(daemon.socket());
 
-    let (visible_tx, visible_rx) = watch::channel::<Option<ConversationId>>(None);
+    let (visible_tx, visible_rx) = watch::channel::<SnapshotRequest>(SnapshotRequest::default());
     let (event_tx, mut event_rx) = mpsc::unbounded_channel::<EventKind>();
     let (snapshot_tx, mut snapshot_rx) = mpsc::unbounded_channel::<Snapshot>();
     let (status_tx, mut status_rx) = mpsc::unbounded_channel::<ConnectionState>();
@@ -932,7 +935,7 @@ async fn session_snapshots_events_and_resyncs_the_selected_thread() {
 
     // Selecting another conversation triggers a fresh read of that thread.
     let second = first.conversations[1].id.clone();
-    visible_tx.send(Some(second.clone())).unwrap();
+    visible_tx.send(Some(second.clone()).into()).unwrap();
     let resynced = next_snapshot(&mut snapshot_rx).await;
     assert_eq!(resynced.visible.as_ref().unwrap(), &second);
     assert_eq!(resynced.history.len(), 1);
@@ -951,7 +954,7 @@ async fn a_lost_subscription_surfaces_as_an_error_so_the_caller_can_reconnect() 
     let daemon = FakeDaemon::start(true);
     let client = bloom_ipc::client::BloomClient::new(daemon.socket());
 
-    let (_visible_tx, visible_rx) = watch::channel::<Option<ConversationId>>(None);
+    let (_visible_tx, visible_rx) = watch::channel::<SnapshotRequest>(SnapshotRequest::default());
     let (event_tx, _event_rx) = mpsc::unbounded_channel::<EventKind>();
     let (snapshot_tx, mut snapshot_rx) = mpsc::unbounded_channel::<Snapshot>();
     let (status_tx, mut status_rx) = mpsc::unbounded_channel::<ConnectionState>();

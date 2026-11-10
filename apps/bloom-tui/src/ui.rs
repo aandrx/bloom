@@ -468,31 +468,43 @@ fn sidebar_name_line(
     conversation: &bloom_domain::Conversation,
     width: usize,
     palette: Palette,
+    show_activity: bool,
 ) -> Line<'static> {
     let selected = Some(&conversation.id) == app.selected.as_ref() && !app.new_conversation;
+    let spinner = if show_activity && app.has_local_activity(&conversation.id) {
+        format!("{} ", spinner_frame(app.frame))
+    } else {
+        String::new()
+    };
+    let spinner_width = unicode_width::UnicodeWidthStr::width(spinner.as_str());
     let mut name = app.conversation_name(conversation);
     if let Some(badge) = unread_badge(app, conversation) {
         let suffix = format!(" · {badge}");
         let suffix_width = unicode_width::UnicodeWidthStr::width(suffix.as_str());
-        let name_width = width.saturating_sub(suffix_width);
+        let name_width = width
+            .saturating_sub(spinner_width)
+            .saturating_sub(suffix_width);
         name = if name_width >= 4 {
             format!("{}{}", truncate_with_ellipsis(&name, name_width), suffix)
         } else {
-            truncate_with_ellipsis(&name, width)
+            truncate_with_ellipsis(&name, width.saturating_sub(spinner_width))
         };
     } else {
-        name = truncate_with_ellipsis(&name, width);
+        name = truncate_with_ellipsis(&name, width.saturating_sub(spinner_width));
     }
-    Line::from(vec![Span::styled(
-        name,
-        Style::default()
-            .fg(if selected { palette.cyan } else { palette.text })
-            .add_modifier(if selected {
-                Modifier::BOLD
-            } else {
-                Modifier::empty()
-            }),
-    )])
+    let style = Style::default()
+        .fg(if selected { palette.cyan } else { palette.text })
+        .add_modifier(if selected {
+            Modifier::BOLD
+        } else {
+            Modifier::empty()
+        });
+    let mut spans = Vec::new();
+    if !spinner.is_empty() {
+        spans.push(Span::styled(spinner, Style::default().fg(palette.cyan)));
+    }
+    spans.push(Span::styled(name, style));
+    Line::from(spans)
 }
 
 /// The newest message, clipped with an ellipsis when it cannot fit.
@@ -2946,7 +2958,7 @@ fn render_cached_with_mode(
             let marker = if selected { "▎ " } else { "  " };
             let marker_style =
                 Style::default().fg(if selected { palette.cyan } else { palette.bg });
-            let mut name = sidebar_name_line(app, conversation, entry_width, palette);
+            let mut name = sidebar_name_line(app, conversation, entry_width, palette, false);
             name.spans.insert(0, Span::styled(marker, marker_style));
             let mut lines = vec![name];
             if !compact {
@@ -3116,6 +3128,12 @@ fn render_cached_with_mode(
             heading.extend([
                 Span::raw("  "),
                 Span::styled(format!("· {badge}"), Style::default().fg(palette.muted)),
+            ]);
+        }
+        if app.has_local_activity(&c.id) {
+            heading.extend([
+                Span::raw("  "),
+                Span::styled("Loading local messages", Style::default().fg(palette.muted)),
             ]);
         }
     }
@@ -3631,7 +3649,7 @@ fn render_cached_with_mode(
             )
         } else if app.connection_state == crate::daemon::ConnectionState::Connecting {
             ("Connecting to Bloom", "", "Waiting for the local daemon")
-        } else if app.thread_loading {
+        } else if app.selected_local_activity() {
             (
                 "Loading stored messages",
                 "",
@@ -4098,7 +4116,13 @@ fn render_chat_drawer(frame: &mut Frame<'_>, app: &App, area: Rect, palette: Pal
     let entries: Vec<_> = rows
         .iter()
         .map(|conversation| {
-            let mut lines = vec![sidebar_name_line(app, conversation, entry_width, palette)];
+            let mut lines = vec![sidebar_name_line(
+                app,
+                conversation,
+                entry_width,
+                palette,
+                true,
+            )];
             if entry_height == 2 {
                 lines.push(sidebar_preview_line(conversation, entry_width, palette));
             }
@@ -4578,9 +4602,9 @@ fn composer_feedback(app: &App, palette: &Palette, back: usize) -> Option<(Strin
         return Some((message.to_owned(), palette.red));
     }
     if app
-        .older_loading
+        .selected
         .as_ref()
-        .is_some_and(|id| app.selected.as_ref() == Some(id))
+        .is_some_and(|id| app.has_older_activity(id))
     {
         return Some(("Loading older messages…".to_owned(), palette.muted));
     }

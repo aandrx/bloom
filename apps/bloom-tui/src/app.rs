@@ -31,6 +31,46 @@ pub const SEARCH_RESULT_LIMIT: u32 = 50;
 pub const OLDER_HISTORY_BUDGET: usize = 1000;
 /// Maximum number of composer undo steps kept for the active draft owner.
 const COMPOSER_UNDO_LIMIT: usize = 50;
+/// Upper bound on conversations that may hold a local activity token at once.
+/// Eviction cancels an in-flight local read rather than growing without bound;
+/// stored history, drafts, and selection are never touched.
+pub const ACTIVITY_CAPACITY: usize = 64;
+
+/// The three local reads one conversation can own. Search results are modal and
+/// deliberately not part of this map.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ActivityKind {
+    Snapshot,
+    Older,
+    Context,
+}
+
+/// One conversation's in-flight local reads. Every slot is cleared only by the
+/// exact request token that filled it, so a late reply cannot retire newer work.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ConversationActivity {
+    pub snapshot: Option<crate::daemon::ActivityToken>,
+    pub older: Option<crate::daemon::ActivityToken>,
+    pub context: Option<crate::daemon::ActivityToken>,
+}
+
+impl ConversationActivity {
+    pub fn is_empty(&self) -> bool {
+        self.snapshot.is_none() && self.older.is_none() && self.context.is_none()
+    }
+
+    pub fn is_busy(&self) -> bool {
+        !self.is_empty()
+    }
+
+    fn slot_mut(&mut self, kind: ActivityKind) -> &mut Option<crate::daemon::ActivityToken> {
+        match kind {
+            ActivityKind::Snapshot => &mut self.snapshot,
+            ActivityKind::Older => &mut self.older,
+            ActivityKind::Context => &mut self.context,
+        }
+    }
+}
 
 /// What a key press wants the shell to do.
 ///
@@ -428,8 +468,12 @@ pub struct App {
     pub older_loaded: HashSet<ConversationId>,
     /// Conversations whose paged-back history is exhausted.
     pub older_exhausted: HashSet<ConversationId>,
-    /// The conversation with an older-page request in flight, at most one.
-    pub older_loading: Option<ConversationId>,
+    /// Per-conversation local read ownership. Empty entries are removed.
+    pub activity: HashMap<ConversationId, ConversationActivity>,
+    /// Monotonic request id for activity tokens.
+    pub next_activity_request: u64,
+    /// Connection epoch. Disconnect retires every token from the old epoch.
+    pub activity_epoch: u64,
     /// The oldest message that still belongs to a conversation's newest window.
     /// Everything strictly older is paged-back history subject to the budget.
     pub older_window_floor: HashMap<ConversationId, MessageId>,
@@ -446,7 +490,6 @@ pub struct App {
     pub connection: String,
     pub connection_state: ConnectionState,
     pub frame: u64,
-    pub thread_loading: bool,
     pub session: String,
     /// True while inbound activity indicates the daemon is catching up on messages.
     pub syncing: bool,
@@ -588,6 +631,8 @@ pub struct SearchContext {
     pub loading: bool,
     /// True once the shell has taken the request, so it is spawned at most once.
     pub requested: bool,
+    /// The exact activity token for this lookup, cleared only by its own reply.
+    pub activity: Option<crate::daemon::ActivityToken>,
     pub messages: Vec<Message>,
 }
 
@@ -707,7 +752,9 @@ impl Default for App {
             messages: HashMap::new(),
             older_loaded: HashSet::new(),
             older_exhausted: HashSet::new(),
-            older_loading: None,
+            activity: HashMap::new(),
+            next_activity_request: 0,
+            activity_epoch: 0,
             older_window_floor: HashMap::new(),
             older_error: None,
             older_requested: false,
@@ -717,7 +764,6 @@ impl Default for App {
             connection: String::new(),
             connection_state: ConnectionState::default(),
             frame: 0,
-            thread_loading: false,
             session: String::new(),
             syncing: false,
             startup: StartupState::default(),
@@ -793,7 +839,7 @@ impl App {
             || self.syncing
             || self.startup.overlay_visible()
             || self.sync_in_flight
-            || self.thread_loading
+            || !self.activity.is_empty()
             || self.messages.values().flatten().any(|message| {
                 message.from_me && matches!(message.delivery, bloom_domain::DeliveryState::Queued)
             })
@@ -824,8 +870,195 @@ impl App {
         });
     }
 
+    /// Track the daemon connection and retire local activity whenever the
+    /// connection changes in a way that can orphan a reply. A reconnect therefore
+    /// starts with a fresh epoch, and tokens from the old connection can never
+    /// clear the new connection's busy state.
+    pub fn observe_connection_state(&mut self, state: ConnectionState) {
+        if state != self.connection_state
+            && (matches!(
+                state,
+                ConnectionState::Disconnected | ConnectionState::Connecting
+            ) || matches!(self.connection_state, ConnectionState::Disconnected))
+        {
+            self.retire_activity_epoch();
+        }
+        self.connection_state = state;
+    }
+
     pub fn observe_startup_connection(&mut self, state: ConnectionState) {
+        self.observe_connection_state(state);
         self.startup.observe_connection(state);
+    }
+
+    fn next_activity_token(&mut self) -> crate::daemon::ActivityToken {
+        self.next_activity_request = self.next_activity_request.wrapping_add(1);
+        crate::daemon::ActivityToken {
+            request: self.next_activity_request,
+            epoch: self.activity_epoch,
+        }
+    }
+
+    /// Keep the map bounded. Empty entries are dropped first; if the map is still
+    /// full, evict one conversation other than the one about to be inserted,
+    /// preferring a snapshot-only entry that the periodic read can replace.
+    fn prune_activity(&mut self, keep: Option<&ConversationId>) {
+        self.activity.retain(|_, activity| !activity.is_empty());
+        if self.activity.len() < ACTIVITY_CAPACITY {
+            return;
+        }
+        let selected = self.selected.clone();
+        let snapshot_only = |activity: &ConversationActivity| {
+            activity.snapshot.is_some() && activity.older.is_none() && activity.context.is_none()
+        };
+        let victim = self
+            .activity
+            .iter()
+            .filter(|(id, _)| Some(*id) != keep && Some(*id) != selected.as_ref())
+            .find(|(_, activity)| snapshot_only(activity))
+            .map(|(id, _)| id.clone())
+            .or_else(|| {
+                self.activity
+                    .keys()
+                    .find(|id| Some(*id) != keep && Some(*id) != selected.as_ref())
+                    .cloned()
+            })
+            .or_else(|| {
+                self.activity
+                    .iter()
+                    .filter(|(id, _)| Some(*id) != keep)
+                    .find(|(_, activity)| snapshot_only(activity))
+                    .map(|(id, _)| id.clone())
+            })
+            .or_else(|| self.activity.keys().find(|id| Some(*id) != keep).cloned());
+        if let Some(victim) = victim {
+            self.activity.remove(&victim);
+        }
+    }
+
+    fn begin_activity(
+        &mut self,
+        conversation: &ConversationId,
+        kind: ActivityKind,
+    ) -> crate::daemon::ActivityToken {
+        self.prune_activity(Some(conversation));
+        let token = self.next_activity_token();
+        self.activity
+            .entry(conversation.clone())
+            .or_default()
+            .slot_mut(kind)
+            .replace(token);
+        token
+    }
+
+    /// Clear a slot only when it still holds this exact token. Returns whether the
+    /// token was current, so callers can gate intent, error, and exhaustion state.
+    fn take_activity(
+        &mut self,
+        conversation: &ConversationId,
+        kind: ActivityKind,
+        token: crate::daemon::ActivityToken,
+    ) -> bool {
+        let Some(activity) = self.activity.get_mut(conversation) else {
+            return false;
+        };
+        if activity.slot_mut(kind).as_ref() != Some(&token) {
+            return false;
+        }
+        *activity.slot_mut(kind) = None;
+        let empty = activity.is_empty();
+        if empty {
+            self.activity.remove(conversation);
+        }
+        true
+    }
+
+    /// Clear a token wherever it lives. Snapshot replies may carry a different
+    /// visible conversation than the request, so they are matched by token alone.
+    fn take_activity_any(&mut self, token: crate::daemon::ActivityToken) -> bool {
+        let mut matched = false;
+        for activity in self.activity.values_mut() {
+            if activity.snapshot == Some(token) {
+                activity.snapshot = None;
+                matched = true;
+            }
+            if activity.older == Some(token) {
+                activity.older = None;
+                matched = true;
+            }
+            if activity.context == Some(token) {
+                activity.context = None;
+                matched = true;
+            }
+        }
+        if matched {
+            self.activity.retain(|_, activity| !activity.is_empty());
+        }
+        matched
+    }
+
+    fn clear_activity_kind(&mut self, conversation: &ConversationId, kind: ActivityKind) {
+        let Some(activity) = self.activity.get_mut(conversation) else {
+            return;
+        };
+        *activity.slot_mut(kind) = None;
+        if activity.is_empty() {
+            self.activity.remove(conversation);
+        }
+    }
+
+    fn retire_conversation_activity(&mut self, conversation: &ConversationId) {
+        self.activity.remove(conversation);
+    }
+
+    fn retire_activity_epoch(&mut self) {
+        self.activity_epoch = self.activity_epoch.wrapping_add(1);
+        self.activity.clear();
+    }
+
+    pub fn conversation_activity(
+        &self,
+        conversation: &ConversationId,
+    ) -> Option<&ConversationActivity> {
+        self.activity.get(conversation)
+    }
+
+    pub fn has_local_activity(&self, conversation: &ConversationId) -> bool {
+        self.activity
+            .get(conversation)
+            .is_some_and(ConversationActivity::is_busy)
+    }
+
+    pub fn has_older_activity(&self, conversation: &ConversationId) -> bool {
+        self.activity
+            .get(conversation)
+            .is_some_and(|activity| activity.older.is_some())
+    }
+
+    /// True while the selected conversation owns any local read. This is the
+    /// only source for the selected header's local-loading copy.
+    pub fn selected_local_activity(&self) -> bool {
+        self.selected
+            .as_ref()
+            .is_some_and(|id| self.has_local_activity(id))
+    }
+
+    /// Begin a snapshot read for the current selection and return the request the
+    /// daemon session must carry. A reselection of the same chat gets a new token,
+    /// so an older reply cannot clear it.
+    pub fn begin_snapshot_request(&mut self) -> crate::daemon::SnapshotRequest {
+        let conversation = self.selected.clone();
+        let token = conversation
+            .as_ref()
+            .map(|id| self.begin_activity(id, ActivityKind::Snapshot));
+        crate::daemon::SnapshotRequest {
+            conversation,
+            token,
+        }
+    }
+
+    pub fn fail_snapshot_activity(&mut self, token: crate::daemon::ActivityToken) -> bool {
+        self.take_activity_any(token)
     }
 
     pub fn observe_startup_readiness(&mut self, snapshot: bloom_ipc::ReadinessSnapshot) {
@@ -873,6 +1106,12 @@ impl App {
     /// Apply a store snapshot only if its read began after our newest state.
     /// History is then replaced, not merged, because the store is authoritative.
     pub fn apply_snapshot(&mut self, snapshot: Snapshot) {
+        // A snapshot reply completes only the request that carried its token. The
+        // token is cleared before the revision gate: an older revision is still a
+        // completion for that request, but it must never clear a newer token.
+        if let Some(token) = snapshot.token {
+            self.take_activity_any(token);
+        }
         if snapshot.revision <= self.latest_snapshot_revision {
             return;
         }
@@ -959,9 +1198,7 @@ impl App {
             // The store says the thread is empty, so there is nothing to retain.
             self.older_loaded.remove(id);
             self.older_exhausted.remove(id);
-            if self.older_loading.as_ref() == Some(id) {
-                self.older_loading = None;
-            }
+            self.clear_activity_kind(id, ActivityKind::Older);
             return incoming;
         };
         let existing = self.messages.remove(id).unwrap_or_default();
@@ -987,7 +1224,7 @@ impl App {
         let Some(id) = self.selected.as_ref() else {
             return false;
         };
-        if self.older_loading.is_some() || self.older_exhausted.contains(id) {
+        if self.has_older_activity(id) || self.older_exhausted.contains(id) {
             return false;
         }
         self.messages
@@ -997,7 +1234,13 @@ impl App {
 
     /// Mark the selected conversation as loading and return the cursor for the
     /// page before its true oldest loaded message.
-    pub fn begin_load_older(&mut self) -> Option<(ConversationId, bloom_ipc::HistoryCursor)> {
+    pub fn begin_load_older(
+        &mut self,
+    ) -> Option<(
+        ConversationId,
+        bloom_ipc::HistoryCursor,
+        crate::daemon::ActivityToken,
+    )> {
         if !self.can_load_older() {
             return None;
         }
@@ -1007,10 +1250,10 @@ impl App {
             created_at: oldest.created_at,
             id: oldest.id().clone(),
         };
-        self.older_loading = Some(id.clone());
+        let token = self.begin_activity(&id, ActivityKind::Older);
         self.older_error = None;
         self.older_requested = false;
-        Some((id, cursor))
+        Some((id, cursor, token))
     }
 
     /// Prepend an older page, ignoring results for a conversation that is no
@@ -1018,14 +1261,20 @@ impl App {
     pub fn finish_load_older(
         &mut self,
         conversation_id: ConversationId,
+        token: crate::daemon::ActivityToken,
         page: Vec<Message>,
         requested: u32,
     ) {
-        self.older_requested = false;
-        if self.older_loading.as_ref() != Some(&conversation_id) {
+        // A stale reply must not clear a newer request's intent, error, or
+        // exhaustion state. Match both conversation and exact token first.
+        if !self.take_activity(&conversation_id, ActivityKind::Older, token) {
             return;
         }
-        self.older_loading = None;
+        let showing = self.selected.as_ref() == Some(&conversation_id);
+        if showing {
+            self.older_requested = false;
+            self.older_error = None;
+        }
         let short_page = page.len() < requested as usize;
         let existing = self.messages.remove(&conversation_id).unwrap_or_default();
         let mut seen: HashSet<MessageId> = existing.iter().map(|m| m.id().clone()).collect();
@@ -1065,22 +1314,25 @@ impl App {
                 .is_some_and(|(before, after)| before.id() == after.id());
         self.messages.insert(conversation_id.clone(), merged);
         self.older_loaded.insert(conversation_id.clone());
-        self.older_error = None;
         if short_page || reached_budget {
             self.older_exhausted.insert(conversation_id.clone());
         }
     }
 
     /// Record a failed older-page load without disturbing the loaded history.
-    pub fn fail_load_older(&mut self, conversation_id: ConversationId, message: String) {
-        self.older_requested = false;
-        if self.older_loading.as_ref() != Some(&conversation_id) {
+    pub fn fail_load_older(
+        &mut self,
+        conversation_id: ConversationId,
+        token: crate::daemon::ActivityToken,
+        message: String,
+    ) {
+        if !self.take_activity(&conversation_id, ActivityKind::Older, token) {
             return;
         }
         let showing = self.selected.as_ref() == Some(&conversation_id);
-        self.older_loading = None;
         // A failure for a chat the user already left must not colour the next one.
         if showing {
+            self.older_requested = false;
             self.older_error = Some(message);
         }
     }
@@ -1096,12 +1348,9 @@ impl App {
         if self.older_exhausted.remove(from) {
             self.older_exhausted.insert(to.clone());
         }
-        // The in-flight reply still carries the retired id and will be ignored, so
-        // drop the slot instead of rewriting it: a rewritten id could never match
-        // and would block every later page load.
-        if self.older_loading.as_ref() == Some(from) {
-            self.older_loading = None;
-        }
+        // Replies still carry the retired id, so retire its ownership instead of
+        // rewriting tokens that could never match again.
+        self.retire_conversation_activity(from);
         if let Some(floor) = self.older_window_floor.remove(from) {
             self.older_window_floor.entry(to.clone()).or_insert(floor);
         }
@@ -1194,9 +1443,8 @@ impl App {
             self.abandon_search_jump();
             self.older_requested = false;
             self.older_error = None;
-            // A page still in flight belongs to the chat being left; its result is
-            // ignored, so the slot must not block the next chat.
-            self.older_loading = None;
+            // Older-page ownership is per conversation, so leaving a chat does not
+            // cancel its page or block the next chat's own request.
             self.scroll_to_newest();
             self.transcript_viewport = None;
             self.send_feedback = None;
@@ -2520,20 +2768,30 @@ impl App {
     }
 
     /// Take the pending exact-context lookup so the shell spawns it once.
-    pub fn begin_search_context_request(&mut self) -> Option<(u64, ConversationId, MessageId)> {
-        let context = self.search_context.as_mut()?;
-        if !context.loading || context.requested {
-            return None;
+    pub fn begin_search_context_request(
+        &mut self,
+    ) -> Option<(u64, ConversationId, MessageId, crate::daemon::ActivityToken)> {
+        let (generation, conversation, target) = {
+            let context = self.search_context.as_ref()?;
+            if !context.loading || context.requested {
+                return None;
+            }
+            (
+                context.generation,
+                context.conversation.clone(),
+                context.target.clone(),
+            )
+        };
+        let token = self.begin_activity(&conversation, ActivityKind::Context);
+        if let Some(context) = self.search_context.as_mut() {
+            context.requested = true;
+            context.activity = Some(token);
         }
-        context.requested = true;
-        Some((
-            context.generation,
-            context.conversation.clone(),
-            context.target.clone(),
-        ))
+        Some((generation, conversation, target, token))
     }
 
     fn start_search_context(&mut self, conversation: ConversationId, target: MessageId) {
+        self.clear_search_context();
         self.search_context_generation = self.search_context_generation.wrapping_add(1);
         self.search_context = Some(SearchContext {
             generation: self.search_context_generation,
@@ -2541,12 +2799,17 @@ impl App {
             target,
             loading: true,
             requested: false,
+            activity: None,
             messages: Vec::new(),
         });
     }
 
     fn clear_search_context(&mut self) {
-        self.search_context = None;
+        if let Some(context) = self.search_context.take() {
+            if let Some(token) = context.activity {
+                self.take_activity(&context.conversation, ActivityKind::Context, token);
+            }
+        }
     }
 
     /// Carry an exact-context lookup across an identity alias by restarting the
@@ -2569,11 +2832,20 @@ impl App {
         }
         self.search_context_generation = self.search_context_generation.wrapping_add(1);
         let generation = self.search_context_generation;
+        let retired = self.search_context.as_ref().and_then(|context| {
+            context
+                .activity
+                .map(|token| (context.conversation.clone(), token))
+        });
+        if let Some((conversation, token)) = retired {
+            self.take_activity(&conversation, ActivityKind::Context, token);
+        }
         if let Some(context) = self.search_context.as_mut() {
             context.generation = generation;
             context.conversation = to.clone();
             context.loading = true;
             context.requested = false;
+            context.activity = None;
             context.messages.clear();
         }
     }
@@ -2585,8 +2857,12 @@ impl App {
         generation: u64,
         conversation: ConversationId,
         target: MessageId,
+        token: crate::daemon::ActivityToken,
         messages: Vec<Message>,
     ) -> bool {
+        if !self.take_activity(&conversation, ActivityKind::Context, token) {
+            return false;
+        }
         if !self.context_reply_matches(generation, &conversation, &target) {
             return false;
         }
@@ -2626,7 +2902,11 @@ impl App {
         generation: u64,
         conversation: ConversationId,
         target: MessageId,
+        token: crate::daemon::ActivityToken,
     ) {
+        if !self.take_activity(&conversation, ActivityKind::Context, token) {
+            return;
+        }
         self.reject_message_context(
             generation,
             &conversation,
@@ -6165,14 +6445,21 @@ pub fn status_text(app: &App) -> Option<String> {
     if !app.connection.is_empty() && app.connection != "Connected" {
         return Some(app.connection.clone());
     }
-    // A catch-up burst or a manual `/sync` is the most useful thing to report
-    // while it is happening.
+    // A manual `/sync` is a real metadata operation and keeps its own label. A
+    // burst of persisted inbound events is only "Updated": it never claims a
+    // per-chat remote sync that the daemon did not perform.
     let session = app.session.trim();
-    if app.syncing || app.sync_requested || app.sync_in_flight {
+    if app.sync_requested || app.sync_in_flight {
         if matches!(session, "Failed" | "Blocked" | "Disconnected") {
             return Some(session.to_owned());
         }
         return Some("Syncing".to_owned());
+    }
+    if app.syncing {
+        if matches!(session, "Failed" | "Blocked" | "Disconnected") {
+            return Some(session.to_owned());
+        }
+        return Some("Updated".to_owned());
     }
     if session.is_empty() {
         return None;
@@ -6205,7 +6492,13 @@ pub fn status_tone(app: &App) -> StatusTone {
             StatusTone::Failure
         };
     }
-    if app.syncing || app.sync_requested || app.sync_in_flight {
+    if app.sync_requested || app.sync_in_flight {
+        if matches!(app.session.trim(), "Failed" | "Blocked" | "Disconnected") {
+            return StatusTone::Failure;
+        }
+        return StatusTone::Attention;
+    }
+    if app.syncing {
         if matches!(app.session.trim(), "Failed" | "Blocked" | "Disconnected") {
             return StatusTone::Failure;
         }
@@ -6403,7 +6696,17 @@ mod tests {
         app.session = "Starting".into();
         assert!(app.is_animating());
         app.session.clear();
-        app.thread_loading = true;
+        let chat = conversation("animating", Some(10));
+        app.activity.insert(
+            chat.id.clone(),
+            ConversationActivity {
+                snapshot: Some(crate::daemon::ActivityToken {
+                    request: 1,
+                    epoch: 0,
+                }),
+                ..Default::default()
+            },
+        );
         assert!(app.is_animating());
     }
 
@@ -7009,6 +7312,7 @@ mod tests {
         let b = conversation("b", Some(20));
         app.upsert(a.id.clone(), message(&a, "stale", 1, "stale"));
         app.apply_snapshot(Snapshot {
+            token: None,
             revision: crate::daemon::next_revision(),
             visible: Some(a.id.clone()),
             conversations: vec![a.clone(), b.clone()],
@@ -7029,12 +7333,14 @@ mod tests {
         let old = crate::daemon::next_revision();
         let new = crate::daemon::next_revision();
         app.apply_snapshot(Snapshot {
+            token: None,
             revision: new,
             visible: Some(chat.id.clone()),
             conversations: vec![chat.clone()],
             history: vec![message(&chat, "new", 2, "newest")],
         });
         app.apply_snapshot(Snapshot {
+            token: None,
             revision: old,
             visible: Some(chat.id.clone()),
             conversations: vec![chat.clone()],
@@ -7049,6 +7355,7 @@ mod tests {
             push_sequence: None,
         });
         app.apply_snapshot(Snapshot {
+            token: None,
             revision: pending_read,
             visible: Some(chat.id.clone()),
             conversations: vec![chat.clone()],
@@ -7058,6 +7365,7 @@ mod tests {
         assert_eq!(app.messages[&chat.id].len(), 2);
 
         app.apply_snapshot(Snapshot {
+            token: None,
             revision: crate::daemon::next_revision(),
             visible: Some(chat.id.clone()),
             conversations: vec![chat.clone()],
@@ -7074,6 +7382,7 @@ mod tests {
             push_sequence: None,
         });
         app.apply_snapshot(Snapshot {
+            token: None,
             revision: unrelated_read,
             visible: Some(chat.id.clone()),
             conversations: vec![chat.clone()],
@@ -7346,7 +7655,7 @@ mod tests {
     }
 
     #[test]
-    fn catching_up_on_messages_shows_a_syncing_status() {
+    fn caught_up_inbound_events_show_updated_without_a_sync_claim() {
         let mut app = App {
             connection: "Connected".into(),
             connection_state: crate::daemon::ConnectionState::Connected,
@@ -7358,7 +7667,7 @@ mod tests {
         assert!(!app.is_animating());
 
         app.set_syncing(true);
-        assert_eq!(status_text(&app).as_deref(), Some("Syncing"));
+        assert_eq!(status_text(&app).as_deref(), Some("Updated"));
         assert_eq!(status_tone(&app), StatusTone::Attention);
         assert!(
             app.is_animating(),
@@ -7866,7 +8175,7 @@ mod tests {
         );
         app.select(Some(chat.id.clone()));
 
-        let (id, cursor) = app.begin_load_older().expect("cursor");
+        let (id, cursor, _token) = app.begin_load_older().expect("cursor");
         assert_eq!(id, chat.id);
         assert_eq!(cursor.created_at, 10);
         assert_eq!(cursor.id.value(), "a");
@@ -7891,9 +8200,10 @@ mod tests {
             row: 3,
         });
 
-        let (id, _) = app.begin_load_older().expect("cursor");
+        let (id, _, token) = app.begin_load_older().expect("cursor");
         app.finish_load_older(
             id,
+            token,
             vec![
                 message(&chat, "old", 100, "older"),
                 message(&chat, "w2", 200, "duplicate"),
@@ -7916,6 +8226,7 @@ mod tests {
         let chat = conversation("budget-stop", Some(10_000_000));
         app.set_conversations(vec![chat.clone()]);
         app.apply_snapshot(crate::daemon::Snapshot {
+            token: None,
             revision: crate::daemon::next_revision(),
             visible: Some(chat.id.clone()),
             conversations: vec![chat.clone()],
@@ -7929,17 +8240,17 @@ mod tests {
                     message(&chat, &format!("r{round}-{offset}"), at, "paged")
                 })
                 .collect();
-            let (id, _) = app.begin_load_older().expect("cursor");
-            app.finish_load_older(id, page, OLDER_PAGE_LIMIT);
+            let (id, _, token) = app.begin_load_older().expect("cursor");
+            app.finish_load_older(id, token, page, OLDER_PAGE_LIMIT);
         }
         assert!(app.can_load_older(), "the budget was exactly filled");
 
         let extra: Vec<Message> = (0..200i64)
             .map(|offset| message(&chat, &format!("extra-{offset}"), 900_000 + offset, "paged"))
             .collect();
-        let (id, _) = app.begin_load_older().expect("cursor");
+        let (id, _, token) = app.begin_load_older().expect("cursor");
         let before = app.messages[&chat.id].len();
-        app.finish_load_older(id, extra, OLDER_PAGE_LIMIT);
+        app.finish_load_older(id, token, extra, OLDER_PAGE_LIMIT);
 
         assert_eq!(
             app.messages[&chat.id].len(),
@@ -7960,13 +8271,14 @@ mod tests {
         app.selected = Some(chat.id.clone());
         app.messages
             .insert(chat.id.clone(), vec![message(&chat, "w", 50, "window")]);
-        let (id, _) = app.begin_load_older().expect("cursor");
-        app.fail_load_older(id, "Older messages could not be loaded.".into());
+        let (id, _, token) = app.begin_load_older().expect("cursor");
+        app.fail_load_older(id, token, "Older messages could not be loaded.".into());
         assert!(app.older_error.is_some());
 
         // A reconciliation landing straight after the failure must not erase the
         // line before it has been on screen.
         app.apply_snapshot(crate::daemon::Snapshot {
+            token: None,
             revision: crate::daemon::next_revision(),
             visible: Some(chat.id.clone()),
             conversations: vec![chat.clone()],
@@ -8026,6 +8338,7 @@ mod tests {
         );
 
         app.apply_snapshot(crate::daemon::Snapshot {
+            token: None,
             revision: crate::daemon::next_revision(),
             visible: Some(canonical.id.clone()),
             conversations: vec![canonical.clone()],
@@ -8073,6 +8386,7 @@ mod tests {
         );
 
         app.apply_snapshot(crate::daemon::Snapshot {
+            token: None,
             revision: crate::daemon::next_revision(),
             visible: Some(canonical.id.clone()),
             conversations: vec![canonical.clone()],
@@ -8104,6 +8418,7 @@ mod tests {
         );
 
         app.apply_snapshot(crate::daemon::Snapshot {
+            token: None,
             revision: crate::daemon::next_revision(),
             visible: Some(canonical.id.clone()),
             conversations: vec![retired.clone(), canonical.clone()],
@@ -8125,9 +8440,10 @@ mod tests {
             .insert(chat.id.clone(), vec![message(&chat, "w", 200, "window")]);
         app.select(Some(chat.id.clone()));
 
-        let (id, _) = app.begin_load_older().expect("cursor");
+        let (id, _, token) = app.begin_load_older().expect("cursor");
         app.finish_load_older(
             id,
+            token,
             vec![message(&chat, "old", 100, "older")],
             OLDER_PAGE_LIMIT,
         );
@@ -8150,15 +8466,17 @@ mod tests {
             vec![message(&chat, "window", 20, "original")],
         );
         app.select(Some(chat.id.clone()));
-        let (id, _) = app.begin_load_older().expect("cursor");
+        let (id, _, token) = app.begin_load_older().expect("cursor");
         app.finish_load_older(
             id,
+            token,
             vec![message(&chat, "old", 10, "paged")],
             OLDER_PAGE_LIMIT,
         );
         assert!(app.older_loaded.contains(&chat.id));
 
         app.apply_snapshot(Snapshot {
+            token: None,
             revision: crate::daemon::next_revision(),
             visible: Some(chat.id.clone()),
             conversations: vec![chat.clone()],
@@ -8180,6 +8498,7 @@ mod tests {
         // newest-window boundary the budget is measured against.
         app.set_conversations(vec![chat.clone()]);
         app.apply_snapshot(crate::daemon::Snapshot {
+            token: None,
             revision: crate::daemon::next_revision(),
             visible: Some(chat.id.clone()),
             conversations: vec![chat.clone()],
@@ -8193,8 +8512,8 @@ mod tests {
                     message(&chat, &format!("r{round}-{offset}"), at, "paged")
                 })
                 .collect();
-            let (id, _) = app.begin_load_older().expect("cursor");
-            app.finish_load_older(id, page, OLDER_PAGE_LIMIT);
+            let (id, _, token) = app.begin_load_older().expect("cursor");
+            app.finish_load_older(id, token, page, OLDER_PAGE_LIMIT);
         }
 
         let ids: Vec<&str> = app.messages[&chat.id]
@@ -8221,16 +8540,20 @@ mod tests {
         app.messages
             .insert(second.id.clone(), vec![message(&second, "b", 10, "b")]);
         app.select(Some(first.id.clone()));
-        let (id, _) = app.begin_load_older().expect("cursor");
+        let (id, _, token) = app.begin_load_older().expect("cursor");
         assert_eq!(id, first.id);
 
         app.finish_load_older(
             second.id.clone(),
+            token,
             vec![message(&second, "old", 5, "old")],
             1,
         );
 
-        assert_eq!(app.older_loading, Some(first.id.clone()));
+        assert!(
+            app.has_older_activity(&first.id),
+            "a reply for another chat must not clear the current page"
+        );
         assert_eq!(app.messages[&second.id].len(), 1);
         assert!(!app.older_loaded.contains(&second.id));
     }
@@ -8245,7 +8568,16 @@ mod tests {
         app.selected = Some(legacy.id.clone());
         app.older_loaded.insert(legacy.id.clone());
         app.older_exhausted.insert(legacy.id.clone());
-        app.older_loading = Some(legacy.id.clone());
+        app.activity.insert(
+            legacy.id.clone(),
+            ConversationActivity {
+                older: Some(crate::daemon::ActivityToken {
+                    request: 1,
+                    epoch: 0,
+                }),
+                ..Default::default()
+            },
+        );
         app.older_window_floor
             .insert(legacy.id.clone(), floor.id().clone());
 
@@ -8258,10 +8590,11 @@ mod tests {
         assert!(!app.older_loaded.contains(&legacy.id));
         assert!(!app.older_exhausted.contains(&legacy.id));
         assert!(!app.older_window_floor.contains_key(&legacy.id));
-        assert_eq!(
-            app.older_loading, None,
-            "an in-flight reply still carries the retired id, so the slot is dropped"
+        assert!(
+            app.conversation_activity(&legacy.id).is_none(),
+            "an in-flight reply still carries the retired id, so its ownership is retired"
         );
+        assert!(!app.has_older_activity(&canonical.id));
 
         // The dropped slot must not wedge paging for the canonical conversation.
         app.messages.insert(
@@ -8285,7 +8618,7 @@ mod tests {
     fn start_context_lookup(
         app: &mut App,
         hit: MessageSearchHit,
-    ) -> (u64, ConversationId, MessageId) {
+    ) -> (u64, ConversationId, MessageId, crate::daemon::ActivityToken) {
         app.open_search();
         for character in "needle".chars() {
             app.search_input(character);
@@ -8570,7 +8903,7 @@ mod tests {
         let hit = search_hit(&target, "needle", "needle");
         let expected = hit.message_id.clone();
 
-        let (generation, conversation, message_id) = start_context_lookup(&mut app, hit);
+        let (generation, conversation, message_id, token) = start_context_lookup(&mut app, hit);
 
         assert_eq!(conversation, target.id);
         assert_eq!(message_id, expected);
@@ -8595,6 +8928,7 @@ mod tests {
             generation,
             conversation.clone(),
             expected.clone(),
+            token,
             rows.clone()
         ));
         assert_eq!(app.displayed_messages(), rows.as_slice());
@@ -8642,9 +8976,9 @@ mod tests {
         app.messages.insert(target.id.clone(), vec![normal.clone()]);
         let hit = search_hit(&target, "needle", "needle");
 
-        let (generation, conversation, message_id) = start_context_lookup(&mut app, hit);
+        let (generation, conversation, message_id, token) = start_context_lookup(&mut app, hit);
         assert!(app.search_context_active());
-        app.fail_message_context(generation, conversation.clone(), message_id);
+        app.fail_message_context(generation, conversation.clone(), message_id, token);
 
         assert!(!app.search_context_active());
         assert!(app.search_jump_pending().is_none());
@@ -8667,7 +9001,7 @@ mod tests {
         let normal = message(&target, "other", 50, "normal");
         app.messages.insert(target.id.clone(), vec![normal.clone()]);
         let hit = search_hit(&target, "needle", "needle");
-        let (first, conversation, message_id) = start_context_lookup(&mut app, hit.clone());
+        let (first, conversation, message_id, token) = start_context_lookup(&mut app, hit.clone());
 
         app.scroll_to_newest();
         assert!(!app.search_context_active());
@@ -8675,38 +9009,42 @@ mod tests {
             first,
             conversation.clone(),
             message_id.clone(),
+            token,
             vec![message(&target, "needle", 20, "late")]
         ));
         assert_eq!(app.displayed_messages(), std::slice::from_ref(&normal));
 
-        let (second, conversation, message_id) = start_context_lookup(&mut app, hit);
+        let (second, conversation, message_id, token) = start_context_lookup(&mut app, hit);
         assert_ne!(first, second);
         app.select(Some(source.id.clone()));
         assert!(!app.finish_message_context(
             second,
             conversation.clone(),
             message_id.clone(),
+            token,
             vec![message(&target, "needle", 20, "selected away")]
         ));
         assert!(app.search_context.is_none());
 
         app.select(Some(target.id.clone()));
-        let (third, conversation, message_id) =
+        let (third, conversation, message_id, third_token) =
             start_context_lookup(&mut app, search_hit(&target, "needle", "needle"));
         // A replacement request gets a new generation while the old reply stays stale.
-        let (fourth, newer_conversation, newer_message) =
+        let (fourth, newer_conversation, newer_message, fourth_token) =
             start_context_lookup(&mut app, search_hit(&target, "needle", "needle"));
         assert_ne!(third, fourth);
         assert!(!app.finish_message_context(
             third,
             conversation,
             message_id,
+            third_token,
             vec![message(&target, "needle", 20, "old request")]
         ));
         assert!(app.finish_message_context(
             fourth,
             newer_conversation,
             newer_message,
+            fourth_token,
             vec![message(&target, "needle", 20, "new request")]
         ));
     }
@@ -8719,7 +9057,7 @@ mod tests {
             let target = conversation("cancel-error-target", Some(10));
             app.set_conversations(vec![source.clone(), target.clone()]);
             app.select(Some(source.id.clone()));
-            let (generation, conversation, target_id) =
+            let (generation, conversation, target_id, token) =
                 start_context_lookup(&mut app, search_hit(&target, "needle", "needle"));
             assert!(app.search_context.as_ref().unwrap().loading);
             match exit {
@@ -8741,7 +9079,7 @@ mod tests {
                 .search_context
                 .as_ref()
                 .map(|context| context.generation);
-            app.fail_message_context(generation, conversation, target_id);
+            app.fail_message_context(generation, conversation, target_id, token);
             assert_eq!(app.notice, notice, "late error after {exit}");
             assert_eq!(app.selected, selected);
             assert_eq!(app.draft, draft);
@@ -8760,7 +9098,7 @@ mod tests {
         let target = conversation("cold-context-thread", Some(10));
         app.set_conversations(vec![target.clone()]);
         assert!(!app.messages.contains_key(&target.id));
-        let (generation, conversation, target_id) =
+        let (generation, conversation, target_id, token) =
             start_context_lookup(&mut app, search_hit(&target, "needle", "needle"));
         assert!(
             app.begin_search_context_request().is_none(),
@@ -8770,6 +9108,7 @@ mod tests {
             generation,
             conversation,
             target_id,
+            token,
             vec![message(&target, "needle", 20, "exact cold hit")]
         ));
         assert!(app.search_context_active());
@@ -8789,7 +9128,7 @@ mod tests {
             vec![message(&target, "normal", 90, "normal latest")],
         );
         let hit = search_hit(&target, "needle", "needle");
-        let (generation, conversation, message_id) = start_context_lookup(&mut app, hit);
+        let (generation, conversation, message_id, token) = start_context_lookup(&mut app, hit);
         let context_rows = vec![
             message(&target, "before", 10, "context before"),
             message(&target, "needle", 20, "context hit"),
@@ -8799,10 +9138,12 @@ mod tests {
             generation,
             conversation.clone(),
             message_id,
+            token,
             context_rows.clone()
         ));
 
         app.apply_snapshot(Snapshot {
+            token: None,
             revision: 1,
             conversations: vec![source, target.clone()],
             visible: Some(target.id.clone()),
@@ -8828,7 +9169,7 @@ mod tests {
         app.set_conversations(vec![old.clone()]);
         app.select(Some(old.id.clone()));
         let hit = search_hit(&old, "needle", "needle");
-        let (old_generation, old_conversation, target) = start_context_lookup(&mut app, hit);
+        let (old_generation, old_conversation, target, token) = start_context_lookup(&mut app, hit);
 
         app.set_conversations(vec![canonical.clone()]);
 
@@ -8842,9 +9183,10 @@ mod tests {
             old_generation,
             old_conversation,
             target.clone(),
+            token,
             vec![message(&old, "needle", 20, "old reply")]
         ));
-        let (new_generation, new_conversation, new_target) = app
+        let (new_generation, new_conversation, new_target, token) = app
             .begin_search_context_request()
             .expect("canonical request");
         assert_eq!(new_conversation, canonical.id);
@@ -8852,6 +9194,7 @@ mod tests {
             new_generation,
             new_conversation,
             new_target,
+            token,
             vec![message(&canonical, "needle", 20, "canonical reply")]
         ));
         assert_eq!(
@@ -8872,11 +9215,12 @@ mod tests {
         let newest = message(&chat, "newest", 90, "newest normal");
         app.messages.insert(chat.id.clone(), vec![newest]);
         let hit = search_hit(&chat, "target", "target");
-        let (generation, conversation, target) = start_context_lookup(&mut app, hit);
+        let (generation, conversation, target, token) = start_context_lookup(&mut app, hit);
         assert!(app.finish_message_context(
             generation,
             conversation.clone(),
             target.clone(),
+            token,
             vec![message(&chat, "target", 10, "short context")]
         ));
 
@@ -8943,11 +9287,12 @@ mod tests {
         app.draft_cursor = 4;
         app.pasted_body = true;
         let hit = search_hit(&chat, "target", "target");
-        let (generation, conversation, target) = start_context_lookup(&mut app, hit);
+        let (generation, conversation, target, token) = start_context_lookup(&mut app, hit);
         assert!(app.finish_message_context(
             generation,
             conversation.clone(),
             target.clone(),
+            token,
             vec![message(&chat, "target", 10, "context")]
         ));
         let owner = app.active_draft_owner.clone();
@@ -8975,11 +9320,12 @@ mod tests {
         app.messages.insert(chat.id.clone(), vec![unread.clone()]);
         app.mark_read(chat.id.clone(), message(&chat, "normal", 90, "seen"));
         let hit = search_hit(&chat, "target", "target");
-        let (generation, conversation, target) = start_context_lookup(&mut app, hit);
+        let (generation, conversation, target, token) = start_context_lookup(&mut app, hit);
         assert!(app.finish_message_context(
             generation,
             conversation,
             target,
+            token,
             vec![message(&chat, "target", 10, "context")]
         ));
         assert!(app.jump_to_first_unread());
@@ -9127,6 +9473,7 @@ mod tests {
         let (mut app, conversation) = read_app();
         let newest = message(&conversation, "m1", 10, "unseen");
         app.apply_snapshot(Snapshot {
+            token: None,
             revision: 1,
             conversations: vec![conversation.clone()],
             visible: Some(conversation.id.clone()),
@@ -9598,5 +9945,289 @@ mod tests {
         );
         assert!(!app.apply_loaded_draft(key, loaded));
         assert!(app.draft.is_empty());
+    }
+
+    #[test]
+    fn a_late_snapshot_for_the_same_chat_cannot_clear_a_newer_request() {
+        let mut app = App::default();
+        let chat = conversation("activity-same", Some(10));
+        app.set_conversations(vec![chat.clone()]);
+        app.select(Some(chat.id.clone()));
+
+        let first = app.begin_snapshot_request().token.expect("first token");
+        let second = app.begin_snapshot_request().token.expect("second token");
+        assert_ne!(first, second);
+
+        app.apply_snapshot(Snapshot {
+            token: Some(first),
+            revision: crate::daemon::next_revision(),
+            visible: Some(chat.id.clone()),
+            conversations: vec![chat.clone()],
+            history: vec![message(&chat, "one", 10, "one")],
+        });
+        assert!(
+            app.has_local_activity(&chat.id),
+            "the older reply must not clear the newer request"
+        );
+
+        app.apply_snapshot(Snapshot {
+            token: Some(second),
+            revision: crate::daemon::next_revision(),
+            visible: Some(chat.id.clone()),
+            conversations: vec![chat.clone()],
+            history: vec![message(&chat, "one", 10, "one")],
+        });
+        assert!(!app.has_local_activity(&chat.id));
+    }
+
+    #[test]
+    fn activity_is_owned_by_conversation_and_kind() {
+        let mut app = App::default();
+        let first = conversation("activity-first", Some(10));
+        let second = conversation("activity-second", Some(10));
+        app.set_conversations(vec![first.clone(), second.clone()]);
+        app.messages
+            .insert(second.id.clone(), vec![message(&second, "b", 10, "b")]);
+
+        app.select(Some(first.id.clone()));
+        let snapshot = app.begin_snapshot_request().token.expect("snapshot token");
+        assert!(app.has_local_activity(&first.id));
+        assert!(
+            !app.has_local_activity(&second.id),
+            "one chat request must not mark every row busy"
+        );
+
+        app.select(Some(second.id.clone()));
+        let (_, _, older) = app.begin_load_older().expect("older token");
+        assert!(app.has_older_activity(&second.id));
+
+        // A token from another chat cannot clear this page.
+        app.finish_load_older(
+            first.id.clone(),
+            older,
+            vec![message(&first, "old", 5, "old")],
+            1,
+        );
+        assert!(app.has_older_activity(&second.id));
+
+        app.finish_load_older(
+            second.id.clone(),
+            older,
+            vec![message(&second, "old", 5, "old")],
+            1,
+        );
+        assert!(!app.has_older_activity(&second.id));
+        assert!(
+            app.has_local_activity(&first.id),
+            "the snapshot token belongs to the other chat"
+        );
+
+        app.apply_snapshot(Snapshot {
+            token: Some(snapshot),
+            revision: crate::daemon::next_revision(),
+            visible: Some(first.id.clone()),
+            conversations: vec![first.clone(), second.clone()],
+            history: vec![message(&first, "a", 10, "a")],
+        });
+        assert!(!app.has_local_activity(&first.id));
+    }
+
+    #[test]
+    fn a_snapshot_does_not_acknowledge_an_older_page() {
+        let mut app = App::default();
+        let chat = conversation("activity-kinds", Some(20));
+        app.set_conversations(vec![chat.clone()]);
+        app.select(Some(chat.id.clone()));
+        app.messages.insert(
+            chat.id.clone(),
+            vec![message(&chat, "window", 20, "window")],
+        );
+
+        let (_, _, older) = app.begin_load_older().expect("older token");
+        let snapshot = app.begin_snapshot_request().token.expect("snapshot token");
+        app.apply_snapshot(Snapshot {
+            token: Some(snapshot),
+            revision: crate::daemon::next_revision(),
+            visible: Some(chat.id.clone()),
+            conversations: vec![chat.clone()],
+            history: vec![message(&chat, "window", 20, "window")],
+        });
+        assert!(
+            app.has_older_activity(&chat.id),
+            "a snapshot completes only the snapshot slot"
+        );
+
+        app.finish_load_older(
+            chat.id.clone(),
+            older,
+            vec![message(&chat, "old", 10, "old")],
+            OLDER_PAGE_LIMIT,
+        );
+        assert!(!app.has_older_activity(&chat.id));
+    }
+
+    #[test]
+    fn a_b_a_reselection_uses_a_new_epoch_token() {
+        let mut app = App::default();
+        let first = conversation("aba-first", Some(10));
+        let second = conversation("aba-second", Some(10));
+        app.set_conversations(vec![first.clone(), second.clone()]);
+
+        app.select(Some(first.id.clone()));
+        let old = app.begin_snapshot_request().token.expect("old token");
+        app.select(Some(second.id.clone()));
+        app.begin_snapshot_request();
+        app.select(Some(first.id.clone()));
+        let current = app.begin_snapshot_request().token.expect("current token");
+        assert_ne!(old, current);
+
+        app.apply_snapshot(Snapshot {
+            token: Some(old),
+            revision: crate::daemon::next_revision(),
+            visible: Some(first.id.clone()),
+            conversations: vec![first.clone(), second.clone()],
+            history: vec![message(&first, "a", 10, "a")],
+        });
+        assert!(
+            app.has_local_activity(&first.id),
+            "the first selection's late reply must not clear the reselection"
+        );
+
+        app.apply_snapshot(Snapshot {
+            token: Some(current),
+            revision: crate::daemon::next_revision(),
+            visible: Some(first.id.clone()),
+            conversations: vec![first.clone(), second.clone()],
+            history: vec![message(&first, "a", 10, "a")],
+        });
+        assert!(!app.has_local_activity(&first.id));
+    }
+
+    #[test]
+    fn failure_cancellation_and_disconnect_clear_only_their_own_token() {
+        let mut app = App::default();
+        let chat = conversation("activity-clear", Some(10));
+        app.set_conversations(vec![chat.clone()]);
+        app.select(Some(chat.id.clone()));
+        app.messages
+            .insert(chat.id.clone(), vec![message(&chat, "a", 10, "a")]);
+
+        let (_, _, older) = app.begin_load_older().expect("older token");
+        app.fail_load_older(chat.id.clone(), older, "failed".into());
+        assert!(!app.has_older_activity(&chat.id));
+
+        app.start_search_context(
+            chat.id.clone(),
+            MessageId::new(chat.id.transport().clone(), "a").unwrap(),
+        );
+        let (_, _, _, context) = app.begin_search_context_request().expect("context token");
+        assert!(app.has_local_activity(&chat.id));
+        app.clear_search_context();
+        assert!(!app.has_local_activity(&chat.id));
+        assert!(!app.finish_message_context(
+            1,
+            chat.id.clone(),
+            MessageId::new(chat.id.transport().clone(), "a").unwrap(),
+            context,
+            vec![message(&chat, "a", 10, "a")],
+        ));
+
+        let old = app.begin_snapshot_request().token.expect("old token");
+        app.observe_connection_state(ConnectionState::Disconnected);
+        assert!(app.activity.is_empty(), "disconnect retires old tokens");
+        app.observe_connection_state(ConnectionState::Connecting);
+        app.observe_connection_state(ConnectionState::Connected);
+        let current = app.begin_snapshot_request().token.expect("current token");
+        assert_ne!(old.epoch, current.epoch, "reconnect starts a fresh epoch");
+        app.apply_snapshot(Snapshot {
+            token: Some(old),
+            revision: crate::daemon::next_revision(),
+            visible: Some(chat.id.clone()),
+            conversations: vec![chat.clone()],
+            history: vec![message(&chat, "a", 10, "a")],
+        });
+        assert!(
+            app.has_local_activity(&chat.id),
+            "an old-epoch reply cannot clear the new connection's request"
+        );
+        app.fail_snapshot_activity(current);
+        assert!(!app.has_local_activity(&chat.id));
+    }
+
+    #[test]
+    fn alias_migration_retires_the_retired_conversations_activity() {
+        let legacy = conversation("activity-legacy", Some(20));
+        let mut canonical = conversation("activity-canonical", Some(20));
+        canonical.aliases = vec![legacy.id.clone()];
+        let mut app = App::default();
+        app.set_conversations(vec![legacy.clone()]);
+        app.select(Some(legacy.id.clone()));
+        app.messages
+            .insert(legacy.id.clone(), vec![message(&legacy, "a", 10, "a")]);
+        let snapshot = app.begin_snapshot_request().token.expect("snapshot token");
+        let (_, _, older) = app.begin_load_older().expect("older token");
+        assert!(app.has_local_activity(&legacy.id));
+
+        app.set_conversations(vec![canonical.clone()]);
+
+        assert_eq!(app.selected, Some(canonical.id.clone()));
+        assert!(app.conversation_activity(&legacy.id).is_none());
+        assert!(!app.has_local_activity(&canonical.id));
+        // The retired tokens cannot clear a fresh canonical request.
+        let fresh = app.begin_snapshot_request().token.expect("fresh token");
+        app.fail_snapshot_activity(snapshot);
+        app.fail_snapshot_activity(older);
+        assert!(app.has_local_activity(&canonical.id));
+        app.fail_snapshot_activity(fresh);
+        assert!(!app.has_local_activity(&canonical.id));
+    }
+
+    #[test]
+    fn the_activity_map_stays_bounded_and_drops_empty_entries() {
+        let mut app = App::default();
+        for index in 0..(ACTIVITY_CAPACITY + 12) {
+            let chat = conversation(&format!("bounded-{index}"), Some(10));
+            app.begin_activity(&chat.id, ActivityKind::Snapshot);
+        }
+        assert!(app.activity.len() <= ACTIVITY_CAPACITY);
+        assert!(app.activity.values().all(ConversationActivity::is_busy));
+
+        let chat = conversation("bounded-finish", Some(10));
+        let token = app.begin_activity(&chat.id, ActivityKind::Snapshot);
+        assert!(app.fail_snapshot_activity(token));
+        assert!(
+            app.activity.values().all(ConversationActivity::is_busy),
+            "empty entries are removed"
+        );
+    }
+
+    #[test]
+    fn activity_changes_preserve_selection_and_unread_navigation() {
+        let mut app = App::default();
+        let chat = conversation("activity-unread", Some(20));
+        let other = conversation("activity-other", Some(10));
+        app.set_conversations(vec![chat.clone(), other.clone()]);
+        app.select(Some(chat.id.clone()));
+        let first = message(&chat, "first", 10, "first");
+        let second = message(&chat, "second", 20, "second");
+        app.messages
+            .insert(chat.id.clone(), vec![first.clone(), second.clone()]);
+        app.read_positions
+            .insert(chat.id.clone(), (10, first.id().clone()));
+        let before = app.unread_count(&chat.id);
+        assert_eq!(before.map(|count| count.shown), Some(1));
+
+        let token = app.begin_snapshot_request().token.expect("snapshot token");
+        assert_eq!(app.selected, Some(chat.id.clone()));
+        assert_eq!(app.unread_count(&chat.id), before);
+        app.apply_snapshot(Snapshot {
+            token: Some(token),
+            revision: crate::daemon::next_revision(),
+            visible: Some(chat.id.clone()),
+            conversations: vec![chat.clone(), other.clone()],
+            history: vec![first, second],
+        });
+        assert_eq!(app.selected, Some(chat.id.clone()));
+        assert_eq!(app.unread_count(&chat.id), before);
     }
 }
