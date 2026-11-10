@@ -18,6 +18,7 @@ import time
 import unittest
 
 HELPERS = runpy.run_path(str(Path(__file__).with_name('test-tui-messaging-e2e.py')), run_name='helpers')
+STATE = runpy.run_path(str(Path(__file__).with_name('test-stateful-fake-daemon.py')), run_name='helpers')
 SHOT = HELPERS['SHOT']
 
 
@@ -145,6 +146,10 @@ class InputFlows(unittest.TestCase):
         try:
             fcntl.ioctl(master, termios.TIOCSWINSZ, struct.pack('HHHH', 30, 100, 0, 0))
             pump(1.5)
+            if 'Open Bloom' not in '\n'.join(SHOT['render'](bytes(raw), 100, 30).display):
+                pump(2.0)
+            os.write(master, b'\r')
+            pump(.5)
             raw.clear()
             fcntl.ioctl(master, termios.TIOCSWINSZ, struct.pack('HHHH', 18, 60, 0, 0))
             os.kill(pid, signal.SIGWINCH)
@@ -157,6 +162,60 @@ class InputFlows(unittest.TestCase):
             os.kill(pid, signal.SIGTERM)
             os.waitpid(pid, 0)
             os.close(master)
+
+    def test_startup_double_enter_cannot_send_a_restored_draft(self):
+        draft = {
+            'body': 'RepeatRaceDraft',
+            'cursor': 0,
+            'pasted_body': False,
+            'uncertain': False,
+        }
+        STATE['request'](
+            str(self.fixture.socket_path), 'draft_save',
+            key={'kind': 'conversation', 'owner': {
+                'transport': 'openbubbles', 'value': 'alice@example.invalid'}},
+            draft=draft, revision=1,
+        )
+        with HELPERS['isolated_environment']({
+            'BLOOM_SOCKET_PATH': str(self.fixture.socket_path),
+            'XDG_CONFIG_HOME': str(self.fixture.root / 'config'),
+            'XDG_STATE_HOME': str(self.fixture.root / 'state'),
+            'XDG_DATA_HOME': str(self.fixture.root / 'data'),
+            'NO_COLOR': '1',
+        }):
+            raw = SHOT['run_tui'](
+                [str(HELPERS['BINARY'])], 100, 30, [b'\r', b'\r'], 1.5,
+            )
+        text = '\n'.join(SHOT['render'](raw, 100, 30).display)
+        self.assertIn('RepeatRaceDraft', text, 'the restored draft must remain visible')
+        self.assertEqual(self.fixture.persisted()['messages'], [],
+                         'a startup Enter burst must not send the restored draft')
+
+    def test_startup_checklist_blocks_burst_input_until_explicit_confirmation(self):
+        fixture = self.fixture
+        environment = {
+            'BLOOM_SOCKET_PATH': str(fixture.socket_path),
+            'BLOOM_CONFIG_HOME': str(fixture.root / 'config'),
+            'XDG_CONFIG_HOME': str(fixture.root / 'config'),
+            'XDG_STATE_HOME': str(fixture.root / 'state'),
+            'XDG_DATA_HOME': str(fixture.root / 'data'),
+            'NO_COLOR': '1',
+        }
+        with HELPERS['isolated_environment'](environment):
+            checklist = SHOT['run_tui'](
+                [str(HELPERS['BINARY'])], 100, 30, [], 1.5, False,
+            )
+            opened = SHOT['run_tui'](
+                [str(HELPERS['BINARY'])], 100, 30, [b'burst', b'\r'], 1.5, False,
+            )
+        checklist_text = '\n'.join(SHOT['render'](checklist, 100, 30).display)
+        opened_text = '\n'.join(SHOT['render'](opened, 100, 30).display)
+        self.assertIn('Open Bloom', checklist_text)
+        self.assertIn('5/5 checks', checklist_text)
+        self.assertNotIn('Write a message', checklist_text)
+        self.assertEqual(self.fixture.persisted()['messages'], [])
+        self.assertIn('Alice', opened_text)
+        self.assertEqual(self.fixture.persisted()['messages'], [], 'loading input must not send')
 
     def test_failed_settings_save_is_painted_without_another_key(self):
         fixture = self.fixture
@@ -197,7 +256,12 @@ class InputFlows(unittest.TestCase):
         try:
             fcntl.ioctl(master, termios.TIOCSWINSZ, struct.pack('HHHH', 30, 100, 0, 0))
             self.assertTrue(
-                pump_until(lambda text: 'Alice' in text, 15),
+                pump_until(lambda text: 'Open Bloom' in text, 15),
+                'TUI did not offer Open Bloom: ' + current_text(),
+            )
+            os.write(master, b'\r')
+            self.assertTrue(
+                pump_until(lambda text: 'Alice' in text, 5),
                 'TUI did not draw the normal transcript: ' + current_text(),
             )
 

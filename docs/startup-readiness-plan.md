@@ -1,6 +1,6 @@
 # Startup readiness plan
 
-Status: P1 accepted. P2-P4 are PENDING and were not started. P1 passed the synthetic daemon and fake-sidecar gate; no live engine was run. Work targets branch `feat/startup-readiness-ui` at baseline `ead2c43`. The main development checkout stays untouched.
+Status: P1 and P2 accepted. P3 and P4 are PENDING and were not started. Both accepted units passed synthetic daemon and fake-sidecar gates; no live engine was run. Work targets branch `feat/startup-readiness-ui` at baseline `ead2c43`. The main development checkout stays untouched.
 
 P1 was implemented under explicit authorization and is accepted. P2-P4 remain proposal-only until separately authorized. Each unit is independently verifiable, and each unit needs its own acceptance before the next starts.
 
@@ -73,20 +73,24 @@ Proposed files: `apps/bloom-tui/src/app.rs`, `main.rs`, `daemon.rs`, and `ui.rs`
 
 Acceptance:
 
-- [ ] Five checks render with N/5, a spinner, and the observed record count, with no percent or ETA.
-- [ ] Readiness copy says the initial list is persisted and the local view is ready, not that the account is fully synced.
-- [ ] Failed, limited, unavailable, and timeout states fail closed and offer only Retry and Quit.
-- [ ] Text, new-chat, and attachment actions are refused in the TUI with a bounded status and zero IPC dispatch attempts while daemon readiness or client bootstrap is incomplete; the daemon independently rejects direct IPC attempts.
-- [ ] No key skips the checklist. Quit exits instead of opening chats.
-- [ ] Open Bloom appears only after all five checks pass, and the confirming event is consumed once.
-- [ ] Burst Enter, paste, queued keys, key repeat, and mouse clicks from loading cannot send or run commands after the transition.
-- [ ] Draft body, recipient, and cursor survive the checklist and reconnect.
-- [ ] A second TUI does not launch another engine listing, but must finish its own post-refresh snapshot and selected draft load before Open Bloom is offered. A ready daemon alone cannot bypass those client checks.
-- [ ] Quitting the client leaves a reusable daemon alive and cleans up the terminal.
-- [ ] Reconnect and recovery reset the gate and keep the read anchor and drafts.
-- [ ] Manual sync blocks Send and shows real progress without a five second screen dependency.
+- [x] Five checks render with N/5, a spinner, and the observed record count, with no percent or ETA.
+- [x] Readiness copy says the initial list is persisted and the local view is ready, not that the account is fully synced.
+- [x] Failed, limited, unavailable, and timeout states fail closed and offer only Retry and Quit.
+- [x] Text, new-chat, and attachment actions are refused in the TUI with a bounded status and zero IPC dispatch attempts while daemon readiness or client bootstrap is incomplete; the daemon independently rejects direct IPC attempts.
+- [x] No key skips the checklist. Quit exits instead of opening chats.
+- [x] Open Bloom appears only after all five checks pass, and the confirming event is consumed once.
+- [x] Burst Enter, paste, queued keys, key repeat, and mouse clicks from loading cannot send or run commands after the transition.
+- [x] Draft body, recipient, and cursor survive the checklist and reconnect.
+- [x] A second TUI does not launch another engine listing, but must finish its own post-refresh snapshot and selected draft load before Open Bloom is offered. A ready daemon alone cannot bypass those client checks.
+- [x] Quitting the client leaves a reusable daemon alive and cleans up the terminal.
+- [x] Reconnect and recovery reset the gate and keep the read anchor and drafts.
+- [x] Manual sync blocks Send and shows real progress without a five second screen dependency.
 
 Failure cases: each failed check, timeout, limited metadata, missing client, late daemon event, second client with a delayed snapshot or draft load, queued input burst, click-through, reconnect during the checklist, and quit during loading. Done when the TUI input safety, daemon session, and UI render tests pass and the parent inspects the diff.
+
+Implementation evidence: Rust workspace, strict Clippy, formatting, source guard, TUI 430 tests, and synthetic PTY suites passed: stateful 68, input 15, messaging 8, reading 26, launcher 15. Final independent review found no P2 blocker. It confirmed the startup overlay gate, zero-dispatch refusal paths, second-client bootstrap, draft/recipient/cursor preservation, reconnect reset, and compact 44x12 rendering. The review also found and the branch fixed a reconnect Enter latch and a restarted-daemon readiness revision reset. No live engine was run. P2 is accepted; P3 and P4 remain untouched.
+
+
 
 ## P3: truthful per-chat local activity
 
@@ -134,7 +138,7 @@ Only parent-verified evidence enters this table. A unit stays PENDING until its 
 | Unit | Status | Commit | Test command and result | Review | Remaining limits |
 | --- | --- | --- | --- | --- | --- |
 | P1 | ACCEPTED | P1 commits 3a4714e..4d0fbb7 | workspace, Clippy, 21 sidecar, 232 lib, 43 IPC, 128 TUI, 68 stateful, Python PTY pass | final review no blocker; stale-Active fix regression-tested | an admitted in-flight send may complete after invalidation; no new send, queue, or retry |
-| P2 | PENDING | none | not run | none | depends on P1 |
+| P2 | ACCEPTED | P2 implementation commit | TUI 430, PTY 132 (stateful 68, input 15, messaging 8, reading 26, launcher 15), workspace, Clippy, fmt, source guard | final review no blockers; latch and reconnect revision fixes regression-tested | no live engine; reconnected Enter is deliberately latched; readiness revision reset on disconnect |
 | P3 | PENDING | none | not run | none | depends on P1 |
 | P4 | PENDING | none | not run | none | scheduled after P3; independently testable |
 

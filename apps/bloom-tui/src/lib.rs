@@ -8,6 +8,7 @@ pub mod drafts;
 pub mod launcher;
 #[cfg(unix)]
 pub mod open;
+pub mod startup;
 pub mod transcript;
 pub mod ui;
 

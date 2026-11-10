@@ -59,6 +59,10 @@ class ReadingFlows(unittest.TestCase):
             self.pid, self.master = pty.fork()
             if self.pid == 0:
                 os.execv(str(H['BINARY']), [str(H['BINARY'])])
+        self.resize(100, 30, force=True)
+        self.wait_for(lambda: 'Open Bloom' in self.text(), 10)
+        self.key(b'\r')
+        self.wait_for(lambda: 'Write a message' in self.text(), 5)
 
     def stop_tui(self):
         try:
@@ -72,7 +76,9 @@ class ReadingFlows(unittest.TestCase):
         R['request'](str(self.fixture.socket_path), 'send', conversation_id=CID,
                      body={'parts': [{'type': 'text', 'value': f'READ_MARKER_{index:03d} synthetic context'}]})
 
-    def resize(self, width, height):
+    def resize(self, width, height, force=False):
+        if not force and getattr(self, 'width', None) == width and getattr(self, 'height', None) == height:
+            return
         self.width, self.height = width, height
         self.screen = H['SHOT']['pyte'].Screen(width, height)
         self.stream = H['SHOT']['pyte'].ByteStream(self.screen)
@@ -353,10 +359,15 @@ class ReadingFlows(unittest.TestCase):
             bob['title'] = f'Bob {suffix} identity'
             self.fixture.store_path.write_text(json.dumps(state))
             self.fixture.start_daemon()
+            self.wait_for(lambda: 'Open Bloom' in self.text(), timeout=10)
+            self.key(b'\r')
             self.wait_for(lambda: bob['title'] in self.text(), timeout=10)
             self.artifact(f'candidate-after-{suffix}-reconnect')
             self.assertIn(f'› {bob["title"]}', self.text(),
                           'successive identity reconciliation must preserve the logical candidate')
+        # One neutral key satisfies the post-open Enter latch before the drawer
+        # Enter, without weakening the startup burst protection.
+        self.key(b'\x1bOP')
         self.key(b'\r')
         self.assertIn('Bob final identity', self.screen.display[0])
         self.assertEqual(len(self.fixture.persisted()['messages']), 60)

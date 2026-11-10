@@ -16,7 +16,7 @@ use bloom_tui::RedrawScheduler;
 use crossterm::{
     event::{
         self, DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
-        Event, KeyEventKind,
+        Event, KeyCode, KeyEventKind,
     },
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
@@ -88,6 +88,23 @@ fn spawn_draft(
     tokio::spawn(async move {
         let _ = results.send(execute_draft(&client, operation).await);
     });
+}
+
+fn observe_startup_draft(app: &mut App, coordinator: &DraftCoordinator) {
+    if app.startup.opened() {
+        return;
+    }
+    if app.latest_snapshot_revision == 0 {
+        return;
+    }
+    match app.current_persistable_owner() {
+        None => app.observe_startup_draft_ready(),
+        Some(key) if coordinator.is_loaded(&key) => app.observe_startup_draft_ready(),
+        Some(_) if coordinator.error().is_some() => {
+            app.fail_startup_local(bloom_tui::startup::StartupFailure::Client);
+        }
+        Some(_) => {}
+    }
 }
 
 fn observe_drafts(app: &App, coordinator: &mut DraftCoordinator) {
@@ -389,6 +406,7 @@ async fn main() -> Result<()> {
         error: config_warning,
         connection: ConnectionState::Connecting.label().to_owned(),
         connection_state: ConnectionState::Connecting,
+        startup: bloom_tui::startup::StartupState::loading(),
         ..Default::default()
     };
     app.apply_read_positions(&read_positions);
@@ -426,6 +444,8 @@ async fn main() -> Result<()> {
     {
         let client = client.clone();
         let snapshot_tx = snapshot_tx.clone();
+        let event_tx = event_tx.clone();
+        let status_tx = status_tx.clone();
         tokio::spawn(async move {
             let mut delay = FIRST_RETRY;
             loop {
@@ -454,17 +474,18 @@ async fn main() -> Result<()> {
     // blocking read freeze rendering, so the UI showed stale state. Only key
     // presses and repeats are forwarded: a terminal that reports key releases (the
     // enhanced keyboard protocol) must not fire every binding twice.
-    let (input_tx, mut input_rx) = mpsc::unbounded_channel::<Event>();
+    let (input_tx, mut input_rx) = mpsc::unbounded_channel::<(Instant, Event)>();
     std::thread::spawn(move || loop {
         if event::poll(Duration::from_millis(100)).unwrap_or(false) {
+            let read_at = Instant::now();
             match event::read() {
                 Ok(Event::Key(key)) if key.kind != KeyEventKind::Release => {
-                    if input_tx.send(Event::Key(key)).is_err() {
+                    if input_tx.send((read_at, Event::Key(key))).is_err() {
                         return;
                     }
                 }
                 Ok(event @ (Event::Mouse(_) | Event::Paste(_) | Event::Resize(_, _))) => {
-                    if input_tx.send(event).is_err() {
+                    if input_tx.send((read_at, event)).is_err() {
                         return;
                     }
                 }
@@ -489,11 +510,16 @@ async fn main() -> Result<()> {
     redraw.request();
     let mut next_animation = tokio::time::Instant::now();
     let mut next_draft_tick = tokio::time::Instant::now();
+    let mut startup_input_cutoff: Option<Instant> = None;
+    let mut startup_enter_armed = true;
     loop {
         // Owner and modal changes can arrive through any branch, so capture them
         // before painting rather than only after the next key press.
         observe_drafts(&app, &mut drafts);
+        observe_startup_draft(&mut app, &drafts);
         if surface_draft_error(&mut app, &mut drafts) {
+            // A failed background save is reported in the normal UI, not as a
+            // terminal startup failure.
             redraw.request();
         }
         if redraw.take_due(std::time::Instant::now()) {
@@ -591,13 +617,17 @@ async fn main() -> Result<()> {
                         redraw.request();
                     }
                 }
+                observe_startup_draft(&mut app, &drafts);
                 if surface_draft_error(&mut app, &mut drafts) {
+                    // A failed save must not make the startup checklist look
+                    // terminal; draft loads still drive the local check above.
                     redraw.request();
                 }
             }
             Some(snapshot) = snapshot_rx.recv() => {
                 app.thread_loading = false;
                 app.apply_snapshot(snapshot);
+                app.observe_startup_snapshot();
                 app.advance_search_jump();
                 redraw.request();
                 if app.selected != last_visible {
@@ -612,6 +642,7 @@ async fn main() -> Result<()> {
             Some(state) = status_rx.recv() => {
                 app.connection = state.label().to_owned();
                 app.connection_state = state;
+                app.observe_startup_connection(state);
                 redraw.request();
                 if app.is_animating() { next_animation = tokio::time::Instant::now() + Duration::from_millis(33); }
             }
@@ -744,7 +775,31 @@ async fn main() -> Result<()> {
                 });
                 redraw.request();
             },
-            Some(input) = input_rx.recv() => {
+            Some((read_at, input)) = input_rx.recv() => {
+                if let Some(cutoff) = startup_input_cutoff {
+                    if read_at <= cutoff {
+                        redraw.request();
+                        continue;
+                    }
+                    startup_input_cutoff = None;
+                }
+                if !startup_enter_armed && !app.startup.overlay_visible() {
+                    match &input {
+                        Event::Key(key)
+                            if key.code == KeyCode::Enter
+                                || key.kind == KeyEventKind::Repeat =>
+                        {
+                            redraw.request();
+                            continue;
+                        }
+                        Event::Key(_) | Event::Paste(_) | Event::Mouse(_) => {
+                            // Require one deliberate non-Enter event after Open
+                            // Bloom before Enter can submit a restored draft.
+                            startup_enter_armed = true;
+                        }
+                        _ => {}
+                    }
+                }
                 // Keep vertical cursor motion and mouse placement aligned with the
                 // responsive composer width currently on screen.
                 let size = terminal.size()?;
@@ -787,6 +842,15 @@ async fn main() -> Result<()> {
                         )
                         .await;
                         break;
+                    }
+                    bloom_tui::app::Action::SendMessage { .. } if !app.outbound_allowed() => {
+                        app.refuse_outbound();
+                    }
+                    bloom_tui::app::Action::StartConversation { .. } if !app.outbound_allowed() => {
+                        app.refuse_outbound();
+                    }
+                    bloom_tui::app::Action::SendAttachment { .. } if !app.outbound_allowed() => {
+                        app.refuse_outbound();
                     }
                     bloom_tui::app::Action::SendMessage { attempt, conversation, body } => {
                         let target = Some(conversation.clone());
@@ -863,6 +927,38 @@ async fn main() -> Result<()> {
                                 .await
                                 .map_err(|error| sync_failure_message(&error));
                             let _ = tx.send(result);
+                        });
+                    }
+                    bloom_tui::app::Action::OpenBloom => {
+                        if app.open_bloom() {
+                            // Events already read from the terminal before this
+                            // confirmation must not become composer commands. Stamp
+                            // a read-time cutoff instead of draining the channel:
+                            // a drain would also eat keys the user pressed immediately
+                            // after the screen changed.
+                            startup_input_cutoff = Some(Instant::now());
+                            startup_enter_armed = false;
+                        }
+                    }
+                    bloom_tui::app::Action::RetryStartup => {
+                        app.begin_startup_retry();
+                        let client = client.clone();
+                        let events = event_tx.clone();
+                        let snapshots = snapshot_tx.clone();
+                        let sync_tx = sync_tx.clone();
+                        let selected = app.selected.clone();
+                        tokio::spawn(async move {
+                            let sync_result = client
+                                .sync_conversations()
+                                .await
+                                .map_err(|error| sync_failure_message(&error));
+                            let _ = sync_tx.send(sync_result);
+                            if let Ok(readiness) = client.readiness().await {
+                                let _ = events.send(EventKind::Readiness { snapshot: readiness });
+                            }
+                            if let Ok(snapshot) = daemon::snapshot(&client, selected).await {
+                                let _ = snapshots.send(snapshot);
+                            }
                         });
                     }
                     bloom_tui::app::Action::None => {}

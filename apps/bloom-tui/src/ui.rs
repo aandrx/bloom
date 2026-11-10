@@ -2,6 +2,7 @@ use crate::app::{
     conversation_subtitle, message_text, status_text, status_tone, timestamp, App, ComposerPrompt,
     Focus, SearchParticipantCandidate, SearchState, StatusTone, Theme, SEARCH_RESULT_LIMIT,
 };
+use crate::startup::CHECK_LABELS;
 
 use bloom_domain::{Conversation, ConversationId, DeliveryState, HandleKind, Message, MessageId};
 use bloom_ipc::ParticipantFilter;
@@ -2621,6 +2622,148 @@ fn transcript_window(
     (lines, relative_scroll as u16)
 }
 
+fn startup_spinner(app: &App) -> &'static str {
+    if app.startup.retrying() {
+        return spinner_frame(app.frame);
+    }
+    if app.startup.can_confirm() {
+        return "✓";
+    }
+    if app.startup.failure().is_some() {
+        return "!";
+    }
+    spinner_frame(app.frame)
+}
+
+fn render_startup(frame: &mut Frame<'_>, app: &App, area: Rect, palette: Palette) -> HitMap {
+    let hits = HitMap::default();
+    let width = area.width.min(72);
+    let height = area.height.min(20);
+    let card = Rect::new(
+        area.x.saturating_add(area.width.saturating_sub(width) / 2),
+        area.y
+            .saturating_add(area.height.saturating_sub(height) / 2),
+        width,
+        height,
+    );
+    frame.render_widget(Clear, card);
+    frame.render_widget(
+        Block::default()
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(palette.rule))
+            .style(Style::default().bg(palette.surface).fg(palette.text)),
+        card,
+    );
+    let content = card.inner(Margin {
+        vertical: 1,
+        horizontal: 2,
+    });
+    if content.width == 0 || content.height == 0 {
+        return hits;
+    }
+    let checks = app.startup.checks();
+    let compact = content.height < 16;
+    let mut lines: Vec<Line<'static>> = Vec::new();
+    lines.push(Line::from(Span::styled(
+        "Preparing Bloom",
+        Style::default()
+            .fg(palette.cyan)
+            .add_modifier(Modifier::BOLD),
+    )));
+    lines.push(Line::from(format!(
+        "{}  {}/5 checks · {} records",
+        startup_spinner(app),
+        app.startup.completed_checks(),
+        app.startup.observed_records()
+    )));
+    if compact {
+        if let Some(failure) = app.startup.failure() {
+            lines.push(Line::from(Span::styled(
+                failure.message(),
+                Style::default().fg(palette.red),
+            )));
+            lines.push(Line::from("Retry (r)    Quit (q)"));
+        } else {
+            for (label, done) in CHECK_LABELS.iter().zip(checks) {
+                let marker = if done { "✓" } else { "○" };
+                let style = if done {
+                    Style::default().fg(palette.green)
+                } else {
+                    Style::default().fg(palette.muted)
+                };
+                lines.push(Line::from(vec![
+                    Span::styled(format!("{marker} "), style),
+                    Span::styled((*label).to_owned(), style),
+                ]));
+            }
+            if app.startup.can_confirm() {
+                lines.push(Line::from(Span::styled(
+                    "Open Bloom (Enter)",
+                    Style::default()
+                        .fg(palette.cyan)
+                        .add_modifier(Modifier::BOLD),
+                )));
+            }
+        }
+    } else {
+        lines.push(Line::from(""));
+        for (label, done) in CHECK_LABELS.iter().zip(checks) {
+            let marker = if done { "✓" } else { "○" };
+            let style = if done {
+                Style::default().fg(palette.green)
+            } else {
+                Style::default().fg(palette.muted)
+            };
+            lines.push(Line::from(vec![
+                Span::styled(format!("{marker} "), style),
+                Span::styled((*label).to_owned(), style),
+            ]));
+        }
+        lines.push(Line::from(""));
+        lines.push(Line::from(format!(
+            "Observed metadata records: {}",
+            app.startup.observed_records()
+        )));
+        if let Some(failure) = app.startup.failure() {
+            lines.push(Line::from(""));
+            lines.push(Line::from(Span::styled(
+                failure.message(),
+                Style::default().fg(palette.red),
+            )));
+            lines.push(Line::from(""));
+            lines.push(Line::from("Retry (r)    Quit (q)"));
+        } else if app.startup.can_confirm() {
+            lines.push(Line::from(""));
+            lines.push(Line::from("Your initial list is persisted locally."));
+            lines.push(Line::from(
+                "This makes the local view ready; it is not a fully synced account.",
+            ));
+            lines.push(Line::from(""));
+            lines.push(Line::from(Span::styled(
+                "Open Bloom (Enter)",
+                Style::default()
+                    .fg(palette.cyan)
+                    .add_modifier(Modifier::BOLD),
+            )));
+        } else {
+            lines.push(Line::from(""));
+            lines.push(Line::from(
+                "Your initial list is being persisted locally. This is the local view, not a fully synced account.",
+            ));
+            lines.push(Line::from(
+                "No key skips this checklist. Quit with q or Ctrl+C.",
+            ));
+        }
+    }
+    frame.render_widget(
+        Paragraph::new(lines)
+            .style(Style::default().bg(palette.surface).fg(palette.text))
+            .wrap(Wrap { trim: true }),
+        content,
+    );
+    hits
+}
+
 pub fn render(frame: &mut Frame<'_>, app: &App) -> HitMap {
     render_with_mode(frame, app, monochrome())
 }
@@ -2665,6 +2808,9 @@ fn render_cached_with_mode(
         area,
     );
     let inner = area;
+    if app.startup.overlay_visible() {
+        return render_startup(frame, app, area, palette);
+    }
     if app.chat_drawer.is_some() {
         return render_chat_drawer(frame, app, inner, palette);
     }

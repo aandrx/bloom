@@ -167,6 +167,13 @@ pub async fn pump_session(
     snapshots: &mpsc::UnboundedSender<Snapshot>,
     status: &mpsc::UnboundedSender<ConnectionState>,
 ) -> Result<(), ClientError> {
+    // Report authoritative readiness before the first local snapshot. The
+    // snapshot is still read independently: a daemon that is ready before this
+    // client connects must not bypass the client-side bootstrap barrier.
+    let readiness = client.readiness().await?;
+    let _ = events.send(EventKind::Readiness {
+        snapshot: readiness,
+    });
     pump_session_with_interval(
         client,
         visible,

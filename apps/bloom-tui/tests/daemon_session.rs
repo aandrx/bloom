@@ -10,8 +10,10 @@ use bloom_ipc::{
     DraftKey, DraftWriteOutcome, DurableDraft, Event, EventKind, ProtocolError, ReadinessOutcome,
     ReadinessPhase, ReadinessSnapshot, RequestKind, Response, ResponseKind,
 };
-use bloom_tui::daemon::{
-    pump_session, pump_session_with_interval, snapshot, ConnectionState, Snapshot,
+use bloom_tui::{
+    app::App,
+    daemon::{pump_session, pump_session_with_interval, snapshot, ConnectionState, Snapshot},
+    startup::StartupState,
 };
 use std::{
     fs,
@@ -753,6 +755,123 @@ async fn live_events_are_not_blocked_by_a_slow_history_reconciliation() {
 }
 
 #[tokio::test]
+async fn a_second_tui_completes_its_own_readiness_and_snapshot() {
+    let daemon = FakeDaemon::start(false);
+    let client_a = bloom_ipc::client::BloomClient::new(daemon.socket());
+    let client_b = bloom_ipc::client::BloomClient::new(daemon.socket());
+    let (_visible_a, visible_a) = watch::channel::<Option<ConversationId>>(None);
+    let (_visible_b, visible_b) = watch::channel::<Option<ConversationId>>(None);
+    let (events_a, mut event_a) = mpsc::unbounded_channel::<EventKind>();
+    let (events_b, mut event_b) = mpsc::unbounded_channel::<EventKind>();
+    let (snapshots_a, mut snapshot_a) = mpsc::unbounded_channel::<Snapshot>();
+    let (snapshots_b, mut snapshot_b) = mpsc::unbounded_channel::<Snapshot>();
+    let (status_tx_a, mut status_a) = mpsc::unbounded_channel::<ConnectionState>();
+    let (status_tx_b, mut status_b) = mpsc::unbounded_channel::<ConnectionState>();
+    let session_a = tokio::spawn(async move {
+        pump_session(&client_a, visible_a, &events_a, &snapshots_a, &status_tx_a).await
+    });
+    let session_b = tokio::spawn(async move {
+        pump_session(&client_b, visible_b, &events_b, &snapshots_b, &status_tx_b).await
+    });
+
+    let readiness_a = loop {
+        if let EventKind::Readiness { snapshot } = event_a.recv().await.unwrap() {
+            break snapshot;
+        }
+    };
+    let readiness_b = loop {
+        if let EventKind::Readiness { snapshot } = event_b.recv().await.unwrap() {
+            break snapshot;
+        }
+    };
+    let first = next_snapshot(&mut snapshot_a).await;
+    let second = next_snapshot(&mut snapshot_b).await;
+    wait_for_status(&mut status_a, ConnectionState::Connected).await;
+    wait_for_status(&mut status_b, ConnectionState::Connected).await;
+
+    let mut app = App {
+        startup: StartupState::loading(),
+        ..Default::default()
+    };
+    app.observe_startup_connection(ConnectionState::Connected);
+    app.observe_startup_readiness(readiness_a);
+    app.apply_snapshot(first);
+    app.observe_startup_draft_ready();
+    assert!(app.startup.can_confirm());
+    let mut second_app = App {
+        startup: StartupState::loading(),
+        ..Default::default()
+    };
+    second_app.observe_startup_connection(ConnectionState::Connected);
+    second_app.observe_startup_readiness(readiness_b);
+    second_app.apply_snapshot(second);
+    second_app.observe_startup_draft_ready();
+    assert!(
+        second_app.startup.can_confirm(),
+        "second TUI must finish its own snapshot"
+    );
+    let lists = daemon
+        .timeline()
+        .iter()
+        .filter(|entry| entry.as_str() == "list:start")
+        .count();
+    assert!(
+        lists >= 2,
+        "each TUI reads its own local list: {:?}",
+        daemon.timeline()
+    );
+    assert!(
+        !daemon.timeline().iter().any(|entry| entry.contains("sync")),
+        "the TUI must not trigger an engine listing"
+    );
+    session_a.abort();
+    session_b.abort();
+}
+
+#[tokio::test]
+async fn startup_readiness_is_reported_before_the_client_snapshot() {
+    let daemon = FakeDaemon::start(false);
+    let client = bloom_ipc::client::BloomClient::new(daemon.socket());
+
+    let (_visible_tx, visible_rx) = watch::channel::<Option<ConversationId>>(None);
+    let (event_tx, mut event_rx) = mpsc::unbounded_channel::<EventKind>();
+    let (snapshot_tx, mut snapshot_rx) = mpsc::unbounded_channel::<Snapshot>();
+    let (status_tx, mut status_rx) = mpsc::unbounded_channel::<ConnectionState>();
+    let session = {
+        let client = client.clone();
+        tokio::spawn(async move {
+            pump_session(&client, visible_rx, &event_tx, &snapshot_tx, &status_tx).await
+        })
+    };
+
+    let readiness = tokio::time::timeout(Duration::from_secs(2), event_rx.recv())
+        .await
+        .expect("readiness event arrives")
+        .expect("event channel open");
+    let EventKind::Readiness {
+        snapshot: readiness,
+    } = readiness
+    else {
+        panic!("expected readiness before the first snapshot");
+    };
+    let initial = next_snapshot(&mut snapshot_rx).await;
+    wait_for_status(&mut status_rx, ConnectionState::Connected).await;
+
+    let mut app = App {
+        startup: StartupState::loading(),
+        ..Default::default()
+    };
+    app.observe_startup_connection(ConnectionState::Connected);
+    app.observe_startup_readiness(readiness);
+    app.apply_snapshot(initial);
+    app.observe_startup_draft_ready();
+    assert!(app.startup.can_confirm());
+    assert!(app.open_bloom());
+    assert!(app.startup.opened());
+    session.abort();
+}
+
+#[tokio::test]
 async fn session_snapshots_events_and_resyncs_the_selected_thread() {
     let daemon = FakeDaemon::start(false);
     let client = bloom_ipc::client::BloomClient::new(daemon.socket());
@@ -794,10 +913,16 @@ async fn session_snapshots_events_and_resyncs_the_selected_thread() {
             push_sequence: None,
         },
     });
-    let event = tokio::time::timeout(Duration::from_secs(5), event_rx.recv())
-        .await
-        .expect("an event arrives")
-        .expect("event channel open");
+    let event = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let event = event_rx.recv().await.expect("event channel open");
+            if !matches!(event, EventKind::Readiness { .. }) {
+                break event;
+            }
+        }
+    })
+    .await
+    .expect("an event arrives");
     match event {
         EventKind::Message { message, .. } => {
             assert_eq!(message.parts(), &[MessagePart::Text("live".into())])

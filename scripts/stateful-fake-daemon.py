@@ -726,6 +726,21 @@ def serve(client, args, state):
                                 write(client, {"request_id": request_id, "response": response})
                                 continue
                             response = {"result": "search_results", "hits": hits}
+                        elif op == "readiness":
+                            response = {
+                                "result": "readiness",
+                                "snapshot": {
+                                    "generation": 1,
+                                    "operation": 1,
+                                    "revision": 1,
+                                    "phase": "ready",
+                                    "outcome": "complete",
+                                    "observed_records": len(state["conversations"]),
+                                    "can_send": True,
+                                    "engine_ready": True,
+                                    "bounded_error": None,
+                                },
+                            }
                         elif op == "sync_conversations":
                             response = {"result": "conversation_sync", "status": "complete", "conversations": len(state["conversations"])}
                         else:

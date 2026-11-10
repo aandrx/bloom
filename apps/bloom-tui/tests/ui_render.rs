@@ -8,7 +8,11 @@ use bloom_domain::{
     AttachmentRef, Conversation, ConversationId, ConversationKind, DeliveryState, Handle,
     HandleKind, Message, MessageId, MessagePart, Participant, Reaction, TransportId,
 };
-use bloom_ipc::{MessageSearchHit, ParticipantFilter};
+use bloom_ipc::{
+    MessageSearchHit, ParticipantFilter, ReadinessError, ReadinessOutcome, ReadinessPhase,
+    ReadinessSnapshot,
+};
+use bloom_tui::startup::StartupState;
 use bloom_tui::{
     app::{
         message_text, Action, App, Focus, SendFeedback, SendPhase, Theme, OLDER_PAGE_LIMIT,
@@ -5471,4 +5475,61 @@ fn keyboard_selection_reveals_the_selected_chat() {
         app.sidebar_scroll, 13,
         "selection below the window scrolls it into view"
     );
+}
+
+#[test]
+fn startup_checklist_is_the_only_surface_until_all_five_checks_pass() {
+    let mut app = App {
+        startup: StartupState::loading(),
+        connection_state: ConnectionState::Connecting,
+        ..Default::default()
+    };
+    let text = rendered(&app);
+    assert!(text.contains("0/5 checks"), "{text}");
+    assert!(text.contains("Daemon connected"));
+    assert!(text.contains("Engine ready"));
+    assert!(text.contains("Metadata refresh"));
+    assert!(text.contains("Persistence acknowledged"));
+    assert!(text.contains("Local view and draft"));
+    assert!(text.contains("not a fully synced account"));
+    assert!(!text.contains("Open Bloom"));
+    assert!(!text.contains('%'));
+
+    app.observe_startup_connection(ConnectionState::Connected);
+    app.observe_startup_readiness(ReadinessSnapshot {
+        generation: 1,
+        operation: 1,
+        revision: 1,
+        phase: ReadinessPhase::Ready,
+        outcome: Some(ReadinessOutcome::Complete),
+        observed_records: 12,
+        can_send: true,
+        engine_ready: true,
+        bounded_error: None,
+    });
+    app.observe_startup_snapshot();
+    app.observe_startup_draft_ready();
+    let ready = rendered(&app);
+    assert!(ready.contains("5/5 checks"), "{ready}");
+    assert!(ready.contains("Observed metadata records: 12"));
+    assert!(ready.contains("Your initial list is persisted locally."));
+    assert!(ready.contains("not a fully synced account"));
+    assert!(ready.contains("Open Bloom (Enter)"));
+
+    app.observe_startup_readiness(ReadinessSnapshot {
+        generation: 1,
+        operation: 2,
+        revision: 2,
+        phase: ReadinessPhase::Failed,
+        outcome: Some(ReadinessOutcome::Failed),
+        observed_records: 0,
+        can_send: false,
+        engine_ready: true,
+        bounded_error: Some(ReadinessError::Timeout),
+    });
+    let failed = rendered(&app);
+    assert!(failed.contains("timed out"), "{failed}");
+    assert!(failed.contains("Retry (r)"));
+    assert!(failed.contains("Quit (q)"));
+    assert!(!failed.contains("Open Bloom"));
 }

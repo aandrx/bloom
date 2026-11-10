@@ -3,6 +3,7 @@
 use crate::composer::wrap_draft;
 use crate::daemon::{ConnectionState, Snapshot, HISTORY_LIMIT};
 use crate::drafts::DraftMap;
+use crate::startup::{StartupFailure, StartupState};
 use crate::ui::{Hit, HitMap};
 use bloom_domain::{
     Conversation, ConversationId, ConversationKind, Handle, HandleKind, Message, MessageId,
@@ -62,6 +63,8 @@ pub enum Action {
         conversation: ConversationId,
         path: String,
     },
+    OpenBloom,
+    RetryStartup,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -447,6 +450,7 @@ pub struct App {
     pub session: String,
     /// True while inbound activity indicates the daemon is catching up on messages.
     pub syncing: bool,
+    pub startup: StartupState,
     pub draft: String,
     /// Pasted body text is literal even when it starts with a command prefix.
     pub pasted_body: bool,
@@ -716,6 +720,7 @@ impl Default for App {
             thread_loading: false,
             session: String::new(),
             syncing: false,
+            startup: StartupState::default(),
             draft: String::new(),
             pasted_body: false,
             draft_uncertain: false,
@@ -786,6 +791,7 @@ impl App {
             ConnectionState::Connecting | ConnectionState::Disconnected
         ) || !matches!(self.session.as_str(), "" | "Active")
             || self.syncing
+            || self.startup.overlay_visible()
             || self.sync_in_flight
             || self.thread_loading
             || self.messages.values().flatten().any(|message| {
@@ -802,6 +808,68 @@ impl App {
         self.syncing = syncing;
     }
 
+    /// Outbound admission is intentionally narrower than "the daemon is up".
+    /// Startup must be explicitly opened for this client and a manual sync must
+    /// not be in flight.
+    pub fn outbound_allowed(&self) -> bool {
+        self.startup.can_send() && !self.sync_in_flight
+    }
+
+    pub fn refuse_outbound(&mut self) {
+        self.error = None;
+        self.notice = Some(if self.sync_in_flight {
+            "A conversation-list sync is in progress. Nothing was sent.".into()
+        } else {
+            "Bloom is still preparing. Nothing was sent.".into()
+        });
+    }
+
+    pub fn observe_startup_connection(&mut self, state: ConnectionState) {
+        self.startup.observe_connection(state);
+    }
+
+    pub fn observe_startup_readiness(&mut self, snapshot: bloom_ipc::ReadinessSnapshot) {
+        self.startup.observe_readiness(snapshot);
+    }
+
+    pub fn observe_startup_snapshot(&mut self) {
+        self.startup.observe_snapshot();
+    }
+
+    pub fn observe_startup_draft_ready(&mut self) {
+        self.startup.observe_draft_ready();
+    }
+
+    pub fn begin_startup_retry(&mut self) {
+        self.startup.begin_retry();
+    }
+
+    pub fn fail_startup_local(&mut self, failure: StartupFailure) {
+        self.startup.fail_local(failure);
+    }
+
+    pub fn open_bloom(&mut self) -> bool {
+        self.startup.confirm_open()
+    }
+
+    fn startup_key(&mut self, key: KeyEvent) -> Action {
+        if key.code == KeyCode::Char('q')
+            || (key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL))
+        {
+            return Action::Quit;
+        }
+        if self.startup.failure().is_some() {
+            if key.code == KeyCode::Char('r') || key.code == KeyCode::Enter {
+                return Action::RetryStartup;
+            }
+            return Action::None;
+        }
+        if self.startup.can_confirm() && matches!(key.code, KeyCode::Enter | KeyCode::Char(' ')) {
+            return Action::OpenBloom;
+        }
+        Action::None
+    }
+
     /// Apply a store snapshot only if its read began after our newest state.
     /// History is then replaced, not merged, because the store is authoritative.
     pub fn apply_snapshot(&mut self, snapshot: Snapshot) {
@@ -809,6 +877,7 @@ impl App {
             return;
         }
         self.latest_snapshot_revision = snapshot.revision;
+        self.startup.observe_snapshot();
         if let Some(id) = snapshot.visible.clone() {
             // Carry paged state across an identity alias before merging. The
             // snapshot names the canonical conversation while the cached messages and
@@ -1118,6 +1187,9 @@ impl App {
     pub fn select(&mut self, id: Option<ConversationId>) {
         if self.selected != id {
             // Changing threads retires any exact-context lookup and its reply.
+            if !self.startup.opened() {
+                self.startup.reset_draft_readiness();
+            }
             self.clear_search_context();
             self.abandon_search_jump();
             self.older_requested = false;
@@ -2653,6 +2725,10 @@ impl App {
     }
 
     pub fn begin_new_conversation(&mut self) {
+        if !self.outbound_allowed() {
+            self.refuse_outbound();
+            return;
+        }
         self.close_preferences();
         if self.contacts_open {
             self.close_contacts();
@@ -3841,6 +3917,10 @@ impl App {
             ["/attachment"] => self.begin_attachment_picker(),
             ["/open"] => self.begin_attachment_fetch(true),
             ["/new"] => {
+                if !self.outbound_allowed() {
+                    self.refuse_outbound();
+                    return;
+                }
                 self.error = None;
                 self.retire_active_draft();
                 self.begin_new_conversation();
@@ -3873,6 +3953,10 @@ impl App {
     }
 
     fn execute_attach_command(&mut self) {
+        if !self.outbound_allowed() {
+            self.refuse_outbound();
+            return;
+        }
         let path = self
             .draft
             .strip_prefix("/attach")
@@ -3914,6 +3998,11 @@ impl App {
     }
 
     fn take_pending_action(&mut self) -> Action {
+        if !self.outbound_allowed() && self.pending_attachment_send.is_some() {
+            self.pending_attachment_send = None;
+            self.attachment_send_in_flight = None;
+            self.refuse_outbound();
+        }
         if let Some((conversation, path)) = self.pending_attachment_send.take() {
             Action::SendAttachment { conversation, path }
         } else if let Some(token) = self.pending_attachment.take() {
@@ -4122,6 +4211,14 @@ impl App {
         self.sync_in_flight = false;
         self.error = None;
         self.notice = None;
+        let startup_failed = matches!(
+            &result,
+            Err(_)
+                | Ok((
+                    ConversationSyncStatus::Failed | ConversationSyncStatus::Limited,
+                    _
+                ))
+        );
         match result {
             Ok((ConversationSyncStatus::Complete, count)) => {
                 self.notice = Some(format!("Sync complete: {count} conversations listed."));
@@ -4137,6 +4234,9 @@ impl App {
                 ));
             }
             Err(message) => self.error = Some(message),
+        }
+        if self.startup.retrying() && startup_failed {
+            self.startup.fail_local(StartupFailure::Failed);
         }
     }
 
@@ -4217,6 +4317,9 @@ impl App {
 
     /// Paste is data, never keystrokes or a command. Non-editable overlays own input.
     pub fn paste(&mut self, input: &str) {
+        if self.startup.overlay_visible() {
+            return;
+        }
         if let Some(drawer) = self.chat_drawer.as_mut() {
             drawer
                 .query
@@ -4294,6 +4397,9 @@ impl App {
     }
 
     pub fn handle_key(&mut self, key: KeyEvent) -> Action {
+        if self.startup.overlay_visible() {
+            return self.startup_key(key);
+        }
         if self.chat_drawer.is_some() {
             self.drawer_key(key);
             return Action::None;
@@ -4772,6 +4878,10 @@ impl App {
                     if self.draft.trim().is_empty() {
                         return Action::None;
                     }
+                    if !self.outbound_allowed() {
+                        self.refuse_outbound();
+                        return Action::None;
+                    }
                     let action = match self.submit_intent() {
                         CompositionIntent::None => Action::None,
                         CompositionIntent::SendMessage(body) => {
@@ -4971,6 +5081,9 @@ impl App {
         row: u16,
         hits: &HitMap,
     ) -> Action {
+        if self.startup.overlay_visible() {
+            return Action::None;
+        }
         // A wheel notch moves a few rows, the way a terminal usually scrolls.
         const WHEEL_ROWS: usize = 3;
         if self.chat_drawer.is_some() {
@@ -5702,7 +5815,10 @@ impl App {
             EventKind::ConversationsChanged => {
                 self.latest_conversations_revision = revision;
             }
-            EventKind::Session { .. } | EventKind::Readiness { .. } => {}
+            EventKind::Session { .. } => {}
+            EventKind::Readiness { snapshot } => {
+                self.startup.observe_readiness(snapshot.clone());
+            }
         }
         match event {
             EventKind::Message {
