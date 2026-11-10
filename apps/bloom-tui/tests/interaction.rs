@@ -191,6 +191,24 @@ fn slash_picker_draft_stays_with_its_chat_after_sidebar_switching() {
 }
 
 #[test]
+fn exit_and_quit_commands_request_the_generic_quit_path() {
+    for command in ["/exit", "/quit"] {
+        let mut app = App {
+            draft: command.into(),
+            ..Default::default()
+        };
+        assert_eq!(
+            app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+            Action::Quit,
+            "{command} must use the generic quit action"
+        );
+    }
+    let suggestions = App::default().command_suggestions();
+    assert!(suggestions.iter().any(|(name, _)| *name == "/exit"));
+    assert!(suggestions.iter().any(|(name, _)| *name == "/quit"));
+}
+
+#[test]
 fn sync_command_returns_an_action_and_reports_truthful_outcomes() {
     use bloom_ipc::ConversationSyncStatus;
 
