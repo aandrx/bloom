@@ -448,8 +448,10 @@ async fn main() -> Result<()> {
     let (bootstrap_fail_tx, mut bootstrap_fail_rx) = mpsc::unbounded_channel::<BootstrapTicket>();
     // A retry's readiness fetch is the only thing that can schedule its bootstrap
     // read, so its result must reach the loop even when it fails.
-    let (retry_readiness_tx, mut retry_readiness_rx) =
-        mpsc::unbounded_channel::<Result<ReadinessSnapshot, ClientError>>();
+    let (retry_readiness_tx, mut retry_readiness_rx) = mpsc::unbounded_channel::<(
+        bloom_tui::startup::RetryToken,
+        Result<ReadinessSnapshot, ClientError>,
+    )>();
     let (status_tx, mut status_rx) = mpsc::unbounded_channel::<ConnectionState>();
     let (send_tx, mut send_rx) = mpsc::unbounded_channel::<(
         u64,
@@ -700,10 +702,11 @@ async fn main() -> Result<()> {
                 app.fail_startup_bootstrap(ticket);
                 redraw.request();
             }
-            Some(result) = retry_readiness_rx.recv() => {
+            Some((token, result)) = retry_readiness_rx.recv() => {
                 // A failed fetch becomes a bounded startup failure and drops any
-                // ticket, so the overlay offers Retry instead of stalling.
-                if app.startup.observe_retry_readiness(result) {
+                // ticket, so the overlay offers Retry instead of stalling. A
+                // reply from a retired attempt or connection is inert.
+                if app.startup.observe_retry_readiness(token, result) {
                     // The retry's readiness fetch is what schedules its bootstrap
                     // read, so launch it here: the event and snapshot paths may
                     // already have run before this result arrived, and with no
@@ -1065,7 +1068,7 @@ async fn main() -> Result<()> {
                         }
                     }
                     bloom_tui::app::Action::RetryStartup => {
-                        app.begin_startup_retry();
+                        let retry_token = app.begin_startup_retry();
                         let client = client.clone();
                         let snapshots = snapshot_tx.clone();
                         let failures = snapshot_fail_tx.clone();
@@ -1082,7 +1085,7 @@ async fn main() -> Result<()> {
                             // Forward the fetch result either way: a silent error
                             // would leave no readiness identity and therefore no
                             // bootstrap ticket, wedging the checklist.
-                            let _ = readiness.send(client.readiness().await);
+                            let _ = readiness.send((retry_token, client.readiness().await));
                             match daemon::snapshot(&client, request).await {
                                 Ok(snapshot) => {
                                     let _ = snapshots.send(SnapshotNotice::Completed(snapshot));

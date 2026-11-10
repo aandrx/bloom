@@ -73,6 +73,15 @@ pub struct BootstrapTicket {
     pub readiness: ReadinessIdentity,
 }
 
+/// A client-local token for the readiness fetch a startup retry dispatched. It
+/// ties the reply to the startup attempt and connection epoch that issued it, so
+/// a stalled fetch cannot apply or fail a session that already recovered.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RetryToken {
+    pub attempt: u64,
+    pub epoch: u64,
+}
+
 /// One client startup session. `opened` is only set after an explicit Open Bloom
 /// confirmation; it never follows automatically from a readiness packet.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -97,6 +106,9 @@ pub struct StartupState {
     bootstrap_in_flight: Option<BootstrapTicket>,
     /// A rejected ticketed read gets at most one replacement.
     bootstrap_replacement_used: bool,
+    /// Connection epoch. A lost connection retires every retry token issued on
+    /// the old one, so a reply from a retired connection is inert.
+    connection_epoch: u64,
 }
 
 impl Default for StartupState {
@@ -137,6 +149,7 @@ impl StartupState {
             bootstrap_pending: None,
             bootstrap_in_flight: None,
             bootstrap_replacement_used: false,
+            connection_epoch: 0,
         }
     }
 
@@ -169,6 +182,7 @@ impl StartupState {
             bootstrap_pending: None,
             bootstrap_in_flight: None,
             bootstrap_replacement_used: false,
+            connection_epoch: 0,
         }
     }
 
@@ -261,6 +275,7 @@ impl StartupState {
             }
             ConnectionState::Disconnected => {
                 self.connected = false;
+                self.connection_epoch = self.connection_epoch.wrapping_add(1);
                 self.opened = false;
                 self.snapshot_ready = false;
                 self.draft_ready = false;
@@ -341,7 +356,10 @@ impl StartupState {
         }
     }
 
-    pub fn begin_retry(&mut self) {
+    /// Start a retry and issue the token its readiness fetch must present. Any
+    /// later retry, disconnect, or readiness identity change advances the
+    /// attempt or epoch and makes this token stale.
+    pub fn begin_retry(&mut self) -> RetryToken {
         self.invalidate_bootstrap();
         self.bootstrap_readiness = None;
         self.failure = None;
@@ -350,6 +368,10 @@ impl StartupState {
         self.snapshot_ready = false;
         self.draft_ready = false;
         self.draft_owner = None;
+        RetryToken {
+            attempt: self.bootstrap_attempt,
+            epoch: self.connection_epoch,
+        }
     }
 
     pub fn fail_local(&mut self, failure: StartupFailure) {
@@ -366,10 +388,18 @@ impl StartupState {
     /// local failure: without a readiness packet no bootstrap read is ever
     /// scheduled, so ignoring the error would wedge the checklist. The failure
     /// also drops any pending or in-flight ticket from the retry.
+    ///
+    /// Both outcomes are inert unless the token still matches the current
+    /// attempt and connection epoch. A fetch that stalled across a reconnect
+    /// must not close a session that already recovered or drop its ticket.
     pub fn observe_retry_readiness(
         &mut self,
+        token: RetryToken,
         result: Result<ReadinessSnapshot, ClientError>,
     ) -> bool {
+        if token.attempt != self.bootstrap_attempt || token.epoch != self.connection_epoch {
+            return false;
+        }
         match result {
             Ok(snapshot) => {
                 self.observe_readiness(snapshot);
@@ -636,10 +666,10 @@ mod tests {
     #[test]
     fn failed_retry_readiness_surfaces_a_bounded_failure_and_leaves_no_ticket() {
         let mut startup = StartupState::ready_for_tests();
-        startup.begin_retry();
+        let token = startup.begin_retry();
         assert!(startup.retrying());
 
-        assert!(!startup.observe_retry_readiness(Err(ClientError::Timeout)));
+        assert!(!startup.observe_retry_readiness(token, Err(ClientError::Timeout)));
         assert_eq!(startup.failure(), Some(StartupFailure::Client));
         assert!(!startup.retrying(), "a failure must stop the spinner");
         assert!(!startup.is_loading());
@@ -663,15 +693,98 @@ mod tests {
     #[test]
     fn successful_retry_readiness_schedules_the_bootstrap_read() {
         let mut startup = StartupState::ready_for_tests();
-        startup.begin_retry();
-        assert!(startup.observe_retry_readiness(Ok(snapshot(
-            ReadinessPhase::Ready,
-            Some(ReadinessOutcome::Complete)
-        ))));
+        let token = startup.begin_retry();
+        assert!(startup.observe_retry_readiness(
+            token,
+            Ok(snapshot(
+                ReadinessPhase::Ready,
+                Some(ReadinessOutcome::Complete)
+            ))
+        ));
         assert_eq!(startup.failure(), None);
+        let ticket = startup
+            .take_pending_bootstrap()
+            .expect("the retry schedules one read");
+        assert!(
+            startup.take_pending_bootstrap().is_none(),
+            "the retry must schedule exactly one read"
+        );
+        assert!(startup.accept_bootstrap(ticket));
+        startup.observe_draft_ready(None);
+        assert!(startup.can_confirm());
+    }
+
+    #[test]
+    fn stale_retry_readiness_error_after_reconnect_leaves_the_recovered_session_intact() {
+        let mut startup = StartupState::ready_for_tests();
+        let stale = startup.begin_retry();
+
+        // The separate session reconnects and finishes startup while the retry
+        // fetch is still outstanding.
+        startup.observe_connection(ConnectionState::Disconnected);
+        startup.observe_connection(ConnectionState::Connected);
+        startup.observe_readiness(snapshot(
+            ReadinessPhase::Ready,
+            Some(ReadinessOutcome::Complete),
+        ));
+        assert!(startup.bootstrap_pending.is_some());
+
+        assert!(!startup.observe_retry_readiness(stale, Err(ClientError::Timeout)));
+        assert_eq!(startup.failure(), None, "a stale error cannot fail startup");
+        assert!(
+            !startup.retrying(),
+            "a stale error cannot re-arm the spinner"
+        );
+        assert!(
+            startup.bootstrap_pending.is_some(),
+            "a stale error must not retire the current ticket"
+        );
+
         complete_bootstrap(&mut startup);
         startup.observe_draft_ready(None);
         assert!(startup.can_confirm());
+    }
+
+    #[test]
+    fn stale_retry_readiness_success_is_ignored() {
+        let mut startup = StartupState::ready_for_tests();
+        let stale = startup.begin_retry();
+        startup.observe_connection(ConnectionState::Disconnected);
+        startup.observe_connection(ConnectionState::Connected);
+
+        let mut recovered = snapshot(ReadinessPhase::Ready, Some(ReadinessOutcome::Complete));
+        recovered.revision = 2;
+        startup.observe_readiness(recovered);
+        let ticket = startup.take_pending_bootstrap().expect("recovered read");
+
+        assert!(!startup.observe_retry_readiness(
+            stale,
+            Ok(snapshot(
+                ReadinessPhase::Ready,
+                Some(ReadinessOutcome::Complete)
+            ))
+        ));
+        assert!(startup.bootstrap_pending.is_none());
+        assert!(
+            startup.accept_bootstrap(ticket),
+            "a stale success must not disturb the current ticket"
+        );
+        startup.observe_draft_ready(None);
+        assert!(startup.can_confirm());
+    }
+
+    #[test]
+    fn retry_token_from_a_retired_epoch_is_inert_even_when_the_attempt_matches() {
+        let mut startup = StartupState::ready_for_tests();
+        let token = startup.begin_retry();
+        let retired = RetryToken {
+            attempt: startup.bootstrap_attempt,
+            epoch: token.epoch.wrapping_sub(1),
+        };
+
+        assert!(!startup.observe_retry_readiness(retired, Err(ClientError::Timeout)));
+        assert_eq!(startup.failure(), None);
+        assert!(startup.retrying());
     }
 
     #[test]

@@ -1151,8 +1151,8 @@ impl App {
         self.startup.fail_bootstrap(ticket)
     }
 
-    pub fn begin_startup_retry(&mut self) {
-        self.startup.begin_retry();
+    pub fn begin_startup_retry(&mut self) -> crate::startup::RetryToken {
+        self.startup.begin_retry()
     }
 
     pub fn fail_startup_local(&mut self, failure: StartupFailure) {
