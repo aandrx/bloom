@@ -662,6 +662,8 @@ fn drafts_follow_their_chat_even_when_a_snapshot_establishes_the_selection() {
     // An initial snapshot selects the first chat before any key is pressed; that
     // selection must still establish draft ownership.
     app.apply_snapshot(Snapshot {
+        token: None,
+        bootstrap: None,
         revision: 1,
         visible: Some(alice.id.clone()),
         conversations: vec![alice.clone(), bob.clone()],
@@ -2045,6 +2047,8 @@ fn following_the_newest_row_marks_read_but_reading_back_does_not() {
     app.select(Some(chat.id.clone()));
 
     app.apply_snapshot(Snapshot {
+        token: None,
+        bootstrap: None,
         revision: 1,
         conversations: vec![chat.clone()],
         visible: Some(chat.id.clone()),
@@ -2063,6 +2067,8 @@ fn following_the_newest_row_marks_read_but_reading_back_does_not() {
 
     app.scroll = 3;
     app.apply_snapshot(Snapshot {
+        token: None,
+        bootstrap: None,
         revision: 2,
         conversations: vec![chat.clone()],
         visible: Some(chat.id.clone()),
@@ -2079,6 +2085,8 @@ fn following_the_newest_row_marks_read_but_reading_back_does_not() {
     app.scroll = 0;
     app.help_open = true;
     app.apply_snapshot(Snapshot {
+        token: None,
+        bootstrap: None,
         revision: 3,
         conversations: vec![chat.clone()],
         visible: Some(chat.id.clone()),
@@ -2384,5 +2392,49 @@ fn persisted_read_position_survives_apply_read_positions_round_trip() {
     assert_eq!(
         reloaded.first_unread(&chat.id).map(Message::id),
         Some(rows[1].id())
+    );
+}
+
+#[test]
+fn transcript_rail_column_is_passive_and_keeps_wheel_scrolling() {
+    use bloom_tui::ui::HitMap;
+    use crossterm::event::{MouseButton, MouseEventKind};
+    use ratatui::layout::Rect;
+
+    let chat = conversation("Rail input", 2);
+    let mut app = App::default();
+    app.set_conversations(vec![chat.clone()]);
+    app.selected = Some(chat.id.clone());
+    app.messages.insert(
+        chat.id.clone(),
+        (0..20)
+            .map(|index| message(&chat, &format!("rail-input-{index:03}")))
+            .collect(),
+    );
+    let hits = HitMap {
+        transcript: Rect::new(0, 0, 20, 10),
+        composer: Rect::new(0, 11, 20, 1),
+        ..Default::default()
+    };
+    let rail_x = hits.transcript.right().saturating_sub(1);
+    let rail_y = hits.transcript.y + 1;
+    assert_eq!(
+        hits.at(rail_x, rail_y),
+        Some(bloom_tui::ui::Hit::Transcript)
+    );
+
+    let before = app.scroll;
+    for kind in [
+        MouseEventKind::Down(MouseButton::Left),
+        MouseEventKind::Drag(MouseButton::Left),
+        MouseEventKind::Up(MouseButton::Left),
+    ] {
+        assert_eq!(app.handle_mouse(kind, rail_x, rail_y, &hits), Action::None);
+        assert_eq!(app.scroll, before, "a passive rail must not move the view");
+    }
+    app.handle_mouse(MouseEventKind::ScrollUp, rail_x, rail_y, &hits);
+    assert!(
+        app.scroll > before,
+        "wheel over the uncovered rail still scrolls the transcript"
     );
 }

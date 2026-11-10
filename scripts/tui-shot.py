@@ -161,7 +161,14 @@ def parse_keys(value: str) -> list[bytes]:
     return result
 
 
-def run_tui(command: list[str], cols: int, rows: int, keys: list[bytes], settle: float) -> bytes:
+def run_tui(
+    command: list[str],
+    cols: int,
+    rows: int,
+    keys: list[bytes],
+    settle: float,
+    startup_confirmation: bool = True,
+) -> bytes:
     pid, master = pty.fork()
     if pid == 0:
         os.environ["COLUMNS"] = str(cols)
@@ -187,6 +194,25 @@ def run_tui(command: list[str], cols: int, rows: int, keys: list[bytes], settle:
 
     while time.time() < deadline:
         pump(0.1)
+    if startup_confirmation:
+        # The startup checklist owns input until Open Bloom is explicitly
+        # confirmed. Wait for the real rendered button rather than assuming a
+        # fixed startup latency, then consume it before the scenario keys.
+        confirm_deadline = time.time() + 5
+        while time.time() < confirm_deadline:
+            pump(0.1)
+            if "Open Bloom" in "\n".join(render(bytes(captured), cols, rows).display):
+                break
+        # A readiness/draft update can land between the painted button and the
+        # key. Retry the explicit confirmation until the normal composer appears.
+        for _ in range(4):
+            screen = "\n".join(render(bytes(captured), cols, rows).display)
+            if "Write a message" in screen:
+                break
+            if "Open Bloom" in screen:
+                os.write(master, b"\r")
+            for _ in range(6):
+                pump(0.1)
     for key in keys:
         os.write(master, key)
         end = time.time() + 0.6

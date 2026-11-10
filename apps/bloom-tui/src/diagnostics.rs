@@ -62,6 +62,7 @@ pub fn safe_reason(error: &ClientError) -> &'static str {
         ClientError::Server(bloom_ipc::ProtocolError::RecipientUnreachable) => "Recipient is unreachable. The message was not sent.",
         ClientError::Server(bloom_ipc::ProtocolError::NotRegistered) => "Bloom account is not registered. The message was not sent.",
         ClientError::Server(bloom_ipc::ProtocolError::SessionExpired) => "Bloom session expired. The message was not sent.",
+        ClientError::Server(bloom_ipc::ProtocolError::NotReady) => "Bloom is still preparing. The message was not sent.",
         ClientError::Server(_) => "Bloom rejected the request. The message was not sent.",
     }
 }
@@ -89,6 +90,7 @@ pub fn category(error: &ClientError) -> &'static str {
         ClientError::Server(bloom_ipc::ProtocolError::Unsupported) => "unsupported",
         ClientError::Server(bloom_ipc::ProtocolError::Protocol) => "protocol",
         ClientError::Server(bloom_ipc::ProtocolError::Internal) => "internal",
+        ClientError::Server(bloom_ipc::ProtocolError::NotReady) => "not_ready",
     }
 }
 

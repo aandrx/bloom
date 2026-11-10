@@ -16,6 +16,7 @@ import unittest
 DAEMON = os.path.join(os.path.dirname(__file__), "stateful-fake-daemon.py")
 FAKE = os.path.join(os.path.dirname(__file__), "fake-daemon.py")
 TIMEOUT = 2.0
+PROTOCOL_VERSION = 10
 
 
 def identity(value, transport="openbubbles"):
@@ -39,7 +40,7 @@ def oversized_response(limit):
 
 def send(client, obj):
     payload = json.dumps(obj).encode()
-    client.sendall(b"\x09" + struct.pack(">I", len(payload)) + payload)
+    client.sendall(bytes([PROTOCOL_VERSION]) + struct.pack(">I", len(payload)) + payload)
 
 
 def recv_exact(client, size):
@@ -55,7 +56,7 @@ def recv_exact(client, size):
 def recv(client):
     header = recv_exact(client, 5)
     version, size = struct.unpack(">BI", header)
-    if version != 9 or not 0 < size <= 1048576:
+    if version != 10 or not 0 < size <= 1048576:
         raise AssertionError("invalid response frame")
     return json.loads(recv_exact(client, size))
 
@@ -1304,10 +1305,10 @@ class FrameSerialization(unittest.TestCase):
             module["frame"](event)
 
     def test_fake_daemon_frames_stay_within_limit(self):
-        self.check_fixture(FAKE, 9)
+        self.check_fixture(FAKE, 10)
 
     def test_stateful_fake_daemon_frames_stay_within_limit(self):
-        self.check_fixture(DAEMON, 9)
+        self.check_fixture(DAEMON, 10)
 
 
 class FrameHeaderParity(unittest.TestCase):
@@ -1338,13 +1339,13 @@ class FrameHeaderParity(unittest.TestCase):
             server.close()
         return outcome
 
-    def test_valid_v9_frame_parses_in_both_fixtures(self):
+    def test_valid_v10_frame_parses_in_both_fixtures(self):
         payload = {"request_id": 3, "request": {"op": "echo", "who": identity("me@example.invalid")}}
         for path in (DAEMON, FAKE):
             with self.subTest(fixture=os.path.basename(path)):
                 module = runpy.run_path(path)
                 frame_version, body, size = parse_frame(module["frame"](payload))
-                self.assertEqual(frame_version, 9)
+                self.assertEqual(frame_version, 10)
                 self.assertEqual(size, len(json.dumps(body, separators=(",", ":"), ensure_ascii=False).encode()))
                 outcome = self.call_read_frame(module, module["frame"](payload))
                 self.assertNotIn("error", outcome)

@@ -2,6 +2,7 @@ use crate::app::{
     conversation_subtitle, message_text, status_text, status_tone, timestamp, App, ComposerPrompt,
     Focus, SearchParticipantCandidate, SearchState, StatusTone, Theme, SEARCH_RESULT_LIMIT,
 };
+use crate::startup::CHECK_LABELS;
 
 use bloom_domain::{Conversation, ConversationId, DeliveryState, HandleKind, Message, MessageId};
 use bloom_ipc::ParticipantFilter;
@@ -11,7 +12,7 @@ use unicode_segmentation::UnicodeSegmentation;
 
 #[cfg(test)]
 #[path = "ui_cache_tests.rs"]
-mod cache_tests;
+mod ui_cache_tests;
 
 fn monochrome_from(value: Option<std::ffi::OsString>) -> bool {
     value.is_some_and(|value| !value.is_empty())
@@ -69,6 +70,14 @@ const LIGHT: Palette = Palette {
 };
 
 const COMFORTABLE_RAIL_MIN_WIDTH: u16 = 70;
+
+/// The transcript reserves exactly one column for the passive reading rail
+/// before wrapping and cache measurement, so showing or hiding the rail can
+/// never change how messages wrap.
+const TRANSCRIPT_RAIL_WIDTH: u16 = 1;
+/// Below this content width the rail glyphs are hidden. The column stays
+/// reserved; a two-column message area is not worth a track.
+const TRANSCRIPT_RAIL_MIN_WIDTH: u16 = 3;
 
 pub fn uses_chat_drawer(width: u16) -> bool {
     width < COMFORTABLE_RAIL_MIN_WIDTH
@@ -467,31 +476,43 @@ fn sidebar_name_line(
     conversation: &bloom_domain::Conversation,
     width: usize,
     palette: Palette,
+    show_activity: bool,
 ) -> Line<'static> {
     let selected = Some(&conversation.id) == app.selected.as_ref() && !app.new_conversation;
+    let spinner = if show_activity && app.has_local_activity(&conversation.id) {
+        format!("{} ", spinner_frame(app.frame))
+    } else {
+        String::new()
+    };
+    let spinner_width = unicode_width::UnicodeWidthStr::width(spinner.as_str());
     let mut name = app.conversation_name(conversation);
     if let Some(badge) = unread_badge(app, conversation) {
         let suffix = format!(" · {badge}");
         let suffix_width = unicode_width::UnicodeWidthStr::width(suffix.as_str());
-        let name_width = width.saturating_sub(suffix_width);
+        let name_width = width
+            .saturating_sub(spinner_width)
+            .saturating_sub(suffix_width);
         name = if name_width >= 4 {
             format!("{}{}", truncate_with_ellipsis(&name, name_width), suffix)
         } else {
-            truncate_with_ellipsis(&name, width)
+            truncate_with_ellipsis(&name, width.saturating_sub(spinner_width))
         };
     } else {
-        name = truncate_with_ellipsis(&name, width);
+        name = truncate_with_ellipsis(&name, width.saturating_sub(spinner_width));
     }
-    Line::from(vec![Span::styled(
-        name,
-        Style::default()
-            .fg(if selected { palette.cyan } else { palette.text })
-            .add_modifier(if selected {
-                Modifier::BOLD
-            } else {
-                Modifier::empty()
-            }),
-    )])
+    let style = Style::default()
+        .fg(if selected { palette.cyan } else { palette.text })
+        .add_modifier(if selected {
+            Modifier::BOLD
+        } else {
+            Modifier::empty()
+        });
+    let mut spans = Vec::new();
+    if !spinner.is_empty() {
+        spans.push(Span::styled(spinner, Style::default().fg(palette.cyan)));
+    }
+    spans.push(Span::styled(name, style));
+    Line::from(spans)
 }
 
 /// The newest message, clipped with an ellipsis when it cannot fit.
@@ -2591,6 +2612,54 @@ fn reaction_summary(message: &Message) -> Option<String> {
     )
 }
 
+/// A passive scrollbar track and thumb over the painted transcript rows. It is
+/// derived from the final viewport, never from message count or remote history.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct TranscriptRail {
+    track: Rect,
+    thumb: Rect,
+}
+
+/// Geometry for the passive rail. `view.top` is the final paint offset after
+/// clamping and the no-orphan-byline adjustment, and `view.rows` is the wrapped
+/// extent of the same local buffer the paragraph paints.
+fn transcript_rail(
+    content: Rect,
+    view: &crate::transcript::TranscriptViewport,
+) -> Option<TranscriptRail> {
+    if content.width < TRANSCRIPT_RAIL_MIN_WIDTH {
+        return None;
+    }
+    let track_height = usize::from(content.height);
+    if track_height < 2 {
+        return None;
+    }
+    let rows = view.rows;
+    let height = view.height.min(track_height);
+    let range = rows.saturating_sub(height);
+    if rows == 0 || height == 0 || rows <= height || range == 0 {
+        return None;
+    }
+    let track = Rect::new(
+        content.right().saturating_sub(TRANSCRIPT_RAIL_WIDTH),
+        content.y,
+        TRANSCRIPT_RAIL_WIDTH,
+        content.height,
+    );
+    // u128 keeps the proportional products from overflowing on any platform.
+    let thumb_length = ((track_height as u128 * height as u128) / rows as u128)
+        .clamp(1, (track_height - 1) as u128) as usize;
+    let thumb_offset = ((track_height - thumb_length) as u128 * view.top.min(range) as u128
+        / range as u128) as usize;
+    let thumb = Rect::new(
+        track.x,
+        content.y.saturating_add(thumb_offset as u16),
+        track.width,
+        thumb_length as u16,
+    );
+    Some(TranscriptRail { track, thumb })
+}
+
 fn transcript_window(
     layout: &TranscriptLayout,
     scroll: u16,
@@ -2619,6 +2688,148 @@ fn transcript_window(
         }
     }
     (lines, relative_scroll as u16)
+}
+
+fn startup_spinner(app: &App) -> &'static str {
+    if app.startup.retrying() {
+        return spinner_frame(app.frame);
+    }
+    if app.startup.can_confirm() {
+        return "✓";
+    }
+    if app.startup.failure().is_some() {
+        return "!";
+    }
+    spinner_frame(app.frame)
+}
+
+fn render_startup(frame: &mut Frame<'_>, app: &App, area: Rect, palette: Palette) -> HitMap {
+    let hits = HitMap::default();
+    let width = area.width.min(72);
+    let height = area.height.min(20);
+    let card = Rect::new(
+        area.x.saturating_add(area.width.saturating_sub(width) / 2),
+        area.y
+            .saturating_add(area.height.saturating_sub(height) / 2),
+        width,
+        height,
+    );
+    frame.render_widget(Clear, card);
+    frame.render_widget(
+        Block::default()
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(palette.rule))
+            .style(Style::default().bg(palette.surface).fg(palette.text)),
+        card,
+    );
+    let content = card.inner(Margin {
+        vertical: 1,
+        horizontal: 2,
+    });
+    if content.width == 0 || content.height == 0 {
+        return hits;
+    }
+    let checks = app.startup.checks();
+    let compact = content.height < 16;
+    let mut lines: Vec<Line<'static>> = Vec::new();
+    lines.push(Line::from(Span::styled(
+        "Preparing Bloom",
+        Style::default()
+            .fg(palette.cyan)
+            .add_modifier(Modifier::BOLD),
+    )));
+    lines.push(Line::from(format!(
+        "{}  {}/5 checks · {} records",
+        startup_spinner(app),
+        app.startup.completed_checks(),
+        app.startup.observed_records()
+    )));
+    if compact {
+        if let Some(failure) = app.startup.failure() {
+            lines.push(Line::from(Span::styled(
+                failure.message(),
+                Style::default().fg(palette.red),
+            )));
+            lines.push(Line::from("Retry (r)    Quit (q)"));
+        } else {
+            for (label, done) in CHECK_LABELS.iter().zip(checks) {
+                let marker = if done { "✓" } else { "○" };
+                let style = if done {
+                    Style::default().fg(palette.green)
+                } else {
+                    Style::default().fg(palette.muted)
+                };
+                lines.push(Line::from(vec![
+                    Span::styled(format!("{marker} "), style),
+                    Span::styled((*label).to_owned(), style),
+                ]));
+            }
+            if app.startup.can_confirm() {
+                lines.push(Line::from(Span::styled(
+                    "Open Bloom (Enter)",
+                    Style::default()
+                        .fg(palette.cyan)
+                        .add_modifier(Modifier::BOLD),
+                )));
+            }
+        }
+    } else {
+        lines.push(Line::from(""));
+        for (label, done) in CHECK_LABELS.iter().zip(checks) {
+            let marker = if done { "✓" } else { "○" };
+            let style = if done {
+                Style::default().fg(palette.green)
+            } else {
+                Style::default().fg(palette.muted)
+            };
+            lines.push(Line::from(vec![
+                Span::styled(format!("{marker} "), style),
+                Span::styled((*label).to_owned(), style),
+            ]));
+        }
+        lines.push(Line::from(""));
+        lines.push(Line::from(format!(
+            "Observed metadata records: {}",
+            app.startup.observed_records()
+        )));
+        if let Some(failure) = app.startup.failure() {
+            lines.push(Line::from(""));
+            lines.push(Line::from(Span::styled(
+                failure.message(),
+                Style::default().fg(palette.red),
+            )));
+            lines.push(Line::from(""));
+            lines.push(Line::from("Retry (r)    Quit (q)"));
+        } else if app.startup.can_confirm() {
+            lines.push(Line::from(""));
+            lines.push(Line::from("Your initial list is persisted locally."));
+            lines.push(Line::from(
+                "This makes the local view ready; it is not a fully synced account.",
+            ));
+            lines.push(Line::from(""));
+            lines.push(Line::from(Span::styled(
+                "Open Bloom (Enter)",
+                Style::default()
+                    .fg(palette.cyan)
+                    .add_modifier(Modifier::BOLD),
+            )));
+        } else {
+            lines.push(Line::from(""));
+            lines.push(Line::from(
+                "Your initial list is being persisted locally. This is the local view, not a fully synced account.",
+            ));
+            lines.push(Line::from(
+                "No key skips this checklist. Quit with q or Ctrl+C.",
+            ));
+        }
+    }
+    frame.render_widget(
+        Paragraph::new(lines)
+            .style(Style::default().bg(palette.surface).fg(palette.text))
+            .wrap(Wrap { trim: true }),
+        content,
+    );
+    hits
 }
 
 pub fn render(frame: &mut Frame<'_>, app: &App) -> HitMap {
@@ -2665,6 +2876,9 @@ fn render_cached_with_mode(
         area,
     );
     let inner = area;
+    if app.startup.overlay_visible() {
+        return render_startup(frame, app, area, palette);
+    }
     if app.chat_drawer.is_some() {
         return render_chat_drawer(frame, app, inner, palette);
     }
@@ -2800,7 +3014,7 @@ fn render_cached_with_mode(
             let marker = if selected { "▎ " } else { "  " };
             let marker_style =
                 Style::default().fg(if selected { palette.cyan } else { palette.bg });
-            let mut name = sidebar_name_line(app, conversation, entry_width, palette);
+            let mut name = sidebar_name_line(app, conversation, entry_width, palette, false);
             name.spans.insert(0, Span::styled(marker, marker_style));
             let mut lines = vec![name];
             if !compact {
@@ -2970,6 +3184,12 @@ fn render_cached_with_mode(
             heading.extend([
                 Span::raw("  "),
                 Span::styled(format!("· {badge}"), Style::default().fg(palette.muted)),
+            ]);
+        }
+        if app.has_local_activity(&c.id) {
+            heading.extend([
+                Span::raw("  "),
+                Span::styled("Loading local messages", Style::default().fg(palette.muted)),
             ]);
         }
     }
@@ -3187,8 +3407,17 @@ fn render_cached_with_mode(
             Rect::new(left, context_row, available, 1),
         );
     }
-    let layout = cache.layout(app, content.width.max(1), palette, new_message, || {
-        let transcript_width = content.width.max(1) as usize;
+    // Reserve the rightmost column before any measurement. The original `content`
+    // rectangle still owns Latest and panel geometry.
+    let message_width = content.width.saturating_sub(TRANSCRIPT_RAIL_WIDTH).max(1);
+    let message_area = Rect::new(
+        content.x,
+        content.y,
+        message_width.min(content.width),
+        content.height,
+    );
+    let layout = cache.layout(app, message_width, palette, new_message, || {
+        let transcript_width = message_width as usize;
         let mut lines = Vec::new();
         let mut header_lines: Vec<usize> = Vec::new();
         let mut message_lines = Vec::new();
@@ -3365,7 +3594,7 @@ fn render_cached_with_mode(
         for line in &lines {
             let count = Paragraph::new(line.clone())
                 .wrap(Wrap { trim: false })
-                .line_count(content.width.max(1))
+                .line_count(message_width)
                 .max(1);
             line_starts.push(rows);
             rows += count;
@@ -3430,6 +3659,11 @@ fn render_cached_with_mode(
     if let Some(view) = viewport.as_mut() {
         view.top = usize::from(scroll);
     }
+    // The rail is derived from the final viewport: clamped top, byline-adjusted,
+    // and only the local history or bounded search-context buffer it paints.
+    let rail = viewport
+        .as_ref()
+        .and_then(|view| transcript_rail(content, view));
     hits.transcript_view = viewport;
     // Use the existing breathing row, not the feedback/error footer or a message
     // row. Panels and tiny layouts never acquire a hidden latest hitbox.
@@ -3485,7 +3719,7 @@ fn render_cached_with_mode(
             )
         } else if app.connection_state == crate::daemon::ConnectionState::Connecting {
             ("Connecting to Bloom", "", "Waiting for the local daemon")
-        } else if app.thread_loading {
+        } else if app.selected_local_activity() {
             (
                 "Loading stored messages",
                 "",
@@ -3535,8 +3769,38 @@ fn render_cached_with_mode(
                 .wrap(Wrap { trim: false })
                 .scroll((relative_scroll, 0))
                 .style(Style::default().bg(palette.surface)),
-            content,
+            message_area,
         );
+    }
+    // The reserved column is painted even when glyphs are hidden, so the rail's
+    // visibility cannot change the transcript's wrapping or background.
+    if content.width > 0 && content.height > 0 {
+        frame.render_widget(
+            Block::default().style(Style::default().bg(palette.surface)),
+            Rect::new(
+                content.right().saturating_sub(TRANSCRIPT_RAIL_WIDTH),
+                content.y,
+                TRANSCRIPT_RAIL_WIDTH,
+                content.height,
+            ),
+        );
+    }
+    if let Some(rail) = rail {
+        let mut lines = Vec::with_capacity(usize::from(rail.track.height));
+        for offset in 0..usize::from(rail.track.height) {
+            let y = rail.track.y.saturating_add(offset as u16);
+            let in_thumb = y >= rail.thumb.y && y < rail.thumb.bottom();
+            let (glyph, color) = if in_thumb {
+                ("█", palette.muted)
+            } else {
+                ("│", palette.rule)
+            };
+            lines.push(Line::from(Span::styled(
+                glyph,
+                Style::default().fg(color).bg(palette.surface),
+            )));
+        }
+        frame.render_widget(Paragraph::new(lines), rail.track);
     }
     let new_recipient_open = app.new_conversation && app.pending_address.is_none();
     let filter_open = app.filter_query().is_some();
@@ -3952,7 +4216,13 @@ fn render_chat_drawer(frame: &mut Frame<'_>, app: &App, area: Rect, palette: Pal
     let entries: Vec<_> = rows
         .iter()
         .map(|conversation| {
-            let mut lines = vec![sidebar_name_line(app, conversation, entry_width, palette)];
+            let mut lines = vec![sidebar_name_line(
+                app,
+                conversation,
+                entry_width,
+                palette,
+                true,
+            )];
             if entry_height == 2 {
                 lines.push(sidebar_preview_line(conversation, entry_width, palette));
             }
@@ -4432,9 +4702,9 @@ fn composer_feedback(app: &App, palette: &Palette, back: usize) -> Option<(Strin
         return Some((message.to_owned(), palette.red));
     }
     if app
-        .older_loading
+        .selected
         .as_ref()
-        .is_some_and(|id| app.selected.as_ref() == Some(id))
+        .is_some_and(|id| app.has_older_activity(id))
     {
         return Some(("Loading older messages…".to_owned(), palette.muted));
     }

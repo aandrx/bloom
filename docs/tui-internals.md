@@ -14,6 +14,8 @@ Input comes from a blocking terminal reader into an async channel. Only key Pres
 
 The Chats navigator keeps its query/candidate separate from actual selection. Incoming aliases migrate the stored candidate in `set_conversations`, without committing navigation, so successive snapshots that expose only the previous identity still retain the same logical chat. Read-time alias lookup alone would strand the stored candidate after two transitions.
 
+Startup readiness lives in `startup.rs` as a client-side ticket: the daemon's revisioned snapshot is ignored when older than the current revision, and the Open Bloom confirmation is consumed once rather than inferred from readiness alone. Local history activity is owned per conversation and per request kind (snapshot, older page, context) by a request/epoch token, so a late reply clears only its own slot; the map is bounded and retired when the connection epoch changes. An identity alias restarts a pending exact-context lookup under a new generation and canonical ID instead of reusing the old reply.
+
 `main.rs` propagates App-generated send attempts without inventing another counter. New-chat navigation waits for correlation between the acknowledged message ID, actual message and conversation metadata. Neither success text nor a matching preview establishes a recipient's thread. No automatic retry follows an uncertain outcome.
 
 ## Animation and status

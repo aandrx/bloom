@@ -12,14 +12,37 @@ use super::listener::AuthenticatedStream;
 pub const SUBSCRIPTION_WRITE_TIMEOUT: Duration = Duration::from_secs(30);
 const DEFAULT_CAPACITY: usize = 128;
 
+/// The latest session and readiness events, replayed to a late subscriber.
+#[derive(Default)]
+struct Replay {
+    session: Option<Event>,
+    readiness: Option<Event>,
+}
+
+impl Replay {
+    fn events(&self) -> Vec<Event> {
+        let mut events = Vec::with_capacity(2);
+        if let Some(session) = &self.session {
+            events.push(session.clone());
+        }
+        if let Some(readiness) = &self.readiness {
+            events.push(readiness.clone());
+        }
+        events
+    }
+}
+
 /// Bounded fanout for events that have already been persisted.
 #[derive(Clone)]
 pub struct SubscriptionHub {
     sender: broadcast::Sender<Event>,
-    /// The most recent session state, replayed to clients that subscribe later.
-    /// Without it a client that connects after startup never learns the engine's
-    /// state, because the event was published before it existed.
-    latest_session: Arc<Mutex<Option<Event>>>,
+    /// The most recent session and readiness state, replayed to clients that
+    /// subscribe later. Without it a client that connects after startup never
+    /// learns the engine's state or the current readiness revision.
+    latest: Arc<Mutex<Replay>>,
+    /// Serializes subscription capture with publication, so the replayed snapshot
+    /// and the live receiver cannot lose, duplicate, or reorder an event.
+    publish_lock: Arc<Mutex<()>>,
 }
 
 impl SubscriptionHub {
@@ -28,7 +51,8 @@ impl SubscriptionHub {
         let (sender, _) = broadcast::channel(capacity);
         Self {
             sender,
-            latest_session: Arc::new(Mutex::new(None)),
+            latest: Arc::new(Mutex::new(Replay::default())),
+            publish_lock: Arc::new(Mutex::new(())),
         }
     }
 
@@ -41,17 +65,33 @@ impl SubscriptionHub {
         self.sender.subscribe()
     }
 
+    /// Capture the receiver and replay together under the publication lock. The
+    /// returned receiver sees only events published after this capture.
+    pub fn subscribe_with_replay(&self) -> (broadcast::Receiver<Event>, Vec<Event>) {
+        let _guard = self.publish_lock.lock().unwrap();
+        let receiver = self.sender.subscribe();
+        let replay = self.latest.lock().unwrap().events();
+        (receiver, replay)
+    }
+
     /// Publish a persisted event. No receivers is normal and is not a persistence error.
     pub fn publish(&self, event: Event) {
-        if matches!(event.event, bloom_ipc::EventKind::Session { .. }) {
-            *self.latest_session.lock().unwrap() = Some(event.clone());
+        let _guard = self.publish_lock.lock().unwrap();
+        {
+            let mut latest = self.latest.lock().unwrap();
+            match event.event {
+                bloom_ipc::EventKind::Session { .. } => latest.session = Some(event.clone()),
+                bloom_ipc::EventKind::Readiness { .. } => latest.readiness = Some(event.clone()),
+                _ => {}
+            }
         }
         let _ = self.sender.send(event);
     }
 
-    /// The last session state published, for replay on subscription.
-    pub fn latest_session(&self) -> Option<Event> {
-        self.latest_session.lock().unwrap().clone()
+    /// The last session and readiness events published, for replay on subscription.
+    pub fn latest_replay(&self) -> Vec<Event> {
+        let _guard = self.publish_lock.lock().unwrap();
+        self.latest.lock().unwrap().events()
     }
 }
 
@@ -69,7 +109,7 @@ pub async fn serve_subscriber(
     mut connection: AuthenticatedStream,
     request_id: u64,
     mut receiver: broadcast::Receiver<Event>,
-    initial: Option<Event>,
+    initial: Vec<Event>,
 ) {
     let response = Response {
         request_id,
@@ -85,7 +125,7 @@ pub async fn serve_subscriber(
         return;
     }
 
-    if let Some(event) = initial {
+    for event in initial {
         if write_event_bounded(connection.stream_mut(), &event, SUBSCRIPTION_WRITE_TIMEOUT)
             .await
             .is_err()
@@ -152,6 +192,24 @@ mod tests {
         }
     }
 
+    fn readiness_event(revision: u64) -> Event {
+        Event {
+            event: EventKind::Readiness {
+                snapshot: bloom_ipc::ReadinessSnapshot {
+                    generation: 1,
+                    operation: 1,
+                    revision,
+                    phase: bloom_ipc::ReadinessPhase::Ready,
+                    outcome: Some(bloom_ipc::ReadinessOutcome::Complete),
+                    observed_records: 0,
+                    can_send: true,
+                    engine_ready: true,
+                    bounded_error: None,
+                },
+            },
+        }
+    }
+
     async fn subscribe_request(server: &mut AuthenticatedStream, client: &mut UnixStream) {
         write_request(
             client,
@@ -174,7 +232,7 @@ mod tests {
         let hub = SubscriptionHub::new(4);
         let receiver = hub.subscribe();
         hub.publish(event());
-        let task = tokio::spawn(serve_subscriber(server, 77, receiver, None));
+        let task = tokio::spawn(serve_subscriber(server, 77, receiver, Vec::new()));
         let ack = read_response(&mut client).await.unwrap();
         assert_eq!(ack.request_id, 77);
         assert!(matches!(ack.response, ResponseKind::Subscribed));
@@ -192,7 +250,7 @@ mod tests {
         let (_dir, mut server, mut client) = pair().await;
         subscribe_request(&mut server, &mut client).await;
         let hub = SubscriptionHub::new(4);
-        let task = tokio::spawn(serve_subscriber(server, 77, hub.subscribe(), None));
+        let task = tokio::spawn(serve_subscriber(server, 77, hub.subscribe(), Vec::new()));
         assert!(matches!(
             read_response(&mut client).await.unwrap().response,
             ResponseKind::Subscribed
@@ -213,7 +271,7 @@ mod tests {
         for _ in 0..3 {
             hub.publish(event());
         }
-        let task = tokio::spawn(serve_subscriber(server, 77, receiver, None));
+        let task = tokio::spawn(serve_subscriber(server, 77, receiver, Vec::new()));
         assert!(matches!(
             read_response(&mut client).await.unwrap().response,
             ResponseKind::Subscribed
@@ -248,14 +306,10 @@ mod tests {
                 state: bloom_domain::SessionState::Active,
             },
         });
-        assert!(hub.latest_session().is_some());
+        assert!(!hub.latest_replay().is_empty());
 
-        let task = tokio::spawn(serve_subscriber(
-            server,
-            77,
-            hub.subscribe(),
-            hub.latest_session(),
-        ));
+        let (receiver, replay) = hub.subscribe_with_replay();
+        let task = tokio::spawn(serve_subscriber(server, 77, receiver, replay));
         assert!(matches!(
             read_response(&mut client).await.unwrap().response,
             ResponseKind::Subscribed
@@ -267,6 +321,44 @@ mod tests {
                 state: bloom_domain::SessionState::Active
             }
         ));
+        drop(client);
+        timeout(Duration::from_secs(1), task)
+            .await
+            .unwrap()
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_second_client_replays_session_and_readiness_in_order() {
+        let (_dir, mut server, mut client) = pair().await;
+        subscribe_request(&mut server, &mut client).await;
+        let hub = SubscriptionHub::new(4);
+
+        hub.publish(Event {
+            event: EventKind::Session {
+                state: bloom_domain::SessionState::Active,
+            },
+        });
+        hub.publish(readiness_event(1));
+        hub.publish(readiness_event(2));
+
+        let (receiver, replay) = hub.subscribe_with_replay();
+        assert_eq!(replay.len(), 2);
+        let task = tokio::spawn(serve_subscriber(server, 77, receiver, replay));
+        assert!(matches!(
+            read_response(&mut client).await.unwrap().response,
+            ResponseKind::Subscribed
+        ));
+        assert!(matches!(
+            read_event(&mut client).await.unwrap().event,
+            EventKind::Session {
+                state: bloom_domain::SessionState::Active
+            }
+        ));
+        match read_event(&mut client).await.unwrap().event {
+            EventKind::Readiness { snapshot } => assert_eq!(snapshot.revision, 2),
+            _ => panic!("expected readiness replay"),
+        }
         drop(client);
         timeout(Duration::from_secs(1), task)
             .await

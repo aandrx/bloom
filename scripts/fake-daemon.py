@@ -20,7 +20,7 @@ import threading
 import time
 import unicodedata
 
-PROTOCOL_VERSION = 9
+PROTOCOL_VERSION = 10
 MAX_FRAME = 1024 * 1024
 MAX_DRAFT_BYTES = 65_536
 SEARCH_SCAN_LIMIT = 20_000
@@ -550,6 +550,24 @@ def serve_client(conn: socket.socket) -> None:
         if op in ("draft_save", "draft_load", "draft_delete"):
             response = handle_draft(op, kind)
             conn.sendall(frame({"request_id": request_id, "response": response}))
+        elif op == "readiness":
+            conn.sendall(frame({
+                "request_id": request_id,
+                "response": {
+                    "result": "readiness",
+                    "snapshot": {
+                        "generation": 1,
+                        "operation": 1,
+                        "revision": 1,
+                        "phase": "ready",
+                        "outcome": "complete",
+                        "observed_records": len(CONVERSATIONS),
+                        "can_send": True,
+                        "engine_ready": True,
+                        "bounded_error": None,
+                    },
+                },
+            }))
         elif op == "sync_conversations":
             if os.environ.get("BLOOM_FAKE_MISSED_MESSAGE") == "1":
                 # A stored phone message with no live Message event: the sidebar

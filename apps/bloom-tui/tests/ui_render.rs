@@ -8,7 +8,11 @@ use bloom_domain::{
     AttachmentRef, Conversation, ConversationId, ConversationKind, DeliveryState, Handle,
     HandleKind, Message, MessageId, MessagePart, Participant, Reaction, TransportId,
 };
-use bloom_ipc::{MessageSearchHit, ParticipantFilter};
+use bloom_ipc::{
+    MessageSearchHit, ParticipantFilter, ReadinessError, ReadinessOutcome, ReadinessPhase,
+    ReadinessSnapshot,
+};
+use bloom_tui::startup::StartupState;
 use bloom_tui::{
     app::{
         message_text, Action, App, Focus, SendFeedback, SendPhase, Theme, OLDER_PAGE_LIMIT,
@@ -604,7 +608,7 @@ fn empty_offline_view_prioritizes_connection_recovery() {
 }
 
 #[test]
-fn syncing_catch_up_shows_a_spinner_and_word_in_the_header() {
+fn inbound_catch_up_says_updated_without_a_sync_spinner() {
     let selected = conversation("Weekend crew", 3, 40);
     for (width, height) in [(100u16, 30u16), (60, 18)] {
         let mut app = App {
@@ -618,19 +622,41 @@ fn syncing_catch_up_shows_a_spinner_and_word_in_the_header() {
         app.set_conversations(vec![selected.clone()]);
         let grid = buffer(&app, width, height);
         let header = format!("{}\n{}", row_text(&grid, 0), row_text(&grid, 1));
-        assert!(header.contains("Syncing"), "{width}: {header:?}");
+        assert!(header.contains("Updated"), "{width}: {header:?}");
         assert!(
-            !header.contains("Active"),
-            "catch-up replaces the idle session label: {header:?}"
+            !header.contains("Syncing"),
+            "persisted inbound events must not claim a remote sync: {header:?}"
         );
-        // The braille spinner proves the header is animating, not a static dot.
         assert!(
-            header
+            !header
                 .chars()
                 .any(|c| ('\u{2800}'..'\u{2900}').contains(&c)),
-            "a spinner must accompany Syncing: {header:?}"
+            "Updated must not paint a sync spinner: {header:?}"
         );
     }
+}
+
+#[test]
+fn manual_sync_keeps_its_own_spinner_and_word() {
+    let selected = conversation("Weekend crew", 3, 40);
+    let mut app = App {
+        selected: Some(selected.id.clone()),
+        connection: "Connected".into(),
+        connection_state: ConnectionState::Connected,
+        session: "Active".into(),
+        sync_in_flight: true,
+        ..Default::default()
+    };
+    app.set_conversations(vec![selected.clone()]);
+    let grid = buffer(&app, 100, 30);
+    let header = row_text(&grid, 0);
+    assert!(header.contains("Syncing"), "{header:?}");
+    assert!(
+        header
+            .chars()
+            .any(|c| ('\u{2800}'..'\u{2900}').contains(&c)),
+        "manual sync keeps a spinner: {header:?}"
+    );
 }
 
 #[test]
@@ -3298,9 +3324,10 @@ fn older_page_keeps_every_visible_message_on_screen_when_the_thread_fits() {
         app.older_requested,
         "the fitting thread is already at its oldest row"
     );
-    let (id, _) = app.begin_load_older().expect("a cursor");
+    let (id, _, token) = app.begin_load_older().expect("a cursor");
     app.finish_load_older(
         id,
+        token,
         // Enough to push the whole thread past the viewport once merged.
         (0..40)
             .map(|index| {
@@ -3400,9 +3427,10 @@ fn older_page_requests_fire_only_at_the_top_and_preserve_the_reading_anchor() {
         .message
         .clone();
 
-    let (id, _) = app.begin_load_older().expect("an older page cursor");
+    let (id, _, token) = app.begin_load_older().expect("an older page cursor");
     app.finish_load_older(
         id,
+        token,
         (0..10)
             .map(|index| {
                 message(
@@ -3503,6 +3531,8 @@ fn reading_anchor_survives_appends_edits_duplicates_snapshots_and_reflow() {
     tracked_frame(&mut app, 100, 24);
     assert_eq!(app.reading_anchor.as_ref().unwrap().message, anchor.message);
     app.apply_snapshot(bloom_tui::daemon::Snapshot {
+        token: None,
+        bootstrap: None,
         revision: 10,
         conversations: vec![only.clone()],
         visible: Some(only.id.clone()),
@@ -3625,6 +3655,8 @@ fn alias_reconciliation_is_the_same_reading_context_even_before_history_arrives(
         })
         .collect();
     app.apply_snapshot(bloom_tui::daemon::Snapshot {
+        token: None,
+        bootstrap: None,
         revision: 20,
         visible: Some(canonical.id.clone()),
         conversations: vec![canonical.clone()],
@@ -3970,7 +4002,12 @@ fn start_context_lookup(
     app: &mut App,
     conversation: &Conversation,
     target: &str,
-) -> (u64, ConversationId, MessageId) {
+) -> (
+    u64,
+    ConversationId,
+    MessageId,
+    bloom_tui::daemon::ActivityToken,
+) {
     let request = start_search(app, "needle");
     app.finish_search(request, vec![search_hit(conversation, target, "needle")]);
     app.begin_search_jump().expect("search jump");
@@ -4532,7 +4569,7 @@ fn search_context_paints_its_rows_not_latest_and_labels_loading_and_exit() {
         message(&chat, "normal-newest", 90, "NORMAL_LATEST_ROW", false),
     );
     let normal_history = app.messages[&chat.id].clone();
-    let (generation, conversation, target) = start_context_lookup(&mut app, &chat, "target");
+    let (generation, conversation, target, token) = start_context_lookup(&mut app, &chat, "target");
 
     let loading = rendered(&app);
     assert!(loading.contains("Search context"), "{loading}");
@@ -4544,7 +4581,13 @@ fn search_context_paints_its_rows_not_latest_and_labels_loading_and_exit() {
         message(&chat, "target", 20, "CONTEXT_TARGET_ROW", false),
         message(&chat, "after", 30, "CONTEXT_AFTER_ROW", false),
     ];
-    assert!(app.finish_message_context(generation, conversation.clone(), target, rows.clone()));
+    assert!(app.finish_message_context(
+        generation,
+        conversation.clone(),
+        target,
+        token,
+        rows.clone()
+    ));
     let (buffer, hits) = tracked_frame(&mut app, 100, 24);
     let painted: String = (0..24).map(|y| row_text(&buffer, y)).collect();
     assert!(painted.contains("CONTEXT_TARGET_ROW"), "{painted}");
@@ -4590,11 +4633,12 @@ fn short_search_context_still_has_a_measured_latest_control() {
         chat.id.clone(),
         message(&chat, "normal-newest", 90, "normal newest", false),
     );
-    let (generation, conversation, target) = start_context_lookup(&mut app, &chat, "target");
+    let (generation, conversation, target, token) = start_context_lookup(&mut app, &chat, "target");
     assert!(app.finish_message_context(
         generation,
         conversation,
         target,
+        token,
         vec![message(&chat, "target", 20, "short target", false)]
     ));
 
@@ -5470,5 +5514,655 @@ fn keyboard_selection_reveals_the_selected_chat() {
     assert_eq!(
         app.sidebar_scroll, 13,
         "selection below the window scrolls it into view"
+    );
+}
+
+#[test]
+fn startup_checklist_is_the_only_surface_until_all_five_checks_pass() {
+    let mut app = App {
+        startup: StartupState::loading(),
+        connection_state: ConnectionState::Connecting,
+        ..Default::default()
+    };
+    let text = rendered(&app);
+    assert!(text.contains("0/5 checks"), "{text}");
+    assert!(text.contains("Daemon connected"));
+    assert!(text.contains("Engine ready"));
+    assert!(text.contains("Metadata refresh"));
+    assert!(text.contains("Persistence acknowledged"));
+    assert!(text.contains("Local view and draft"));
+    assert!(text.contains("not a fully synced account"));
+    assert!(!text.contains("Open Bloom"));
+    assert!(!text.contains('%'));
+
+    app.observe_startup_connection(ConnectionState::Connected);
+    app.observe_startup_readiness(ReadinessSnapshot {
+        generation: 1,
+        operation: 1,
+        revision: 1,
+        phase: ReadinessPhase::Ready,
+        outcome: Some(ReadinessOutcome::Complete),
+        observed_records: 12,
+        can_send: true,
+        engine_ready: true,
+        bounded_error: None,
+    });
+    app.observe_startup_snapshot();
+    app.observe_startup_draft_ready();
+    let ready = rendered(&app);
+    assert!(ready.contains("5/5 checks"), "{ready}");
+    assert!(ready.contains("Observed metadata records: 12"));
+    assert!(ready.contains("Your initial list is persisted locally."));
+    assert!(ready.contains("not a fully synced account"));
+    assert!(ready.contains("Open Bloom (Enter)"));
+
+    app.observe_startup_readiness(ReadinessSnapshot {
+        generation: 1,
+        operation: 2,
+        revision: 2,
+        phase: ReadinessPhase::Failed,
+        outcome: Some(ReadinessOutcome::Failed),
+        observed_records: 0,
+        can_send: false,
+        engine_ready: true,
+        bounded_error: Some(ReadinessError::Timeout),
+    });
+    let failed = rendered(&app);
+    assert!(failed.contains("timed out"), "{failed}");
+    assert!(failed.contains("Retry (r)"));
+    assert!(failed.contains("Quit (q)"));
+    assert!(!failed.contains("Open Bloom"));
+}
+
+#[test]
+fn only_the_busy_drawer_row_shows_a_local_spinner() {
+    let busy = conversation("Busy chat", 2, 20);
+    let idle = conversation("Idle chat", 2, 10);
+    let mut app = App {
+        selected: Some(busy.id.clone()),
+        connection: "Connected".into(),
+        connection_state: ConnectionState::Connected,
+        session: "Active".into(),
+        ..Default::default()
+    };
+    app.set_conversations(vec![busy.clone(), idle.clone()]);
+    app.begin_snapshot_request();
+    app.open_chat_drawer();
+
+    let grid = buffer(&app, 100, 30);
+    let busy_row = (0..grid.area.height)
+        .map(|y| row_text(&grid, y))
+        .find(|row| row.contains("Busy chat"))
+        .expect("busy drawer row");
+    let idle_row = (0..grid.area.height)
+        .map(|y| row_text(&grid, y))
+        .find(|row| row.contains("Idle chat"))
+        .expect("idle drawer row");
+    assert!(
+        busy_row
+            .chars()
+            .any(|c| ('\u{2800}'..'\u{2900}').contains(&c)),
+        "the busy conversation owns the only spinner: {busy_row:?}"
+    );
+    assert!(
+        !idle_row
+            .chars()
+            .any(|c| ('\u{2800}'..'\u{2900}').contains(&c)),
+        "an idle conversation must not look busy: {idle_row:?}"
+    );
+}
+
+#[test]
+fn selected_header_says_loading_local_messages_for_local_activity() {
+    let chat = conversation("Local loading chat", 2, 20);
+    let mut app = App {
+        selected: Some(chat.id.clone()),
+        connection: "Connected".into(),
+        connection_state: ConnectionState::Connected,
+        session: "Active".into(),
+        ..Default::default()
+    };
+    app.set_conversations(vec![chat.clone()]);
+    app.begin_snapshot_request();
+
+    let grid = buffer(&app, 120, 30);
+    let header = row_text(&grid, 0);
+    assert!(
+        header.contains("Loading local messages"),
+        "the selected header describes local loading: {header:?}"
+    );
+    assert!(
+        !header.contains("Syncing"),
+        "local loading is not a remote sync: {header:?}"
+    );
+}
+
+#[test]
+fn global_metadata_sync_keeps_its_messaging_alongside_local_loading() {
+    let chat = conversation("Metadata chat", 2, 20);
+    let mut app = App {
+        selected: Some(chat.id.clone()),
+        connection: "Connected".into(),
+        connection_state: ConnectionState::Connected,
+        session: "Active".into(),
+        sync_in_flight: true,
+        ..Default::default()
+    };
+    app.set_conversations(vec![chat.clone()]);
+
+    let grid = buffer(&app, 120, 30);
+    let header = row_text(&grid, 0);
+    assert!(header.contains("Syncing"), "{header:?}");
+    assert!(
+        !header.contains("Loading local messages"),
+        "metadata refresh alone is not per-chat local loading: {header:?}"
+    );
+
+    app.begin_snapshot_request();
+    let grid = buffer(&app, 120, 30);
+    let header = row_text(&grid, 0);
+    assert!(header.contains("Syncing"), "{header:?}");
+    assert!(
+        header.contains("Loading local messages"),
+        "local activity is reported separately from metadata: {header:?}"
+    );
+}
+
+// --- Passive transcript rail -------------------------------------------------
+
+fn rail_cells(
+    buffer: &ratatui::buffer::Buffer,
+    hits: &ui::HitMap,
+) -> Vec<(u16, String, ratatui::style::Color)> {
+    let content = hits.transcript;
+    if content.width == 0 {
+        return Vec::new();
+    }
+    let x = content.right().saturating_sub(1);
+    (content.y..content.bottom())
+        .map(|y| {
+            let cell = &buffer[(x, y)];
+            (y, cell.symbol().to_owned(), cell.fg)
+        })
+        .collect()
+}
+
+fn expected_rail_thumb(
+    view: &bloom_tui::transcript::TranscriptViewport,
+    track_height: usize,
+) -> Option<(usize, usize)> {
+    if track_height < 2 {
+        return None;
+    }
+    let height = view.height.min(track_height);
+    let range = view.rows.saturating_sub(height);
+    if view.rows == 0 || height == 0 || view.rows <= height || range == 0 {
+        return None;
+    }
+    let thumb_length = ((track_height as u128 * height as u128) / view.rows as u128)
+        .clamp(1, (track_height - 1) as u128) as usize;
+    let thumb_offset = ((track_height - thumb_length) as u128 * view.top.min(range) as u128
+        / range as u128) as usize;
+    Some((thumb_offset, thumb_length))
+}
+
+fn assert_rail_matches(buffer: &ratatui::buffer::Buffer, hits: &ui::HitMap) {
+    let content = hits.transcript;
+    let cells = rail_cells(buffer, hits);
+    let expected = if content.width < 3 {
+        None
+    } else {
+        hits.transcript_view
+            .as_ref()
+            .and_then(|view| expected_rail_thumb(view, usize::from(content.height)))
+    };
+    match expected {
+        Some((offset, length)) => {
+            assert_eq!(
+                cells.len(),
+                usize::from(content.height),
+                "the rail must span the transcript height"
+            );
+            for (index, (y, symbol, _)) in cells.iter().enumerate() {
+                let want = if index >= offset && index < offset + length {
+                    "█"
+                } else {
+                    "│"
+                };
+                assert_eq!(
+                    symbol,
+                    want,
+                    "rail row {y} must be {want:?} for thumb {offset}..{}",
+                    offset + length
+                );
+            }
+        }
+        None => {
+            for (y, symbol, _) in &cells {
+                assert!(
+                    symbol.trim().is_empty(),
+                    "a hidden rail must not paint {symbol:?} at row {y}"
+                );
+            }
+        }
+    }
+}
+
+fn rail_fixture() -> (App, Conversation) {
+    let only = conversation("Rail thread", 2, 1);
+    let mut app = App::default();
+    app.set_conversations(vec![only.clone()]);
+    app.selected = Some(only.id.clone());
+    for index in 0..40 {
+        app.upsert(
+            only.id.clone(),
+            message(
+                &only,
+                &format!("rail{index:03}"),
+                1_700_000_000_000 + index * 60_000,
+                &format!("rail message {index:03} with enough words to wrap on narrow screens"),
+                index % 2 == 0,
+            ),
+        );
+    }
+    (app, only)
+}
+
+#[test]
+fn passive_rail_geometry_matches_the_final_viewport_at_normal_widths() {
+    for (width, height) in [(100u16, 30u16), (66, 18), (44, 12), (24, 12)] {
+        let (mut app, _) = rail_fixture();
+        let (buffer, hits) = tracked_frame(&mut app, width, height);
+        assert!(
+            hits.transcript_view
+                .as_ref()
+                .is_some_and(|view| view.rows > view.height),
+            "{width}x{height} must overflow so the rail is eligible"
+        );
+        assert_rail_matches(&buffer, &hits);
+        let cells = rail_cells(&buffer, &hits);
+        assert!(
+            cells.iter().any(|(_, symbol, _)| symbol == "█"),
+            "{width}x{height} must paint a thumb"
+        );
+        assert!(
+            cells.iter().any(|(_, symbol, _)| symbol == "│"),
+            "{width}x{height} must paint a track"
+        );
+    }
+}
+
+#[test]
+fn passive_rail_hides_when_content_fits_or_the_layout_is_tiny() {
+    let chat = conversation("Fit rail", 2, 1);
+    let mut app = App {
+        selected: Some(chat.id.clone()),
+        ..Default::default()
+    };
+    app.set_conversations(vec![chat.clone()]);
+    app.upsert(
+        chat.id.clone(),
+        message(&chat, "only", 10, "short body", false),
+    );
+    let (buffer, hits) = tracked_frame(&mut app, 100, 30);
+    assert!(
+        hits.transcript_view
+            .as_ref()
+            .is_some_and(|view| view.rows <= view.height),
+        "the fixture must fit"
+    );
+    assert_rail_matches(&buffer, &hits);
+    assert!(
+        rail_cells(&buffer, &hits)
+            .iter()
+            .all(|(_, symbol, _)| symbol.trim().is_empty()),
+        "a fitting transcript must not paint a rail"
+    );
+
+    let (mut tiny, _) = rail_fixture();
+    let (buffer, hits) = tracked_frame(&mut tiny, 20, 3);
+    assert_eq!(
+        hits.transcript.width, 0,
+        "the tiny fallback has no transcript viewport"
+    );
+    assert!(rail_cells(&buffer, &hits).is_empty());
+}
+
+#[test]
+fn passive_rail_reflects_wrapped_extent_not_message_count() {
+    let only = conversation("Extent rail", 2, 1);
+    let build = |body: &str| {
+        let mut app = App {
+            selected: Some(only.id.clone()),
+            ..Default::default()
+        };
+        app.set_conversations(vec![only.clone()]);
+        for index in 0..24 {
+            app.upsert(
+                only.id.clone(),
+                message(
+                    &only,
+                    &format!("extent{index:03}"),
+                    1_700_000_000_000 + index * 60_000,
+                    body,
+                    false,
+                ),
+            );
+        }
+        app
+    };
+    let mut short = build("hi");
+    let mut long = build(&"wrapped words ".repeat(40));
+    assert_eq!(
+        short.messages[&only.id].len(),
+        long.messages[&only.id].len(),
+        "the comparison must hold message count equal"
+    );
+    let (short_buffer, short_hits) = tracked_frame(&mut short, 100, 30);
+    let (long_buffer, long_hits) = tracked_frame(&mut long, 100, 30);
+    assert_rail_matches(&short_buffer, &short_hits);
+    assert_rail_matches(&long_buffer, &long_hits);
+    let short_view = short_hits.transcript_view.as_ref().expect("short view");
+    let long_view = long_hits.transcript_view.as_ref().expect("long view");
+    assert!(
+        long_view.rows > short_view.rows,
+        "heavier wrapping must produce more rows"
+    );
+    let short_thumb = expected_rail_thumb(short_view, usize::from(short_hits.transcript.height))
+        .expect("short rail")
+        .1;
+    let long_thumb = expected_rail_thumb(long_view, usize::from(long_hits.transcript.height))
+        .expect("long rail")
+        .1;
+    assert!(
+        long_thumb < short_thumb,
+        "a larger wrapped extent must shorten the thumb: {long_thumb} vs {short_thumb}"
+    );
+}
+
+#[test]
+fn passive_rail_uses_the_byline_adjusted_final_top() {
+    let (mut app, _) = rail_fixture();
+    let (_, first) = tracked_frame(&mut app, 100, 24);
+    let max_scroll = first
+        .transcript_view
+        .as_ref()
+        .expect("viewport")
+        .max_scroll();
+    let mut checked = 0;
+    let mut found = false;
+    for back in 0..=max_scroll {
+        app.scroll = back;
+        app.reading_anchor = None;
+        app.transcript_viewport = None;
+        let (buffer, hits) = tracked_frame(&mut app, 100, 24);
+        let view = hits.transcript_view.as_ref().expect("viewport");
+        assert_rail_matches(&buffer, &hits);
+        let raw_top = view.max_scroll().saturating_sub(back);
+        if view.top == raw_top {
+            continue;
+        }
+        found = true;
+        let track = usize::from(hits.transcript.height);
+        let adjusted = expected_rail_thumb(view, track).expect("adjusted rail");
+        let raw = ((track - adjusted.1) as u128 * raw_top.min(view.max_scroll()) as u128
+            / view.max_scroll() as u128) as usize;
+        if raw != adjusted.0 {
+            assert_eq!(
+                rail_cells(&buffer, &hits)
+                    .iter()
+                    .position(|(_, symbol, _)| symbol == "█"),
+                Some(adjusted.0),
+                "the thumb must start at the byline-adjusted top, not the raw scroll"
+            );
+            checked += 1;
+            break;
+        }
+    }
+    assert!(found, "the fixture must exercise a byline adjustment");
+    assert!(checked > 0, "the adjustment must move the thumb");
+}
+
+#[test]
+fn passive_rail_tracks_the_bounded_search_context_extent() {
+    let chat = conversation("Context rail", 2, 1);
+    let build = || {
+        let mut app = App {
+            selected: Some(chat.id.clone()),
+            ..Default::default()
+        };
+        app.set_conversations(vec![chat.clone()]);
+        app.upsert(
+            chat.id.clone(),
+            message(&chat, "normal-newest", 90, "NORMAL_LATEST_ROW", false),
+        );
+        app
+    };
+    let mut short = build();
+    let (generation, conversation, target, token) =
+        start_context_lookup(&mut short, &chat, "target");
+    assert!(short.finish_message_context(
+        generation,
+        conversation,
+        target,
+        token,
+        vec![message(&chat, "target", 20, "short context", false)]
+    ));
+    let (buffer, hits) = tracked_frame(&mut short, 100, 24);
+    assert_rail_matches(&buffer, &hits);
+    assert!(
+        rail_cells(&buffer, &hits)
+            .iter()
+            .all(|(_, symbol, _)| symbol.trim().is_empty()),
+        "a short search context fits and hides the rail"
+    );
+
+    let mut long = build();
+    let (generation, conversation, target, token) =
+        start_context_lookup(&mut long, &chat, "target");
+    let rows = (0..40)
+        .map(|index| {
+            let id = if index == 20 {
+                "target".to_owned()
+            } else {
+                format!("ctx{index:03}")
+            };
+            message(
+                &chat,
+                &id,
+                1_700_000_000_000 + index,
+                &format!("context row {index:03} with words that wrap"),
+                false,
+            )
+        })
+        .collect::<Vec<_>>();
+    assert!(long.finish_message_context(generation, conversation, target, token, rows.clone()));
+    let (buffer, hits) = tracked_frame(&mut long, 100, 24);
+    assert_rail_matches(&buffer, &hits);
+    let view = hits.transcript_view.as_ref().expect("context viewport");
+    assert_eq!(
+        view.messages
+            .iter()
+            .map(|row| row.id.clone())
+            .collect::<Vec<_>>(),
+        rows.iter().map(|row| row.id().clone()).collect::<Vec<_>>()
+    );
+    assert!(
+        rail_cells(&buffer, &hits)
+            .iter()
+            .any(|(_, symbol, _)| symbol == "█"),
+        "the rail must reflect the loaded context buffer"
+    );
+}
+
+#[test]
+fn passive_rail_keeps_anchors_across_arrival_prepend_reconcile_and_resize() {
+    use bloom_ipc::EventKind;
+    let (mut app, only) = reading_fixture();
+    let anchor = app.reading_anchor.clone().expect("reading anchor");
+    let (buffer, hits) = tracked_frame(&mut app, 100, 24);
+    assert_rail_matches(&buffer, &hits);
+
+    app.apply_event(EventKind::Message {
+        conversation_id: only.id.clone(),
+        message: message(
+            &only,
+            "rail-arrival",
+            1_700_000_001_000,
+            &"new wrapped content ".repeat(30),
+            false,
+        ),
+        push_sequence: None,
+    });
+    let (buffer, hits) = tracked_frame(&mut app, 100, 24);
+    assert_eq!(app.reading_anchor.as_ref().unwrap().message, anchor.message);
+    assert_rail_matches(&buffer, &hits);
+
+    let (id, _, token) = app.begin_load_older().expect("older page cursor");
+    app.finish_load_older(
+        id,
+        token,
+        (0..12)
+            .map(|index| {
+                message(
+                    &only,
+                    &format!("rail-old{index:03}"),
+                    1_699_999_999_000 + index,
+                    &format!("prepended older message {index:03}"),
+                    false,
+                )
+            })
+            .collect(),
+        OLDER_PAGE_LIMIT,
+    );
+    let (buffer, hits) = tracked_frame(&mut app, 100, 24);
+    assert_eq!(app.reading_anchor.as_ref().unwrap().message, anchor.message);
+    assert_rail_matches(&buffer, &hits);
+
+    app.apply_snapshot(bloom_tui::daemon::Snapshot {
+        token: None,
+        bootstrap: None,
+        revision: 30,
+        conversations: vec![only.clone()],
+        visible: Some(only.id.clone()),
+        history: app.messages[&only.id].clone(),
+    });
+    let (buffer, hits) = tracked_frame(&mut app, 100, 24);
+    assert_eq!(app.reading_anchor.as_ref().unwrap().message, anchor.message);
+    assert_rail_matches(&buffer, &hits);
+
+    for (width, height) in [(66u16, 18u16), (24, 12), (100, 24)] {
+        let (buffer, hits) = tracked_frame(&mut app, width, height);
+        assert_eq!(
+            app.reading_anchor.as_ref().unwrap().message,
+            anchor.message,
+            "resize to {width}x{height} must keep the anchor"
+        );
+        assert_rail_matches(&buffer, &hits);
+    }
+}
+
+#[test]
+fn latest_keeps_its_behavior_with_a_visible_rail() {
+    let (mut app, _) = reading_fixture();
+    let (buffer, hits) = tracked_frame(&mut app, 100, 24);
+    assert_rail_matches(&buffer, &hits);
+    assert!(rail_cells(&buffer, &hits)
+        .iter()
+        .any(|(_, symbol, _)| symbol == "█"));
+    let latest = hits.latest.expect("Latest control");
+    assert_eq!(hits.at(latest.x, latest.y), Some(ui::Hit::Latest));
+    assert_eq!(
+        latest.y,
+        hits.transcript.bottom(),
+        "Latest stays on the reserved spacer row"
+    );
+    assert_eq!(
+        latest.x + latest.width,
+        hits.transcript.right(),
+        "Latest keeps the original outer content width"
+    );
+    app.handle_mouse(
+        MouseEventKind::Down(MouseButton::Left),
+        latest.x,
+        latest.y,
+        &hits,
+    );
+    assert!(!app.is_scrolled_back());
+    let (buffer, hits) = tracked_frame(&mut app, 100, 24);
+    assert_rail_matches(&buffer, &hits);
+    assert!(hits.latest.is_none());
+}
+
+#[test]
+fn passive_rail_click_drag_and_release_do_nothing_but_wheel_still_scrolls() {
+    let (mut app, _) = reading_fixture();
+    let (_, hits) = tracked_frame(&mut app, 100, 24);
+    let content = hits.transcript;
+    let x = content.right().saturating_sub(1);
+    let y = content.y + 1;
+    assert_eq!(
+        hits.at(x, y),
+        Some(ui::Hit::Transcript),
+        "the rail column is still the transcript, not a new hit target"
+    );
+    let before = app.scroll;
+    for kind in [
+        MouseEventKind::Down(MouseButton::Left),
+        MouseEventKind::Drag(MouseButton::Left),
+        MouseEventKind::Up(MouseButton::Left),
+    ] {
+        let action = app.handle_mouse(kind, x, y, &hits);
+        assert_eq!(action, Action::None);
+        assert_eq!(app.scroll, before, "a passive rail must not move the view");
+    }
+    app.handle_mouse(MouseEventKind::ScrollUp, x, y, &hits);
+    assert!(
+        app.scroll > before,
+        "wheel over the uncovered rail still scrolls the transcript"
+    );
+}
+
+#[test]
+fn passive_rail_input_is_owned_by_a_covering_overlay() {
+    let (mut app, _) = reading_fixture();
+    app.open_settings();
+    let (_, hits) = tracked_frame(&mut app, 100, 30);
+    let x = hits.transcript.right().saturating_sub(1);
+    let covered = (hits.transcript.y..hits.transcript.bottom())
+        .find(|y| hits.overlay_contains(x, *y))
+        .expect("the settings overlay must cover part of the rail column");
+    let before = app.scroll;
+    app.handle_mouse(MouseEventKind::ScrollUp, x, covered, &hits);
+    assert_eq!(app.scroll, before, "the overlay owns the rail wheel");
+    app.handle_mouse(MouseEventKind::Down(MouseButton::Left), x, covered, &hits);
+    assert_eq!(app.scroll, before, "the overlay owns the rail click");
+}
+
+#[test]
+fn passive_rail_uses_theme_colors_and_stays_distinct() {
+    let (mut app, _) = rail_fixture();
+    let mut colors = Vec::new();
+    for theme in [Theme::Dark, Theme::Light] {
+        app.theme = theme;
+        let (buffer, hits) = tracked_frame(&mut app, 100, 30);
+        assert_rail_matches(&buffer, &hits);
+        let cells = rail_cells(&buffer, &hits);
+        let thumb = cells
+            .iter()
+            .find(|(_, symbol, _)| symbol == "█")
+            .map(|(_, _, fg)| *fg)
+            .expect("thumb");
+        let track = cells
+            .iter()
+            .find(|(_, symbol, _)| symbol == "│")
+            .map(|(_, _, fg)| *fg)
+            .expect("track");
+        assert_ne!(thumb, track, "{theme:?} must separate thumb and track");
+        colors.push((thumb, track));
+    }
+    assert_ne!(
+        colors[0], colors[1],
+        "dark and light themes must paint different rail colors"
     );
 }

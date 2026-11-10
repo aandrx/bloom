@@ -9,6 +9,7 @@ use bloomd::{
     engine::{engine_slot, Engine, EVENT_CAPACITY},
     generation::{Outcome, RecoveryLoop},
     ipc::{serve_with_subscriptions, Listener, SubscriptionHub},
+    readiness::Readiness,
     recovery::RecoveryPolicy,
     service::Service,
     store::EncryptedStore,
@@ -16,7 +17,10 @@ use bloomd::{
 };
 use std::{
     process::ExitCode,
-    sync::{Arc, Mutex},
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc, Mutex,
+    },
     time::Duration,
 };
 use tokio::sync::{mpsc, watch};
@@ -75,13 +79,10 @@ async fn main() -> ExitCode {
             return ExitCode::from(2);
         }
     };
-    // Only ask the engine for a full conversation listing when this store has none.
-    let store_is_empty = {
-        let guard = store.lock().unwrap();
-        bloomd::store::list_conversations(&guard).map_or(true, |rows| rows.is_empty())
-    };
+    // The daemon owns the required startup refresh explicitly. The sidecar must
+    // not run its own unsolicited listing, even when this store is empty.
     let mut engine_config = config.engine.clone();
-    engine_config.sync_chats = store_is_empty;
+    engine_config.sync_chats = false;
 
     eprintln!(
         "bloomd: starting pid={} socket={}",
@@ -100,6 +101,11 @@ async fn main() -> ExitCode {
     };
 
     let hub = SubscriptionHub::with_default_capacity();
+    let readiness = Readiness::new_starting(hub.clone());
+    // Establish the initial generation before the engine can emit Active. The
+    // first session event then marks engine readiness without racing the sync
+    // operation created below.
+    let _ = readiness.begin(1);
     let engine = Arc::new(Engine::new(engine_config.clone()));
     // The service reads the current engine from this slot, so the recovery loop can
     // replace its contents without rebuilding the service.
@@ -112,20 +118,63 @@ async fn main() -> ExitCode {
         return ExitCode::from(3);
     }
 
+    let service = Arc::new(Service::with_engine_slot_and_readiness(
+        store,
+        slot.clone(),
+        hub.clone(),
+        readiness.clone(),
+    ));
+    let generations = Arc::new(AtomicU64::new(1));
+
     // Replacements are built over the same sink and engine config, so the new
-    // supervisor always wraps the engine it returns.
-    let builder = move || {
-        let engine = Arc::new(Engine::new(engine_config.clone()));
-        let supervisor = Supervisor::new(engine.clone(), sink.clone());
-        (supervisor, engine)
+    // supervisor always wraps the engine it returns. The generation advances and
+    // readiness is invalidated before the replacement is exposed.
+    let builder = {
+        let service = service.clone();
+        let generations = generations.clone();
+        let engine_config = engine_config.clone();
+        let sink = sink.clone();
+        move || {
+            let generation = generations.fetch_add(1, Ordering::SeqCst) + 1;
+            let _ = service.readiness().begin(generation);
+            let engine = Arc::new(Engine::with_generation(engine_config.clone(), generation));
+            let supervisor = Supervisor::new(engine.clone(), sink.clone());
+            (supervisor, engine)
+        }
     };
     let (cancel_tx, mut cancel_rx) = watch::channel(false);
     let mut recovery =
-        RecoveryLoop::new(slot.clone(), supervisor, RecoveryPolicy::default(), builder);
+        RecoveryLoop::new(slot.clone(), supervisor, RecoveryPolicy::default(), builder)
+            .with_recovery_hook({
+                let readiness = readiness.clone();
+                move || readiness.begin_recovery()
+            })
+            .with_started_hook({
+                let service = service.clone();
+                let generations = generations.clone();
+                move || {
+                    let generation = generations.load(Ordering::SeqCst);
+                    let service = service.clone();
+                    tokio::spawn(async move {
+                        service.run_sync_for_generation(generation).await;
+                    });
+                }
+            })
+            .with_failed_hook({
+                let readiness = readiness.clone();
+                move || readiness.recovery_failed()
+            });
     let recovery_task = tokio::spawn(async move { recovery.run(&mut cancel_rx).await });
 
-    let service = Arc::new(Service::with_engine_slot(store, slot, hub.clone()));
     let persistence = tokio::spawn(service.clone().persist_events(events));
+    // The initial required refresh starts only after the supervisor is running and
+    // the persistence receiver exists. An empty listing is a valid complete result.
+    {
+        let service = service.clone();
+        tokio::spawn(async move {
+            service.run_sync_for_generation(1).await;
+        });
+    }
 
     loop {
         tokio::select! {

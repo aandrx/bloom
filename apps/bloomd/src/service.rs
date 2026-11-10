@@ -7,16 +7,17 @@
 use crate::{
     engine::{engine_slot, outgoing_text, Engine, EngineSlot},
     ipc::{HandlerFuture, RequestHandler, SubscriptionHub},
+    readiness::{Finish, Readiness},
     store::{self, EncryptedStore},
 };
 use bloom_domain::{
     AttachmentRef, Conversation, ConversationId, ConversationKind, DeliveryState, Handle,
-    HandleKind, Message, MessageId, MessagePart, OutgoingBody, Participant, Reaction,
+    HandleKind, Message, MessageId, MessagePart, OutgoingBody, Participant, Reaction, SessionState,
 };
 use bloom_ipc::{
     DraftKey as IpcDraftKey, DraftLoad as IpcDraftLoad, DraftWriteOutcome as IpcDraftWriteOutcome,
     DurableDraft as IpcDurableDraft, Event, EventKind, HistoryCursor, MessageSearchHit,
-    ParticipantFilter, ProtocolError,
+    ParticipantFilter, ProtocolError, ReadinessSnapshot,
 };
 use bloom_transport::{TransportError, TransportEvent};
 use std::{
@@ -28,6 +29,7 @@ pub struct Service {
     store: Arc<Mutex<EncryptedStore>>,
     engine: EngineSlot,
     hub: SubscriptionHub,
+    readiness: Readiness,
 }
 
 impl Service {
@@ -36,10 +38,12 @@ impl Service {
         engine: Arc<Engine>,
         hub: SubscriptionHub,
     ) -> Self {
+        let readiness = Readiness::new_ready(1, hub.clone());
         Self {
             store,
             engine: engine_slot(engine),
             hub,
+            readiness,
         }
     }
 
@@ -50,7 +54,65 @@ impl Service {
         engine: EngineSlot,
         hub: SubscriptionHub,
     ) -> Self {
-        Self { store, engine, hub }
+        let readiness = Readiness::new_ready(1, hub.clone());
+        Self {
+            store,
+            engine,
+            hub,
+            readiness,
+        }
+    }
+
+    /// Production constructor: the caller owns the shared readiness state so the
+    /// startup and recovery tasks publish into the same revisioned snapshot.
+    pub fn with_engine_slot_and_readiness(
+        store: Arc<Mutex<EncryptedStore>>,
+        engine: EngineSlot,
+        hub: SubscriptionHub,
+        readiness: Readiness,
+    ) -> Self {
+        Self {
+            store,
+            engine,
+            hub,
+            readiness,
+        }
+    }
+
+    pub fn readiness(&self) -> &Readiness {
+        &self.readiness
+    }
+
+    pub fn readiness_snapshot(&self) -> ReadinessSnapshot {
+        self.readiness.snapshot()
+    }
+
+    /// Run one explicit startup metadata refresh for `generation`. The engine's
+    /// `sync_lock` serializes this with a manual sync, and the readiness token
+    /// makes a late result from an older generation or operation inert.
+    pub async fn run_sync_for_generation(self: Arc<Self>, generation: u64) {
+        let Some(token) = self.readiness.begin(generation) else {
+            return;
+        };
+        let engine = self.current_engine();
+        if engine.generation() != generation {
+            self.readiness.finish(token, Finish::Unavailable);
+            return;
+        }
+        let result = engine.sync_conversations().await;
+        let finish = match result {
+            Ok((limited, count)) => {
+                if limited {
+                    Finish::Limited(count)
+                } else {
+                    Finish::Complete(count)
+                }
+            }
+            Err(TransportError::TransportUnavailable) => Finish::Unavailable,
+            Err(TransportError::Timeout) => Finish::Timeout,
+            Err(_) => Finish::Failed,
+        };
+        self.readiness.finish(token, finish);
     }
 
     /// Clone the current engine out of the slot. The lock is released here, so no
@@ -126,12 +188,24 @@ impl Service {
                 });
                 Ok(true)
             }
-            TransportEvent::Session { state, .. } => {
+            TransportEvent::Session {
+                generation, state, ..
+            } => {
+                if *generation != self.readiness.current_generation() {
+                    return Ok(false);
+                }
                 self.hub.publish(Event {
                     event: EventKind::Session {
                         state: state.clone(),
                     },
                 });
+                // Active is independent engine readiness; lost or failed sessions
+                // invalidate it. Routine local events never close the gate.
+                if matches!(state, SessionState::Active) {
+                    self.readiness.mark_engine_ready_current();
+                } else if matches!(state, SessionState::Disconnected | SessionState::Failed) {
+                    self.readiness.session_lost();
+                }
                 Ok(true)
             }
             TransportEvent::ReactionChanged {
@@ -319,11 +393,37 @@ impl Service {
                 conversation_persistence_failed = false;
             }
             let is_conversation = matches!(&event, TransportEvent::Conversation { .. });
-            if let Err(error) = self.persist(&event) {
-                if is_conversation {
-                    conversation_persistence_failed = true;
+            let reconnect_candidate = matches!(
+                &event,
+                TransportEvent::Session {
+                    generation,
+                    state: SessionState::Active,
+                    ..
+                } if *generation == self.readiness.current_generation()
+            );
+            let persisted = match self.persist(&event) {
+                Ok(persisted) => persisted,
+                Err(error) => {
+                    if is_conversation {
+                        conversation_persistence_failed = true;
+                    }
+                    eprintln!("bloomd: dropping event that failed to persist: {error}");
+                    false
                 }
-                eprintln!("bloomd: dropping event that failed to persist: {error}");
+            };
+            // Reserve the refresh only after the event was accepted for this
+            // generation. A stale Active must not consume the reconnect slot.
+            let reconnect = persisted && reconnect_candidate && self.readiness.begin_reconnect();
+            if reconnect {
+                // A session can return on the same engine generation after a
+                // transport loss. Re-run the required refresh; sends stay gated
+                // until it completes. Initial Active is not a reconnect because
+                // the readiness phase is Refreshing, not Failed/Disconnected.
+                let service = self.clone();
+                let generation = self.readiness.current_generation();
+                tokio::spawn(async move {
+                    service.run_sync_for_generation(generation).await;
+                });
             }
         }
     }
@@ -438,11 +538,30 @@ impl RequestHandler for Service {
 
     fn sync_conversations(&self) -> HandlerFuture<'_, (bloom_ipc::ConversationSyncStatus, u32)> {
         Box::pin(async move {
+            let generation = self.readiness.current_generation();
+            let Some(token) = self.readiness.begin(generation) else {
+                return Err(ProtocolError::NotReady);
+            };
             let engine = self.current_engine();
-            let (limited, count) = engine
-                .sync_conversations()
-                .await
-                .map_err(map_transport_error)?;
+            if engine.generation() != generation {
+                self.readiness.finish(token, Finish::Unavailable);
+                return Err(ProtocolError::NotReady);
+            }
+            let result = engine.sync_conversations().await;
+            let finish = match result {
+                Ok((limited, count)) => {
+                    if limited {
+                        Finish::Limited(count)
+                    } else {
+                        Finish::Complete(count)
+                    }
+                }
+                Err(TransportError::TransportUnavailable) => Finish::Unavailable,
+                Err(TransportError::Timeout) => Finish::Timeout,
+                Err(_) => Finish::Failed,
+            };
+            self.readiness.finish(token, finish);
+            let (limited, count) = result.map_err(map_transport_error)?;
             // The engine resolves only after its ordered completion marker is persisted and
             // the conversation-list refresh event has been published.
             Ok((
@@ -454,6 +573,10 @@ impl RequestHandler for Service {
                 count,
             ))
         })
+    }
+
+    fn readiness(&self) -> HandlerFuture<'_, ReadinessSnapshot> {
+        Box::pin(async move { Ok(self.readiness.snapshot()) })
     }
 
     fn history(
@@ -530,12 +653,19 @@ impl RequestHandler for Service {
         body: OutgoingBody,
     ) -> HandlerFuture<'_, MessageId> {
         Box::pin(async move {
+            if !self.readiness.can_send() {
+                return Err(ProtocolError::NotReady);
+            }
+            let generation = self.readiness.current_generation();
             let text = outgoing_text(&body).map_err(|_| ProtocolError::Unsupported)?;
             let (handle, recipient) = normalize_address(&address)?;
             let engine_transport = crate::engine::transport_id();
             // Resolve one engine for the whole operation: a swap between building
             // the participants and sending must not mix two generations.
             let engine = self.current_engine();
+            if engine.generation() != generation {
+                return Err(ProtocolError::NotReady);
+            }
             let conversation = {
                 let mut store = self.store.lock().unwrap();
                 let linked = match store::reconcile_stored_direct_conversations(&mut store) {
@@ -645,10 +775,17 @@ impl RequestHandler for Service {
         body: OutgoingBody,
     ) -> HandlerFuture<'_, MessageId> {
         Box::pin(async move {
+            if !self.readiness.can_send() {
+                return Err(ProtocolError::NotReady);
+            }
+            let generation = self.readiness.current_generation();
             let (text, recipients, conversation) =
                 self.send_blocking_prepare(&conversation_id, &body)?;
 
             let engine = self.current_engine();
+            if engine.generation() != generation {
+                return Err(ProtocolError::NotReady);
+            }
             let message_id = engine
                 .send_text(&recipients, Some(&conversation.remote_id), &text)
                 .await
@@ -702,10 +839,17 @@ impl RequestHandler for Service {
         path: String,
     ) -> HandlerFuture<'_, MessageId> {
         Box::pin(async move {
+            if !self.readiness.can_send() {
+                return Err(ProtocolError::NotReady);
+            }
+            let generation = self.readiness.current_generation();
             let (name, byte_len) = outgoing_attachment_file(&path)?;
             let (recipients, conversation) = self.send_targets(&conversation_id)?;
 
             let engine = self.current_engine();
+            if engine.generation() != generation {
+                return Err(ProtocolError::NotReady);
+            }
             let message_id = engine
                 .send_attachment(&recipients, Some(&conversation.remote_id), &path)
                 .await
@@ -882,6 +1026,7 @@ fn map_transport_error(error: TransportError) -> ProtocolError {
         TransportError::RecipientUnreachable => ProtocolError::RecipientUnreachable,
         TransportError::NotRegistered => ProtocolError::NotRegistered,
         TransportError::TransportUnavailable => ProtocolError::TransportUnavailable,
+        TransportError::Timeout => ProtocolError::Protocol,
         TransportError::Unsupported => ProtocolError::Unsupported,
         TransportError::Protocol => ProtocolError::Protocol,
         TransportError::Internal => ProtocolError::Internal,
@@ -2022,5 +2167,185 @@ mod outgoing_attachment_tests {
             outgoing_attachment_file(path.to_str().unwrap()),
             Err(ProtocolError::InvalidRequest)
         );
+    }
+}
+
+#[cfg(test)]
+mod readiness_gate_tests {
+    use super::*;
+    use crate::{
+        engine::{engine_slot, EngineConfig},
+        ipc::RequestHandler,
+        readiness::Readiness,
+    };
+    use bloom_domain::{MessagePart, TransportId};
+    use std::{os::unix::fs::PermissionsExt, path::PathBuf};
+
+    fn harness(ready: bool) -> (tempfile::TempDir, Arc<Service>) {
+        let directory = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(directory.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        let store = Arc::new(Mutex::new(
+            EncryptedStore::open_with_key(directory.path().join("store.db"), &[7; 32]).unwrap(),
+        ));
+        let engine = Arc::new(Engine::new(EngineConfig {
+            dart_executable: PathBuf::from("dart"),
+            script: PathBuf::from("engine.dart"),
+            state_dir: directory.path().join("state"),
+            library: PathBuf::from("engine.dylib"),
+            sync_chats: false,
+        }));
+        let slot = engine_slot(engine);
+        let hub = SubscriptionHub::new(4);
+        let readiness = if ready {
+            Readiness::new_ready(1, hub.clone())
+        } else {
+            Readiness::new_starting(hub.clone())
+        };
+        let service = Arc::new(Service::with_engine_slot_and_readiness(
+            store, slot, hub, readiness,
+        ));
+        (directory, service)
+    }
+
+    fn body() -> OutgoingBody {
+        OutgoingBody {
+            parts: vec![MessagePart::Text("synthetic body".into())],
+        }
+    }
+
+    #[tokio::test]
+    async fn closed_gate_rejects_all_three_before_preparation_or_store_lookup() {
+        let (_directory, service) = harness(false);
+        let conversation =
+            ConversationId::new(TransportId::new("openbubbles").unwrap(), "missing").unwrap();
+
+        assert_eq!(
+            service.send(conversation.clone(), body()).await,
+            Err(ProtocolError::NotReady),
+            "send must reject before the store lookup or engine call"
+        );
+        assert_eq!(
+            service
+                .start_conversation("not a valid address".into(), body())
+                .await,
+            Err(ProtocolError::NotReady),
+            "new chat must reject before address preparation"
+        );
+        assert_eq!(
+            service
+                .send_attachment(conversation, "/definitely/not/a/file".into())
+                .await,
+            Err(ProtocolError::NotReady),
+            "attachment must reject before path validation"
+        );
+        assert!(
+            service.list_conversations().await.unwrap().is_empty(),
+            "a gated request must not mutate the store"
+        );
+    }
+
+    #[tokio::test]
+    async fn manual_sync_closes_the_gate_and_reports_unavailable() {
+        let (_directory, service) = harness(true);
+        assert!(service.readiness().can_send());
+        let result = service.sync_conversations().await;
+        assert_eq!(result, Err(ProtocolError::TransportUnavailable));
+        let snapshot = service.readiness_snapshot();
+        assert!(!snapshot.can_send);
+        assert_eq!(snapshot.phase, bloom_ipc::ReadinessPhase::Failed);
+        assert_eq!(
+            snapshot.outcome,
+            Some(bloom_ipc::ReadinessOutcome::Unavailable)
+        );
+    }
+
+    #[tokio::test]
+    async fn inbound_and_local_events_do_not_close_an_open_gate() {
+        let (_directory, service) = harness(true);
+        service
+            .persist(&TransportEvent::ConversationsChanged)
+            .unwrap();
+        service
+            .persist(&TransportEvent::Session {
+                generation: 1,
+                state: SessionState::Active,
+                reason: None,
+            })
+            .unwrap();
+        assert!(service.readiness().can_send());
+    }
+
+    #[tokio::test]
+    async fn disconnected_session_closes_the_gate() {
+        let (_directory, service) = harness(true);
+        service
+            .persist(&TransportEvent::Session {
+                generation: 1,
+                state: SessionState::Disconnected,
+                reason: None,
+            })
+            .unwrap();
+        assert!(!service.readiness().can_send());
+    }
+
+    #[tokio::test]
+    async fn stale_session_from_the_previous_generation_cannot_close_the_gate() {
+        let (_directory, service) = harness(true);
+        let token = service.readiness().begin(2).unwrap();
+        service.readiness().mark_engine_ready(token);
+        assert!(service.readiness().finish(token, Finish::Complete(0)));
+        assert!(service.readiness().can_send());
+
+        service
+            .persist(&TransportEvent::Session {
+                generation: 1,
+                state: SessionState::Disconnected,
+                reason: None,
+            })
+            .unwrap();
+
+        assert!(
+            service.readiness().can_send(),
+            "a session event from the replaced engine generation must be ignored"
+        );
+    }
+
+    #[tokio::test]
+    async fn stale_active_does_not_consume_a_reconnect_refresh_slot() {
+        let (_directory, service) = harness(true);
+        let token = service.readiness().begin(2).unwrap();
+        service.readiness().mark_engine_ready(token);
+        assert!(service.readiness().finish(token, Finish::Complete(0)));
+        service.readiness().session_lost();
+
+        let (sender, receiver) = tokio::sync::mpsc::channel(4);
+        let task = tokio::spawn(service.clone().persist_events(receiver));
+        sender
+            .send(TransportEvent::Session {
+                generation: 1,
+                state: SessionState::Active,
+                reason: None,
+            })
+            .await
+            .unwrap();
+        drop(sender);
+        task.await.unwrap();
+
+        assert_eq!(
+            service.readiness().snapshot().bounded_error,
+            Some(bloom_ipc::ReadinessError::Disconnected)
+        );
+        assert!(
+            service.readiness().begin_reconnect(),
+            "a stale Active must not reserve the reconnect slot"
+        );
+    }
+
+    #[tokio::test]
+    async fn readiness_query_returns_the_shared_snapshot() {
+        let (_directory, service) = harness(false);
+        let snapshot = RequestHandler::readiness(&*service).await.unwrap();
+        assert_eq!(snapshot.phase, bloom_ipc::ReadinessPhase::Starting);
+        assert!(!snapshot.can_send);
     }
 }

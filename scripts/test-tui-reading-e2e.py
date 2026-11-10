@@ -16,6 +16,7 @@ import signal
 import struct
 import termios
 import time
+import unicodedata
 import unittest
 
 HERE = Path(__file__).resolve().parent
@@ -23,6 +24,23 @@ H = runpy.run_path(str(HERE / 'test-tui-messaging-e2e.py'), run_name='helpers')
 R = runpy.run_path(str(HERE / 'test-stateful-fake-daemon.py'), run_name='helpers')
 CID = {'transport': 'openbubbles', 'value': 'alice@example.invalid'}
 BOB = {'transport': 'openbubbles', 'value': 'bob@example.invalid'}
+
+
+def truncate_columns(text, columns):
+    """Truncate `text` to `columns` screen columns.
+
+    pyte's `display` omits the continuation cell of a wide character, so string
+    indices drift right of the screen column after one. Walk with the widths the
+    TUI uses so a reserved column can be excluded exactly.
+    """
+    used = 0
+    for index, character in enumerate(text):
+        width = 0 if unicodedata.combining(character) else (
+            2 if unicodedata.east_asian_width(character) in ('W', 'F') else 1)
+        if used + width > columns:
+            return text[:index]
+        used += width
+    return text
 
 
 class ReadingFlows(unittest.TestCase):
@@ -59,6 +77,10 @@ class ReadingFlows(unittest.TestCase):
             self.pid, self.master = pty.fork()
             if self.pid == 0:
                 os.execv(str(H['BINARY']), [str(H['BINARY'])])
+        self.resize(100, 30, force=True)
+        self.wait_for(lambda: 'Open Bloom' in self.text(), 10)
+        self.key(b'\r')
+        self.wait_for(lambda: 'Write a message' in self.text(), 5)
 
     def stop_tui(self):
         try:
@@ -72,7 +94,9 @@ class ReadingFlows(unittest.TestCase):
         R['request'](str(self.fixture.socket_path), 'send', conversation_id=CID,
                      body={'parts': [{'type': 'text', 'value': f'READ_MARKER_{index:03d} synthetic context'}]})
 
-    def resize(self, width, height):
+    def resize(self, width, height, force=False):
+        if not force and getattr(self, 'width', None) == width and getattr(self, 'height', None) == height:
+            return
         self.width, self.height = width, height
         self.screen = H['SHOT']['pyte'].Screen(width, height)
         self.stream = H['SHOT']['pyte'].ByteStream(self.screen)
@@ -353,10 +377,15 @@ class ReadingFlows(unittest.TestCase):
             bob['title'] = f'Bob {suffix} identity'
             self.fixture.store_path.write_text(json.dumps(state))
             self.fixture.start_daemon()
+            self.wait_for(lambda: 'Open Bloom' in self.text(), timeout=10)
+            self.key(b'\r')
             self.wait_for(lambda: bob['title'] in self.text(), timeout=10)
             self.artifact(f'candidate-after-{suffix}-reconnect')
             self.assertIn(f'› {bob["title"]}', self.text(),
                           'successive identity reconciliation must preserve the logical candidate')
+        # One neutral key satisfies the post-open Enter latch before the drawer
+        # Enter, without weakening the startup burst protection.
+        self.key(b'\x1bOP')
         self.key(b'\r')
         self.assertIn('Bob final identity', self.screen.display[0])
         self.assertEqual(len(self.fixture.persisted()['messages']), 60)
@@ -455,7 +484,11 @@ class ReadingFlows(unittest.TestCase):
         def transcript_text():
             divider = self.screen.display[0].find('│')
             left = divider + 3 if divider >= 0 else 2
-            return '\n'.join(line[left:] for line in self.screen.display[2:-5])
+            # The transcript reserves its last content column for the reading
+            # rail; the two columns right of it are the pane's right gutter.
+            right = self.width - 3 - left
+            return '\n'.join(truncate_columns(line[left:], right)
+                             for line in self.screen.display[2:-5])
 
         self.wait_for(lambda: 'ALICE_SCOPED_HIT' in transcript_text())
         self.assertIn('Alice', self.screen.display[0])
@@ -677,7 +710,11 @@ class ReadingFlows(unittest.TestCase):
         def transcript_text():
             divider = self.screen.display[0].find('│')
             left = divider + 3 if divider >= 0 else 2
-            return '\n'.join(line[left:] for line in self.screen.display[2:-5])
+            # The transcript reserves its last content column for the reading
+            # rail; the two columns right of it are the pane's right gutter.
+            right = self.width - 3 - left
+            return '\n'.join(truncate_columns(line[left:], right)
+                             for line in self.screen.display[2:-5])
 
         def projected():
             return re.sub(r'\s+', ' ', transcript_text())
@@ -805,7 +842,11 @@ class ReadingFlows(unittest.TestCase):
         def transcript_text():
             divider = self.screen.display[0].find('│')
             left = divider + 3 if divider >= 0 else 2
-            return '\n'.join(line[left:] for line in self.screen.display[2:-5])
+            # The transcript reserves its last content column for the reading
+            # rail; the two columns right of it are the pane's right gutter.
+            right = self.width - 3 - left
+            return '\n'.join(truncate_columns(line[left:], right)
+                             for line in self.screen.display[2:-5])
 
         for width in (100, 44, 24):
             self.resize(width, 30)
@@ -858,7 +899,11 @@ class ReadingFlows(unittest.TestCase):
         def transcript_text():
             divider = self.screen.display[0].find('│')
             left = divider + 3 if divider >= 0 else 2
-            return '\n'.join(line[left:] for line in self.screen.display[2:-5])
+            # The transcript reserves its last content column for the reading
+            # rail; the two columns right of it are the pane's right gutter.
+            right = self.width - 3 - left
+            return '\n'.join(truncate_columns(line[left:], right)
+                             for line in self.screen.display[2:-5])
 
         for width in (100, 44, 24):
             self.resize(width, 30)

@@ -1,5 +1,7 @@
 use bloom_domain::{ConversationId, TransportId};
+use bloom_ipc::{ReadinessError, ReadinessOutcome, ReadinessPhase, ReadinessSnapshot};
 use bloom_tui::app::{Action, App, Focus};
+use bloom_tui::startup::StartupState;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
 fn chat() -> ConversationId {
@@ -132,4 +134,136 @@ fn new_chat_body_preserves_whitespace_and_literal_slash() {
     };
     app.paste("  /new\nbody  ");
     assert!(matches!(enter(&mut app),Action::StartConversation{body,..} if body=="  /new\nbody  "));
+}
+
+#[test]
+fn startup_loading_consumes_all_input_and_preserves_the_draft() {
+    let mut app = App {
+        startup: StartupState::loading(),
+        selected: Some(chat()),
+        draft: "hello".into(),
+        draft_cursor: 5,
+        ..Default::default()
+    };
+    assert_eq!(enter(&mut app), Action::None);
+    assert_eq!(app.draft, "hello");
+    assert_eq!(app.draft_cursor, 5);
+    assert!(app.pending_send_attempt.is_none());
+    assert!(app.pending_attachment_send.is_none());
+
+    app.paste(" world");
+    assert_eq!(app.draft, "hello");
+    app.handle_key(KeyEvent::new(KeyCode::Char('n'), KeyModifiers::NONE));
+    assert!(!app.new_conversation);
+    assert_eq!(
+        app.handle_key(KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE)),
+        Action::Quit
+    );
+}
+
+#[test]
+fn startup_preserves_new_chat_recipient_body_and_cursor() {
+    let mut app = App {
+        startup: StartupState::loading(),
+        new_conversation: true,
+        pending_address: Some("alice@example.invalid".into()),
+        draft: "body text".into(),
+        draft_cursor: 4,
+        pasted_body: true,
+        ..Default::default()
+    };
+    assert_eq!(enter(&mut app), Action::None);
+    app.paste("more");
+    assert_eq!(app.draft, "body text");
+    assert_eq!(app.draft_cursor, 4);
+    assert!(app.pasted_body);
+    assert_eq!(
+        app.pending_address.as_deref(),
+        Some("alice@example.invalid")
+    );
+    assert!(app.new_conversation);
+}
+
+#[test]
+fn startup_failure_offers_retry_and_quit_without_skipping() {
+    let mut app = App {
+        startup: StartupState::loading(),
+        selected: Some(chat()),
+        draft: "keep me".into(),
+        ..Default::default()
+    };
+    app.observe_startup_connection(bloom_tui::daemon::ConnectionState::Connected);
+    app.observe_startup_readiness(ReadinessSnapshot {
+        generation: 1,
+        operation: 1,
+        revision: 1,
+        phase: ReadinessPhase::Failed,
+        outcome: Some(ReadinessOutcome::Failed),
+        observed_records: 0,
+        can_send: false,
+        engine_ready: true,
+        bounded_error: Some(ReadinessError::Timeout),
+    });
+    assert_eq!(enter(&mut app), Action::RetryStartup);
+    assert_eq!(
+        app.handle_key(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::NONE)),
+        Action::RetryStartup
+    );
+    assert_eq!(
+        app.handle_key(KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE)),
+        Action::Quit
+    );
+    assert_eq!(app.draft, "keep me");
+}
+
+#[test]
+fn startup_confirmation_requires_all_five_checks_and_is_explicit() {
+    let mut app = App {
+        startup: StartupState::loading(),
+        selected: Some(chat()),
+        draft: "keep me".into(),
+        ..Default::default()
+    };
+    app.observe_startup_connection(bloom_tui::daemon::ConnectionState::Connected);
+    app.observe_startup_readiness(ReadinessSnapshot {
+        generation: 1,
+        operation: 1,
+        revision: 1,
+        phase: ReadinessPhase::Ready,
+        outcome: Some(ReadinessOutcome::Complete),
+        observed_records: 0,
+        can_send: true,
+        engine_ready: true,
+        bounded_error: None,
+    });
+    app.observe_startup_snapshot();
+    assert_eq!(enter(&mut app), Action::None);
+    app.observe_startup_draft_ready();
+    assert_eq!(enter(&mut app), Action::OpenBloom);
+    assert_eq!(app.draft, "keep me");
+    assert!(app.open_bloom());
+    assert!(app.startup.opened());
+}
+
+#[test]
+fn manual_sync_closes_all_three_outbound_intents_without_mutating_them() {
+    let mut app = App {
+        selected: Some(chat()),
+        draft: "hello".into(),
+        sync_in_flight: true,
+        ..Default::default()
+    };
+    assert_eq!(enter(&mut app), Action::None);
+    assert_eq!(app.draft, "hello");
+    assert!(app.pending_send_attempt.is_none());
+
+    app.draft = "/new".into();
+    assert_eq!(enter(&mut app), Action::None);
+    assert!(!app.new_conversation);
+    assert!(app.pending_send_attempt.is_none());
+
+    app.draft = "/attach /tmp/report.txt".into();
+    assert_eq!(enter(&mut app), Action::None);
+    assert!(app.pending_attachment_send.is_none());
+    assert!(app.attachment_send_in_flight.is_none());
 }

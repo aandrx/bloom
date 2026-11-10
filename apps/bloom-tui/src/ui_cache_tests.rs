@@ -241,6 +241,7 @@ fn context_loading_and_ready_switch_layouts_and_latest_geometry() {
         target: app.messages[&id][5].id().clone(),
         loading: true,
         requested: true,
+        activity: None,
         messages: Vec::new(),
     });
     let loading = equivalent(&app, 100, 30, &mut cache, false);
@@ -261,6 +262,7 @@ fn context_loading_and_ready_switch_layouts_and_latest_geometry() {
         target,
         loading: false,
         requested: true,
+        activity: None,
         messages: rows.clone(),
     });
     let ready = equivalent(&app, 100, 30, &mut cache, false);
@@ -359,4 +361,121 @@ fn windowed_paragraph_matches_full_history_reflow() {
             }
         }
     }
+}
+
+fn rail_cells(buffer: &Buffer, hits: &HitMap) -> Vec<(u16, String, ratatui::style::Color)> {
+    let content = hits.transcript;
+    if content.width == 0 {
+        return Vec::new();
+    }
+    let x = content.right().saturating_sub(1);
+    (content.y..content.bottom())
+        .map(|y| {
+            let cell = &buffer[(x, y)];
+            (y, cell.symbol().to_owned(), cell.fg)
+        })
+        .collect()
+}
+
+#[test]
+fn transcript_rail_reserves_the_rightmost_column_in_the_cache_key() {
+    let mut app = fixture();
+    let mut cache = RenderCache::default();
+    let (_, hits) = draw(&app, 100, 30, &mut cache, false);
+    let message_width = hits.transcript.width.saturating_sub(TRANSCRIPT_RAIL_WIDTH);
+    assert_eq!(
+        cache.transcripts.last().unwrap().key.width,
+        message_width,
+        "the cache key must use the rail-reduced message width"
+    );
+    assert_eq!(cache.builds, 1);
+    let (first, _) = draw(&app, 100, 30, &mut cache, false);
+    assert_eq!(cache.builds, 1, "the same reduced width must reuse");
+    app.scroll_back(8);
+    let (scrolled, _) = draw(&app, 100, 30, &mut cache, false);
+    assert_eq!(cache.builds, 1, "scrolling must not reflow history");
+    assert_ne!(
+        first, scrolled,
+        "the scroll must still repaint the viewport"
+    );
+
+    let (_, wide_hits) = draw(&app, 101, 30, &mut cache, false);
+    assert_eq!(cache.builds, 2, "a wider layout must rebuild");
+    assert_eq!(
+        cache.transcripts.last().unwrap().key.width,
+        wide_hits
+            .transcript
+            .width
+            .saturating_sub(TRANSCRIPT_RAIL_WIDTH)
+    );
+    draw(&app, 100, 30, &mut cache, false);
+    assert_eq!(cache.builds, 2, "the parked width variant must be reused");
+}
+
+#[test]
+fn transcript_rail_geometry_handles_fit_zero_range_and_overflow() {
+    let conversation =
+        ConversationId::new(TransportId::new("openbubbles").unwrap(), "rail").unwrap();
+    let view = |rows: usize, height: usize, top: usize| crate::transcript::TranscriptViewport {
+        conversation: conversation.clone(),
+        messages: Vec::new(),
+        rows,
+        height,
+        top,
+    };
+    let content = Rect::new(0, 0, 20, 10);
+    assert!(
+        transcript_rail(content, &view(10, 10, 0)).is_none(),
+        "exact fit has no range"
+    );
+    assert!(
+        transcript_rail(content, &view(0, 10, 0)).is_none(),
+        "no displayed transcript has no rail"
+    );
+    assert!(
+        transcript_rail(Rect::new(0, 0, 20, 1), &view(20, 1, 0)).is_none(),
+        "a one-row track cannot hold a thumb"
+    );
+    assert!(
+        transcript_rail(Rect::new(0, 0, 2, 10), &view(20, 10, 0)).is_none(),
+        "an unusable message width hides the rail"
+    );
+
+    let rail = transcript_rail(content, &view(11, 10, 0)).expect("one row of range");
+    assert_eq!(rail.track, Rect::new(19, 0, 1, 10));
+    assert_eq!(rail.thumb, Rect::new(19, 0, 1, 9));
+
+    let rail = transcript_rail(content, &view(20, 10, 10)).expect("half-way range");
+    assert_eq!(rail.thumb, Rect::new(19, 5, 1, 5));
+
+    let rail = transcript_rail(content, &view(20, 10, usize::MAX)).expect("clamped range");
+    assert_eq!(rail.thumb, Rect::new(19, 5, 1, 5));
+
+    let rail = transcript_rail(content, &view(usize::MAX, 10, usize::MAX))
+        .expect("overflow-safe arithmetic");
+    assert!(rail.thumb.height >= 1 && rail.thumb.height < rail.track.height);
+    assert!(rail.thumb.bottom() <= rail.track.bottom());
+}
+
+#[test]
+fn transcript_rail_keeps_glyphs_in_monochrome() {
+    let app = fixture();
+    let mut cache = RenderCache::default();
+    let (buffer, hits) = draw(&app, 100, 30, &mut cache, true);
+    let cells = rail_cells(&buffer, &hits);
+    assert!(!cells.is_empty());
+    assert!(
+        cells.iter().any(|(_, symbol, _)| symbol == "█"),
+        "the thumb must remain visible without colour"
+    );
+    assert!(
+        cells.iter().any(|(_, symbol, _)| symbol == "│"),
+        "the track must remain visible without colour"
+    );
+    assert!(
+        cells
+            .iter()
+            .all(|(_, _, fg)| *fg == ratatui::style::Color::Reset),
+        "NO_COLOR must reset every rail colour"
+    );
 }
