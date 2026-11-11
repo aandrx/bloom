@@ -52,7 +52,11 @@ and only extended by U2 (the one declared exception to exclusivity). The
 daemon dispatch seam is fixed as follows: U1 scaffolds the early branch and a
 stub hook in `main.rs` (U1-owned), and U2 fills the demo startup body behind
 that hook in `service.rs`/`demo/mod.rs` (U2-owned), so demo dispatch still
-precedes real configuration and discovery without U2 editing `main.rs`.
+precedes real configuration and discovery without U2 editing `main.rs`. The
+stub hook returns whether to proceed normally or enter demo with its context;
+its shape is fixed in U1 so U2 conforms to it. No other file under
+`apps/bloomd/src/` changes; if implementation reveals a need, the seam is
+reopened in this plan rather than absorbed silently.
 
 ## 2. Isolation contract
 
@@ -82,7 +86,8 @@ One fresh private root per launch, under `/tmp`:
   runs in every entry point, including direct daemon/TUI invocation with
   `BLOOM_DEMO_ROOT` set by hand, so a hostile or malformed root fails startup
   rather than being trusted.
-- Demo ignores (never removes) `BLOOM_SOCKET_PATH`, legacy `BLOOM_SOCKET`,
+- Demo ignores (never removes) every `BLOOM_*` variable except
+  `BLOOM_DEMO_ROOT`, including `BLOOM_SOCKET_PATH`, legacy `BLOOM_SOCKET`,
   `BLOOM_STORE_PATH`, engine settings, opener settings, and inherited `HOME`/XDG
   destinations.
 - Preferences and diagnostics resolve explicitly through demo context, covering
@@ -92,8 +97,8 @@ One fresh private root per launch, under `/tmp`:
   recovery construction, and no registration code.
 - Open only the generated database via `EncryptedStore::open_with_key()` with a
   public fixed 32-byte synthetic demo key. Never construct `OsKeyring`. Never use
-  `open_or_create()`, whose key lookup uses the real `bloom`/`bloomd.sqlite.v1`
-  namespace.
+  `open_or_create()`, whose key lookup uses the real store's
+  `bloomd.sqlite.v1` key namespace.
 - Refuse an existing non-demo database or session rather than importing or
   repairing it: refusal is enforced by the fresh-root guard, which rejects any
   pre-existing unexpected file under the new root, not by inspecting the
