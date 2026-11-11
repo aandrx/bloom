@@ -51,7 +51,10 @@ One fresh private root per launch, under `/tmp`:
 ```
 
 - One new coordination variable, `BLOOM_DEMO_ROOT`, is passed by the launcher.
-  Derived paths are fixed and not independently overrideable.
+  Derived paths are fixed and not independently overrideable. Only the launcher
+  creates a demo root; a hand-set root with a hand-crafted `demo-session.json`
+  may pass structural validation, which is accepted because the threat model is
+  accidental access, not a hostile process.
 - Guards: validate an absolute, owned, private root; reject symlinks, traversal,
   and unexpected files; check the socket-path length.
 - Demo ignores or removes `BLOOM_SOCKET_PATH`, legacy `BLOOM_SOCKET`,
@@ -68,7 +71,10 @@ One fresh private root per launch, under `/tmp`:
   namespace.
 - Refuse an existing non-demo database or session rather than importing or
   repairing it. Missing demo context must not downgrade to normal mode.
-- Cleanup removes only the session root, after owned children exit.
+- Cleanup removes only the session root, after owned children exit. A crashed
+  or killed session leaves its root behind; the next launch uses a fresh random
+  root and never reuses, adopts, or repairs a stale one. Stale roots are swept
+  manually, never automatically.
 - Implementation seam: `Service` depends on a concrete `EngineSlot`. Add a
   narrowly scoped real/demo backend enum for engine-facing operations in
   `service.rs`. Keep store-backed history, search, and drafts plus
@@ -101,14 +107,26 @@ One fresh private root per launch, under `/tmp`:
 - A restrained Demo indicator sits outside the transcript; captions disclose
   synthetic content.
 - Static deterministic history only; there is no scripted traffic. Recordings
-  repeat captures over the static history with a fixed clock, producing real
-  persisted demo events rather than renderer-only animation. Capture mode is
+  repeat captures over the static history with a fixed clock; a capture over a
+  fresh root persists no new events beyond its own session data. Capture mode is
   quiet by default.
 - `/sync` and sends operate locally; no real recipient or account is contacted.
 
 ## 5. Verification and docs
 
-Isolation is the acceptance gate.
+Per-unit verification, each independently runnable before Section 5:
+
+- Section 1: `cargo build --profile demo -p bloomd -p bloom-tui`, plus unit
+  tests for flag parsing, `--help`, and unknown/conflicting-argument rejection.
+- Section 2: `cargo test -p bloomd` for root validation, the environment
+  ignore-list, `open_with_key` use, non-demo refusal, and stale-root behavior.
+- Section 3: `cargo test -p bloomd demo` for fixture referential integrity,
+  deterministic seeding, and seeder output.
+- Section 4: `cargo test -p bloom-tui` plus `scripts/test-launcher-e2e.py` for
+  launcher flow, the indicator, and the session lifecycle.
+
+Section 5 (integration and PTY) runs only after Sections 1-4 land. Isolation is
+the acceptance gate.
 
 - Unit-test option parsing, path derivation, missing context, and
   symlink/traversal refusal of unsafe roots.
