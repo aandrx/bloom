@@ -42,7 +42,7 @@ its own review before the next starts:
 | Unit | Owns exclusively | Depends on |
 | --- | --- | --- |
 | U1: flag surface and IPC context | root `Cargo.toml`, `apps/bloomd/src/main.rs`, `crates/bloom-ipc` | none |
-| U2: isolation contract | `apps/bloomd/src/store*`, `apps/bloomd/src/service.rs` (backend enum seam), `apps/bloomd/src/demo/mod.rs` context validation (excluding `seeder.rs`) (excluding `seeder.rs`), `apps/bloomd/src/service.rs` (backend enum seam) | U1 |
+| U2: isolation contract | `apps/bloomd/src/store*`, `apps/bloomd/src/service.rs` (backend enum seam), `apps/bloomd/src/demo/mod.rs` context validation (excluding `seeder.rs`) | U1 |
 | U3: synthetic data | `fixtures/demo/`, `apps/bloomd/src/demo/seeder.rs` | U2 |
 | U4: launcher and TUI wiring | `scripts/bloom`, `apps/bloom-tui/src/bin/bloom.rs` (the shipped `bloom` launcher entry point), `apps/bloom-tui/src/main.rs`, `apps/bloom-tui/src/launcher.rs` | U1, U2, U3 |
 
