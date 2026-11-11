@@ -52,7 +52,10 @@ and only extended by U2 (the one declared exception to exclusivity). The
 daemon dispatch seam is fixed as follows: U1 scaffolds the early branch and a
 stub hook in `main.rs` (U1-owned), and U2 fills the demo startup body behind
 that hook in `service.rs`/`demo/mod.rs` (U2-owned), so demo dispatch still
-precedes real configuration and discovery without U2 editing `main.rs`. The
+precedes real configuration and discovery. Because `bloomd` is a lib-plus-bin
+package, U2 is permitted exactly one `main.rs` edit: replacing the stub body
+with a call into the U2-owned demo module. Nothing else in `main.rs` changes at
+U2; the early branch, argument parsing, and `--help` stay U1-owned. The
 stub hook returns whether to proceed normally or enter demo with its context;
 its shape is fixed in U1 so U2 conforms to it. No other file under
 `apps/bloomd/src/` changes; if implementation reveals a need, the seam is
