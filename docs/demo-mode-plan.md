@@ -48,10 +48,11 @@ its own review before the next starts:
 
 Sections 5 and 6 are verification and boundaries, not deliverables. No unit
 edits another unit's files; the shared `bloom-ipc` component is created in U1
-and only extended by U2. The daemon dispatch hook lives in `service.rs`
-(U2-owned): U1 scaffolds the flag surface and `--help` in `main.rs`, and U2
-implements the demo dispatch there so it precedes real configuration and
-discovery.
+and only extended by U2 (the one declared exception to exclusivity). The
+daemon dispatch seam is fixed as follows: U1 scaffolds the early branch and a
+stub hook in `main.rs` (U1-owned), and U2 fills the demo startup body behind
+that hook in `service.rs`/`demo/mod.rs` (U2-owned), so demo dispatch still
+precedes real configuration and discovery without U2 editing `main.rs`.
 
 ## 2. Isolation contract
 
