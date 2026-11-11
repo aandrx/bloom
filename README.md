@@ -24,7 +24,7 @@ The offline, illustrative prototype is at [`design/mockup/index.html`](design/mo
 
 **New maintainer or fresh agent:** read [AGENTS.md](AGENTS.md), then the [handoff](docs/handoff.md). The [documentation map](docs/README.md) distinguishes current guides from historical research/plans.
 
-For keyboard controls and troubleshooting, see the [terminal client guide](docs/tui.md). For implemented/partial/missing features and verification boundaries, see [status](docs/status.md). The [system design](docs/system-design.md), [active roadmap](docs/implementation-plan.md), and [switching-latency follow-up](docs/tui-switching-performance.md) explain the architecture, next decisions, and latest accepted work.
+For keyboard controls and troubleshooting, see the [terminal client guide](docs/tui.md). For implemented/partial/missing features and verification boundaries, see [status](docs/status.md). The [system design](docs/system-design.md), [active roadmap](docs/implementation-plan.md), and [switching-latency follow-up](docs/tui-switching-performance.md) explain the architecture, next decisions, and latest accepted work. The [demo mode plan](docs/demo-mode-plan.md) is planning only: it records the proposed isolated synthetic session and its isolation acceptance gate.
 
 ## Staged direction
 

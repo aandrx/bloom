@@ -31,6 +31,7 @@ Start with [fresh-session handoff](handoff.md). The root [AGENTS.md](../AGENTS.m
 | [Reaction application](reaction-application-plan.md) | Accepted inbound reaction mapping, persistence, fixture parity and TUI display; outbound reactions intentionally unsupported |
 | [Inbound edit and unsend](edit-unsend-plan.md) | Accepted inbound part-targeted text edits and whole-body unsends: evidence, phases, display and limits |
 | [Outbound edit/unsend gate](outbound-mutation-gate.md) | Structural engine gate pass; part-scoped unsend, outbound part-map prerequisite; not implemented |
+| [Demo mode plan](demo-mode-plan.md) | Planning only: runtime `--demo` flag, isolated synthetic session, and the isolation acceptance gate; no implementation yet |
 | [Remaining plans](remaining-plans.md) | Packaging tail, launcher profile spike, and gated rich-messaging phases |
 | [Durable drafts plan](durable-drafts-plan.md) | Encrypted daemon-owned drafts, revision guard, retention; design only |
 | [Packaging plan](packaging-plan.md) | Standalone install layout, doctor diagnostics, phases 1-3 accepted; phase 4 and 4c distribution blocked |
