@@ -21,8 +21,8 @@ write, or contact real state, not merely configured to avoid it.
   `target/demo/`.
 - `scripts/bloom`: make `--release`, `--debug`, and `--demo` mutually exclusive,
   and parse the choice before sourcing `.env`. Demo never sources `.env`.
-- `bloom-tui` binary: parse `--demo`, `--doctor`, and help; reject unknown or
-  conflicting arguments.
+- `bloom-tui` binary (U4): parse `--demo`, `--doctor`, and help; reject unknown
+  or conflicting arguments.
 - Launcher: the demo launch path creates an isolated session and passes `--demo`
   to both children. It never probes or reuses the normal socket.
 - Daemon: parse arguments before `DaemonConfig::from_env()`, and add a safe
@@ -42,13 +42,16 @@ its own review before the next starts:
 | Unit | Owns exclusively | Depends on |
 | --- | --- | --- |
 | U1: flag surface and IPC context | root `Cargo.toml`, `apps/bloomd/src/main.rs`, `crates/bloom-ipc` | none |
-| U2: isolation contract | `apps/bloomd/src/store*`, `apps/bloomd/src/service.rs` (backend enum seam), `apps/bloomd/src/demo/mod.rs` context validation (excluding `seeder.rs`) | U1 |
+| U2: isolation contract | `apps/bloomd/src/store/` (all files), `apps/bloomd/src/service.rs` (backend enum seam and the demo dispatch point), `apps/bloomd/src/demo/mod.rs` context validation (excluding `seeder.rs`) | U1 |
 | U3: synthetic data | `fixtures/demo/`, `apps/bloomd/src/demo/seeder.rs` | U2 |
 | U4: launcher and TUI wiring | `scripts/bloom`, `apps/bloom-tui/src/bin/bloom.rs` (the shipped `bloom` launcher entry point), `apps/bloom-tui/src/main.rs`, `apps/bloom-tui/src/launcher.rs` | U1, U2, U3 |
 
 Sections 5 and 6 are verification and boundaries, not deliverables. No unit
 edits another unit's files; the shared `bloom-ipc` component is created in U1
-and only extended by U2.
+and only extended by U2. The daemon dispatch hook lives in `service.rs`
+(U2-owned): U1 scaffolds the flag surface and `--help` in `main.rs`, and U2
+implements the demo dispatch there so it precedes real configuration and
+discovery.
 
 ## 2. Isolation contract
 
@@ -144,14 +147,14 @@ Per-unit verification, each independently runnable before Section 5:
 - U1: `cargo build --profile demo -p bloomd -p bloom-tui`, plus unit tests for
   daemon flag parsing, `--help`, and unknown/conflicting-argument rejection. The
   TUI binary's flag tests run at U4.
-- Section 2: `cargo test -p bloomd` for root validation, the environment
+- U2: `cargo test -p bloomd` for root validation, the environment
   ignore-list, `open_with_key` use, non-demo refusal, and stale-root behavior.
-- Section 3: `cargo test -p bloomd demo` for fixture referential integrity,
+- U3: `cargo test -p bloomd demo` for fixture referential integrity,
   deterministic seeding, and seeder output.
-- Section 4: `cargo test -p bloom-tui` plus `scripts/test-launcher-e2e.py` for
+- U4: `cargo test -p bloom-tui` plus `scripts/test-launcher-e2e.py` for
   launcher flow, the indicator, and the session lifecycle.
 
-Section 5 (integration and PTY) runs only after Sections 1-4 land. Isolation is
+Section 5 (integration and PTY) runs only after U1-U4 land. Isolation is
 the acceptance gate.
 
 - Unit-test option parsing, path derivation, missing context, and
