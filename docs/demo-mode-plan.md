@@ -100,9 +100,10 @@ One fresh private root per launch, under `/tmp`:
 - Preserve themes, the startup checklist, activity tokens, and the passive rail.
 - A restrained Demo indicator sits outside the transcript; captions disclose
   synthetic content.
-- Static deterministic history by default. Optional bounded scripted traffic for
-  recordings produces real persisted demo events, not renderer-only animation.
-  Capture mode is quiet by default.
+- Static deterministic history only; there is no scripted traffic. Recordings
+  repeat captures over the static history with a fixed clock, producing real
+  persisted demo events rather than renderer-only animation. Capture mode is
+  quiet by default.
 - `/sync` and sends operate locally; no real recipient or account is contacted.
 
 ## 5. Verification and docs
@@ -139,6 +140,6 @@ Isolation is the acceptance gate.
   connector architecture or duplicated IPC.
 - The fixed demo key is public and gives no confidentiality for anything typed
   into demo. Document ephemeral storage.
-- Demo mode prevents accidental real-state access, not hostile-host compromise.
+- Demo mode is designed to prevent accidental real-state access; it is not a defense against a hostile-host compromise.
 - No P4 redesign, live engine, real account, registration, remote traffic,
   historical import, or publication/deployment action.
