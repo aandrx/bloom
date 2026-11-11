@@ -56,8 +56,13 @@ One fresh private root per launch, under `/tmp`:
   may pass structural validation, which is accepted because the threat model is
   accidental access, not a hostile process.
 - Guards: validate an absolute, owned, private root; reject symlinks, traversal,
-  and unexpected files; check the socket-path length.
-- Demo ignores or removes `BLOOM_SOCKET_PATH`, legacy `BLOOM_SOCKET`,
+  and unexpected files; check the socket-path length. "Unexpected" is measured
+  against the top-level layout above only, not recursively: session data under
+  `cache/attachments/`, `home/`, and the state logs is legitimate. Validation
+  runs in every entry point, including direct daemon/TUI invocation with
+  `BLOOM_DEMO_ROOT` set by hand, so a hostile or malformed root fails startup
+  rather than being trusted.
+- Demo ignores (never removes) `BLOOM_SOCKET_PATH`, legacy `BLOOM_SOCKET`,
   `BLOOM_STORE_PATH`, engine settings, opener settings, and inherited `HOME`/XDG
   destinations.
 - Preferences and diagnostics resolve explicitly through demo context, covering
@@ -153,7 +158,7 @@ the acceptance gate.
 ## 6. Risks and boundaries
 
 - Isolation is enforced in every entry point, not inferred from `target/demo` or
-  environment.
+  environment. Normal mode never consults `BLOOM_DEMO_ROOT`.
 - Engine coupling makes backend selection the main coding risk. Avoid a general
   connector architecture or duplicated IPC.
 - The fixed demo key is public and gives no confidentiality for anything typed
