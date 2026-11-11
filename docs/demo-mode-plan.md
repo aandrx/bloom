@@ -42,9 +42,9 @@ its own review before the next starts:
 | Unit | Owns exclusively | Depends on |
 | --- | --- | --- |
 | U1: flag surface and IPC context | root `Cargo.toml`, `apps/bloomd/src/main.rs`, `crates/bloom-ipc` | none |
-| U2: isolation contract | `apps/bloomd/src/store*`, the guard/context half of `apps/bloomd/src/demo/` | U1 |
+| U2: isolation contract | `apps/bloomd/src/store*`, `apps/bloomd/src/service.rs` (backend enum seam), `apps/bloomd/src/demo/mod.rs` context validation (excluding `seeder.rs`) (excluding `seeder.rs`), `apps/bloomd/src/service.rs` (backend enum seam) | U1 |
 | U3: synthetic data | `fixtures/demo/`, `apps/bloomd/src/demo/seeder.rs` | U2 |
-| U4: launcher and TUI wiring | `scripts/bloom`, `apps/bloom-tui/src/main.rs`, `apps/bloom-tui/src/launcher.rs` | U1, U2, U3 |
+| U4: launcher and TUI wiring | `scripts/bloom`, `apps/bloom-tui/src/bin/bloom.rs` (the shipped `bloom` launcher entry point), `apps/bloom-tui/src/main.rs`, `apps/bloom-tui/src/launcher.rs` | U1, U2, U3 |
 
 Sections 5 and 6 are verification and boundaries, not deliverables. No unit
 edits another unit's files; the shared `bloom-ipc` component is created in U1
@@ -141,8 +141,9 @@ One fresh private root per launch, under `/tmp`:
 
 Per-unit verification, each independently runnable before Section 5:
 
-- Section 1: `cargo build --profile demo -p bloomd -p bloom-tui`, plus unit
-  tests for flag parsing, `--help`, and unknown/conflicting-argument rejection.
+- U1: `cargo build --profile demo -p bloomd -p bloom-tui`, plus unit tests for
+  daemon flag parsing, `--help`, and unknown/conflicting-argument rejection. The
+  TUI binary's flag tests run at U4.
 - Section 2: `cargo test -p bloomd` for root validation, the environment
   ignore-list, `open_with_key` use, non-demo refusal, and stale-root behavior.
 - Section 3: `cargo test -p bloomd demo` for fixture referential integrity,
@@ -178,7 +179,7 @@ the acceptance gate.
 ## 6. Risks and boundaries
 
 - Isolation is enforced in every entry point, not inferred from `target/demo` or
-  environment. Normal mode never consults `BLOOM_DEMO_ROOT`. Normal mode never consults `BLOOM_DEMO_ROOT`.
+  environment. Normal mode never consults `BLOOM_DEMO_ROOT`.
 - Engine coupling makes backend selection the main coding risk. Avoid a general
   connector architecture or duplicated IPC.
 - The fixed demo key is public and gives no confidentiality for anything typed
