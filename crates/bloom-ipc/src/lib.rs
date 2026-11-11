@@ -10,6 +10,7 @@
 //! only [`Event`] frames.
 
 pub mod client;
+pub mod demo;
 
 use bloom_domain::{
     Conversation, ConversationId, DeliveryState, Handle, Message, MessageId, OutgoingBody,

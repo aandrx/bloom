@@ -16,6 +16,11 @@ edition = "2021"
 license = "MIT"
 version = "0.1.0"
 
+[profile.demo]
+# Demo mode ships the same optimized binaries as a release build, but keeps its
+# outputs under target/demo so a demo build cannot be mistaken for a release.
+inherits = "release"
+
 [workspace.dependencies]
 anyhow = "1"
 keyring = { version = "4.2.0", default-features = true }
