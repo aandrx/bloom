@@ -34,6 +34,22 @@ write, or contact real state, not merely configured to avoid it.
 - Share session and path validation through a small new component in
   `crates/bloom-ipc`. Normal `socket_path_from_env()` is unchanged.
 
+### Implementation units
+
+Work is delegated as four disjoint, ordered units. Each lands separately with
+its own review before the next starts:
+
+| Unit | Owns exclusively | Depends on |
+| --- | --- | --- |
+| U1: flag surface and IPC context | root `Cargo.toml`, `apps/bloomd/src/main.rs`, `crates/bloom-ipc` | none |
+| U2: isolation contract | `apps/bloomd/src/store*`, the guard/context half of `apps/bloomd/src/demo/` | U1 |
+| U3: synthetic data | `fixtures/demo/`, `apps/bloomd/src/demo/seeder.rs` | U2 |
+| U4: launcher and TUI wiring | `scripts/bloom`, `apps/bloom-tui/src/main.rs`, `apps/bloom-tui/src/launcher.rs` | U1, U2, U3 |
+
+Sections 5 and 6 are verification and boundaries, not deliverables. No unit
+edits another unit's files; the shared `bloom-ipc` component is created in U1
+and only extended by U2.
+
 ## 2. Isolation contract
 
 One fresh private root per launch, under `/tmp`:
@@ -75,7 +91,11 @@ One fresh private root per launch, under `/tmp`:
   `open_or_create()`, whose key lookup uses the real `bloom`/`bloomd.sqlite.v1`
   namespace.
 - Refuse an existing non-demo database or session rather than importing or
-  repairing it. Missing demo context must not downgrade to normal mode.
+  repairing it: refusal is enforced by the fresh-root guard, which rejects any
+  pre-existing unexpected file under the new root, not by inspecting the
+  database. Missing demo context must not downgrade to normal mode. A malformed
+  root fails startup; a well-formed hand-built root is accepted because the
+  threat model is accidental access, not a hostile process.
 - Cleanup removes only the session root, after owned children exit. A crashed
   or killed session leaves its root behind; the next launch uses a fresh random
   root and never reuses, adopts, or repairs a stale one. Stale roots are swept
@@ -158,7 +178,7 @@ the acceptance gate.
 ## 6. Risks and boundaries
 
 - Isolation is enforced in every entry point, not inferred from `target/demo` or
-  environment. Normal mode never consults `BLOOM_DEMO_ROOT`.
+  environment. Normal mode never consults `BLOOM_DEMO_ROOT`. Normal mode never consults `BLOOM_DEMO_ROOT`.
 - Engine coupling makes backend selection the main coding risk. Avoid a general
   connector architecture or duplicated IPC.
 - The fixed demo key is public and gives no confidentiality for anything typed
