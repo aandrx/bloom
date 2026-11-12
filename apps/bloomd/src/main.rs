@@ -546,29 +546,69 @@ mod tests {
         );
     }
 
+    const REFUSAL_CHILD_ENV: &str = "BLOOMD_DEMO_REFUSAL_CHILD";
+    const REFUSAL_CHILD_TIMEOUT: Duration = Duration::from_secs(30);
+
+    /// Child-process body for [`assert_demo_refusal_in_child`].
+    ///
+    /// The parent sets [`REFUSAL_CHILD_ENV`], so a normal test run skips this.
     #[test]
-    fn demo_flag_reaches_the_stub_hook() {
+    fn demo_refusal_child_probe() {
+        if std::env::var_os(REFUSAL_CHILD_ENV).is_none() {
+            return;
+        }
         let args = parse_args(["--demo"]).unwrap();
-        assert_eq!(args, ArgOutcome::Run(DaemonArgs { demo: true }));
         let ArgOutcome::Run(args) = args else {
             panic!("expected runnable arguments");
         };
         assert_eq!(demo_dispatch(args), DemoDispatch::Exit(ExitCode::from(1)));
     }
 
+    /// Run the demo refusal check in a child with a controlled environment.
+    ///
+    /// Real demo startup reads `BLOOM_DEMO_ROOT`, so an inherited valid root
+    /// would make the child serve until a signal arrives. The child clears the
+    /// environment and sets only a deliberately invalid root, making refusal
+    /// immediate and independent of the parent's environment.
+    fn assert_demo_refusal_in_child() {
+        let exe = std::env::current_exe().expect("test executable path");
+        let mut child = std::process::Command::new(exe)
+            .args(["--exact", "tests::demo_refusal_child_probe", "--nocapture"])
+            .env_clear()
+            .env(REFUSAL_CHILD_ENV, "1")
+            .env("BLOOM_DEMO_ROOT", "demo-refusal-probe")
+            .spawn()
+            .expect("spawn refusal probe");
+
+        let deadline = std::time::Instant::now() + REFUSAL_CHILD_TIMEOUT;
+        let status = loop {
+            match child.try_wait().expect("poll refusal probe") {
+                Some(status) => break status,
+                None if std::time::Instant::now() >= deadline => {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    panic!("refusal probe did not finish within {REFUSAL_CHILD_TIMEOUT:?}");
+                }
+                None => std::thread::sleep(Duration::from_millis(10)),
+            }
+        };
+        assert!(status.success(), "refusal probe failed: {status}");
+    }
+
+    #[test]
+    fn demo_flag_reaches_the_stub_hook() {
+        let args = parse_args(["--demo"]).unwrap();
+        assert_eq!(args, ArgOutcome::Run(DaemonArgs { demo: true }));
+        assert_demo_refusal_in_child();
+    }
+
     #[test]
     fn stub_hook_fails_without_touching_state() {
         // The stub body only prints and returns; it does not read configuration,
         // discovery, the store, the keychain, a socket, or the environment.
-        assert_eq!(
-            run_demo_daemon(DemoContext::requested()),
-            DemoDispatch::Exit(ExitCode::from(1))
-        );
+        assert_demo_refusal_in_child();
         // Calling it again is deterministic and still touches nothing.
-        assert_eq!(
-            run_demo_daemon(DemoContext::requested()),
-            DemoDispatch::Exit(ExitCode::from(1))
-        );
+        assert_demo_refusal_in_child();
     }
 
     #[test]

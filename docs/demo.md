@@ -63,7 +63,9 @@ normal mode.
 - Searchable history, including the 205-message `Harbour log` for paging and
   deep search.
 
-Sends, `/sync`, and preference changes apply only inside the session.
+Sends and `/sync` are unavailable in demo mode: the demo daemon rejects both
+with an unsupported-operation error. Preference changes apply only inside the
+demo session and are discarded when it exits.
 
 ## Isolation guarantees
 

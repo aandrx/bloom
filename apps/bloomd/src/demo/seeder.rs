@@ -1004,8 +1004,17 @@ fn validate(fixture: &Fixture) -> Result<(), SeedError> {
                     conversation.id
                 )));
             }
-            if draft.updated_offset_seconds > 0 || draft.updated_offset_seconds < -MAX_DRAFT_AGE_MS
-            {
+            let updated_offset_ms =
+                draft
+                    .updated_offset_seconds
+                    .checked_mul(1_000)
+                    .ok_or_else(|| {
+                        invalid(format!(
+                            "conversation `{}` draft retention offset overflows",
+                            conversation.id
+                        ))
+                    })?;
+            if !(-MAX_DRAFT_AGE_MS..=0).contains(&updated_offset_ms) {
                 return Err(invalid(format!(
                     "conversation `{}` draft is outside the retention window",
                     conversation.id
@@ -1204,6 +1213,26 @@ mod tests {
         let error = validate_fixture(&corrupted).unwrap_err().to_string();
         assert!(
             error.contains("file_name"),
+            "unexpected validator error: {error}"
+        );
+    }
+
+    #[test]
+    fn draft_just_beyond_retention_is_rejected() {
+        let mut value = fixture_value();
+        let draft = value["conversations"]
+            .as_array_mut()
+            .unwrap()
+            .iter_mut()
+            .find(|conversation| conversation.get("draft").is_some())
+            .expect("fixture includes a parked draft");
+        // Offsets are seconds; the retention window is milliseconds. One second
+        // past the 30-day limit must be rejected, not silently accepted.
+        draft["draft"]["updated_offset_seconds"] = Value::from(-(MAX_DRAFT_AGE_MS / 1_000) - 1);
+        let corrupted = serde_json::to_string(&value).unwrap();
+        let error = validate_fixture(&corrupted).unwrap_err().to_string();
+        assert!(
+            error.contains("retention window"),
             "unexpected validator error: {error}"
         );
     }
