@@ -139,14 +139,18 @@ fn demo_dispatch(args: DaemonArgs) -> DemoDispatch {
 
 /// Fixed demo dispatch seam.
 ///
-/// U1 owns this stub. U2 fills the demo startup body behind it in
-/// `service.rs`/`demo/mod.rs`; the signature and [`DemoDispatch`] shape are
-/// fixed so dispatch stays here. The stub deliberately touches no
-/// configuration, discovery, store, keychain, socket, or environment.
+/// The signature and [`DemoDispatch`] shape are fixed so dispatch stays here.
+/// The body calls the U2-owned demo module, which owns root validation, demo
+/// startup, and cleanup. A demo request never falls through to normal startup.
 fn run_demo_daemon(context: DemoContext) -> DemoDispatch {
     debug_assert!(context.requested);
-    eprintln!("bloomd: demo not implemented yet");
-    DemoDispatch::Exit(ExitCode::from(1))
+    match bloomd::demo::run() {
+        Ok(()) => DemoDispatch::Exit(ExitCode::SUCCESS),
+        Err(error) => {
+            eprintln!("bloomd: demo startup refused: {error}");
+            DemoDispatch::Exit(ExitCode::from(1))
+        }
+    }
 }
 
 /// Name the signal that ended the run, so the log says how the daemon stopped.

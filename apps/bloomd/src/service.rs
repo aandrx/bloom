@@ -25,9 +25,35 @@ use std::{
     time::Instant,
 };
 
+/// Engine-facing backend behind a [`Service`].
+///
+/// Normal mode holds the slot the recovery loop can replace. Demo mode has no
+/// engine at all: there is no configuration, spawn, supervisor, recovery, or
+/// discovery code on that path, and every engine-facing operation reports the
+/// existing unsupported error. Store-backed history, search, drafts, and
+/// persist-before-fanout stay shared between both variants.
+enum Backend {
+    Real(EngineSlot),
+    Demo,
+}
+
+impl Backend {
+    /// Clone the current engine out of the slot, if this backend has one.
+    fn engine(&self) -> Option<Arc<Engine>> {
+        match self {
+            Self::Real(slot) => Some(Arc::clone(&slot.read().unwrap())),
+            Self::Demo => None,
+        }
+    }
+
+    fn is_demo(&self) -> bool {
+        matches!(self, Self::Demo)
+    }
+}
+
 pub struct Service {
     store: Arc<Mutex<EncryptedStore>>,
-    engine: EngineSlot,
+    backend: Backend,
     hub: SubscriptionHub,
     readiness: Readiness,
 }
@@ -41,7 +67,7 @@ impl Service {
         let readiness = Readiness::new_ready(1, hub.clone());
         Self {
             store,
-            engine: engine_slot(engine),
+            backend: Backend::Real(engine_slot(engine)),
             hub,
             readiness,
         }
@@ -57,7 +83,7 @@ impl Service {
         let readiness = Readiness::new_ready(1, hub.clone());
         Self {
             store,
-            engine,
+            backend: Backend::Real(engine),
             hub,
             readiness,
         }
@@ -73,7 +99,23 @@ impl Service {
     ) -> Self {
         Self {
             store,
-            engine,
+            backend: Backend::Real(engine),
+            hub,
+            readiness,
+        }
+    }
+
+    /// Build the demo service: the same store-backed request handling over the
+    /// synthetic store, with no engine and no engine configuration.
+    ///
+    /// Readiness starts ready so history, search, drafts, and listings work
+    /// immediately; the demo backend rejects every engine-facing operation with
+    /// the existing unsupported error before any preparation or store work.
+    pub fn demo(store: Arc<Mutex<EncryptedStore>>, hub: SubscriptionHub) -> Self {
+        let readiness = Readiness::new_ready(1, hub.clone());
+        Self {
+            store,
+            backend: Backend::Demo,
             hub,
             readiness,
         }
@@ -91,10 +133,13 @@ impl Service {
     /// `sync_lock` serializes this with a manual sync, and the readiness token
     /// makes a late result from an older generation or operation inert.
     pub async fn run_sync_for_generation(self: Arc<Self>, generation: u64) {
+        // The demo backend has no engine, so there is nothing to refresh.
+        let Some(engine) = self.current_engine() else {
+            return;
+        };
         let Some(token) = self.readiness.begin(generation) else {
             return;
         };
-        let engine = self.current_engine();
         if engine.generation() != generation {
             self.readiness.finish(token, Finish::Unavailable);
             return;
@@ -116,10 +161,10 @@ impl Service {
     }
 
     /// Clone the current engine out of the slot. The lock is released here, so no
-    /// caller holds it across an await.
-    fn current_engine(&self) -> Arc<Engine> {
-        let engine = self.engine.read().unwrap();
-        Arc::clone(&engine)
+    /// caller holds it across an await. `None` means the demo backend, which has
+    /// no engine.
+    fn current_engine(&self) -> Option<Arc<Engine>> {
+        self.backend.engine()
     }
 
     /// Persist a transport event, then fan it out. Returns whether anything changed.
@@ -538,11 +583,16 @@ impl RequestHandler for Service {
 
     fn sync_conversations(&self) -> HandlerFuture<'_, (bloom_ipc::ConversationSyncStatus, u32)> {
         Box::pin(async move {
+            // Demo has no engine transport to sync against; reject before the
+            // readiness gate moves or any store work happens.
+            if self.backend.is_demo() {
+                return Err(ProtocolError::Unsupported);
+            }
             let generation = self.readiness.current_generation();
             let Some(token) = self.readiness.begin(generation) else {
                 return Err(ProtocolError::NotReady);
             };
-            let engine = self.current_engine();
+            let engine = self.current_engine().ok_or(ProtocolError::Unsupported)?;
             if engine.generation() != generation {
                 self.readiness.finish(token, Finish::Unavailable);
                 return Err(ProtocolError::NotReady);
@@ -653,6 +703,10 @@ impl RequestHandler for Service {
         body: OutgoingBody,
     ) -> HandlerFuture<'_, MessageId> {
         Box::pin(async move {
+            // Demo has no engine: reject before address parsing or store work.
+            if self.backend.is_demo() {
+                return Err(ProtocolError::Unsupported);
+            }
             if !self.readiness.can_send() {
                 return Err(ProtocolError::NotReady);
             }
@@ -662,7 +716,7 @@ impl RequestHandler for Service {
             let engine_transport = crate::engine::transport_id();
             // Resolve one engine for the whole operation: a swap between building
             // the participants and sending must not mix two generations.
-            let engine = self.current_engine();
+            let engine = self.current_engine().ok_or(ProtocolError::Unsupported)?;
             if engine.generation() != generation {
                 return Err(ProtocolError::NotReady);
             }
@@ -775,6 +829,10 @@ impl RequestHandler for Service {
         body: OutgoingBody,
     ) -> HandlerFuture<'_, MessageId> {
         Box::pin(async move {
+            // Demo has no engine: reject before preparation or store lookup.
+            if self.backend.is_demo() {
+                return Err(ProtocolError::Unsupported);
+            }
             if !self.readiness.can_send() {
                 return Err(ProtocolError::NotReady);
             }
@@ -782,7 +840,7 @@ impl RequestHandler for Service {
             let (text, recipients, conversation) =
                 self.send_blocking_prepare(&conversation_id, &body)?;
 
-            let engine = self.current_engine();
+            let engine = self.current_engine().ok_or(ProtocolError::Unsupported)?;
             if engine.generation() != generation {
                 return Err(ProtocolError::NotReady);
             }
@@ -839,6 +897,10 @@ impl RequestHandler for Service {
         path: String,
     ) -> HandlerFuture<'_, MessageId> {
         Box::pin(async move {
+            // Demo disables local-file upload: reject before touching the path.
+            if self.backend.is_demo() {
+                return Err(ProtocolError::Unsupported);
+            }
             if !self.readiness.can_send() {
                 return Err(ProtocolError::NotReady);
             }
@@ -846,7 +908,7 @@ impl RequestHandler for Service {
             let (name, byte_len) = outgoing_attachment_file(&path)?;
             let (recipients, conversation) = self.send_targets(&conversation_id)?;
 
-            let engine = self.current_engine();
+            let engine = self.current_engine().ok_or(ProtocolError::Unsupported)?;
             if engine.generation() != generation {
                 return Err(ProtocolError::NotReady);
             }
@@ -905,10 +967,14 @@ impl RequestHandler for Service {
 
     fn fetch_attachment(&self, token: String) -> HandlerFuture<'_, (String, u64)> {
         Box::pin(async move {
+            // Demo disables external opening: no engine fetch, no file access.
+            if self.backend.is_demo() {
+                return Err(ProtocolError::Unsupported);
+            }
             if !bloom_domain::AttachmentRef::is_valid_fetch_token(&token) {
                 return Err(ProtocolError::InvalidRequest);
             }
-            let engine = self.current_engine();
+            let engine = self.current_engine().ok_or(ProtocolError::Unsupported)?;
             match engine.fetch_attachment(&token).await {
                 Ok(file) => Ok((file.path, file.bytes)),
                 Err(error) => {
@@ -1542,7 +1608,10 @@ mod engine_slot_service_tests {
         let directory = tempfile::tempdir().unwrap();
         let engine = engine(&directory);
         let service = Service::new(store(&directory), engine.clone(), SubscriptionHub::new(4));
-        assert!(Arc::ptr_eq(&engine, &service.engine.read().unwrap()));
+        let Backend::Real(slot) = &service.backend else {
+            panic!("Service::new must build a real backend");
+        };
+        assert!(Arc::ptr_eq(&engine, &slot.read().unwrap()));
     }
 
     #[test]
@@ -1551,7 +1620,10 @@ mod engine_slot_service_tests {
         let slot = engine_slot(engine(&directory));
         let service =
             Service::with_engine_slot(store(&directory), slot.clone(), SubscriptionHub::new(4));
-        assert!(Arc::ptr_eq(&slot, &service.engine));
+        let Backend::Real(shared) = &service.backend else {
+            panic!("with_engine_slot must build a real backend");
+        };
+        assert!(Arc::ptr_eq(&slot, shared));
     }
 }
 
@@ -2347,5 +2419,159 @@ mod readiness_gate_tests {
         let snapshot = RequestHandler::readiness(&*service).await.unwrap();
         assert_eq!(snapshot.phase, bloom_ipc::ReadinessPhase::Starting);
         assert!(!snapshot.can_send);
+    }
+}
+
+#[cfg(test)]
+mod demo_backend_tests {
+    use super::*;
+    use bloom_domain::{MessagePart, TransportId};
+    use std::os::unix::fs::PermissionsExt;
+
+    fn harness() -> (tempfile::TempDir, Arc<Mutex<EncryptedStore>>, Arc<Service>) {
+        let directory = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(directory.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        let store = Arc::new(Mutex::new(
+            EncryptedStore::open_demo(directory.path().join("store.db")).unwrap(),
+        ));
+        let service = Arc::new(Service::demo(store.clone(), SubscriptionHub::new(4)));
+        (directory, store, service)
+    }
+
+    fn seed(store: &Arc<Mutex<EncryptedStore>>) -> (ConversationId, MessageId) {
+        let transport = TransportId::new("openbubbles").unwrap();
+        let sender = Handle::new(HandleKind::Opaque, "demo@example.invalid").unwrap();
+        let conversation = Conversation {
+            id: ConversationId::new(transport.clone(), "demo-chat").unwrap(),
+            remote_id: "demo-chat".into(),
+            kind: ConversationKind::Direct,
+            title: Some("Demo chat".into()),
+            participants: vec![Participant {
+                handle: sender.clone(),
+                display_name: None,
+                is_me: false,
+            }],
+            created_at: 1,
+            last_message_at: Some(1),
+            aliases: Vec::new(),
+            preview: None,
+        };
+        let message = Message::new(
+            MessageId::new(transport, "demo-message").unwrap(),
+            conversation.id.clone(),
+            None,
+            sender,
+            vec![MessagePart::Text("synthetic hello".into())],
+            1,
+            None,
+            DeliveryState::Delivered,
+            false,
+            None,
+            Vec::new(),
+            None,
+        )
+        .unwrap();
+        let mut guard = store.lock().unwrap();
+        store::upsert_conversation(&mut guard, &conversation).unwrap();
+        store::ingest_inbound_with_parts(&mut guard, &conversation, &message, &[Some(0)]).unwrap();
+        (conversation.id, message.id().clone())
+    }
+
+    #[tokio::test]
+    async fn store_backed_reads_work_without_an_engine() {
+        let (_directory, store, service) = harness();
+        let (conversation_id, message_id) = seed(&store);
+
+        let conversations = service.list_conversations().await.unwrap();
+        assert_eq!(conversations.len(), 1);
+        assert_eq!(conversations[0].id, conversation_id);
+
+        let history = service.history(conversation_id.clone(), 10).await.unwrap();
+        assert_eq!(history.len(), 1);
+        assert_eq!(history[0].id(), &message_id);
+
+        let search = service
+            .search_messages("synthetic".into(), 10)
+            .await
+            .unwrap();
+        assert_eq!(search.len(), 1);
+
+        let context = service
+            .message_context(conversation_id, message_id, 10)
+            .await
+            .unwrap();
+        assert_eq!(context.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn drafts_round_trip_in_the_demo_store() {
+        let (_directory, _store, service) = harness();
+        let key = IpcDraftKey::NewChat {
+            transport: TransportId::new("openbubbles").unwrap(),
+            address: "demo@example.invalid".into(),
+        };
+        let draft = IpcDurableDraft {
+            body: "parked demo draft".into(),
+            cursor: 4,
+            pasted_body: false,
+            uncertain: false,
+        };
+        assert_eq!(
+            service.draft_save(key.clone(), draft, 1).await.unwrap(),
+            IpcDraftWriteOutcome::Applied
+        );
+        let loaded = service.draft_load(key).await.unwrap();
+        assert_eq!(loaded.draft.unwrap().body, "parked demo draft");
+    }
+
+    #[tokio::test]
+    async fn engine_facing_operations_are_unsupported_in_demo() {
+        let (_directory, _store, service) = harness();
+        let conversation_id =
+            ConversationId::new(TransportId::new("openbubbles").unwrap(), "demo-chat").unwrap();
+        let body = OutgoingBody {
+            parts: vec![MessagePart::Text("hello".into())],
+        };
+
+        assert_eq!(
+            service
+                .start_conversation("demo@example.invalid".into(), body.clone())
+                .await
+                .unwrap_err(),
+            ProtocolError::Unsupported
+        );
+        assert_eq!(
+            service.send(conversation_id, body).await.unwrap_err(),
+            ProtocolError::Unsupported
+        );
+        assert_eq!(
+            service
+                .send_attachment(
+                    ConversationId::new(TransportId::new("openbubbles").unwrap(), "demo-chat")
+                        .unwrap(),
+                    "/etc/passwd".into(),
+                )
+                .await
+                .unwrap_err(),
+            ProtocolError::Unsupported
+        );
+        assert_eq!(
+            service
+                .fetch_attachment("0123456789abcdef0123456789abcdef".into())
+                .await
+                .unwrap_err(),
+            ProtocolError::Unsupported
+        );
+        assert_eq!(
+            service.sync_conversations().await.unwrap_err(),
+            ProtocolError::Unsupported
+        );
+    }
+
+    #[test]
+    fn demo_service_has_no_engine_slot() {
+        let (_directory, _store, service) = harness();
+        assert!(matches!(&service.backend, Backend::Demo));
+        assert!(service.current_engine().is_none());
     }
 }
