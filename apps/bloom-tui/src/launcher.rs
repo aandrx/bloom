@@ -6,8 +6,13 @@
 //! stops only the daemon it started. A daemon that was already running is reused
 //! and left alone, so several TUIs can share one owner of the engine state.
 
+use crate::config::{Config, StoredReadPosition};
+use bloom_ipc::demo::{DemoPaths, DemoRootError};
+use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::ffi::{OsStr, OsString};
 use std::fs::{self, OpenOptions};
+use std::io::Read;
 #[cfg(unix)]
 use std::os::fd::AsRawFd;
 use std::path::{Path, PathBuf};
@@ -129,6 +134,448 @@ pub fn run_app(bloomd: Option<&Path>, tui: &Path, socket: &Path, log: &Path) -> 
     run_tui(tui, socket, started_daemon.as_mut())
 }
 
+/// Version of the synthetic-only session marker written by the launcher.
+pub const DEMO_SESSION_VERSION: u32 = 1;
+/// Marker kind, so a stray JSON file cannot pass as a demo session.
+pub const DEMO_SESSION_KIND: &str = "bloom-demo-session";
+/// Restrained header label shown while a demo session is open.
+pub const DEMO_INDICATOR: &str = "Demo";
+/// The fixed relative socket path inside a demo root.
+const DEMO_SOCKET_RELATIVE: &str = "runtime/bloomd.sock";
+/// The fixed relative store path inside a demo root.
+const DEMO_STORE_RELATIVE: &str = "data/store.db";
+/// Top-level directories the launcher creates inside a fresh demo root.
+const DEMO_LAYOUT: [&str; 6] = [
+    "runtime",
+    "data",
+    "config/bloom",
+    "state/bloom",
+    "cache/attachments",
+    "home",
+];
+
+/// The synthetic-only identity marker stored at `demo-session.json`.
+///
+/// The launcher writes it when it creates the root. Seeded read positions are
+/// handed to the TUI through this marker: the demo daemon may replace it with
+/// the seeded positions before the TUI starts, and the launcher copies them into
+/// the demo TUI config. Nothing here is read in normal mode.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DemoSessionMarker {
+    pub version: u32,
+    pub kind: String,
+    pub synthetic: bool,
+    pub root: String,
+    pub socket: String,
+    pub store: String,
+    pub created_at: i64,
+    #[serde(default)]
+    pub read_positions: HashMap<String, StoredReadPosition>,
+}
+
+/// Why a demo session was refused before the TUI started.
+#[derive(Debug)]
+pub enum DemoContextError {
+    /// `BLOOM_DEMO_ROOT` is missing or the root failed structural validation.
+    Root(DemoRootError),
+    /// The session marker is absent, so this is not a launcher-created session.
+    MissingMarker,
+    /// The marker is unreadable or not valid JSON.
+    Marker(String),
+    /// The marker does not describe this root.
+    MarkerMismatch(&'static str),
+    /// A filesystem operation on the root failed.
+    Io(String),
+}
+
+impl std::fmt::Display for DemoContextError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Root(error) => write!(f, "{error}"),
+            Self::MissingMarker => write!(f, "demo session marker is missing"),
+            Self::Marker(reason) => write!(f, "demo session marker is invalid: {reason}"),
+            Self::MarkerMismatch(reason) => {
+                write!(f, "demo session marker does not match the root: {reason}")
+            }
+            Self::Io(error) => write!(f, "demo session filesystem error: {error}"),
+        }
+    }
+}
+
+impl std::error::Error for DemoContextError {}
+
+/// A validated demo session: fixed paths plus the seeded read positions.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DemoContext {
+    pub paths: DemoPaths,
+    pub read_positions: HashMap<String, StoredReadPosition>,
+}
+
+impl DemoContext {
+    /// Resolve the demo session named by `BLOOM_DEMO_ROOT`.
+    ///
+    /// Normal mode never calls this, so an inherited `BLOOM_DEMO_ROOT` is inert
+    /// unless the operator asked for `--demo`.
+    pub fn from_env() -> Result<Self, DemoContextError> {
+        let paths = DemoPaths::from_env().map_err(DemoContextError::Root)?;
+        Self::from_paths(paths)
+    }
+
+    /// Validate an explicit root and read its session marker.
+    pub fn from_root(root: &Path) -> Result<Self, DemoContextError> {
+        let paths = DemoPaths::validate(root).map_err(DemoContextError::Root)?;
+        Self::from_paths(paths)
+    }
+
+    fn from_paths(paths: DemoPaths) -> Result<Self, DemoContextError> {
+        let marker = read_marker(&paths)?;
+        validate_marker(&paths, &marker)?;
+        Ok(Self {
+            paths,
+            read_positions: marker.read_positions,
+        })
+    }
+
+    /// The demo socket. The normal socket is never probed or reused.
+    pub fn socket_path(&self) -> &Path {
+        &self.paths.socket_path
+    }
+
+    /// The demo preferences file, written by the launcher before the TUI starts.
+    pub fn config_path(&self) -> &Path {
+        &self.paths.tui_config_path
+    }
+
+    /// The demo state directory, used so diagnostics never touch the real one.
+    pub fn state_dir(&self) -> PathBuf {
+        self.paths.root.join("state")
+    }
+}
+
+fn read_marker(paths: &DemoPaths) -> Result<DemoSessionMarker, DemoContextError> {
+    let bytes = match fs::read(&paths.session_file) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Err(DemoContextError::MissingMarker)
+        }
+        Err(error) => return Err(DemoContextError::Io(error.to_string())),
+    };
+    serde_json::from_slice(&bytes).map_err(|error| DemoContextError::Marker(error.to_string()))
+}
+
+fn validate_marker(paths: &DemoPaths, marker: &DemoSessionMarker) -> Result<(), DemoContextError> {
+    if marker.version != DEMO_SESSION_VERSION {
+        return Err(DemoContextError::MarkerMismatch("unsupported version"));
+    }
+    if marker.kind != DEMO_SESSION_KIND {
+        return Err(DemoContextError::MarkerMismatch("unexpected kind"));
+    }
+    if !marker.synthetic {
+        return Err(DemoContextError::MarkerMismatch("not marked synthetic"));
+    }
+    if marker.socket != DEMO_SOCKET_RELATIVE {
+        return Err(DemoContextError::MarkerMismatch("unexpected socket path"));
+    }
+    if marker.store != DEMO_STORE_RELATIVE {
+        return Err(DemoContextError::MarkerMismatch("unexpected store path"));
+    }
+    let actual_root = fs::canonicalize(&paths.root).map_err(DemoContextError::io)?;
+    // A marker naming a nonexistent root still fails the comparison rather than
+    // becoming a different error, so every mismatch reports the same reason.
+    let marker_root =
+        fs::canonicalize(&marker.root).unwrap_or_else(|_| PathBuf::from(&marker.root));
+    if marker_root != actual_root {
+        return Err(DemoContextError::MarkerMismatch("unexpected root"));
+    }
+    Ok(())
+}
+
+impl DemoContextError {
+    fn io(error: std::io::Error) -> Self {
+        Self::Io(error.to_string())
+    }
+}
+
+/// A launcher-owned demo session root, created fresh for one launch.
+#[derive(Debug)]
+pub struct DemoSession {
+    context: DemoContext,
+}
+
+impl DemoSession {
+    /// Create a fresh private root under `/tmp` with the exact demo layout and
+    /// the synthetic-only marker. An existing path is never reused.
+    pub fn create() -> Result<Self, String> {
+        let root = create_demo_root()?;
+        for relative in DEMO_LAYOUT {
+            create_private_tree(&root, relative)?;
+        }
+        let paths = DemoPaths::validate(&root).map_err(|error| error.to_string())?;
+        let marker = DemoSessionMarker {
+            version: DEMO_SESSION_VERSION,
+            kind: DEMO_SESSION_KIND.to_owned(),
+            synthetic: true,
+            root: paths.root.to_string_lossy().into_owned(),
+            socket: DEMO_SOCKET_RELATIVE.to_owned(),
+            store: DEMO_STORE_RELATIVE.to_owned(),
+            created_at: now_millis(),
+            read_positions: HashMap::new(),
+        };
+        write_marker(&paths, &marker)?;
+        Ok(Self {
+            context: DemoContext {
+                paths,
+                read_positions: HashMap::new(),
+            },
+        })
+    }
+
+    pub fn context(&self) -> &DemoContext {
+        &self.context
+    }
+
+    /// Re-read the marker after the daemon has seeded the session so seeded read
+    /// positions reach the TUI. A malformed marker fails startup.
+    pub fn refresh_read_positions(&mut self) -> Result<(), String> {
+        let context =
+            DemoContext::from_root(&self.context.paths.root).map_err(|error| error.to_string())?;
+        self.context.read_positions = context.read_positions;
+        Ok(())
+    }
+
+    /// Write the demo TUI preferences before the TUI starts. This is the only
+    /// config the demo TUI loads; the real preferences file is never touched.
+    pub fn write_tui_config(&self) -> Result<(), String> {
+        write_demo_tui_config(&self.context)
+    }
+
+    /// Remove only the session root. The daemon may already have removed it, and
+    /// a missing root is not an error.
+    pub fn cleanup(&self) {
+        match fs::remove_dir_all(&self.context.paths.root) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => eprintln!("bloom: demo cleanup failed: {error}"),
+        }
+    }
+}
+
+/// Write the demo TUI preferences for a validated context. The seeded read
+/// positions land in `config/bloom/tui.json`; no real preferences file is read
+/// or written.
+pub fn write_demo_tui_config(context: &DemoContext) -> Result<(), String> {
+    let config = Config {
+        version: 1,
+        read_positions: context.read_positions.clone(),
+        ..Config::default()
+    };
+    config
+        .save(&context.paths.tui_config_path)
+        .map_err(|error| format!("could not write demo preferences: {error}"))
+}
+
+fn now_millis() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_millis() as i64)
+        .unwrap_or_default()
+}
+
+/// Create one fresh, private root. A collision is retried with a new name; an
+/// existing root is never adopted.
+fn create_demo_root() -> Result<PathBuf, String> {
+    let base = Path::new("/tmp");
+    for _ in 0..8 {
+        let root = base.join(format!("bloom-demo-{}", random_hex()?));
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::DirBuilderExt;
+            match fs::DirBuilder::new().mode(0o700).create(&root) {
+                Ok(()) => return Ok(root),
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                Err(error) => return Err(format!("could not create {}: {error}", root.display())),
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            match fs::create_dir(&root) {
+                Ok(()) => return Ok(root),
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                Err(error) => return Err(format!("could not create {}: {error}", root.display())),
+            }
+        }
+    }
+    Err("could not allocate a fresh demo session root".into())
+}
+
+fn random_hex() -> Result<String, String> {
+    let mut bytes = [0u8; 8];
+    fs::File::open("/dev/urandom")
+        .and_then(|mut file| file.read_exact(&mut bytes))
+        .map_err(|error| format!("could not read randomness: {error}"))?;
+    Ok(bytes.iter().map(|byte| format!("{byte:02x}")).collect())
+}
+
+fn create_private_tree(root: &Path, relative: &str) -> Result<(), String> {
+    let mut current = root.to_path_buf();
+    for component in Path::new(relative).components() {
+        current.push(component);
+        match fs::symlink_metadata(&current) {
+            Ok(metadata) if metadata.is_dir() => {}
+            Ok(_) => return Err(format!("{} is not a directory", current.display())),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::DirBuilderExt;
+                    fs::DirBuilder::new()
+                        .mode(0o700)
+                        .create(&current)
+                        .map_err(|error| {
+                            format!("could not create {}: {error}", current.display())
+                        })?;
+                }
+                #[cfg(not(unix))]
+                {
+                    fs::create_dir(&current).map_err(|error| {
+                        format!("could not create {}: {error}", current.display())
+                    })?;
+                }
+            }
+            Err(error) => return Err(format!("could not inspect {}: {error}", current.display())),
+        }
+    }
+    Ok(())
+}
+
+fn write_marker(paths: &DemoPaths, marker: &DemoSessionMarker) -> Result<(), String> {
+    let bytes = serde_json::to_vec_pretty(marker)
+        .map_err(|error| format!("could not encode demo session marker: {error}"))?;
+    let mut options = OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut file = options
+        .open(&paths.session_file)
+        .map_err(|error| format!("could not write demo session marker: {error}"))?;
+    use std::io::Write;
+    file.write_all(&bytes)
+        .and_then(|()| file.write_all(b"\n"))
+        .map_err(|error| format!("could not write demo session marker: {error}"))
+}
+
+/// Run an isolated demo session: fresh root, demo daemon, demo TUI, cleanup.
+pub fn run_demo() -> ExitCode {
+    install_termination_handlers();
+    let Some(tui) = find_binary("bloom-tui") else {
+        eprintln!("bloom: could not find bloom-tui next to bloom or on PATH");
+        return ExitCode::from(1);
+    };
+    let Some(bloomd) = find_binary("bloomd") else {
+        eprintln!("bloom: could not find bloomd next to bloom or on PATH");
+        return ExitCode::from(1);
+    };
+    run_demo_app(&bloomd, &tui)
+}
+
+/// The testable demo core: it never installs process signal handlers and never
+/// probes the normal socket.
+pub fn run_demo_app(bloomd: &Path, tui: &Path) -> ExitCode {
+    let mut session = match DemoSession::create() {
+        Ok(session) => session,
+        Err(message) => {
+            eprintln!("bloom: {message}");
+            return ExitCode::from(1);
+        }
+    };
+    let paths = session.context().paths.clone();
+    let mut daemon = match start_demo_daemon(bloomd, &paths) {
+        Ok(child) => child,
+        Err(message) => {
+            eprintln!("bloom: {message}");
+            session.cleanup();
+            return ExitCode::from(1);
+        }
+    };
+    if termination_signal() != 0 {
+        stop_daemon(&mut daemon);
+        session.cleanup();
+        return ExitCode::from(128 + termination_signal() as u8);
+    }
+    // The daemon seeds before it listens, so the marker is complete now. Copy the
+    // seeded read positions into the demo preferences before the TUI reads them.
+    if let Err(message) = session.refresh_read_positions() {
+        eprintln!("bloom: {message}");
+        stop_daemon(&mut daemon);
+        session.cleanup();
+        return ExitCode::from(1);
+    }
+    if let Err(message) = session.write_tui_config() {
+        eprintln!("bloom: {message}");
+        stop_daemon(&mut daemon);
+        session.cleanup();
+        return ExitCode::from(1);
+    }
+    run_demo_tui(tui, &paths, &mut daemon, &session)
+}
+
+fn run_demo_tui(
+    tui: &Path,
+    paths: &DemoPaths,
+    daemon: &mut Child,
+    session: &DemoSession,
+) -> ExitCode {
+    let original_termios = capture_terminal();
+    let mut tui_child = match Command::new(tui)
+        .arg("--demo")
+        .env(bloom_ipc::demo::DEMO_ROOT_ENV, &paths.root)
+        .stdin(Stdio::inherit())
+        .stdout(Stdio::inherit())
+        .stderr(Stdio::inherit())
+        .spawn()
+    {
+        Ok(child) => child,
+        Err(error) => {
+            stop_daemon(daemon);
+            session.cleanup();
+            eprintln!("bloom: could not run the demo TUI: {error}");
+            return ExitCode::from(1);
+        }
+    };
+    let status = loop {
+        if termination_signal() != 0 {
+            terminate_tui(&mut tui_child);
+            restore_terminal(original_termios);
+            stop_daemon(daemon);
+            session.cleanup();
+            return ExitCode::from(128 + termination_signal() as u8);
+        }
+        match tui_child.try_wait() {
+            Ok(Some(status)) => {
+                restore_terminal(original_termios);
+                break Ok(status);
+            }
+            Ok(None) => std::thread::sleep(POLL),
+            Err(error) => {
+                stop_child(&mut tui_child, TUI_STOP_TIMEOUT);
+                restore_terminal(original_termios);
+                break Err(error);
+            }
+        }
+    };
+    stop_daemon(daemon);
+    session.cleanup();
+    match status {
+        Ok(status) => ExitCode::from(status.code().unwrap_or(1) as u8),
+        Err(error) => {
+            eprintln!("bloom: could not run the demo TUI: {error}");
+            ExitCode::from(1)
+        }
+    }
+}
+
 /// Reuse a listening daemon, otherwise start one and wait for its socket.
 fn ensure_daemon(
     bloomd: Option<&Path>,
@@ -197,8 +644,8 @@ fn run_tui(tui: &Path, socket: &Path, daemon: Option<&mut Child>) -> ExitCode {
     }
 }
 
-/// Start the daemon with its diagnostics in the log, then wait for the socket.
-pub fn start_daemon(bloomd: &Path, socket: &Path, log: &Path) -> Result<Child, String> {
+/// Open a private daemon log, refusing a symlink or a file we do not own.
+fn open_private_log(log: &Path) -> Result<(fs::File, fs::File), String> {
     secure_log_parent(log)?;
     use std::os::unix::fs::OpenOptionsExt;
     let stdout = OpenOptions::new()
@@ -225,14 +672,49 @@ pub fn start_daemon(bloomd: &Path, socket: &Path, log: &Path) -> Result<Child, S
     let stderr = stdout
         .try_clone()
         .map_err(|error| format!("could not open {}: {error}", log.display()))?;
+    Ok((stdout, stderr))
+}
 
-    let mut child = Command::new(bloomd)
-        .env("BLOOM_SOCKET_PATH", socket)
+/// Start the daemon with its diagnostics in the log, then wait for the socket.
+pub fn start_daemon(bloomd: &Path, socket: &Path, log: &Path) -> Result<Child, String> {
+    let (stdout, stderr) = open_private_log(log)?;
+    let mut command = Command::new(bloomd);
+    command.env("BLOOM_SOCKET_PATH", socket);
+    spawn_daemon(command, stdout, stderr, socket, log)
+}
+
+/// Start the demo daemon against the session root, then wait for the demo socket.
+/// The normal socket is never consulted, and only `BLOOM_DEMO_ROOT` and `--demo`
+/// are added to the inherited environment.
+fn start_demo_daemon(bloomd: &Path, paths: &DemoPaths) -> Result<Child, String> {
+    let (stdout, stderr) = open_private_log(&paths.daemon_log_path)?;
+    let mut command = Command::new(bloomd);
+    command
+        .arg("--demo")
+        .env(bloom_ipc::demo::DEMO_ROOT_ENV, &paths.root);
+    spawn_daemon(
+        command,
+        stdout,
+        stderr,
+        &paths.socket_path,
+        &paths.daemon_log_path,
+    )
+}
+
+fn spawn_daemon(
+    mut command: Command,
+    stdout: fs::File,
+    stderr: fs::File,
+    socket: &Path,
+    log: &Path,
+) -> Result<Child, String> {
+    let program = command.get_program().to_string_lossy().into_owned();
+    let mut child = command
         .stdin(Stdio::null())
         .stdout(Stdio::from(stdout))
         .stderr(Stdio::from(stderr))
         .spawn()
-        .map_err(|error| format!("could not start {}: {error}", bloomd.display()))?;
+        .map_err(|error| format!("could not start {program}: {error}"))?;
 
     let deadline = Instant::now() + START_TIMEOUT;
     loop {

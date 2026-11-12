@@ -235,6 +235,93 @@ async fn demo_startup_opens_only_root_internal_paths() {
 }
 
 #[tokio::test]
+async fn demo_startup_writes_seeded_read_positions_to_the_marker() {
+    let root = demo_root();
+    let marker_path = root.path().join("demo-session.json");
+    // Use the full launcher-shaped marker so the rewrite can be checked for
+    // preserving every field except `read_positions`.
+    let original = serde_json::json!({
+        "version": 1,
+        "kind": "bloom-demo-session",
+        "synthetic": true,
+        "root": root.path().to_string_lossy().into_owned(),
+        "socket": "runtime/bloomd.sock",
+        "store": "data/store.db",
+        "created_at": 1_700_000_000_000_i64,
+    });
+    std::fs::write(&marker_path, serde_json::to_vec_pretty(&original).unwrap()).unwrap();
+
+    let logs = tempfile::tempdir().unwrap();
+    let mut daemon = DemoDaemon::spawn(root.path(), &[], logs.path());
+    daemon.wait_for_socket(&socket_path(root.path())).await;
+
+    let marker: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&marker_path).unwrap()).unwrap();
+    let object = marker.as_object().expect("marker must be a JSON object");
+    for field in [
+        "version",
+        "kind",
+        "synthetic",
+        "root",
+        "socket",
+        "store",
+        "created_at",
+    ] {
+        assert_eq!(
+            object.get(field),
+            original.get(field),
+            "marker field {field} must be preserved"
+        );
+    }
+
+    let fixture: serde_json::Value =
+        serde_json::from_str(include_str!("../../../fixtures/demo/venue.json")).unwrap();
+    let transport = fixture["transport"].as_str().unwrap();
+    let expected: Vec<(String, &str)> = fixture["conversations"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|conversation| {
+            let read_marker = conversation.get("read_marker")?.as_str()?;
+            let id = conversation["id"].as_str()?;
+            Some((format!("{transport}|{id}"), read_marker))
+        })
+        .collect();
+    assert!(!expected.is_empty(), "the fixture must seed read positions");
+
+    let positions = object
+        .get("read_positions")
+        .and_then(serde_json::Value::as_object)
+        .expect("seeded read positions must be an object");
+    assert_eq!(positions.len(), expected.len());
+    for (key, message) in expected {
+        let position = positions
+            .get(&key)
+            .unwrap_or_else(|| panic!("missing seeded read position {key}"));
+        assert_eq!(position["transport"].as_str(), Some(transport));
+        assert_eq!(position["value"].as_str(), Some(message));
+        assert!(
+            position["created_at"].as_i64().unwrap_or_default() > 0,
+            "seeded read position {key} must carry its message timestamp"
+        );
+    }
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = std::fs::metadata(&marker_path)
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, 0o600, "session marker must stay private");
+    }
+
+    daemon.terminate();
+    assert!(daemon.wait_for_exit().await.success());
+}
+
+#[tokio::test]
 async fn demo_ignores_foreign_environment_and_sentinels() {
     let root = demo_root();
     let logs = tempfile::tempdir().unwrap();

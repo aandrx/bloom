@@ -401,20 +401,85 @@ fn socket_path() -> std::path::PathBuf {
     bloom_ipc::socket_path_from_env()
 }
 
+/// What the command line asked for. `--demo` is the only mode that consults
+/// `BLOOM_DEMO_ROOT`; normal mode never reads it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum StartupRequest {
+    Help,
+    Normal,
+    Demo,
+}
+
+fn parse_startup_request(
+    args: impl IntoIterator<Item = std::ffi::OsString>,
+) -> Result<StartupRequest, String> {
+    let mut demo = false;
+    let mut help = false;
+    for argument in args {
+        match argument.to_str() {
+            Some("--demo") if !demo => demo = true,
+            Some("--demo") => return Err("--demo was given more than once".into()),
+            Some("--help") | Some("-h") if !help => help = true,
+            Some("--help") | Some("-h") => return Err("--help was given more than once".into()),
+            _ => return Err(format!("unknown argument {}", argument.to_string_lossy())),
+        }
+    }
+    match (demo, help) {
+        (true, true) => Err("--demo cannot be combined with --help".into()),
+        (_, true) => Ok(StartupRequest::Help),
+        (true, false) => Ok(StartupRequest::Demo),
+        (false, false) => Ok(StartupRequest::Normal),
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
-    if std::env::args().any(|argument| argument == "--help" || argument == "-h") {
+    let request = match parse_startup_request(std::env::args_os().skip(1)) {
+        Ok(request) => request,
+        Err(message) => {
+            eprintln!("bloom-tui: {message}");
+            eprintln!("Usage: bloom-tui [--demo] [--help]");
+            std::process::exit(2);
+        }
+    };
+    if request == StartupRequest::Help {
         println!(
-            "Bloom TUI\nUsage: bloom-tui [--help]\n\
+            "Bloom TUI\nUsage: bloom-tui [--demo] [--help]\n\
              Reads BLOOM_SOCKET_PATH (or BLOOM_SOCKET) for the socket path.\n\
+             --demo requires a launcher-created demo session and never falls back to normal mode.\n\
              Keys: up/down scroll or select, Enter send/choose, Esc dismisses, Ctrl+C clears input then quits when empty.\n\
              Herdr-style: Ctrl+B then n/p or h/l changes chat; Ctrl+P goes previous; j/k scroll. Use /new to start a chat."
         );
         return Ok(());
     }
 
-    let client = BloomClient::new(socket_path());
-    let config_path = Config::path();
+    // Resolve the demo context before the client, preferences, or terminal exist.
+    // A missing or malformed session fails here; it never downgrades to normal mode.
+    let demo = match request {
+        StartupRequest::Demo => match bloom_tui::launcher::DemoContext::from_env() {
+            Ok(context) => Some(context),
+            Err(error) => {
+                eprintln!("bloom-tui: demo session rejected: {error}");
+                std::process::exit(1);
+            }
+        },
+        _ => None,
+    };
+    let demo_mode = demo.is_some();
+    let (socket, config_path) = match &demo {
+        Some(context) => {
+            // Diagnostics are pinned to the demo state directory, so neither
+            // XDG_STATE_HOME nor the macOS HOME-based path is consulted.
+            diagnostics::use_state_dir(context.state_dir());
+            (
+                context.socket_path().to_path_buf(),
+                context.config_path().to_path_buf(),
+            )
+        }
+        None => (socket_path(), Config::path()),
+    };
+
+    let client = BloomClient::new(socket);
     let (mut config, config_warning) = Config::load(&config_path);
     let _guard = TerminalGuard::enter()?;
     let system_theme = query_background_theme().unwrap_or_default();
@@ -440,6 +505,10 @@ async fn main() -> Result<()> {
         startup: bloom_tui::startup::StartupState::loading(),
         ..Default::default()
     };
+    if demo_mode {
+        // A restrained demo label in the header status slot, outside the transcript.
+        app.session = bloom_tui::launcher::DEMO_INDICATOR.to_owned();
+    }
     app.apply_read_positions(&read_positions);
 
     let (event_tx, mut event_rx) = mpsc::unbounded_channel::<EventKind>();
@@ -554,6 +623,9 @@ async fn main() -> Result<()> {
     let mut next_draft_tick = tokio::time::Instant::now();
     let mut startup_input_cutoff: Option<Instant> = None;
     let mut startup_enter_armed = true;
+    // A snapshot carries history only for the visible chat. Demo mode seeds
+    // several chats with unread state, so their histories are read once here.
+    let mut demo_histories_seeded = false;
     loop {
         // Owner and modal changes can arrive through any branch, so capture them
         // before painting rather than only after the next key press.
@@ -677,7 +749,35 @@ async fn main() -> Result<()> {
                         }
                     }
                     SnapshotNotice::Completed(snapshot) => {
+                        let demo_seed = if demo_mode
+                            && !demo_histories_seeded
+                            && !snapshot.conversations.is_empty()
+                        {
+                            demo_histories_seeded = true;
+                            Some((snapshot.conversations.clone(), snapshot.visible.clone()))
+                        } else {
+                            None
+                        };
                         app.apply_snapshot(snapshot);
+                        if let Some((conversations, visible)) = demo_seed {
+                            // Read each remaining seeded chat through the same
+                            // snapshot path so its history is loaded and unread
+                            // badges can be computed for chats the user is not on.
+                            let client = client.clone();
+                            let snapshots = snapshot_tx.clone();
+                            tokio::spawn(async move {
+                                for conversation in conversations {
+                                    if Some(&conversation.id) == visible.as_ref() {
+                                        continue;
+                                    }
+                                    if let Ok(snapshot) =
+                                        daemon::snapshot(&client, Some(conversation.id).into()).await
+                                    {
+                                        let _ = snapshots.send(SnapshotNotice::Completed(snapshot));
+                                    }
+                                }
+                            });
+                        }
                         launch_bootstrap_read(
                             &mut app,
                             &client,
@@ -754,6 +854,11 @@ async fn main() -> Result<()> {
                         | EventKind::ConversationsChanged
                 );
                 app.apply_event(event);
+                if demo_mode {
+                    // Session events carry the engine's state; the demo label stays
+                    // visible for the whole session instead.
+                    app.session = bloom_tui::launcher::DEMO_INDICATOR.to_owned();
+                }
                 launch_bootstrap_read(
                     &mut app,
                     &client,

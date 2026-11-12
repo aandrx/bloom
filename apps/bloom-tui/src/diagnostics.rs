@@ -2,27 +2,66 @@ use bloom_ipc::client::ClientError;
 use std::{
     fs::{self, OpenOptions},
     io::Write,
-    path::PathBuf,
+    path::{Path, PathBuf},
+    sync::OnceLock,
     time::Duration,
 };
 
 const MAX_BYTES: u64 = 256 * 1024;
 const FILE: &str = "tui.log";
 
+/// An explicitly pinned state directory. Demo mode sets this before any task
+/// starts so the log never resolves through `HOME` or `XDG_STATE_HOME`.
+static STATE_DIR: OnceLock<PathBuf> = OnceLock::new();
+
+/// Pin diagnostics to an explicit state directory.
+///
+/// Demo mode calls this with the session's own state directory, which keeps the
+/// macOS `HOME`-based branch from writing into the real user log directory.
+/// The first call wins; later calls are ignored.
+pub fn use_state_dir(dir: PathBuf) {
+    let _ = STATE_DIR.set(dir);
+}
+
+/// The diagnostics log inside an explicit state directory.
+pub fn path_in(state_dir: &Path) -> PathBuf {
+    state_dir.join("bloom").join(FILE)
+}
+
+/// Resolve the diagnostics log from an explicit state directory, or from the
+/// platform's normal state directory when none is given.
+pub fn resolve_path(state_dir: Option<&Path>) -> Option<PathBuf> {
+    match state_dir {
+        Some(dir) => Some(path_in(dir)),
+        None => platform_base().map(|base| path_in(&base)),
+    }
+}
+
 pub fn path() -> Option<PathBuf> {
+    resolve_path(STATE_DIR.get().map(PathBuf::as_path))
+}
+
+fn platform_base() -> Option<PathBuf> {
     #[cfg(target_os = "macos")]
-    let base = std::env::var_os("HOME")
-        .map(PathBuf::from)?
-        .join("Library/Logs");
+    {
+        Some(
+            std::env::var_os("HOME")
+                .map(PathBuf::from)?
+                .join("Library/Logs"),
+        )
+    }
     #[cfg(target_os = "windows")]
-    let base = std::env::var_os("LOCALAPPDATA").map(PathBuf::from)?;
+    {
+        std::env::var_os("LOCALAPPDATA").map(PathBuf::from)
+    }
     #[cfg(not(any(target_os = "macos", target_os = "windows")))]
-    let base = std::env::var_os("XDG_STATE_HOME")
-        .map(PathBuf::from)
-        .or_else(|| {
-            std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".local/state"))
-        })?;
-    Some(base.join("bloom").join(FILE))
+    {
+        std::env::var_os("XDG_STATE_HOME")
+            .map(PathBuf::from)
+            .or_else(|| {
+                std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".local/state"))
+            })
+    }
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -239,5 +278,15 @@ mod tests {
     #[test]
     fn logging_failure_is_nonfatal() {
         record("safe");
+    }
+    #[test]
+    fn pinned_state_dir_bypasses_the_platform_environment() {
+        // Process-global by design: demo mode pins this once before any task
+        // starts. A nonexistent parent keeps a later `record` from writing.
+        use_state_dir(PathBuf::from("/nonexistent/bloom-demo/state"));
+        assert_eq!(
+            path(),
+            Some(PathBuf::from("/nonexistent/bloom-demo/state/bloom/tui.log"))
+        );
     }
 }

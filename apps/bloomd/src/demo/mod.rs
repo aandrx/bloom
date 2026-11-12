@@ -21,12 +21,18 @@ use crate::{
     service::Service,
     store::{EncryptedStore, StoreError},
 };
+use bloom_domain::{ConversationId, MessageId};
 use bloom_ipc::demo::{DemoPaths, DemoRootError};
 use std::{
     fmt,
     path::PathBuf,
-    sync::{Arc, Mutex},
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc, Mutex,
+    },
 };
+
+static MARKER_TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 /// Run the demo daemon for the root named by `BLOOM_DEMO_ROOT`.
 ///
@@ -54,15 +60,21 @@ async fn serve(paths: DemoPaths) -> Result<(), DemoError> {
     prepare_directories(&paths)?;
 
     let mut store = EncryptedStore::open_demo(&paths.store_path).map_err(DemoError::Store)?;
-    if let Err(error) = seeder::seed_now(&mut store) {
-        return Err(match error {
-            seeder::SeedError::Store(error) => DemoError::Store(error),
-            other => {
-                eprintln!("bloomd: demo fixture rejected: {other}");
-                DemoError::Layout("demo fixture is invalid")
-            }
-        });
-    }
+    let summary = match seeder::seed_now(&mut store) {
+        Ok(summary) => summary,
+        Err(error) => {
+            return Err(match error {
+                seeder::SeedError::Store(error) => DemoError::Store(error),
+                other => {
+                    eprintln!("bloomd: demo fixture rejected: {other}");
+                    DemoError::Layout("demo fixture is invalid")
+                }
+            });
+        }
+    };
+    // The launcher re-reads the marker as soon as the socket appears, so the
+    // seeded positions must be persisted before the listener starts.
+    write_seeded_read_positions(&paths, &summary.read_positions)?;
     let listener = Listener::bind(&paths.socket_path).map_err(DemoError::Listener)?;
     let hub = SubscriptionHub::with_default_capacity();
     let service = Arc::new(Service::demo(Arc::new(Mutex::new(store)), hub.clone()));
@@ -99,6 +111,100 @@ async fn serve(paths: DemoPaths) -> Result<(), DemoError> {
 
     drop(listener);
     Ok(())
+}
+
+/// Persist the seeded local read positions into the launcher's session marker.
+///
+/// Only `read_positions` is replaced; every other marker field is preserved
+/// verbatim. A missing marker is treated as an empty object so a minimal marker
+/// can still be updated, and a missing marker file is tolerated the same way.
+fn write_seeded_read_positions(
+    paths: &DemoPaths,
+    positions: &[(ConversationId, MessageId, i64)],
+) -> Result<(), DemoError> {
+    let mut marker = match std::fs::read(&paths.session_file) {
+        Ok(bytes) => serde_json::from_slice::<serde_json::Value>(&bytes)
+            .map_err(|error| DemoError::Io(format!("cannot parse demo session marker: {error}")))?,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            serde_json::Value::Object(serde_json::Map::new())
+        }
+        Err(error) => {
+            return Err(DemoError::Io(format!(
+                "cannot read demo session marker: {error}"
+            )))
+        }
+    };
+    let object = marker
+        .as_object_mut()
+        .ok_or_else(|| DemoError::Io("demo session marker is not a JSON object".to_owned()))?;
+
+    let mut seeded = serde_json::Map::with_capacity(positions.len());
+    for (conversation, message, created_at) in positions {
+        let key = format!(
+            "{}|{}",
+            conversation.transport().as_str(),
+            conversation.value()
+        );
+        seeded.insert(
+            key,
+            serde_json::json!({
+                "created_at": created_at,
+                "transport": message.transport().as_str(),
+                "value": message.value(),
+            }),
+        );
+    }
+    object.insert(
+        "read_positions".to_owned(),
+        serde_json::Value::Object(seeded),
+    );
+
+    let bytes = serde_json::to_vec_pretty(&marker)
+        .map_err(|error| DemoError::Io(format!("cannot encode demo session marker: {error}")))?;
+    write_marker_atomically(&paths.session_file, &bytes)
+}
+
+/// Replace the session marker through a private temporary file and a rename, so
+/// a reader never observes a partial marker.
+fn write_marker_atomically(path: &std::path::Path, bytes: &[u8]) -> Result<(), DemoError> {
+    let directory = path.parent().ok_or(DemoError::Layout(
+        "demo session marker has no parent directory",
+    ))?;
+    let file_name = path
+        .file_name()
+        .ok_or(DemoError::Layout("demo session marker has no file name"))?;
+    let sequence = MARKER_TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+    let temp_path = directory.join(format!(
+        ".{}.{}.{}.tmp",
+        file_name.to_string_lossy(),
+        std::process::id(),
+        sequence
+    ));
+
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+
+    let result = (|| {
+        use std::io::Write;
+        let mut file = options.open(&temp_path).map_err(|error| {
+            DemoError::Io(format!("cannot create demo session marker: {error}"))
+        })?;
+        file.write_all(bytes)
+            .and_then(|()| file.write_all(b"\n"))
+            .and_then(|()| file.sync_all())
+            .map_err(|error| DemoError::Io(format!("cannot write demo session marker: {error}")))?;
+        std::fs::rename(&temp_path, path)
+            .map_err(|error| DemoError::Io(format!("cannot replace demo session marker: {error}")))
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_file(&temp_path);
+    }
+    result
 }
 
 /// Refuse a root that already holds a daemon artifact.

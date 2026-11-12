@@ -18,7 +18,7 @@
         { "handle": { "kind": "email", "value": "dana@example.invalid" }, "display_name": "Dana", "is_me": false },
         { "handle": { "kind": "email", "value": "priya@example.invalid" }, "display_name": "Priya", "is_me": false }
       ],
-      "read_marker": "weekend-0010",
+      "read_marker": "weekend-0014",
       "messages": [
         {
           "id": "weekend-0001",
