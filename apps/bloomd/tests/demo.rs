@@ -162,9 +162,22 @@ async fn demo_startup_opens_only_root_internal_paths() {
     );
 
     let client = BloomClient::new(socket_path(root.path()));
-    assert!(client.list_conversations().await.unwrap().is_empty());
-    assert!(client
-        .search_messages("anything", 10)
+    let conversations = client.list_conversations().await.unwrap();
+    assert_eq!(conversations.len(), 5, "the demo fixture must be seeded");
+    assert!(conversations
+        .iter()
+        .any(|conversation| conversation.title.as_deref() == Some("Weekend crew")));
+    let harbour = conversations
+        .iter()
+        .find(|conversation| conversation.title.as_deref() == Some("Harbour log"))
+        .expect("longer history conversation");
+    assert_eq!(
+        client.history(harbour.id.clone(), 200).await.unwrap().len(),
+        200,
+        "the long history must fill a page"
+    );
+    assert!(!client
+        .search_messages("harbour", 10)
         .await
         .unwrap()
         .is_empty());
@@ -264,7 +277,7 @@ async fn demo_ignores_foreign_environment_and_sentinels() {
     );
 
     let client = BloomClient::new(socket_path(root.path()));
-    assert!(client.list_conversations().await.unwrap().is_empty());
+    assert_eq!(client.list_conversations().await.unwrap().len(), 5);
 
     daemon.terminate();
     assert!(daemon.wait_for_exit().await.success());

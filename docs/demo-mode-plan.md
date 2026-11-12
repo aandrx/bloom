@@ -130,6 +130,10 @@ One fresh private root per launch, under `/tmp`:
   commit a binary.
 - Reuse the stateful fixture structure: conversations, messages, drafts, scoped
   IDs, participants, parts, delivery states, reactions, and demo read positions.
+  Read positions are seeded as fixture data and handed to U4 through the demo
+  session: the daemon exposes them in the demo session marker
+  (`demo-session.json`), and the launcher writes them into the demo TUI config
+  before the TUI starts. No bloom-ipc protocol change; no real-config writes.
 - Seed four to six curated chats with natural multi-speaker exchanges, multiline
   text, varied lengths, grouped follow-ups, named synthetic attachments,
   read-only reactions, a parked draft, unread markers, and one longer history for

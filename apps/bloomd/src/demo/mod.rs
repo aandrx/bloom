@@ -12,8 +12,9 @@
 //! `BLOOM_DEMO_ROOT` (and inherited `HOME`/XDG destinations) is ignored by never
 //! being consulted.
 //!
-//! The synthetic data seeder lives in the sibling `seeder` module, which is a
-//! later unit; this module deliberately does not declare it yet.
+//! The synthetic data seeder lives in the sibling `seeder` module.
+
+mod seeder;
 
 use crate::{
     ipc::{serve_with_subscriptions, Listener, ListenerError, SubscriptionHub},
@@ -52,7 +53,16 @@ async fn serve(paths: DemoPaths) -> Result<(), DemoError> {
     ensure_fresh(&paths)?;
     prepare_directories(&paths)?;
 
-    let store = EncryptedStore::open_demo(&paths.store_path).map_err(DemoError::Store)?;
+    let mut store = EncryptedStore::open_demo(&paths.store_path).map_err(DemoError::Store)?;
+    if let Err(error) = seeder::seed_now(&mut store) {
+        return Err(match error {
+            seeder::SeedError::Store(error) => DemoError::Store(error),
+            other => {
+                eprintln!("bloomd: demo fixture rejected: {other}");
+                DemoError::Layout("demo fixture is invalid")
+            }
+        });
+    }
     let listener = Listener::bind(&paths.socket_path).map_err(DemoError::Listener)?;
     let hub = SubscriptionHub::with_default_capacity();
     let service = Arc::new(Service::demo(Arc::new(Mutex::new(store)), hub.clone()));
