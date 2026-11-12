@@ -54,8 +54,11 @@ stub hook in `main.rs` (U1-owned), and U2 fills the demo startup body behind
 that hook in `service.rs`/`demo/mod.rs` (U2-owned), so demo dispatch still
 precedes real configuration and discovery. Because `bloomd` is a lib-plus-bin
 package, U2 is permitted exactly one `main.rs` edit: replacing the stub body
-with a call into the U2-owned demo module. Nothing else in `main.rs` changes at
-U2; the early branch, argument parsing, and `--help` stay U1-owned. The
+with a call into the U2-owned demo module, and retargeting the stub-hook tests
+to the real dispatch behavior. Nothing else in `main.rs` changes at U2; the
+early branch, argument parsing, and `--help` stay U1-owned. U2 is also
+permitted the one-line `pub mod demo;` in `apps/bloomd/src/lib.rs`, which is
+required for the dispatch call to compile. The
 stub hook returns whether to proceed normally or enter demo with its context;
 its shape is fixed in U1 so U2 conforms to it. No other file under
 `apps/bloomd/src/` changes; if implementation reveals a need, the seam is
@@ -82,7 +85,8 @@ One fresh private root per launch, under `/tmp`:
   creates a demo root; a hand-set root with a hand-crafted `demo-session.json`
   may pass structural validation, which is accepted because the threat model is
   accidental access, not a hostile process.
-- Guards: validate an absolute, owned, private root; reject symlinks, traversal,
+- Guards (structure lives in U1's `crates/bloom-ipc/src/demo.rs`; U2 only
+  consumes it): validate an absolute, owned, private root; reject symlinks, traversal,
   and unexpected files; check the socket-path length. "Unexpected" is measured
   against the top-level layout above only, not recursively: session data under
   `cache/attachments/`, `home/`, and the state logs is legitimate. Validation
