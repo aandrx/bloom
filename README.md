@@ -44,7 +44,14 @@ same version.
 - **Dart 3.13.4**, used by the engine sidecar in `ext/bloom-engine-sidecar/dart`.
 The launcher finds `dart` on `PATH`, then in the checkout at `.dart-sdk/bin/dart`,
 then under `~/.cache/dart-sdk/dart-sdk/bin`. The checkout copy is pinned and
-git-ignored so a cache clean cannot remove the engine's interpreter.
+git-ignored so a cache clean cannot remove the engine's interpreter. A fresh
+clone has no SDK; install it once into the checkout:
+
+  ```sh
+  curl -fL -o /tmp/dartsdk.zip https://storage.googleapis.com/dart-archive/channels/stable/release/3.13.4/sdk/dartsdk-linux-x64-release.zip
+  mkdir -p .dart-sdk && unzip -q /tmp/dartsdk.zip -d /tmp/dartsdk && cp -a /tmp/dartsdk/dart-sdk/. .dart-sdk/
+  rm -rf /tmp/dartsdk /tmp/dartsdk.zip
+  ```
 - **The OpenBubbles Flatpak**, which supplies the engine library and the existing
 engine state.
 
