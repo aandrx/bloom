@@ -5,6 +5,9 @@
 __pycache__/
 *.pyc
 
+# Local test evidence artifacts (machine-local, not part of the source tree)
+/docs/evidence/
+
 # Local environment and credentials
 .env
 .env.*
