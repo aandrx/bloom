@@ -13,6 +13,9 @@ use std::{fmt, path::PathBuf};
 const FLATPAK_APP: &str = "app.openbubbles.OpenBubbles";
 /// Sidecar entry point inside the repository, used for development builds.
 const REPO_SCRIPT: &str = "../../ext/bloom-engine-sidecar/dart/bin/bloom_engine.dart";
+/// Pinned Dart SDK, relative to the checkout root. Kept in the repository so a
+/// cache clean cannot remove the engine's interpreter.
+const REPO_DART: &str = ".dart-sdk/bin/dart";
 
 #[derive(Clone, Debug)]
 pub struct DaemonConfig {
@@ -84,7 +87,8 @@ pub fn default_script() -> Option<PathBuf> {
     bloom_ipc::sidecar_script(&executable, script_env.as_deref(), &checkout)
 }
 
-/// Dart from `PATH`, else a user-local SDK, so no export is normally needed.
+/// Dart from `PATH`, else the checkout's pinned SDK, else a user-local SDK, so
+/// no export is normally needed.
 pub fn default_dart() -> PathBuf {
     if let Ok(path) = std::env::var("PATH") {
         for directory in std::env::split_paths(&path) {
@@ -93,6 +97,12 @@ pub fn default_dart() -> PathBuf {
                 return candidate;
             }
         }
+    }
+    let checkout = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../..")
+        .join(REPO_DART);
+    if checkout.is_file() {
+        return checkout;
     }
     if let Some(home) = home() {
         for relative in [

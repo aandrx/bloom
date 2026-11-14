@@ -25,6 +25,8 @@ const POLL: Duration = Duration::from_millis(100);
 const FLATPAK_APP: &str = "app.openbubbles.OpenBubbles";
 /// Sidecar entry point inside the repository, used for development builds.
 const REPO_SCRIPT: &str = "../../ext/bloom-engine-sidecar/dart/bin/bloom_engine.dart";
+/// Pinned Dart SDK, relative to the checkout root.
+const REPO_DART: &str = ".dart-sdk/bin/dart";
 
 /// The socket path, resolved the same way the daemon and TUI resolve it.
 pub fn socket_path() -> PathBuf {
@@ -399,6 +401,7 @@ pub struct DoctorInput {
     pub store_env: Option<OsString>,
     pub data_home: Option<OsString>,
     pub home: Option<PathBuf>,
+    pub checkout: Option<PathBuf>,
     pub repo_script: PathBuf,
     pub flatpak_library: Option<PathBuf>,
 }
@@ -461,11 +464,13 @@ pub fn resolve_state(state_env: Option<&OsStr>, home: Option<&Path>) -> Option<R
     })
 }
 
-/// Dart executable: the environment override, `PATH`, then a known local SDK.
+/// Dart executable: the environment override, `PATH`, the checkout's pinned SDK,
+/// then a known user-local SDK.
 pub fn resolve_dart(
     dart_env: Option<&OsStr>,
     path_env: Option<&OsStr>,
     home: Option<&Path>,
+    checkout: Option<&Path>,
 ) -> Option<Resolved> {
     if let Some(value) = dart_env.filter(|value| !value.is_empty()) {
         return Some(Resolved {
@@ -481,6 +486,15 @@ pub fn resolve_dart(
             return Some(Resolved {
                 path,
                 source: "PATH",
+            });
+        }
+    }
+    if let Some(checkout) = checkout {
+        let candidate = checkout.join(REPO_DART);
+        if candidate.is_file() {
+            return Some(Resolved {
+                path: candidate,
+                source: "checkout Dart SDK",
             });
         }
     }
@@ -573,6 +587,7 @@ impl DoctorInput {
             store_env: std::env::var_os("BLOOM_STORE_PATH"),
             data_home: std::env::var_os("XDG_DATA_HOME"),
             home: std::env::var_os("HOME").map(PathBuf::from),
+            checkout: Some(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..")),
             repo_script: PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(REPO_SCRIPT),
             flatpak_library: flatpak_engine_library(),
         }
@@ -671,6 +686,7 @@ pub fn doctor_checks(input: &DoctorInput) -> Vec<DoctorCheck> {
         input.dart.as_deref(),
         input.path_env.as_deref(),
         input.home.as_deref(),
+        input.checkout.as_deref(),
     );
     checks.push(match dart {
         Some(found) if is_executable(&found.path) => {
@@ -916,6 +932,7 @@ mod tests {
             store_env: None,
             data_home: None,
             home: Some(prefix.to_path_buf()),
+            checkout: None,
             repo_script: prefix.join("repo/bloom_engine.dart"),
             flatpak_library: None,
         }
@@ -1048,6 +1065,40 @@ mod tests {
         assert!(!dart.ok);
         assert!(doctor_report(&checks).contains("FAIL dart executable"));
         assert_eq!(doctor_exit_code(&checks), 1);
+    }
+
+    #[test]
+    fn checkout_dart_sdk_wins_over_the_home_cache() {
+        let directory = tempfile::tempdir().unwrap();
+        let checkout = directory.path().join("checkout");
+        let checkout_dart = checkout.join(REPO_DART);
+        fs::create_dir_all(checkout_dart.parent().unwrap()).unwrap();
+        write_executable(&checkout_dart);
+
+        let home = directory.path().join("home");
+        let cached = home.join(".cache/dart-sdk/dart-sdk/bin/dart");
+        fs::create_dir_all(cached.parent().unwrap()).unwrap();
+        write_executable(&cached);
+
+        let resolved = resolve_dart(None, None, Some(&home), Some(&checkout)).unwrap();
+        assert_eq!(resolved.path, checkout_dart);
+        assert_eq!(resolved.source, "checkout Dart SDK");
+    }
+
+    #[test]
+    fn home_cache_is_the_fallback_when_the_checkout_has_no_sdk() {
+        let directory = tempfile::tempdir().unwrap();
+        let checkout = directory.path().join("checkout");
+        fs::create_dir(&checkout).unwrap();
+
+        let home = directory.path().join("home");
+        let cached = home.join(".cache/dart-sdk/dart-sdk/bin/dart");
+        fs::create_dir_all(cached.parent().unwrap()).unwrap();
+        write_executable(&cached);
+
+        let resolved = resolve_dart(None, None, Some(&home), Some(&checkout)).unwrap();
+        assert_eq!(resolved.path, cached);
+        assert_eq!(resolved.source, "local Dart SDK");
     }
 
     #[test]

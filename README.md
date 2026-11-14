@@ -42,7 +42,9 @@ Prerequisites:
 automatically; bump the pin deliberately and re-verify, since CI installs the
 same version.
 - **Dart 3.13.4**, used by the engine sidecar in `ext/bloom-engine-sidecar/dart`.
-The launcher finds `dart` on `PATH` or under `~/.cache/dart-sdk/dart-sdk/bin`.
+The launcher finds `dart` on `PATH`, then in the checkout at `.dart-sdk/bin/dart`,
+then under `~/.cache/dart-sdk/dart-sdk/bin`. The checkout copy is pinned and
+git-ignored so a cache clean cannot remove the engine's interpreter.
 - **The OpenBubbles Flatpak**, which supplies the engine library and the existing
 engine state.
 

@@ -4,7 +4,7 @@
 #
 # Everything is discovered automatically: the OpenBubbles Flatpak provides the
 # engine library and state, the sidecar script lives in this repository, and Dart
-# is taken from PATH or a user-local SDK. Override with BLOOM_ENGINE_STATE,
+# is taken from PATH, the checkout's pinned SDK, or a user-local SDK. Override with BLOOM_ENGINE_STATE,
 # BLOOM_ENGINE_LIBRARY, BLOOM_ENGINE_SCRIPT, BLOOM_DART_EXECUTABLE or
 # BLOOM_SOCKET_PATH, normally by putting them in a .env file next to this script.
 
@@ -42,9 +42,10 @@ if [ -f "$root/.env" ]; then
   set +a
 fi
 
-# Dart is often installed per-user rather than system-wide.
+# Dart is often installed per-user rather than system-wide. The checkout's pinned
+# SDK wins so that a cache clean cannot remove the engine's interpreter.
 if ! command -v dart >/dev/null 2>&1; then
-  for candidate in "$HOME/.cache/dart-sdk/dart-sdk/bin" "$HOME/.local/share/bloom/dart/bin"; do
+  for candidate in "$root/.dart-sdk/bin" "$HOME/.cache/dart-sdk/dart-sdk/bin" "$HOME/.local/share/bloom/dart/bin"; do
     if [ -x "$candidate/dart" ]; then
       PATH="$candidate:$PATH"
       export PATH

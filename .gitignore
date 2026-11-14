@@ -1,6 +1,9 @@
 # Rust build output
 /target/
 
+# Pinned Dart SDK for the engine sidecar (see README)
+/.dart-sdk/
+
 # Python review/test tooling caches
 __pycache__/
 *.pyc
