@@ -1,0 +1,611 @@
+{
+  "version": 1,
+  "transport": "openbubbles",
+  "me": {
+    "handle": { "kind": "email", "value": "me@example.invalid" },
+    "display_name": "You"
+  },
+  "conversations": [
+    {
+      "id": "weekend-crew",
+      "remote_id": "demo-weekend-crew",
+      "kind": "group",
+      "title": "Weekend crew",
+      "created_offset_seconds": -2600,
+      "participants": [
+        { "handle": { "kind": "email", "value": "me@example.invalid" }, "display_name": "You", "is_me": true },
+        { "handle": { "kind": "email", "value": "jules@example.invalid" }, "display_name": "Jules", "is_me": false },
+        { "handle": { "kind": "email", "value": "dana@example.invalid" }, "display_name": "Dana", "is_me": false },
+        { "handle": { "kind": "email", "value": "priya@example.invalid" }, "display_name": "Priya", "is_me": false }
+      ],
+      "read_marker": "weekend-0014",
+      "messages": [
+        {
+          "id": "weekend-0001",
+          "sender": { "kind": "email", "value": "jules@example.invalid" },
+          "from_me": false,
+          "offset_seconds": -2400,
+          "delivery": "delivered",
+          "parts": [
+            { "type": "text", "value": "Saturday looks calm enough for the coast. Should we take the early train?" }
+          ]
+        },
+        {
+          "id": "weekend-0002",
+          "sender": { "kind": "email", "value": "dana@example.invalid" },
+          "from_me": false,
+          "offset_seconds": -2300,
+          "delivery": "delivered",
+          "parts": [
+            { "type": "text", "value": "Early train works for me. I can bring the flask and a few pastries." }
+          ]
+        },
+        {
+          "id": "weekend-0003",
+          "sender": { "kind": "email", "value": "priya@example.invalid" },
+          "from_me": false,
+          "offset_seconds": -2200,
+          "delivery": "delivered",
+          "parts": [
+            { "type": "text", "value": "I checked the tide table:\nlow water is just after nine, so the walk should be easy." }
+          ]
+        },
+        {
+          "id": "weekend-0004",
+          "sender": { "kind": "email", "value": "me@example.invalid" },
+          "from_me": true,
+          "offset_seconds": -2100,
+          "delivery": "read",
+          "parts": [
+            { "type": "text", "value": "Perfect. I will book four seats and send the times here." }
+          ],
+          "reactions": [
+            { "sender": { "kind": "email", "value": "jules@example.invalid" }, "kind": "👍", "part": 0, "timestamp_offset_seconds": -2050 },
+            { "sender": { "kind": "email", "value": "dana@example.invalid" }, "kind": "👍", "part": 0, "timestamp_offset_seconds": -2000 }
+          ]
+        },
+        {
+          "id": "weekend-0005",
+          "sender": { "kind": "email", "value": "jules@example.invalid" },
+          "from_me": false,
+          "offset_seconds": -1950,
+          "delivery": "delivered",
+          "parts": [
+            { "type": "text", "value": "Booked seats would be great. The later train gets crowded." }
+          ]
+        },
+        {
+          "id": "weekend-0006",
+          "sender": { "kind": "email", "value": "dana@example.invalid" },
+          "from_me": false,
+          "offset_seconds": -1850,
+          "delivery": "delivered",
+          "parts": [
+            { "type": "text", "value": "Here are the notes I saved from last time." },
+            {
+              "type": "attachment",
+              "value": {
+                "id": "att-weekend-tide-notes",
+                "mime_type": "text/plain",
+                "file_name": "tide-notes.txt",
+                "byte_len": 2048
+              }
+            }
+          ],
+          "reactions": [
+            { "sender": { "kind": "email", "value": "priya@example.invalid" }, "kind": "🙏", "part": 0, "timestamp_offset_seconds": -1800 }
+          ]
+        },
+        {
+          "id": "weekend-0007",
+          "sender": { "kind": "email", "value": "priya@example.invalid" },
+          "from_me": false,
+          "offset_seconds": -1750,
+          "delivery": "delivered",
+          "parts": [
+            { "type": "text", "value": "If the wind picks up we can swap the cliff path for the harbour loop." }
+          ]
+        },
+        {
+          "id": "weekend-0008",
+          "sender": { "kind": "email", "value": "jules@example.invalid" },
+          "from_me": false,
+          "offset_seconds": -1650,
+          "delivery": "delivered",
+          "parts": [
+            { "type": "text", "value": "Good call. The harbour loop has benches and a cafe." }
+          ]
+        },
+        {
+          "id": "weekend-0009",
+          "sender": { "kind": "email", "value": "dana@example.invalid" },
+          "from_me": false,
+          "offset_seconds": -1550,
+          "delivery": "delivered",
+          "parts": [
+            { "type": "text", "value": "Cafe closes at four, so we should aim to be back by three." }
+          ],
+          "reactions": [
+            { "sender": { "kind": "email", "value": "me@example.invalid" }, "kind": "👍", "part": 0, "timestamp_offset_seconds": -1500 }
+          ]
+        },
+        {
+          "id": "weekend-0010",
+          "sender": { "kind": "email", "value": "me@example.invalid" },
+          "from_me": true,
+          "offset_seconds": -1400,
+          "delivery": "read",
+          "parts": [
+            { "type": "text", "value": "Aiming for three. I will pack a small first-aid kit as well." }
+          ]
+        },
+        {
+          "id": "weekend-0011",
+          "sender": { "kind": "email", "value": "priya@example.invalid" },
+          "from_me": false,
+          "offset_seconds": -1200,
+          "delivery": "delivered",
+          "parts": [
+            { "type": "text", "value": "I can bring an extra rain shell if anyone needs one." }
+          ]
+        },
+        {
+          "id": "weekend-0012",
+          "sender": { "kind": "email", "value": "jules@example.invalid" },
+          "from_me": false,
+          "offset_seconds": -1000,
+          "delivery": "delivered",
+          "parts": [
+            { "type": "text", "value": "Thanks. I will take you up on that.\nThe forecast still looks dry, but the coast changes quickly." }
+          ]
+        },
+        {
+          "id": "weekend-0013",
+          "sender": { "kind": "email", "value": "dana@example.invalid" },
+          "from_me": false,
+          "offset_seconds": -700,
+          "delivery": "delivered",
+          "parts": [
+            { "type": "text", "value": "Meet at the north entrance at eight fifteen?" }
+          ]
+        },
+        {
+          "id": "weekend-0014",
+          "sender": { "kind": "email", "value": "priya@example.invalid" },
+          "from_me": false,
+          "offset_seconds": -300,
+          "delivery": "delivered",
+          "parts": [
+            { "type": "text", "value": "Eight fifteen at the north entrance. See you there." }
+          ]
+        }
+      ]
+    },
+    {
+      "id": "design-systems",
+      "remote_id": "demo-design-systems",
+      "kind": "group",
+      "title": "Design systems",
+      "created_offset_seconds": -6500,
+      "participants": [
+        { "handle": { "kind": "email", "value": "me@example.invalid" }, "display_name": "You", "is_me": true },
+        { "handle": { "kind": "email", "value": "priya@example.invalid" }, "display_name": "Priya", "is_me": false },
+        { "handle": { "kind": "email", "value": "marco@example.invalid" }, "display_name": "Marco", "is_me": false },
+        { "handle": { "kind": "email", "value": "sam@example.invalid" }, "display_name": "Sam", "is_me": false }
+      ],
+      "read_marker": "design-0007",
+      "draft": {
+        "body": "Draft: tighten the spacing scale notes before the next review",
+        "cursor": 24,
+        "pasted_body": false,
+        "uncertain": false,
+        "revision": 4,
+        "updated_offset_seconds": -3000
+      },
+      "messages": [
+        {
+          "id": "design-0001",
+          "sender": { "kind": "email", "value": "marco@example.invalid" },
+          "from_me": false,
+          "offset_seconds": -6000,
+          "delivery": "delivered",
+          "parts": [
+            { "type": "text", "value": "The new spacing tokens are in the shared library. Can someone check the compact table?" }
+          ]
+        },
+        {
+          "id": "design-0002",
+          "sender": { "kind": "email", "value": "priya@example.invalid" },
+          "from_me": false,
+          "offset_seconds": -5900,
+          "delivery": "delivered",
+          "parts": [
+            { "type": "text", "value": "I ran it through the narrow layout.\nThe rows hold up, but the header needs a little more breathing room." }
+          ]
+        },
+        {
+          "id": "design-0003",
+          "sender": { "kind": "email", "value": "sam@example.invalid" },
+          "from_me": false,
+          "offset_seconds": -5800,
+          "delivery": "delivered",
+          "parts": [
+            { "type": "text", "value": "I can take the header. Is the type scale still the one from last week?" }
+          ],
+          "reactions": [
+            { "sender": { "kind": "email", "value": "priya@example.invalid" }, "kind": "👀", "part": 0, "timestamp_offset_seconds": -5750 }
+          ]
+        },
+        {
+          "id": "design-0004",
+          "sender": { "kind": "email", "value": "me@example.invalid" },
+          "from_me": true,
+          "offset_seconds": -5600,
+          "delivery": "read",
+          "parts": [
+            { "type": "text", "value": "Yes, same scale. I will add the header note to the review checklist." }
+          ]
+        },
+        {
+          "id": "design-0005",
+          "sender": { "kind": "email", "value": "marco@example.invalid" },
+          "from_me": false,
+          "offset_seconds": -5400,
+          "delivery": "delivered",
+          "parts": [
+            { "type": "text", "value": "Spec attached. The table is on page four." },
+            {
+              "type": "attachment",
+              "value": {
+                "id": "att-design-spacing-spec",
+                "mime_type": "application/pdf",
+                "file_name": "spacing-spec.pdf",
+                "byte_len": 18432
+              }
+            }
+          ]
+        },
+        {
+          "id": "design-0006",
+          "sender": { "kind": "email", "value": "priya@example.invalid" },
+          "from_me": false,
+          "offset_seconds": -5200,
+          "delivery": "delivered",
+          "parts": [
+            { "type": "text", "value": "Page four looks right. The compact rows are much easier to scan now." }
+          ]
+        },
+        {
+          "id": "design-0007",
+          "sender": { "kind": "email", "value": "sam@example.invalid" },
+          "from_me": false,
+          "offset_seconds": -5000,
+          "delivery": "delivered",
+          "parts": [
+            { "type": "text", "value": "I will open a small patch for the header and tag you both." }
+          ]
+        },
+        {
+          "id": "design-0008",
+          "sender": { "kind": "email", "value": "marco@example.invalid" },
+          "from_me": false,
+          "offset_seconds": -4200,
+          "delivery": "delivered",
+          "parts": [
+            { "type": "text", "value": "Patch is up. It only touches the header spacing and the empty state." }
+          ]
+        },
+        {
+          "id": "design-0009",
+          "sender": { "kind": "email", "value": "priya@example.invalid" },
+          "from_me": false,
+          "offset_seconds": -4000,
+          "delivery": "delivered",
+          "parts": [
+            { "type": "text", "value": "Reviewed the patch.\nOne request: keep the empty state copy short so it does not wrap in narrow mode." }
+          ]
+        },
+        {
+          "id": "design-0010",
+          "sender": { "kind": "email", "value": "me@example.invalid" },
+          "from_me": true,
+          "offset_seconds": -3600,
+          "delivery": "read",
+          "parts": [
+            { "type": "text", "value": "Agreed. Short copy, then we can ship it with the next build." }
+          ]
+        },
+        {
+          "id": "design-0011",
+          "sender": { "kind": "email", "value": "sam@example.invalid" },
+          "from_me": false,
+          "offset_seconds": -3200,
+          "delivery": "delivered",
+          "parts": [
+            { "type": "text", "value": "Done. I will mark it ready for review." }
+          ]
+        }
+      ]
+    },
+    {
+      "id": "jules-lee",
+      "remote_id": "demo-jules-lee",
+      "kind": "direct",
+      "title": "Jules Lee",
+      "created_offset_seconds": -15500,
+      "participants": [
+        { "handle": { "kind": "email", "value": "me@example.invalid" }, "display_name": "You", "is_me": true },
+        { "handle": { "kind": "email", "value": "jules@example.invalid" }, "display_name": "Jules", "is_me": false }
+      ],
+      "read_marker": "jules-0009",
+      "messages": [
+        {
+          "id": "jules-0001",
+          "sender": { "kind": "email", "value": "jules@example.invalid" },
+          "from_me": false,
+          "offset_seconds": -15000,
+          "delivery": "delivered",
+          "parts": [
+            { "type": "text", "value": "Did the revised deck reach you? I sent it before the meeting." }
+          ]
+        },
+        {
+          "id": "jules-0002",
+          "sender": { "kind": "email", "value": "me@example.invalid" },
+          "from_me": true,
+          "offset_seconds": -14800,
+          "delivery": "read",
+          "parts": [
+            { "type": "text", "value": "It did. I am reading through the middle section now." }
+          ]
+        },
+        {
+          "id": "jules-0003",
+          "sender": { "kind": "email", "value": "jules@example.invalid" },
+          "from_me": false,
+          "offset_seconds": -14600,
+          "delivery": "delivered",
+          "parts": [
+            { "type": "text", "value": "The middle section is the part I am least sure about." }
+          ]
+        },
+        {
+          "id": "jules-0004",
+          "sender": { "kind": "email", "value": "me@example.invalid" },
+          "from_me": true,
+          "offset_seconds": -14400,
+          "delivery": "read",
+          "parts": [
+            { "type": "text", "value": "The structure is clear.\nI would move the two examples earlier so the point lands sooner." }
+          ]
+        },
+        {
+          "id": "jules-0005",
+          "sender": { "kind": "email", "value": "jules@example.invalid" },
+          "from_me": false,
+          "offset_seconds": -14200,
+          "delivery": "delivered",
+          "parts": [
+            { "type": "text", "value": "That makes sense. I will reorder them this afternoon." }
+          ],
+          "reactions": [
+            { "sender": { "kind": "email", "value": "me@example.invalid" }, "kind": "👍", "part": 0, "timestamp_offset_seconds": -14100 }
+          ]
+        },
+        {
+          "id": "jules-0006",
+          "sender": { "kind": "email", "value": "me@example.invalid" },
+          "from_me": true,
+          "offset_seconds": -14000,
+          "delivery": "read",
+          "parts": [
+            { "type": "text", "value": "No rush. Tomorrow morning is fine." }
+          ]
+        },
+        {
+          "id": "jules-0007",
+          "sender": { "kind": "email", "value": "jules@example.invalid" },
+          "from_me": false,
+          "offset_seconds": -13800,
+          "delivery": "delivered",
+          "parts": [
+            { "type": "text", "value": "Thanks.\nI will send the reordered version and a short note about what changed." }
+          ]
+        },
+        {
+          "id": "jules-0008",
+          "sender": { "kind": "email", "value": "jules@example.invalid" },
+          "from_me": false,
+          "offset_seconds": -1800,
+          "delivery": "delivered",
+          "parts": [
+            { "type": "text", "value": "Here is the reordered deck." },
+            {
+              "type": "attachment",
+              "value": {
+                "id": "att-jules-deck-v3",
+                "mime_type": "application/pdf",
+                "file_name": "deck-v3.pdf",
+                "byte_len": 51200
+              }
+            }
+          ]
+        },
+        {
+          "id": "jules-0009",
+          "sender": { "kind": "email", "value": "me@example.invalid" },
+          "from_me": true,
+          "offset_seconds": -1700,
+          "delivery": "read",
+          "parts": [
+            { "type": "text", "value": "Got it. The new order reads much better." }
+          ]
+        }
+      ]
+    },
+    {
+      "id": "dana-okafor",
+      "remote_id": "demo-dana-okafor",
+      "kind": "direct",
+      "title": "Dana Okafor",
+      "created_offset_seconds": -8500,
+      "participants": [
+        { "handle": { "kind": "email", "value": "me@example.invalid" }, "display_name": "You", "is_me": true },
+        { "handle": { "kind": "email", "value": "dana@example.invalid" }, "display_name": "Dana", "is_me": false }
+      ],
+      "read_marker": "dana-0005",
+      "messages": [
+        {
+          "id": "dana-0001",
+          "sender": { "kind": "email", "value": "dana@example.invalid" },
+          "from_me": false,
+          "offset_seconds": -8000,
+          "delivery": "delivered",
+          "parts": [
+            { "type": "text", "value": "Are we still on for the walk on Sunday?" }
+          ]
+        },
+        {
+          "id": "dana-0002",
+          "sender": { "kind": "email", "value": "me@example.invalid" },
+          "from_me": true,
+          "offset_seconds": -7800,
+          "delivery": "read",
+          "parts": [
+            { "type": "text", "value": "Yes, morning works best for me." }
+          ]
+        },
+        {
+          "id": "dana-0003",
+          "sender": { "kind": "email", "value": "dana@example.invalid" },
+          "from_me": false,
+          "offset_seconds": -7600,
+          "delivery": "delivered",
+          "parts": [
+            { "type": "text", "value": "Perfect. I will bring the map and the small compass." }
+          ]
+        },
+        {
+          "id": "dana-0004",
+          "sender": { "kind": "email", "value": "dana@example.invalid" },
+          "from_me": false,
+          "offset_seconds": -7400,
+          "delivery": "delivered",
+          "parts": [
+            { "type": "text", "value": "This is the route I had in mind." },
+            {
+              "type": "attachment",
+              "value": {
+                "id": "att-dana-route-map",
+                "mime_type": "image/png",
+                "file_name": "route-map.png",
+                "byte_len": 40960
+              }
+            }
+          ]
+        },
+        {
+          "id": "dana-0005",
+          "sender": { "kind": "email", "value": "me@example.invalid" },
+          "from_me": true,
+          "offset_seconds": -7200,
+          "delivery": "read",
+          "parts": [
+            { "type": "text", "value": "Looks good. The middle loop is new to me." }
+          ]
+        },
+        {
+          "id": "dana-0006",
+          "sender": { "kind": "email", "value": "dana@example.invalid" },
+          "from_me": false,
+          "offset_seconds": -1100,
+          "delivery": "delivered",
+          "parts": [
+            { "type": "text", "value": "The forecast says light rain around noon. Should we start earlier?" }
+          ]
+        },
+        {
+          "id": "dana-0007",
+          "sender": { "kind": "email", "value": "dana@example.invalid" },
+          "from_me": false,
+          "offset_seconds": -1000,
+          "delivery": "delivered",
+          "parts": [
+            { "type": "text", "value": "I can do eight if that helps." }
+          ]
+        },
+        {
+          "id": "dana-0008",
+          "sender": { "kind": "email", "value": "dana@example.invalid" },
+          "from_me": false,
+          "offset_seconds": -900,
+          "delivery": "delivered",
+          "parts": [
+            { "type": "text", "value": "No pressure either way. The route is fine in rain." }
+          ]
+        }
+      ]
+    },
+    {
+      "id": "harbour-log",
+      "remote_id": "demo-harbour-log",
+      "kind": "group",
+      "title": "Harbour log",
+      "created_offset_seconds": -260000,
+      "participants": [
+        { "handle": { "kind": "email", "value": "me@example.invalid" }, "display_name": "You", "is_me": true },
+        { "handle": { "kind": "email", "value": "nadia@example.invalid" }, "display_name": "Nadia", "is_me": false },
+        { "handle": { "kind": "email", "value": "theo@example.invalid" }, "display_name": "Theo", "is_me": false }
+      ],
+      "read_marker": "harbour-log-0198",
+      "history": {
+        "count": 205,
+        "start_offset_seconds": -259200,
+        "step_seconds": 120,
+        "turns": [
+          { "sender": { "kind": "email", "value": "nadia@example.invalid" }, "text": "Morning check: the harbour gate is open and the water is calm." },
+          { "sender": { "kind": "email", "value": "theo@example.invalid" }, "text": "Thanks. I will log the first ferry at seven." },
+          { "sender": { "kind": "email", "value": "me@example.invalid" }, "text": "I will add the wind reading after the next update." },
+          { "sender": { "kind": "email", "value": "nadia@example.invalid" }, "text": "The east buoy is showing a light swell." },
+          { "sender": { "kind": "email", "value": "theo@example.invalid" }, "text": "Noted. The small boats are still staying inside the breakwater." },
+          { "sender": { "kind": "email", "value": "me@example.invalid" }, "text": "Good. I will mark the harbour loop as clear for now." },
+          { "sender": { "kind": "email", "value": "nadia@example.invalid" }, "text": "The tide turned earlier than expected.\nPlease keep the north ramp clear until the water drops." },
+          { "sender": { "kind": "email", "value": "theo@example.invalid" }, "text": "Understood. I will move the crates back." },
+          { "sender": { "kind": "email", "value": "me@example.invalid" }, "text": "I have updated the log with the new tide time." },
+          { "sender": { "kind": "email", "value": "nadia@example.invalid" }, "text": "The cafe has opened and the first walkers are heading out." },
+          { "sender": { "kind": "email", "value": "theo@example.invalid" }, "text": "The path by the old crane is damp but passable." },
+          { "sender": { "kind": "email", "value": "me@example.invalid" }, "text": "I will add a caution note for the crane path." },
+          { "sender": { "kind": "email", "value": "nadia@example.invalid" }, "text": "A gull has decided the signpost is its new home." },
+          { "sender": { "kind": "email", "value": "theo@example.invalid" }, "text": "I will ask the maintenance team to clean it later." },
+          { "sender": { "kind": "email", "value": "me@example.invalid" }, "text": "The harbour office says the bins will be collected tomorrow." },
+          { "sender": { "kind": "email", "value": "nadia@example.invalid" }, "text": "The west gate latch is sticking again." },
+          { "sender": { "kind": "email", "value": "theo@example.invalid" }, "text": "I can bring a screwdriver on the next round." },
+          { "sender": { "kind": "email", "value": "me@example.invalid" }, "text": "Please log it as a minor repair, not an emergency." },
+          { "sender": { "kind": "email", "value": "nadia@example.invalid" }, "text": "The ferry queue is longer than usual this morning." },
+          { "sender": { "kind": "email", "value": "theo@example.invalid" }, "text": "The second boat is running a few minutes late." },
+          { "sender": { "kind": "email", "value": "me@example.invalid" }, "text": "I will note the delay in the harbour log." },
+          { "sender": { "kind": "email", "value": "nadia@example.invalid" }, "text": "The rain arrived just after ten.\nThe covered benches are full, so the lower path is busier than usual." },
+          { "sender": { "kind": "email", "value": "theo@example.invalid" }, "text": "I will keep an eye on the lower path." },
+          { "sender": { "kind": "email", "value": "me@example.invalid" }, "text": "The wind has dropped and the water is glassy now." },
+          { "sender": { "kind": "email", "value": "nadia@example.invalid" }, "text": "The afternoon ferry is back on time." },
+          { "sender": { "kind": "email", "value": "theo@example.invalid" }, "text": "The crates are clear of the north ramp." },
+          { "sender": { "kind": "email", "value": "me@example.invalid" }, "text": "Thanks. I have closed the tide note." },
+          { "sender": { "kind": "email", "value": "nadia@example.invalid" }, "text": "The old crane path is drying out." },
+          { "sender": { "kind": "email", "value": "theo@example.invalid" }, "text": "The signpost is clean and the gull has moved on." },
+          { "sender": { "kind": "email", "value": "me@example.invalid" }, "text": "The bins were collected before lunch." },
+          { "sender": { "kind": "email", "value": "nadia@example.invalid" }, "text": "The west gate latch is still stiff but usable." },
+          { "sender": { "kind": "email", "value": "theo@example.invalid" }, "text": "I will replace the latch on Friday." },
+          { "sender": { "kind": "email", "value": "me@example.invalid" }, "text": "I have added the repair to the weekly list." },
+          { "sender": { "kind": "email", "value": "nadia@example.invalid" }, "text": "The harbour lights came on early because of the cloud." },
+          { "sender": { "kind": "email", "value": "theo@example.invalid" }, "text": "The lower path is quieter now." },
+          { "sender": { "kind": "email", "value": "me@example.invalid" }, "text": "I will record the light check as complete." },
+          { "sender": { "kind": "email", "value": "nadia@example.invalid" }, "text": "The last ferry is boarding." },
+          { "sender": { "kind": "email", "value": "theo@example.invalid" }, "text": "The north ramp is clear and the gate is closed." },
+          { "sender": { "kind": "email", "value": "me@example.invalid" }, "text": "The harbour log is up to date for today." },
+          { "sender": { "kind": "email", "value": "nadia@example.invalid" }, "text": "Thanks, both. Same check tomorrow?" },
+          { "sender": { "kind": "email", "value": "theo@example.invalid" }, "text": "Same check tomorrow. I will open the gate at seven." }
+        ]
+      }
+    }
+  ]
+}

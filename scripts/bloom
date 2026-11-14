@@ -16,9 +16,10 @@ cd "$root"
 profile=release
 usage() {
   cat <<'EOF'
-usage: scripts/bloom [--release|--debug]
+usage: scripts/bloom [--release|--debug|--demo]
   --release  build and run the optimized daemon and TUI (default)
   --debug    build and run the debug daemon and TUI
+  --demo     build and run an isolated synthetic demo session (never reads .env)
 EOF
 }
 if [ "$#" -gt 1 ]; then
@@ -29,9 +30,20 @@ case "${1:-}" in
   "") ;;
   --release) profile=release ;;
   --debug) profile=debug ;;
+  --demo) profile=demo ;;
   -h|--help) usage; exit 0 ;;
   *) usage >&2; exit 2 ;;
 esac
+
+# The demo profile never sources .env: the session must not inherit real socket,
+# store, engine, or opener settings from a developer checkout. The installed-style
+# launcher (target/demo/bloom --demo) owns the whole demo lifecycle, so this script
+# only builds the profile and hands over.
+if [ "$profile" = demo ]; then
+  echo "building bloom (demo profile)..." >&2
+  CARGO_BUILD_JOBS=${CARGO_BUILD_JOBS:-2} cargo build --profile demo -p bloomd -p bloom-tui
+  exec "$root/target/demo/bloom" --demo
+fi
 
 # Local overrides live in .env so your shell stays clean. Only paths belong there,
 # never secrets. The file is sourced, so it must be trusted like any shell script.

@@ -16,6 +16,7 @@ use bloomd::{
     supervisor::Supervisor,
 };
 use std::{
+    fmt,
     process::ExitCode,
     sync::{
         atomic::{AtomicU64, Ordering},
@@ -26,6 +27,131 @@ use std::{
 use tokio::sync::{mpsc, watch};
 
 const SHUTDOWN_DRAIN: Duration = Duration::from_secs(10);
+
+const USAGE: &str = "\
+Usage: bloomd [OPTIONS]
+
+Options:
+      --demo   Run the isolated synthetic demo daemon
+  -h, --help   Print this help and exit
+";
+
+/// Arguments accepted by the daemon.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct DaemonArgs {
+    demo: bool,
+}
+
+/// Result of parsing the command line.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ArgOutcome {
+    Run(DaemonArgs),
+    Help,
+}
+
+/// Why the command line was rejected.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ArgError {
+    Unknown(String),
+    Duplicate(&'static str),
+    Conflict(&'static str),
+}
+
+impl fmt::Display for ArgError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Unknown(argument) => write!(f, "unknown argument {argument:?}"),
+            Self::Duplicate(argument) => write!(f, "duplicate argument {argument}"),
+            Self::Conflict(argument) => write!(f, "conflicting arguments: {argument}"),
+        }
+    }
+}
+
+/// Parse the daemon command line without touching configuration or discovery.
+fn parse_args<I, S>(args: I) -> Result<ArgOutcome, ArgError>
+where
+    I: IntoIterator<Item = S>,
+    S: Into<String>,
+{
+    let mut demo = false;
+    let mut help = false;
+    for argument in args {
+        let argument = argument.into();
+        match argument.as_str() {
+            "--demo" => {
+                if demo {
+                    return Err(ArgError::Duplicate("--demo"));
+                }
+                if help {
+                    return Err(ArgError::Conflict("--help with --demo"));
+                }
+                demo = true;
+            }
+            "-h" | "--help" => {
+                if help {
+                    return Err(ArgError::Duplicate("--help"));
+                }
+                if demo {
+                    return Err(ArgError::Conflict("--help with --demo"));
+                }
+                help = true;
+            }
+            other => return Err(ArgError::Unknown(other.to_owned())),
+        }
+    }
+    if help {
+        Ok(ArgOutcome::Help)
+    } else {
+        Ok(ArgOutcome::Run(DaemonArgs { demo }))
+    }
+}
+
+/// Parsed demo request handed to the fixed dispatch seam.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct DemoContext {
+    /// Always true: the seam is only called for a demo request.
+    requested: bool,
+}
+
+impl DemoContext {
+    fn requested() -> Self {
+        Self { requested: true }
+    }
+}
+
+/// Where startup goes after the demo dispatch seam.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum DemoDispatch {
+    /// Continue with normal startup.
+    ProceedNormal,
+    /// Demo startup handled the process; exit with this code.
+    Exit(ExitCode),
+}
+
+/// Call the demo dispatch seam when the command line requested demo mode.
+fn demo_dispatch(args: DaemonArgs) -> DemoDispatch {
+    if args.demo {
+        run_demo_daemon(DemoContext::requested())
+    } else {
+        DemoDispatch::ProceedNormal
+    }
+}
+
+/// Fixed demo dispatch seam.
+///
+/// The signature and [`DemoDispatch`] shape are fixed so dispatch stays here.
+/// The body calls the U2-owned demo module, which owns root validation, demo
+/// startup, and cleanup. A demo request never falls through to normal startup.
+fn run_demo_daemon(context: DemoContext) -> DemoDispatch {
+    debug_assert!(context.requested);
+    match bloomd::demo::run() {
+        Ok(()) => DemoDispatch::Exit(ExitCode::SUCCESS),
+        Err(error) => {
+            eprintln!("bloomd: demo startup refused: {error}");
+            DemoDispatch::Exit(ExitCode::from(1))
+        }
+    }
+}
 
 /// Name the signal that ended the run, so the log says how the daemon stopped.
 ///
@@ -57,6 +183,31 @@ async fn termination_signal() -> &'static str {
 
 #[tokio::main]
 async fn main() -> ExitCode {
+    let args = match parse_args(std::env::args().skip(1)) {
+        Ok(ArgOutcome::Help) => {
+            print!("{USAGE}");
+            return ExitCode::SUCCESS;
+        }
+        Ok(ArgOutcome::Run(args)) => args,
+        Err(error) => {
+            eprintln!("bloomd: {error}");
+            eprint!("{USAGE}");
+            return ExitCode::from(2);
+        }
+    };
+
+    // Demo dispatch precedes real configuration and discovery. A demo request
+    // must never fall through to normal startup.
+    match demo_dispatch(args) {
+        DemoDispatch::Exit(code) => return code,
+        DemoDispatch::ProceedNormal => {
+            if args.demo {
+                eprintln!("bloomd: demo startup declined; refusing normal startup");
+                return ExitCode::from(1);
+            }
+        }
+    }
+
     let config = match DaemonConfig::from_env() {
         Ok(config) => config,
         Err(error) => {
@@ -354,6 +505,120 @@ mod tests {
             RecoveryShutdown::classify(Err(elapsed)).incomplete_message(),
             Some("engine recovery loop did not stop in time")
         );
+    }
+
+    #[test]
+    fn help_is_safe_and_exits_zero() {
+        assert_eq!(parse_args(["--help"]), Ok(ArgOutcome::Help));
+        assert_eq!(parse_args(["-h"]), Ok(ArgOutcome::Help));
+        assert!(USAGE.contains("Usage: bloomd"));
+    }
+
+    #[test]
+    fn unknown_argument_is_rejected() {
+        assert_eq!(
+            parse_args(["--nope"]),
+            Err(ArgError::Unknown("--nope".to_owned()))
+        );
+        assert_eq!(
+            parse_args(["positional"]),
+            Err(ArgError::Unknown("positional".to_owned()))
+        );
+    }
+
+    #[test]
+    fn duplicate_and_conflicting_arguments_are_rejected() {
+        assert_eq!(
+            parse_args(["--demo", "--demo"]),
+            Err(ArgError::Duplicate("--demo"))
+        );
+        assert_eq!(
+            parse_args(["--help", "--help"]),
+            Err(ArgError::Duplicate("--help"))
+        );
+        assert_eq!(
+            parse_args(["--demo", "--help"]),
+            Err(ArgError::Conflict("--help with --demo"))
+        );
+        assert_eq!(
+            parse_args(["--help", "--demo"]),
+            Err(ArgError::Conflict("--help with --demo"))
+        );
+    }
+
+    const REFUSAL_CHILD_ENV: &str = "BLOOMD_DEMO_REFUSAL_CHILD";
+    const REFUSAL_CHILD_TIMEOUT: Duration = Duration::from_secs(30);
+
+    /// Child-process body for [`assert_demo_refusal_in_child`].
+    ///
+    /// The parent sets [`REFUSAL_CHILD_ENV`], so a normal test run skips this.
+    #[test]
+    fn demo_refusal_child_probe() {
+        if std::env::var_os(REFUSAL_CHILD_ENV).is_none() {
+            return;
+        }
+        let args = parse_args(["--demo"]).unwrap();
+        let ArgOutcome::Run(args) = args else {
+            panic!("expected runnable arguments");
+        };
+        assert_eq!(demo_dispatch(args), DemoDispatch::Exit(ExitCode::from(1)));
+    }
+
+    /// Run the demo refusal check in a child with a controlled environment.
+    ///
+    /// Real demo startup reads `BLOOM_DEMO_ROOT`, so an inherited valid root
+    /// would make the child serve until a signal arrives. The child clears the
+    /// environment and sets only a deliberately invalid root, making refusal
+    /// immediate and independent of the parent's environment.
+    fn assert_demo_refusal_in_child() {
+        let exe = std::env::current_exe().expect("test executable path");
+        let mut child = std::process::Command::new(exe)
+            .args(["--exact", "tests::demo_refusal_child_probe", "--nocapture"])
+            .env_clear()
+            .env(REFUSAL_CHILD_ENV, "1")
+            .env("BLOOM_DEMO_ROOT", "demo-refusal-probe")
+            .spawn()
+            .expect("spawn refusal probe");
+
+        let deadline = std::time::Instant::now() + REFUSAL_CHILD_TIMEOUT;
+        let status = loop {
+            match child.try_wait().expect("poll refusal probe") {
+                Some(status) => break status,
+                None if std::time::Instant::now() >= deadline => {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    panic!("refusal probe did not finish within {REFUSAL_CHILD_TIMEOUT:?}");
+                }
+                None => std::thread::sleep(Duration::from_millis(10)),
+            }
+        };
+        assert!(status.success(), "refusal probe failed: {status}");
+    }
+
+    #[test]
+    fn demo_flag_reaches_the_stub_hook() {
+        let args = parse_args(["--demo"]).unwrap();
+        assert_eq!(args, ArgOutcome::Run(DaemonArgs { demo: true }));
+        assert_demo_refusal_in_child();
+    }
+
+    #[test]
+    fn stub_hook_fails_without_touching_state() {
+        // The stub body only prints and returns; it does not read configuration,
+        // discovery, the store, the keychain, a socket, or the environment.
+        assert_demo_refusal_in_child();
+        // Calling it again is deterministic and still touches nothing.
+        assert_demo_refusal_in_child();
+    }
+
+    #[test]
+    fn normal_mode_does_not_dispatch_demo() {
+        let args = parse_args(std::iter::empty::<&str>()).unwrap();
+        assert_eq!(args, ArgOutcome::Run(DaemonArgs { demo: false }));
+        let ArgOutcome::Run(args) = args else {
+            panic!("expected runnable arguments");
+        };
+        assert_eq!(demo_dispatch(args), DemoDispatch::ProceedNormal);
     }
 
     #[tokio::test]

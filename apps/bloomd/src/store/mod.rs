@@ -37,6 +37,14 @@ use zeroize::Zeroize;
 const KEY_BYTES: usize = 32;
 const STORE_KEY_NAME: &str = "bloomd.sqlite.v1";
 
+/// Public fixed key for the synthetic demo store.
+///
+/// Demo data has no confidentiality: this key is published in the source tree so
+/// a demo database is reproducible and never depends on the OS keychain. It must
+/// never be used for a real store, and the real key namespace
+/// (`bloomd.sqlite.v1`) is never consulted on the demo path.
+pub const DEMO_STORE_KEY: [u8; KEY_BYTES] = *b"bloom-demo-public-key-not-secret";
+
 /// Fill a buffer from the OS CSPRNG. Used only to provision a new store key.
 fn generate_key() -> Result<[u8; KEY_BYTES], StoreError> {
     let mut key = [0u8; KEY_BYTES];
@@ -219,6 +227,15 @@ impl EncryptedStore {
                 result
             }
         }
+    }
+
+    /// Open the synthetic demo store with the public demo key.
+    ///
+    /// This is the only store entry point the demo daemon uses: no keychain, no
+    /// key provisioning, and no `open_or_create()` key lookup in the real
+    /// namespace.
+    pub fn open_demo(path: impl AsRef<Path>) -> Result<Self, StoreError> {
+        Self::open_with_key(path, &DEMO_STORE_KEY)
     }
 
     pub fn open(path: impl AsRef<Path>, secrets: &dyn SecretStore) -> Result<Self, StoreError> {

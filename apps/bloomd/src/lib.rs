@@ -1,6 +1,7 @@
 //! Bloom daemon crate.
 
 pub mod config;
+pub mod demo;
 pub mod diagnostics;
 pub mod engine;
 pub mod generation;

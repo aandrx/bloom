@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 """Exercise the actual installed-entry binary, with isolated synthetic children."""
+import json
 import os
 from pathlib import Path
 import shutil
@@ -197,6 +198,140 @@ while True:
         self.assertFalse((self.root / 'daemon.pid').exists())
 
 
+class DemoLauncherFlow(unittest.TestCase):
+    """The installed launcher's --demo path, with stub daemon and TUI children."""
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory(prefix='bloom-demo-e2e-')
+        self.root = Path(self.temp.name)
+        self.root.chmod(0o700)
+        self.addCleanup(self.temp.cleanup)
+        shutil.copy2(BINARY, self.root / 'bloom')
+        self.out = self.root / 'out'
+        self.out.mkdir()
+        self.normal_socket = self.root / 'normal.sock'
+        self.normal_store = self.root / 'normal.db'
+        self.env = dict(
+            os.environ,
+            HOME=str(self.root / 'home'),
+            XDG_STATE_HOME=str(self.root / 'state'),
+            XDG_CONFIG_HOME=str(self.root / 'config'),
+            XDG_DATA_HOME=str(self.root / 'data'),
+            BLOOM_SOCKET_PATH=str(self.normal_socket),
+            BLOOM_STORE_PATH=str(self.normal_store),
+            E2E_OUT=str(self.out),
+        )
+        self.stub('bloomd', (
+            'import json, os, signal, socket, sys\n'
+            'from pathlib import Path\n'
+            "out = Path(os.environ['E2E_OUT'])\n"
+            "root = Path(os.environ['BLOOM_DEMO_ROOT'])\n"
+            "marker = json.loads((root / 'demo-session.json').read_text())\n"
+            "(out / 'daemon.json').write_text(json.dumps({\n"
+            "    'argv': sys.argv[1:],\n"
+            "    'root': str(root),\n"
+            "    'root_mode': oct(root.stat().st_mode & 0o777),\n"
+            "    'socket_env': os.environ.get('BLOOM_SOCKET_PATH'),\n"
+            "    'store_env': os.environ.get('BLOOM_STORE_PATH'),\n"
+            "    'marker': marker,\n"
+            "}))\n"
+            "marker['read_positions'] = {\n"
+            "    'openbubbles|chat-1': {'created_at': 10, 'transport': 'openbubbles', 'value': 'm1'}\n"
+            "}\n"
+            "(root / 'demo-session.json').write_text(json.dumps(marker))\n"
+            'def stop(signum, frame):\n'
+            '    raise SystemExit(0)\n'
+            'signal.signal(signal.SIGTERM, stop)\n'
+            "server = socket.socket(socket.AF_UNIX)\n"
+            "server.bind(str(root / 'runtime/bloomd.sock'))\n"
+            'server.listen(8)\n'
+            'while True:\n'
+            '    client, _ = server.accept()\n'
+            '    client.close()\n'
+        ))
+        self.stub('bloom-tui', (
+            'import json, os, sys\n'
+            'from pathlib import Path\n'
+            "out = Path(os.environ['E2E_OUT'])\n"
+            "root = Path(os.environ['BLOOM_DEMO_ROOT'])\n"
+            "config = root / 'config/bloom/tui.json'\n"
+            "(out / 'tui.json').write_text(json.dumps({\n"
+            "    'argv': sys.argv[1:],\n"
+            "    'root': str(root),\n"
+            "    'socket_env': os.environ.get('BLOOM_SOCKET_PATH'),\n"
+            "    'config': json.loads(config.read_text()) if config.exists() else None,\n"
+            "}))\n"
+            'raise SystemExit(0)\n'
+        ))
+
+    def stub(self, name, code):
+        path = self.root / name
+        path.write_text('#!/usr/bin/env python3\nimport os\n' + code)
+        path.chmod(0o700)
+
+    def launch(self):
+        return subprocess.run(
+            [str(self.root / 'bloom'), '--demo'],
+            cwd=self.root,
+            env=self.env,
+            stdin=subprocess.DEVNULL,
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+
+    def test_demo_runs_an_isolated_session_and_cleans_up(self):
+        # A listener on the normal socket must never be contacted.
+        sentinel = socket.socket(socket.AF_UNIX)
+        sentinel.bind(str(self.normal_socket))
+        sentinel.listen(8)
+        sentinel.setblocking(False)
+        self.addCleanup(sentinel.close)
+
+        result = self.launch()
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+        daemon = json.loads((self.out / 'daemon.json').read_text())
+        tui = json.loads((self.out / 'tui.json').read_text())
+        self.assertEqual(daemon['argv'], ['--demo'])
+        self.assertEqual(tui['argv'], ['--demo'], 'both children receive --demo')
+
+        root = Path(daemon['root'])
+        self.assertTrue(str(root).startswith('/tmp/bloom-demo-'))
+        self.assertEqual(daemon['root'], tui['root'], 'both children share one root')
+        self.assertEqual(daemon['root_mode'], '0o700')
+
+        marker = daemon['marker']
+        self.assertTrue(marker['synthetic'])
+        self.assertEqual(marker['kind'], 'bloom-demo-session')
+        self.assertEqual(marker['socket'], 'runtime/bloomd.sock')
+
+        # Seeded read positions reach the demo TUI preferences before it starts.
+        self.assertEqual(
+            tui['config']['read_positions']['openbubbles|chat-1']['value'], 'm1')
+
+        # Inherited variables are ignored, never removed, and never used.
+        self.assertEqual(daemon['socket_env'], self.env['BLOOM_SOCKET_PATH'])
+        self.assertEqual(daemon['store_env'], self.env['BLOOM_STORE_PATH'])
+        self.assertEqual(tui['socket_env'], self.env['BLOOM_SOCKET_PATH'])
+        self.assertFalse(self.normal_store.exists())
+        with self.assertRaises(BlockingIOError):
+            sentinel.accept()
+
+        # Cleanup removes only the session root after the children exit.
+        self.assertFalse(root.exists())
+
+    def test_each_launch_uses_a_fresh_root(self):
+        first = self.launch()
+        self.assertEqual(first.returncode, 0, first.stderr)
+        first_root = json.loads((self.out / 'daemon.json').read_text())['root']
+        (self.out / 'daemon.json').unlink()
+        second = self.launch()
+        self.assertEqual(second.returncode, 0, second.stderr)
+        second_root = json.loads((self.out / 'daemon.json').read_text())['root']
+        self.assertNotEqual(first_root, second_root)
+
+
 class CheckoutLauncherProfile(unittest.TestCase):
     """Run the checkout launcher against fake profile-specific binaries."""
 
@@ -328,6 +463,24 @@ class CheckoutLauncherProfile(unittest.TestCase):
         self.assertEqual((self.root / 'tui.marker').read_text(), 'release')
         self.assertFalse((self.root / 'daemon.pid').exists())
 
+    def test_demo_flag_builds_the_demo_profile_and_hands_to_the_launcher(self):
+        # The demo profile builds target/demo and execs the installed-style
+        # launcher, so the script never implements a second lifecycle.
+        self.stub('demo', 'bloom', (
+            'import sys\n'
+            'from pathlib import Path\n'
+            "Path('demo-args').write_text(' '.join(sys.argv[1:]))\n"
+        ))
+        # A .env that would leave a trace if it were sourced.
+        (self.root / '.env').write_text('touch sourced.marker\n')
+        result = self.run_launcher('--demo')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn('--profile demo', (self.root / 'cargo.args').read_text())
+        self.assertEqual((self.root / 'demo-args').read_text(), '--demo')
+        self.assertFalse((self.root / 'sourced.marker').exists(),
+                         'demo must never source .env')
+        self.assertFalse((self.root / 'tui.marker').exists())
+
 
 class CheckoutLauncherOptions(unittest.TestCase):
     """The checkout launcher must expose the profile opt-in without starting."""
@@ -348,6 +501,7 @@ class CheckoutLauncherOptions(unittest.TestCase):
         self.assertEqual(result.returncode, 0)
         self.assertIn('--release', result.stdout)
         self.assertIn('--debug', result.stdout)
+        self.assertIn('--demo', result.stdout)
         self.assertIn('(default)', result.stdout)
 
     def test_unknown_option_is_refused_before_building(self):
